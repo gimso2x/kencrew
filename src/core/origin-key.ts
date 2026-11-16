@@ -20,8 +20,8 @@ export interface ChatOriginRef {
  * the original Activity id, kept as it is.
  */
 export const GRAMMAR: Readonly<Record<ChatPlatform, { readonly conversation: RegExp; readonly thread: RegExp }>> = {
-	slack: { conversation: /^[A-Z][A-Z0-9]+$/, thread: /^[0-9.]+$/ },
-	discord: { conversation: /^[0-9]+$/, thread: /^[0-9]+$/ },
+	slack: { conversation: /^[A-Z][A-Z0-9]{1,30}$/, thread: /^[0-9.]+$/ },
+	discord: { conversation: /^[0-9]{1,20}$/, thread: /^[0-9]+$/ },
 	teams: { conversation: /^t[0-9a-f]{16}$/, thread: /^[^\s/]+$/ },
 };
 

@@ -12,6 +12,8 @@ export type TaskEvaluation = { ok: true; judgement: TaskJudgement } | { ok: fals
  */
 export type TaskCheckCache = Map<string, { head: string; results: Map<string, SignalCheck> }>;
 
+const CHECK_CHANGED_WORKTREE =
+	"[check:] 명령이 worktree를 변경했습니다(커밋·파일 생성) — 검사는 worktree를 바꾸지 않아야 합니다. 변경을 정리(커밋하거나 지움)한 뒤 다시 알리세요";
 const UNCOMMITTED = "미커밋 변경이 있어 check를 미룹니다";
 
 /**
@@ -35,12 +37,13 @@ export async function runWorktreeChecks(
 		runCheck: (argv: string[]) =>
 			ops.runCheck({ worktree, argv, timeoutMs: CHECK_TIMEOUT_MS, ...(signal === undefined ? {} : { signal }) }),
 		readBytes: async (path: string) => {
-			const read = await ops.readBytes(`${worktree}/${path}`);
+			const read = await ops.readBytes(`${worktree}/${path}`, worktree);
 			if (!read.ok) throw new Error(`cannot read ${path}: ${read.error}`);
 			return read.value;
 		},
 	};
 	const results: TaskCheck[] = [];
+	const ran: string[] = [];
 	// One at a time: two test suites racing in one worktree would judge each other.
 	for (const request of requests) {
 		let result = known.get(request.signal);
@@ -50,7 +53,10 @@ export async function runWorktreeChecks(
 			// A killed check is no verdict: it must not reach the known results.
 			signal?.throwIfAborted();
 			// A timed-out run proves nothing either way: the next judgement runs it again.
-			if (!result.inconclusive) known.set(request.signal, result);
+			if (!result.inconclusive) {
+				known.set(request.signal, result);
+				ran.push(request.signal);
+			}
 		}
 		results.push({
 			id: request.id,
@@ -59,6 +65,13 @@ export async function runWorktreeChecks(
 			detail: result.detail,
 			...(result.inconclusive ? { inconclusive: true as const } : {}),
 		});
+	}
+	// A check that changed the worktree (a commit, a written file) judged a tree that is no longer the claim: its
+	// results are not remembered, and the judgement says why instead of blaming the next, "uncommitted" tree.
+	const after = ran.length === 0 ? head : await ops.headOf(worktree);
+	if (after.sha !== head.sha || !after.clean) {
+		for (const text of ran) known.delete(text);
+		return { deferred: CHECK_CHANGED_WORKTREE };
 	}
 	return { head: head.sha, results };
 }

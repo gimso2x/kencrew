@@ -36,11 +36,17 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 					enum: [...TASK_RISKS],
 					description: "Risk class L0 (trivial) .. L4 (dangerous); default L3",
 				},
+				scope: {
+					type: "array",
+					items: { type: "string" },
+					description:
+						'Repository-relative globs the lane may change (e.g. ["src/lanes/**", "test/lane-*.test.ts"]). At close every file the claim commit changed is matched; any outside holds the auto-merge and is shown on the Outcome card. Omit for no check.',
+				},
 				model: {
 					type: "string",
 					enum: [...LANE_MODEL_TIERS],
 					description:
-						"Model tier of the lane session (owner config `lanes.models`): high for design, debugging or wide changes; middle for ordinary implementation; low for mechanical edits. Omit to use the bot's default model.",
+						"Model tier of the lane session (owner config `lanes.models`): high for design, debugging or wide changes; middle for ordinary implementation; low for mechanical edits. Omit to let the risk class decide (L0-L1 low, L2 middle, L3 and above or unrated high); L3 and above always run on high.",
 				},
 			},
 			required: ["title", "cwd"],
@@ -55,6 +61,7 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 				channel,
 				acceptance: params.acceptance,
 				risk: params.risk,
+				scope: params.scope,
 				model: params.model,
 			});
 			const link = await manager.threadLink(lane);
@@ -102,6 +109,24 @@ export function buildLaneTools(manager: LaneManager, originKey: string): HostToo
 						description:
 							"Five lines: 결과 (done/partial/blocked + gist), 변경 (files, behavior), 증거 (exact commands actually run, results, criteria shown), 미확인 (unrun checks, risks, or 없음), 인계 (remaining work or owner decisions, or 없음)",
 					},
+					leftovers: {
+						type: "array",
+						maxItems: 20,
+						items: {
+							type: "object",
+							properties: {
+								text: { type: "string", description: "One line of remaining work (cut to 200 characters)" },
+								blocking: {
+									type: "boolean",
+									description: "True when the work must be done before merging (holds the auto-merge)",
+								},
+							},
+							required: ["text", "blocking"],
+							additionalProperties: false,
+						},
+						description:
+							"The 인계 line as items: blocking ones hold the auto-merge; the others are written to the bot's follow-up ledger when the lane is merged. Omit when nothing is left.",
+					},
 				},
 				required: ["repo", "commit", "summary"],
 				additionalProperties: false,
@@ -111,6 +136,7 @@ export function buildLaneTools(manager: LaneManager, originKey: string): HostToo
 					repo: stringParam(params, "repo"),
 					commit: stringParam(params, "commit"),
 					summary: stringParam(params, "summary"),
+					leftovers: params.leftovers,
 				}),
 		},
 	];

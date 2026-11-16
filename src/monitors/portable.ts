@@ -22,6 +22,21 @@ import { type MonitorSpec, MonitorSpecError, parseMonitorSpec, type SpecContext 
  */
 const SCRIPTS_PLACEHOLDER = "@SCRIPTS@";
 const WORKSPACE_PLACEHOLDER = "@WORKSPACE@";
+/** A value spelled like a placeholder (`@SCRIPTS@`, `@WORKSPACE@/x`) or like one with extra leading `@`s. */
+const PLACEHOLDER_LIKE = /^(@+)((?:SCRIPTS|WORKSPACE)@(?:\/.*)?)$/s;
+/** `--out=` / `-o=`: an option glued to its value, whose value is the path part. */
+const OPTION_PREFIX = /^(--?[A-Za-z][\w-]*=)(.*)$/s;
+
+/** `value` as `[option prefix, path part]`; the prefix is empty when the value is not a glued option. */
+function splitOption(value: string): [string, string] {
+	const match = OPTION_PREFIX.exec(value);
+	return match === null ? ["", value] : [match[1] as string, match[2] as string];
+}
+
+/** Removes a symlink standing at `path` so a write there creates a file instead of following the link out. */
+function unlinkSymlink(path: string): void {
+	if (lstatSync(path, { throwIfNoEntry: false })?.isSymbolicLink()) rmSync(path);
+}
 
 /** The spec context of one home; export and apply need the workspace to map paths against. */
 export type PortableContext = SpecContext & { workspaceDir: string };
@@ -84,14 +99,30 @@ function portableSpec(
 	onOutside: (path: string) => void = () => {},
 ): Record<string, unknown> {
 	const roots = rootsOf(ctx);
-	const toPortable = (path: string): string => {
-		if (!isAbsolute(path)) return path;
+	const pathToPortable = (path: string): string => {
+		if (!isAbsolute(path)) {
+			// A relative value spelled like a placeholder gets one more `@`, so apply does not mistake it for one.
+			return PLACEHOLDER_LIKE.test(path) ? `@${path}` : path;
+		}
 		const inside = underRoot(path, roots);
 		if (inside === undefined) {
 			onOutside(path);
 			return path;
 		}
 		return inside.rest === "" ? inside.placeholder : `${inside.placeholder}/${inside.rest}`;
+	};
+	const toPortable = (value: string): string => {
+		const [prefix, path] = splitOption(value);
+		return `${prefix}${pathToPortable(path)}`;
+	};
+	// A relative procedure file is resolved against the workspace, so one that leads into the scripts dir
+	// (`../scripts/steps.md`) is written as a placeholder: the target home may lay its workspace out differently.
+	const toPortableProcedure = (path: string): string => {
+		if (!isAbsolute(path)) {
+			const inside = underRoot(resolve(ctx.workspaceDir, path), roots);
+			if (inside?.placeholder === SCRIPTS_PLACEHOLDER) return pathToPortable(resolve(ctx.workspaceDir, path));
+		}
+		return toPortable(path);
 	};
 	const { trigger } = spec;
 	let portableTrigger: Record<string, unknown>;
@@ -131,7 +162,7 @@ function portableSpec(
 		...(spec.model === undefined ? {} : { model: spec.model }),
 		...(spec.thinking === undefined ? {} : { thinking: spec.thinking }),
 		...(spec.deliver === undefined || spec.deliver === "turn" ? {} : { deliver: spec.deliver }),
-		...(spec.procedureFiles === undefined ? {} : { procedureFiles: spec.procedureFiles.map(toPortable) }),
+		...(spec.procedureFiles === undefined ? {} : { procedureFiles: spec.procedureFiles.map(toPortableProcedure) }),
 	};
 }
 
@@ -182,10 +213,13 @@ export function exportMonitors(
 		let file = `${stem}.json`;
 		for (let n = 2; written.has(file); n++) file = `${stem}-${n}.json`;
 		written.add(file);
+		unlinkSymlink(join(dir, file));
 		writeFileSync(join(dir, file), `${JSON.stringify(portable, null, 2)}\n`);
 		if (!options.withFiles) continue;
 		const referenced = [
-			...(spec.trigger.kind === "script" || spec.trigger.kind === "cron" ? (spec.trigger.command ?? []) : []),
+			...(spec.trigger.kind === "script" || spec.trigger.kind === "cron" ? (spec.trigger.command ?? []) : []).map(
+				(arg) => splitOption(arg)[1],
+			),
 			...(spec.procedureFiles ?? []).map((path) => resolve(ctx.workspaceDir, path)),
 		];
 		for (const path of referenced) {
@@ -220,6 +254,7 @@ export function exportMonitors(
 		}
 		try {
 			mkdirSync(dirname(target), { recursive: true });
+			unlinkSymlink(target);
 			copyFileSync(real, target);
 			chmodSync(target, mode);
 		} catch (error) {
@@ -266,13 +301,20 @@ export interface ApplyResult {
 /** Replaces `@SCRIPTS@`/`@WORKSPACE@` in the path fields of a parsed file; anything malformed is left to validation. */
 function resolvePlaceholders(input: Record<string, unknown>, ctx: PortableContext): Record<string, unknown> {
 	const roots = rootsOf(ctx);
-	const toLocal = (value: unknown): unknown => {
-		if (typeof value !== "string") return value;
+	const pathToLocal = (value: string): string => {
+		const escaped = PLACEHOLDER_LIKE.exec(value);
+		// Two or more `@`s is export's escape of a literal value: drop one and leave the rest alone.
+		if (escaped !== null && (escaped[1] as string).length >= 2) return value.slice(1);
 		for (const { root, placeholder } of roots) {
 			if (value === placeholder) return root;
 			if (value.startsWith(`${placeholder}/`)) return join(root, value.slice(placeholder.length + 1));
 		}
 		return value;
+	};
+	const toLocal = (value: unknown): unknown => {
+		if (typeof value !== "string") return value;
+		const [prefix, path] = splitOption(value);
+		return `${prefix}${pathToLocal(path)}`;
 	};
 	const out = { ...input };
 	const trigger = input.trigger;
@@ -300,6 +342,7 @@ export function applyMonitors(
 ): ApplyResult {
 	let files: string[];
 	const warnings: string[] = [];
+	let skipped = 0;
 	try {
 		files = readdirSync(dir)
 			.filter((file) => file.endsWith(".json"))
@@ -310,6 +353,7 @@ export function applyMonitors(
 				const stat = statSync(join(dir, file), { throwIfNoEntry: false });
 				if (stat === undefined || stat.isFile()) return true;
 				warnings.push(`${file}: not a regular file, skipped`);
+				skipped++;
 				return false;
 			});
 	} catch (error) {
@@ -355,11 +399,19 @@ export function applyMonitors(
 		}
 	}
 	if (problems.length > 0) throw new PortableApplyError(problems);
-	const removals = options.prune ? [...existing.values()].filter((row) => !seen.has(row.name)) : [];
+	// A skipped entry may be the file of a monitor whose name cannot be read, so with one present nothing is pruned.
+	const pruneHeld = options.prune === true && skipped > 0;
+	if (pruneHeld)
+		warnings.push(
+			`--prune held: ${skipped} *.json entr${skipped === 1 ? "y is" : "ies are"} not regular files, no monitor removed`,
+		);
+	const removals = options.prune && !pruneHeld ? [...existing.values()].filter((row) => !seen.has(row.name)) : [];
 	if (!options.dryRun) {
-		for (const spec of adds) ledger.addMonitor(spec);
-		for (const { id, spec } of updates) ledger.updateMonitor(id, spec);
-		for (const row of removals) ledger.removeMonitor(row.id);
+		ledger.transaction(() => {
+			for (const spec of adds) ledger.addMonitor(spec);
+			for (const { id, spec } of updates) ledger.updateMonitor(id, spec);
+			for (const row of removals) ledger.removeMonitor(row.id);
+		});
 	}
 	return { added: adds.length, updated: updates.length, unchanged, removed: removals.length, warnings };
 }

@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
+import { redact } from "../redact";
 import { type CronSchedule, nextFire, parseCron } from "./cron";
 import { countIncident, resolveIncidents } from "./incidents";
 import {
@@ -400,6 +401,7 @@ export class MonitorLedger {
 	readonly #listeners = new Set<(event: MonitorEventRow) => void>();
 	readonly #cronCache = new Map<string, CronSchedule>();
 	readonly #onCheckErrorAlert: ((alert: CheckErrorAlert) => void) | undefined;
+	readonly #canAlert: ((monitorId: string) => boolean) | undefined;
 
 	constructor(
 		db: Database,
@@ -408,12 +410,15 @@ export class MonitorLedger {
 			redact?: (text: string) => string;
 			/** Called inside the recording transaction when a check error streak should reach the owner. */
 			onCheckErrorAlert?: (alert: CheckErrorAlert) => void;
+			/** False while an alert for `monitorId` has nowhere to go: the incident is then not consumed (default: always true). */
+			canAlert?: (monitorId: string) => boolean;
 		},
 	) {
 		this.#db = db;
 		this.#clock = options.clock;
 		this.#redact = options.redact ?? ((text) => text);
 		this.#onCheckErrorAlert = options.onCheckErrorAlert;
+		this.#canAlert = options.canAlert;
 		migrateMonitorSchema(db);
 	}
 
@@ -445,6 +450,11 @@ export class MonitorLedger {
 	}
 
 	// ---- monitors ----
+
+	/** Runs `fn` in one transaction: a throw rolls back every monitor write it made. */
+	transaction<T>(fn: () => T): T {
+		return this.#db.transaction(fn)();
+	}
 
 	addMonitor(spec: MonitorSpec): MonitorRow {
 		const now = this.#clock.now();
@@ -708,7 +718,9 @@ export class MonitorLedger {
 	/**
 	 * One script check or watch that failed: the error and its time are kept and the streak grows. The moment the streak
 	 * reaches `CHECK_ERROR_ALERT_STREAK` it counts as a monitor incident, and an incident that alerts goes to the owner
-	 * through `onCheckErrorAlert` in the same transaction; later errors of the same streak stay quiet. Returns the streak.
+	 * through `onCheckErrorAlert` in the same transaction; later errors of the same streak stay quiet. While `canAlert`
+	 * says the alert has no destination, the incident is left unrecorded and the streak stays one short of the
+	 * threshold, so the next error tries again once there is somewhere to send it. Returns the streak.
 	 */
 	recordCheckError(monitorId: string, error: string): number {
 		return this.#db.transaction((): number => {
@@ -721,6 +733,12 @@ export class MonitorLedger {
 				.get(text, now, monitorId) as { name: string; check_error_streak: number } | null;
 			if (row === null) return 0;
 			if (row.check_error_streak === CHECK_ERROR_ALERT_STREAK) {
+				if (this.#canAlert?.(monitorId) === false) {
+					this.#db
+						.query("UPDATE monitors SET check_error_streak = ? WHERE id = ?")
+						.run(row.check_error_streak - 1, monitorId);
+					return row.check_error_streak - 1;
+				}
 				const incident = this.recordMonitorIncident(monitorId, `check_error: ${text}`, now);
 				if (incident.notify) {
 					this.#onCheckErrorAlert?.({
@@ -800,16 +818,6 @@ export class MonitorLedger {
 				)
 				.all(filter.monitorId ?? null, filter.stage ?? null) as EventSql[]
 		).map(toEvent);
-	}
-
-	eventCounts(monitorId: string): Partial<Record<EventStage, number>> {
-		const out: Partial<Record<EventStage, number>> = {};
-		for (const row of this.#db
-			.query("SELECT stage, COUNT(*) AS n FROM monitor_events WHERE monitor_id = ? GROUP BY stage")
-			.all(monitorId) as Array<{ stage: EventStage; n: number }>) {
-			out[row.stage] = row.n;
-		}
-		return out;
 	}
 
 	/**
@@ -984,11 +992,11 @@ export class MonitorLedger {
 	}
 }
 
-/** Standalone connection for the CLI. Unlike `Store` it never touches deliveries or inbound rows. */
+/** Standalone connection for the CLI. Unlike `Store` it never touches deliveries or inbound rows; it redacts like the daemon's. */
 export function openMonitorLedger(path: string, clock: MonitorClock = { now: () => Date.now() }): MonitorLedger {
 	const db = new Database(path, { create: true, strict: true });
 	db.run("PRAGMA journal_mode = WAL");
 	db.run("PRAGMA foreign_keys = ON");
 	db.run("PRAGMA busy_timeout = 5000");
-	return new MonitorLedger(db, { clock });
+	return new MonitorLedger(db, { clock, redact });
 }

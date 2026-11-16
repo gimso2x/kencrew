@@ -237,8 +237,7 @@ function createPendingBundle(
 				} catch (error) {
 					throw new BackupError("bundle_failed", `${source} link does not resolve: ${(error as Error).message}`);
 				}
-				const insideSecrets = real === secretsReal || real.startsWith(`${secretsReal}/`);
-				if (insideSecrets || secretsReal.startsWith(`${real}/`)) {
+				if (isWithin(real, secretsReal) || isWithin(secretsReal, real)) {
 					throw new BackupError("bundle_failed", `${source} links to or around secrets/`);
 				}
 				stat = statSync(real);
@@ -250,9 +249,13 @@ function createPendingBundle(
 			}
 			const here = linked.get(source) ?? join(homeReal, source);
 			for (const [other, otherReal] of reals) {
-				if (here === otherReal || here.startsWith(`${otherReal}/`) || otherReal.startsWith(`${here}/`)) {
+				if (isWithin(here, otherReal) || isWithin(otherReal, here)) {
 					throw new BackupError("bundle_failed", `${source} and ${other} link to overlapping paths`);
 				}
+			}
+			// secrets/ may itself be a link: one that lands inside a source would put the tokens into the bundle.
+			if (isWithin(secretsReal, here)) {
+				throw new BackupError("bundle_failed", `secrets/ resolves inside ${source}`);
 			}
 			reals.set(source, here);
 			if (stat.isDirectory()) {
@@ -280,6 +283,8 @@ function createPendingBundle(
 			tarBin,
 			"-czf",
 			tmp,
+			// GNU tar unquotes backslash escapes in member names given on the command line: a literal `\` in a real path must stay one.
+			"--no-unquote",
 			...transforms,
 			...(plain.length > 0 ? ["-C", homeDir, ...plain] : []),
 			...(linked.size > 0 ? ["-C", "/", ...[...linked.values()].map((real) => `.${real}`)] : []),
@@ -507,6 +512,11 @@ export interface StampInfo {
 	bundleSha256: string | undefined;
 }
 
+/** `child` is `parent` or below it (`/` as parent holds everything: `${parent}/` would be `//`). */
+function isWithin(child: string, parent: string): boolean {
+	return child === parent || child.startsWith(parent === "/" ? "/" : `${parent}/`);
+}
+
 /** Reads the success stamp written by `runBackup`; `undefined` when it does not exist or is unreadable. */
 export function readStamp(backupsDir: string, name: string = STAMP_FILE): StampInfo | undefined {
 	const stampPath = join(backupsDir, name);
@@ -519,7 +529,7 @@ export function readStamp(backupsDir: string, name: string = STAMP_FILE): StampI
 		return undefined;
 	}
 	const fields = parseStampFields(text);
-	const ts = parseStampTs(fields, stampPath);
+	const ts = parseStampTs(fields);
 	if (ts === undefined) return undefined;
 	return {
 		ts,

@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import type { LaneModelTiers } from "../src/config";
 import type { HerdrBoardConfig } from "../src/dispatch/board";
 import type { ProcessRunner } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
@@ -7,10 +8,12 @@ import type { ApprovalDetail, ApprovalResult } from "../src/safety/approval";
 import type { HostToolDef } from "../src/safety/host-tools";
 import { SlackChannel } from "../src/slack/channel";
 import type { HerdrPromptInput } from "../src/store/db";
-import { taskChecksOf } from "../src/tasks/checker";
-import { acceptanceItems, docsDirOf } from "../src/tasks/docs";
+import { type TaskJudgement, taskChecksOf } from "../src/tasks/checker";
+import { acceptanceItems, docsDirOf, type TaskRisk } from "../src/tasks/docs";
 import type { HostResult, ProgressLag, TaskHostOps, TaskResumeOps } from "../src/tasks/host";
 import { TaskLedger } from "../src/tasks/ledger";
+import { buildAcceptedCard, buildAutoLandCard, buildReachedCard } from "../src/tasks/notify";
+import { resolveWorkerTier } from "../src/tasks/worker-tier";
 import { registryOf } from "./helpers/channels";
 import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
@@ -135,6 +138,8 @@ function harness(
 		wslOmpArgs?: string[];
 		/** The inbound ledger has no [TASK] root text, so context.md takes `task`. */
 		noRoot?: boolean;
+		/** Config `lanes.models` as the daemon holds it: `current` may be swapped between calls (a reload). */
+		models?: { current: LaneModelTiers | undefined };
 	} = {},
 ): Harness {
 	const db = new Database(":memory:", { strict: true });
@@ -194,6 +199,7 @@ function harness(
 			},
 		},
 		...(options.workerOmpArgs === undefined ? {} : { workerOmpArgs: options.workerOmpArgs }),
+		...(options.models === undefined ? {} : { laneModels: () => options.models?.current }),
 		run,
 		log: { info: record, warn: record },
 		recordPrompt: (input) => prompts.push(input),
@@ -994,5 +1000,193 @@ describe("worker omp arguments (workerOmpArgs, dispatchHosts.<h>.ompArgs)", () =
 			"빌드 상태 요약",
 		]);
 		expect(omp[0]).not.toContain("--prewalk");
+	});
+});
+
+describe("resolveWorkerTier default by risk", () => {
+	const models: LaneModelTiers = { high: "h/x", middle: "m/x", low: "l/x" };
+	test("AC-1: no tier: L0·L1 low, L2 middle, L3·L4 high; a low request at L3 is raised with a note", () => {
+		expect(["L0", "L1", "L2", "L3", "L4"].map((r) => resolveWorkerTier(r as TaskRisk, {}, models).tier)).toEqual([
+			"low",
+			"low",
+			"middle",
+			"high",
+			"high",
+		]);
+		const raised = resolveWorkerTier("L3", { tier: "low" }, models);
+		expect(raised).toMatchObject({ tier: "high", model: "h/x" });
+		expect(raised.note).toContain("high로 올렸습니다");
+	});
+});
+
+describe("worker tier (taskSpec tier, lanes.models)", () => {
+	const SONNET = "anthropic/claude-sonnet-5-5";
+	const OPUS = "anthropic/claude-opus-5-5";
+	const GLM = "zai/glm-5.3";
+	const MODELS: LaneModelTiers = { high: OPUS, middle: SONNET, low: GLM };
+	const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 2) : cmd);
+	const starts = (h: Harness): string[][] =>
+		h.herdr.map(words).filter((args) => args[1] === "agent" && args[2] === "start");
+	/** What omp got after herdr's `--` on the only agent start; `[]` when there was no `--`. */
+	const ompArgsOf = (h: Harness): string[] => {
+		const all = starts(h);
+		expect(all).toHaveLength(1);
+		const start = all[0] as string[];
+		const dash = start.indexOf("--");
+		return dash === -1 ? [] : start.slice(dash + 1);
+	};
+	const TASK_ID = "T-20261026-01";
+	/** The judgement fields the reached and auto-merge cards read. */
+	const reached = {
+		acChecked: 2,
+		summary: ["로그 회전을 넣었습니다"],
+		checks: [],
+		integrityWarnings: [],
+		evidence: {},
+	} as Partial<TaskJudgement> as TaskJudgement;
+
+	test("AC-1: tier=middle starts the worker with `--model <lanes.models.middle>` and stores model, tier and reason", async () => {
+		const h = harness({ models: { current: MODELS } });
+		const out = await call(h, { taskSpec: { ...GOOD_SPEC, tier: "middle", tierReason: "일반 구현" }, task: "go" });
+		expect(ompArgsOf(h)).toEqual(["--model", SONNET]);
+		expect(h.ledger.require(TASK_ID)).toMatchObject({ workerModel: SONNET, tier: "middle", tierReason: "일반 구현" });
+		expect(out.split("\n")).toContain("워커: claude-sonnet-5-5 (middle — 일반 구현)");
+	});
+
+	test("AC-1: a remote TASK takes the tier model on its host's start too", async () => {
+		const h = harness({ models: { current: MODELS }, wslOmpArgs: ["--prewalk"] });
+		await call(h, { taskSpec: { ...GOOD_SPEC, tier: "low" }, task: "go", host: "wsl" });
+		expect(ompArgsOf(h)).toEqual(["--prewalk", "--model", GLM]);
+	});
+
+	test("AC-2: risk L3 with tier=low runs on high and the reply says it was raised", async () => {
+		const h = harness({ models: { current: MODELS } });
+		const out = await call(h, {
+			taskSpec: { ...GOOD_SPEC, risk: "L3", tier: "low", tierReason: "기계적" },
+			task: "go",
+		});
+		expect(ompArgsOf(h)).toEqual(["--model", OPUS]);
+		expect(out.split("\n")).toContain("위험 L3 이상이라 워커를 high로 올렸습니다");
+		expect(h.ledger.require(TASK_ID).tier).toBe("high");
+	});
+
+	test("AC-2/AC-10: risk-floor L2→L3 raises tier=low to high; tier_reason keeps the raise and the original ask", async () => {
+		const h = harness({ models: { current: MODELS } });
+		const spec = { ...GOOD_SPEC, goal: "DB 마이그레이션을 넣는다", tier: "low", tierReason: "기계적 수선" };
+		const out = await call(h, { taskSpec: spec, task: "go" });
+		expect(h.ledger.require(TASK_ID)).toMatchObject({
+			risk: "L3",
+			tier: "high",
+			workerModel: OPUS,
+			tierReason: "위험 L3 이상 상향(요청 low: 기계적 수선)",
+		});
+		expect(ompArgsOf(h)).toEqual(["--model", OPUS]);
+		expect(out).toContain("위험 L3 이상이라 워커를 high로 올렸습니다");
+		expect(out).toContain("위험등급을 L2→L3으로 올렸습니다");
+	});
+
+	test("AC-3: no tier on L2 runs on middle with reason 기본값; a tier missing from lanes.models adds no `--model`", async () => {
+		const h = harness({ models: { current: MODELS } });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		expect(ompArgsOf(h)).toEqual(["--model", SONNET]);
+		expect(h.ledger.require(TASK_ID)).toMatchObject({ tier: "middle", tierReason: "기본값" });
+
+		const bare = harness({ models: { current: { high: OPUS } } });
+		const out = await call(bare, { taskSpec: GOOD_SPEC, task: "go" });
+		expect(ompArgsOf(bare)).toEqual([]);
+		expect(bare.ledger.require(TASK_ID)).toMatchObject({ tier: "middle", workerModel: null });
+		expect(out.split("\n")).toContain("워커: 기본 모델 (middle)");
+		// No `lanes` at all: the same.
+		const none = harness({ models: { current: undefined } });
+		await call(none, { taskSpec: GOOD_SPEC, task: "go" });
+		expect(ompArgsOf(none)).toEqual([]);
+	});
+
+	test("AC-4: a `--model x/y` pair in workerOmpArgs gives way to the tier model; other arguments stay", async () => {
+		const h = harness({ models: { current: MODELS }, workerOmpArgs: ["--model", "x/y", "--foo"] });
+		await call(h, { taskSpec: { ...GOOD_SPEC, tier: "low" }, task: "go" });
+		const args = ompArgsOf(h);
+		expect(args).toEqual(["--foo", "--model", GLM]);
+		expect(args.filter((arg) => arg === "--model")).toHaveLength(1);
+	});
+
+	test("AC-8: `--model=x/y` gives way to the tier model; with no low model it stays as configured", async () => {
+		const h = harness({ models: { current: MODELS }, workerOmpArgs: ["--model=x/y"] });
+		await call(h, { taskSpec: { ...GOOD_SPEC, tier: "low" }, task: "go" });
+		expect(ompArgsOf(h)).toEqual(["--model", GLM]);
+
+		const kept = harness({ models: { current: { middle: SONNET } }, workerOmpArgs: ["--model=x/y"] });
+		await call(kept, { taskSpec: { ...GOOD_SPEC, tier: "low" }, task: "go" });
+		expect(ompArgsOf(kept)).toEqual(["--model=x/y"]);
+	});
+
+	test("AC-5: a dead worker resumed after lanes.models changed starts on the model stored at registration", async () => {
+		const models = { current: MODELS };
+		const h = harness({ models });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		models.current = { ...MODELS, middle: "openai/gpt-6" };
+		h.herdr.length = 0;
+		h.agents.clear();
+		expect(await call(h, { taskSpec: { id: TASK_ID } })).toContain("같은 워크트리에서 새 에이전트를 시작했습니다");
+		expect(ompArgsOf(h)).toEqual(["--model", SONNET]);
+	});
+
+	test("AC-6: a resume carrying tier or tierReason is refused with a message", async () => {
+		const h = harness({ models: { current: MODELS } });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		h.herdr.length = 0;
+		for (const extra of [{ tier: "high" }, { tierReason: "더 센 모델" }]) {
+			await expect(call(h, { taskSpec: { id: TASK_ID, ...extra } })).rejects.toThrow(
+				"재개에는 tier·tierReason을 줄 수 없습니다",
+			);
+		}
+		expect(h.herdr).toEqual([]);
+	});
+
+	test("a tier outside high·middle·low is refused before anything is registered", async () => {
+		const h = harness({ models: { current: MODELS } });
+		await expect(call(h, { taskSpec: { ...GOOD_SPEC, tier: "ultra" }, task: "go" })).rejects.toThrow(
+			"taskSpec.tier는 high·middle·low 중 하나여야 합니다",
+		);
+		expect(h.ledger.list()).toEqual([]);
+	});
+
+	test("AC-9: lanes.models is read at every registration, so a changed middle model applies to the next TASK", async () => {
+		const models: { current: LaneModelTiers | undefined } = { current: { middle: "a/one" } };
+		const h = harness({ models });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		models.current = { middle: "b/two" }; // what a reload does: the config object is replaced
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		expect(starts(h).map((args) => args.at(-1))).toEqual(["a/one", "b/two"]);
+		expect(h.ledger.list().map((row) => row.workerModel)).toEqual(["a/one", "b/two"]);
+	});
+
+	test("AC-7: the accepted, reached and auto-merge cards carry the worker line", async () => {
+		const h = harness({ models: { current: MODELS } });
+		await call(h, { taskSpec: { ...GOOD_SPEC, tier: "middle", tierReason: "일반 구현" }, task: "go" });
+		const line = "워커: claude-sonnet-5-5 (middle — 일반 구현)";
+		const post = h.transport.calls.find((c) => c.method === "postMessage");
+		expect((post && "text" in post ? post.text : "").split("\n")).toContain(line);
+		const row = h.ledger.require(TASK_ID);
+		expect(buildAcceptedCard(row, { goal: "g" }, undefined).body.split("\n")).toContain(line);
+		for (const card of [buildReachedCard(row, reached, "U1"), buildAutoLandCard(row, reached)]) {
+			expect(card.text.split("\n")).toContain(line);
+			expect(card.body.split("\n")).toContain(line);
+		}
+	});
+
+	test("AC-7: a pre-tier row (tier null) has no worker line; tier=middle with no model reads 기본 모델 (middle)", async () => {
+		const h = harness({ models: { current: MODELS } });
+		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+		const base = h.ledger.require(TASK_ID);
+		const old = { ...base, workerModel: null, tier: null, tierReason: null };
+		const unset = { ...base, workerModel: null, tier: "middle" as const, tierReason: "기본값" };
+		const cards = (row: typeof base) => [
+			buildAcceptedCard(row, { goal: "g" }, undefined),
+			buildReachedCard(row, reached, "U1"),
+			buildAutoLandCard(row, reached),
+		];
+		for (const card of cards(old)) expect(card.text).not.toContain("워커:");
+		for (const card of cards(unset)) expect(card.text.split("\n")).toContain("워커: 기본 모델 (middle)");
 	});
 });

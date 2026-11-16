@@ -343,3 +343,13 @@ describe("cardToEmbed qa-i low", () => {
 		expect(description).toBe("````\na   | b\n``` | x\n````");
 	});
 });
+
+describe("fitEmbed description cut (qa-l #61)", () => {
+	test("a backtick run longer than the limit, even indented, is cut plainly within 4096 instead of collapsing", () => {
+		for (const description of ["`".repeat(5000), `   ${"`".repeat(4200)}`, `앞\n   ${"`".repeat(4200)}`]) {
+			const fitted = discordCard.fitEmbed({ description }).description ?? "";
+			expect(fitted.length).toBeLessThanOrEqual(4096);
+			expect(fitted.length).toBeGreaterThan(2);
+		}
+	});
+});

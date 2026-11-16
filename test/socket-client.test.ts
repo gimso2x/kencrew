@@ -269,6 +269,23 @@ describe("SocketClient", () => {
 		expect(errors).toHaveLength(2);
 	});
 
+	test("an apps.connections.open call that never answers is aborted by its timeout and retried (qa-l #24)", async () => {
+		let calls = 0;
+		const h = startHarness();
+		harness = h;
+		const good = h.fetchImpl;
+		h.fetchImpl = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+			if (++calls > 1) return good(input, init);
+			return new Promise<Response>((_resolve, reject) => {
+				init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+			});
+		}) as unknown as typeof fetch;
+		const errors: string[] = [];
+		await make(h, { openTimeoutMs: 20, onError: (e) => errors.push(e.message) }).start();
+		expect(calls).toBe(2);
+		expect(errors).toEqual([expect.stringContaining("apps.connections.open request failed")]);
+	});
+
 	test("an open url that is not a ws(s) URL is reported and retried, never thrown (#71)", async () => {
 		let calls = 0;
 		const h = startHarness();

@@ -89,7 +89,7 @@ export function chunkText(
 ): string[] {
 	let longest = 3;
 	for (const line of text.split("\n")) {
-		const run = fenceRun(line);
+		const run = fenceRun(line, limit);
 		if (run !== undefined && run > longest) longest = run;
 	}
 	const budget = limit - FENCE_RESERVE - 2 * (longest - 3);
@@ -124,7 +124,7 @@ export function chunkText(
 				}
 				continue;
 			}
-			const run = open === 0 ? fenceRun(line) : undefined;
+			const run = open === 0 ? fenceRun(line, limit) : undefined;
 			if (run !== undefined) {
 				open = run;
 				lineHead = true;
@@ -137,13 +137,14 @@ export function chunkText(
 	});
 }
 
-/** Longest fence `chunkText` closes and reopens with as many backticks; a longer run is treated as plain ```. */
-const MAX_FENCE_RUN = 16;
-
-/** The backtick count of a line opening a fence (up to 3 spaces, 3+ backticks, an info string without backticks). */
-function fenceRun(line: string): number | undefined {
+/**
+ * The backtick count of a line opening a fence (up to 3 spaces, 3+ backticks, an info string without backticks).
+ * Tracked up to `max(16, limit / 4)` backticks, the longest mark a chunk can close and reopen with and still fit; a
+ * longer run is treated as plain ```.
+ */
+function fenceRun(line: string, limit: number): number | undefined {
 	const run = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length;
-	return run !== undefined && run <= MAX_FENCE_RUN ? run : undefined;
+	return run !== undefined && run <= Math.max(16, Math.floor(limit / 4)) ? run : undefined;
 }
 
 /**
@@ -183,8 +184,9 @@ export function oneLine(text: string, max: number): string {
 		.slice(0, max);
 }
 
-/** Cuts to at most `limit` UTF-16 units without leaving a lone high surrogate at the end. */
+/** Cuts to at most `limit` UTF-16 units without leaving a lone high surrogate at the end; "" for `limit <= 0`. */
 export function cutCodePointSafe(text: string, limit: number): string {
+	if (limit <= 0) return "";
 	if (text.length <= limit) return text;
 	const last = text.charCodeAt(limit - 1);
 	return text.slice(0, last >= 0xd800 && last <= 0xdbff ? limit - 1 : limit);
@@ -297,16 +299,20 @@ export function tableSpans(text: string): Array<readonly [number, number]> {
 		offset += line.length + 1;
 	}
 	const spans: Array<readonly [number, number]> = [];
-	let inFence = false;
+	// Fences follow the line-head rule of `chunkText`: one opens on a line of 3+ backticks with an info string free of
+	// backticks and closes on a line of at least as many backticks alone; a ``` inside prose opens nothing.
+	let fence = 0;
 	let i = 0;
 	while (i < lines.length) {
-		const end = inFence ? undefined : tableEndAt(lines, i);
+		const end = fence > 0 ? undefined : tableEndAt(lines, i);
 		if (end !== undefined) {
 			spans.push([starts[i] ?? 0, (starts[end - 1] ?? 0) + (lines[end - 1] ?? "").length]);
 			i = end;
 			continue;
 		}
-		if (((lines[i] ?? "").match(/```/g) ?? []).length % 2 === 1) inFence = !inFence;
+		const line = lines[i] ?? "";
+		if (fence === 0) fence = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length ?? 0;
+		else if ((/^ {0,3}(`+)[ \t]*\r?$/.exec(line)?.[1]?.length ?? 0) >= fence) fence = 0;
 		i++;
 	}
 	return spans;

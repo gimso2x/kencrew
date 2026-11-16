@@ -7,6 +7,7 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
+	type DiscordRole,
 	FATAL_CLOSE_CODES,
 } from "./transport";
 
@@ -382,12 +383,19 @@ export class DiscordGateway {
 				return;
 			case "INTERACTION_CREATE":
 				this.#run(() => handlers.interaction(data as DiscordInteraction));
+				return;
+			case "GUILD_CREATE":
+				if (Array.isArray(d.roles)) this.#run(() => handlers.roles?.(d.roles as DiscordRole[]));
+				return;
+			case "GUILD_ROLE_CREATE":
+			case "GUILD_ROLE_UPDATE":
+				if (d.role !== undefined) this.#run(() => handlers.roles?.([d.role as DiscordRole]));
 		}
 	}
 
-	#run(handler: () => Promise<void>): void {
+	#run(handler: () => Promise<void> | void): void {
 		try {
-			handler().catch((err: unknown) => this.#report(err));
+			Promise.resolve(handler()).catch((err: unknown) => this.#report(err));
 		} catch (err) {
 			this.#report(err);
 		}

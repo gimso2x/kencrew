@@ -1,5 +1,5 @@
-import { realpathSync, statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { lstatSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { buildChildEnv } from "../omp/env";
 
 export interface ClaimEvidence {
@@ -116,6 +116,48 @@ async function topLevel(dir: string, git: GitRunner): Promise<string | undefined
 	}
 }
 
+const HIDDEN_PATHS_MAX = 200;
+
+/**
+ * Paths whose index flag (`--assume-unchanged`, `--skip-worktree`) hides an edit from `git status`: the file on disk
+ * differs from `HEAD`'s (a path missing on disk differs only under assume-unchanged; a sparse checkout leaves skip-worktree
+ * paths out on purpose). `{ failed }` when git cannot say. Status alone calls such a tree clean.
+ */
+export async function hiddenChanges(git: GitRunner, dir: string): Promise<string[] | { failed: string }> {
+	const flagged = await git(["-C", dir, "ls-files", "-v", "-z"]);
+	if (flagged.code !== 0) return { failed: `git ls-files failed in ${dir}: ${flagged.stderr.trim().split("\n")[0]}` };
+	const changed: string[] = [];
+	let looked = 0;
+	for (const entry of flagged.stdout.split("\0")) {
+		const tag = entry[0];
+		if (tag === undefined || tag === "" || !/[a-zS]/.test(tag)) continue;
+		const path = entry.slice(2);
+		const onDisk = join(dir, path);
+		let exists = true;
+		try {
+			lstatSync(onDisk);
+		} catch {
+			exists = false;
+		}
+		const skipWorktree = tag === "S" || tag === "s";
+		if (!exists) {
+			if (!skipWorktree) changed.push(path);
+			continue;
+		}
+		if (looked >= HIDDEN_PATHS_MAX) {
+			changed.push(`${path} (플래그가 ${HIDDEN_PATHS_MAX}개를 넘어 나머지는 대조하지 않았습니다)`);
+			break;
+		}
+		looked += 1;
+		const [disk, head] = [
+			await git(["-C", dir, "hash-object", "--", path]),
+			await git(["-C", dir, "rev-parse", "-q", "--verify", `HEAD:${path}`]),
+		];
+		if (disk.code !== 0 || head.code !== 0 || disk.stdout.trim() !== head.stdout.trim()) changed.push(path);
+	}
+	return changed;
+}
+
 /** HEAD of the lane cwd's repository when the lane starts; undefined when there is no repository or no commit yet. */
 export async function resolveBaseSha(laneCwd: string, git: GitRunner = defaultGit): Promise<string | undefined> {
 	const top = await topLevel(laneCwd, git);
@@ -166,6 +208,14 @@ export async function verifyClaim(
 		const shown = files.slice(0, 10).join("; ");
 		reasons.push(
 			`uncommitted changes in ${top} (${files.length} path${files.length === 1 ? "" : "s"}): ${shown}${files.length > 10 ? "; ..." : ""}`,
+		);
+	}
+
+	const hidden = await hiddenChanges(git, top);
+	if ("failed" in hidden) reasons.push(hidden.failed);
+	else if (hidden.length > 0) {
+		reasons.push(
+			`status가 숨긴 변경(assume-unchanged/skip-worktree) in ${top} (${hidden.length} path${hidden.length === 1 ? "" : "s"}): ${hidden.slice(0, 10).join("; ")}`,
 		);
 	}
 

@@ -12,6 +12,7 @@ import {
 	type OmpOpenResult,
 	type OmpSessionDriver,
 	type OmpState,
+	type OmpTurnUsage,
 	type OmpUsage,
 	type TodoPhase,
 } from "./driver";
@@ -41,6 +42,11 @@ import { isRecord } from "./type-guards";
  *
  * Session continuity: agy stores conversations itself; ompbot pins the conversation per origin epoch with a pointer
  * file (`<sessionDir>/agy-conversation.json`). An unknown `--conversation` id makes agy warn and start a new one.
+ *
+ * Rotation: agy cannot compact. Each model call's usage comes in its `agent_response` DONE step (the result's usage
+ * is the turn's sum, not the context size), so the last such call's input + cache_read is the conversation's size.
+ * A turn that ends with it at or over `AGY_ROTATE_RATIO` of `AGY_CONTEXT_WINDOW` drops the pointer and the child:
+ * the next turn starts a new conversation, and its final says `usage.rotated` so the mailbox re-feeds the thread.
  */
 
 export const AGY_PROVIDER = "agy";
@@ -52,6 +58,10 @@ const DEFAULT_STARTUP_TIMEOUT_MS = 60_000;
 const ABORT_EXIT_TIMEOUT_MS = 5_000;
 const MODELS_TIMEOUT_MS = 30_000;
 const STDERR_TAIL_BYTES = 4_000;
+/** Context window of the agy models ompbot runs (gemini hydrogen: 256k). */
+export const AGY_CONTEXT_WINDOW = 256_000;
+/** Share of the window at which a conversation is rotated after its turn ends. */
+export const AGY_ROTATE_RATIO = 0.7;
 
 export interface AgyOmpDriverOptions {
 	/** Path or name of the agy CLI; names resolve on the child PATH. */
@@ -71,8 +81,10 @@ export interface AgyOmpDriverOptions {
 	baseEnv?: Record<string, string | undefined>;
 	/** How long a spawn waits for agy's `init` event. */
 	startupTimeoutMs?: number;
-	/** Where an unsupported `setTodos` is reported; absent → not reported. */
+	/** Where an unsupported `setTodos` and a conversation rotation are reported; absent → not reported. */
 	log?: Logger;
+	/** Origin the driver serves; named in its log events. */
+	originKey?: string;
 }
 
 interface AgyChild {
@@ -88,6 +100,10 @@ interface AgyChild {
 interface PendingTurn {
 	opRef: string;
 	abortRequested: boolean;
+	/** Token sums over the turn's model calls (`agent_response` DONE steps), steered follow-ups included. */
+	usage: OmpTurnUsage;
+	/** Model calls seen since the last `result`: a result with usage but none of them counts as one call. */
+	callsSinceResult: number;
 }
 
 function str(value: unknown): string | undefined {
@@ -114,6 +130,18 @@ function usageOf(value: unknown): OmpUsage | undefined {
 	if (output !== undefined) mapped.output = output;
 	if (cacheRead !== undefined) mapped.cacheRead = cacheRead;
 	return mapped;
+}
+
+function addCall(sum: OmpTurnUsage, call: OmpUsage): void {
+	sum.calls += 1;
+	sum.input += call.input ?? 0;
+	sum.cacheRead += call.cacheRead ?? 0;
+	sum.output += call.output ?? 0;
+}
+
+/** The final's `usage`: absent when the turn made no model call. */
+function usageField(turn: PendingTurn): { usage?: OmpTurnUsage } {
+	return turn.usage.calls === 0 ? {} : { usage: { ...turn.usage } };
 }
 
 /** `agy models` lines are `<id>\t<label>`; the "Fetching…" banner and blank lines carry no tab. */
@@ -195,7 +223,12 @@ export class AgyOmpDriver implements OmpSessionDriver {
 		await this.#ensureChild();
 		if (this.#turn) throw new OmpDriverError("rpc_error", "a turn is already running");
 		const opRef = `agy-${Date.now().toString(36)}-${++this.#entrySeq}`;
-		this.#turn = { opRef, abortRequested: false };
+		this.#turn = {
+			opRef,
+			abortRequested: false,
+			usage: { calls: 0, input: 0, cacheRead: 0, output: 0, rotated: false },
+			callsSinceResult: 0,
+		};
 		try {
 			this.#sendUserMessage(text);
 		} catch (error) {
@@ -453,6 +486,7 @@ export class AgyOmpDriver implements OmpSessionDriver {
 		const executable = this.#resolveExecutable(env);
 		const previous = this.#child;
 		const cut = this.#turn;
+		const dropped = this.#queued.length;
 		this.#turn = undefined;
 		this.#queued = [];
 		const done = Promise.withResolvers<void>();
@@ -472,7 +506,13 @@ export class AgyOmpDriver implements OmpSessionDriver {
 			if (this.#respawning === done.promise) this.#respawning = undefined;
 			done.resolve();
 			if (cut !== undefined) {
-				this.#settleFinal({ opRef: cut.opRef, status: "aborted", text: "", error: `agy restarted (${reason})` });
+				this.#settleFinal({
+					opRef: cut.opRef,
+					status: "aborted",
+					text: "",
+					error: `agy restarted (${reason})${dropped > 0 ? ` (steer ${dropped}건 미전달)` : ""}`,
+					...usageField(cut),
+				});
 			}
 		}
 	}
@@ -546,7 +586,13 @@ export class AgyOmpDriver implements OmpSessionDriver {
 			const turn = this.#turn;
 			if (turn !== undefined) {
 				this.#turn = undefined;
-				this.#settleFinal({ opRef: turn.opRef, status: "aborted", text: "", error: "interrupted" });
+				this.#settleFinal({
+					opRef: turn.opRef,
+					status: "aborted",
+					text: "",
+					error: "interrupted",
+					...usageField(turn),
+				});
 			}
 			return;
 		}
@@ -645,6 +691,16 @@ export class AgyOmpDriver implements OmpSessionDriver {
 
 	/** Tool steps become omp-style toolCall/toolResult entries and tool events (the mailbox's status lines). */
 	#onStep(step: Record<string, unknown>): void {
+		if (step.step_type === "agent_response" && step.state === "DONE") {
+			const turn = this.#turn;
+			const usage = usageOf(step.usage);
+			if (turn !== undefined && usage !== undefined) {
+				addCall(turn.usage, usage);
+				turn.usage.contextTokens = (usage.input ?? 0) + (usage.cacheRead ?? 0);
+				turn.callsSinceResult += 1;
+			}
+			return;
+		}
 		if (step.step_type !== "tool") return;
 		const info = recordOf(step.tool_info);
 		const name = str(step.tool_name) ?? str(info?.name) ?? "tool";
@@ -681,6 +737,11 @@ export class AgyOmpDriver implements OmpSessionDriver {
 		if (turn === undefined) return;
 		const response = str(result.response) ?? "";
 		const usage = usageOf(result.usage);
+		// An agy that sent no per-call usage still spent this result's tokens: one call, context size unknown.
+		if (usage !== undefined && turn.callsSinceResult === 0 && (usage.input ?? 0) + (usage.output ?? 0) > 0) {
+			addCall(turn.usage, usage);
+		}
+		turn.callsSinceResult = 0;
 		const succeeded = result.status === "SUCCESS";
 		if (response.trim() !== "" || usage !== undefined) {
 			this.#entries.push({
@@ -722,7 +783,49 @@ export class AgyOmpDriver implements OmpSessionDriver {
 				? undefined
 				: (sendFailure ?? str(result.error) ?? `agy turn ended with ${String(result.status)}`);
 		if (error !== undefined && dropped > 0) error = `${error} (steer ${dropped}건 미전달)`;
-		this.#settleFinal({ opRef: turn.opRef, status, text: response, ...(error === undefined ? {} : { error }) });
+		// Before the final: a prompt sent on it must already find the conversation dropped.
+		turn.usage.rotated = this.#rotateIfFull(turn.usage.contextTokens);
+		this.#settleFinal({
+			opRef: turn.opRef,
+			status,
+			text: response,
+			...(error === undefined ? {} : { error }),
+			...usageField(turn),
+		});
+	}
+
+	/**
+	 * Between turns only: a conversation at or over the rotation share drops its pointer, its id and its child, so
+	 * `#ensureChild` starts the next turn without `--conversation`.
+	 */
+	#rotateIfFull(contextTokens: number | undefined): boolean {
+		if (contextTokens === undefined || contextTokens < AGY_CONTEXT_WINDOW * AGY_ROTATE_RATIO) return false;
+		const conversationId = this.#conversationId;
+		this.#clearPointer();
+		this.#conversationId = undefined;
+		this.#retireChild();
+		this.#options.log?.info("agy_conversation_rotated", {
+			origin: this.#options.originKey,
+			conversationId,
+			contextTokens,
+		});
+		return true;
+	}
+
+	/** Ends the live child without a replacement; a prompt meanwhile waits for its exit, then spawns a new one. */
+	#retireChild(): void {
+		const child = this.#child;
+		if (!child) return;
+		this.#child = undefined;
+		const retired: Promise<void> = (async () => {
+			child.kill("SIGTERM");
+			const killer = setTimeout(() => child.kill("SIGKILL"), ABORT_EXIT_TIMEOUT_MS);
+			await child.gone;
+			clearTimeout(killer);
+		})().finally(() => {
+			if (this.#respawning === retired) this.#respawning = undefined;
+		});
+		this.#respawning = retired;
 	}
 
 	#settleFinal(final: OmpFinal): void {

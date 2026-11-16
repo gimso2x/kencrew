@@ -29,7 +29,6 @@ export interface DiscordRestOptions {
 	baseUrl?: string;
 	fetchImpl?: typeof fetch;
 	now?: () => number;
-	userAgent?: string;
 	timeoutMs?: number;
 }
 
@@ -97,7 +96,6 @@ export class DiscordRest {
 	readonly #baseUrl: string;
 	readonly #fetch: typeof fetch;
 	readonly #now: () => number;
-	readonly #userAgent: string;
 	readonly #timeoutMs: number;
 	/** Route key → epoch ms when its spent bucket resets. */
 	readonly #blocked = new Map<string, number>();
@@ -108,7 +106,6 @@ export class DiscordRest {
 		this.#baseUrl = (options.baseUrl ?? DISCORD_API_BASE).replace(/\/$/, "");
 		this.#fetch = options.fetchImpl ?? fetch;
 		this.#now = options.now ?? Date.now;
-		this.#userAgent = options.userAgent ?? DEFAULT_USER_AGENT;
 		this.#timeoutMs = options.timeoutMs ?? 15_000;
 	}
 
@@ -130,7 +127,7 @@ export class DiscordRest {
 		const until = Math.max(globalUntil, this.#blocked.get(key) ?? 0);
 		if (until > now) throw new DiscordRateLimitedError(until - now, globalUntil > now);
 
-		const headers: Record<string, string> = { authorization: `Bot ${this.#token}`, "user-agent": this.#userAgent };
+		const headers: Record<string, string> = { authorization: `Bot ${this.#token}`, "user-agent": DEFAULT_USER_AGENT };
 		let payload: string | FormData | undefined;
 		if (body !== undefined && "json" in body) {
 			headers["content-type"] = "application/json";

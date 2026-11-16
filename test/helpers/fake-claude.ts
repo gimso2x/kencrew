@@ -10,6 +10,7 @@ import { createInterface } from "node:readline";
  * - FAKE_CLAUDE_RESUME_MISSING=1: `--resume <id>` → startup failure "No conversation found…".
  * - "@tool <command>": Bash tool_use + can_use_tool round-trip (allow → TOOL-DONE, deny → TOOL-DENIED).
  * - "@edit <path>": Edit can_use_tool (allow → EDIT-DONE, deny → EDIT-DENIED).
+ * - "@toolpair": two Bash tool_use blocks (ids tu-a, tu-b) in one assistant frame, a tool_result for tu-a, then DONE.
  * - "@steer": assistant PART1, waits for a steered user frame, answers `PART2:<text>`.
  * - "@abort": waits for the driver's interrupt control request, ends error_during_execution.
  * - "/compact": success result carrying usage.input_tokens 4321.
@@ -115,6 +116,27 @@ function handleUserText(text: string): void {
 			() => finishTurn("TOOL-DONE"),
 			() => finishTurn("TOOL-DENIED"),
 		);
+		return;
+	}
+	if (text === "@toolpair") {
+		out({
+			type: "assistant",
+			uuid: `a-${++seq}`,
+			message: {
+				model: "claude-fake-5",
+				role: "assistant",
+				content: [
+					{ type: "tool_use", id: "tu-a", name: "Bash", input: { command: "ls" } },
+					{ type: "tool_use", id: "tu-b", name: "Bash", input: { command: "pwd" } },
+				],
+			},
+		});
+		out({
+			type: "user",
+			uuid: `u-${++seq}`,
+			message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-a", content: "ok" }] },
+		});
+		finishTurn("DONE");
 		return;
 	}
 	if (text.startsWith("@edit ")) {

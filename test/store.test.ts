@@ -413,7 +413,7 @@ describe("backfill thread targets", () => {
 		// A completion answer in a thread also writes its log-channel copy on `CLOG:-`.
 		store.recordAnswer({ originKey: "slack/ch/C1", opRef: "op1", threadRef: "C1:1.1", parts: ["✅ 완료 · done"] });
 		store.recordAnswer({ originKey: "slack/ch/C1", opRef: "new:slash:C1:x", threadRef: "C1:-", parts: ["🆕"] });
-		expect(store.listSlackThreadTargets(0, 200)).toEqual([{ channel: "C1", rootTs: "1.1" }]);
+		expect(store.listThreadTargets("slack", 0, 200)).toEqual([{ channel: "C1", rootTs: "1.1" }]);
 	});
 });
 

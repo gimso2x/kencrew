@@ -1,10 +1,10 @@
 // `ompbot doctor`'s Discord lines (doc/plans/discord-channel.md TASK 4): token file mode, GET /users/@me and
 // GET /gateway/bot, on a fake fetch; nothing when Discord is off.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { OmpbotConfig } from "../src/config";
-import { checkDiscord, countOmpModels } from "../src/daemon/doctor";
+import { checkDiscord, checkInjectedFiles, countOmpModels } from "../src/daemon/doctor";
 import { readVersion } from "../src/daemon/tools";
 import { makeHome, type TestHome, withDiscord } from "./helpers/bot-home";
 
@@ -158,7 +158,7 @@ describe("qa50b I-18: the doctor's bun line", () => {
 		await proc.exited;
 		expect(line).toContain(`${join(bin, "bun")} 0.0.1`);
 		expect(line).toContain(`running ${Bun.version}`);
-	});
+	}, 30_000); // spawns a bun child that runs every doctor probe: slow on a 2-core machine
 });
 
 describe("doctor: discord", () => {
@@ -203,5 +203,54 @@ describe("doctor: discord", () => {
 		await checkDiscord(home.config, report, fakeFetch(healthy));
 		expect(lines).toEqual([]);
 		expect(seen).toHaveLength(0);
+	});
+});
+
+describe("doctor: injected file caps", () => {
+	const warn = (name: string, detail: string): void => {
+		lines.push(`warn ${name}: ${detail}`);
+	};
+	const workspace = (): string => {
+		const dir = join(home.dir, "workspace");
+		mkdirSync(dir, { recursive: true });
+		return dir;
+	};
+	const check = (): string[] => {
+		lines = [];
+		checkInjectedFiles(home.dir, warn);
+		return lines;
+	};
+
+	test("persona: 91% warns once, 73% and a missing file say nothing, over the cap warns of the cut", () => {
+		expect(check()).toEqual([]);
+		const persona = join(workspace(), "persona.md");
+		writeFileSync(persona, "x".repeat(6000));
+		expect(check()).toEqual([]);
+		writeFileSync(persona, "x".repeat(7500));
+		expect(check()).toEqual([
+			"warn injected persona.md: 7500/8192 bytes (91%): near the cap, trim it before it is cut off",
+		]);
+		writeFileSync(persona, "x".repeat(9000));
+		expect(check()).toEqual([
+			"warn injected persona.md: 9000/8192 bytes (109%): over the cap, injected with its tail cut off",
+		]);
+	});
+
+	test("qa-l #10: a persona.md that is a directory is reported as not a regular file, not as injected", () => {
+		mkdirSync(join(workspace(), "persona.md"));
+		expect(check()).toEqual(["warn injected persona.md: EISDIR: not a regular file"]);
+	});
+
+	test("owner.md and soul.md symlinks are judged by their target's size", () => {
+		const target = join(home.dir, "notes");
+		mkdirSync(target);
+		writeFileSync(join(target, "owner.md"), "x".repeat(15_000));
+		writeFileSync(join(target, "soul.md"), "x".repeat(7500));
+		symlinkSync(join(target, "owner.md"), join(workspace(), "owner.md"));
+		symlinkSync(join(target, "soul.md"), join(workspace(), "soul.md"));
+		expect(check()).toEqual([
+			"warn injected soul.md: 7500/8192 bytes (91%): near the cap, trim it before it is cut off",
+			"warn injected owner.md: 15000/16384 bytes (91%): near the cap, trim it before it is cut off",
+		]);
 	});
 });

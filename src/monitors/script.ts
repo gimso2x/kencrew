@@ -181,12 +181,15 @@ function trimmedHash(): { update(chunk: string): void; digest(): string } {
 			const text = started ? chunk : chunk.replace(/^\s+/, "");
 			if (text === "") return;
 			started = true;
-			const joined = pending + text;
-			// A backward scan, not /\s+$/: that regex is quadratic on a long whitespace run followed by text.
-			let end = joined.length;
-			while (end > 0 && /\s/.test(joined[end - 1] as string)) end -= 1;
-			pending = joined.slice(end);
-			sha.update(joined.slice(0, end));
+			// Only the new chunk is scanned backwards (a pending whitespace run is never rescanned: that was quadratic).
+			let end = text.length;
+			while (end > 0 && /\s/.test(text[end - 1] as string)) end -= 1;
+			if (end === 0) {
+				pending += text;
+				return;
+			}
+			sha.update(pending + text.slice(0, end));
+			pending = text.slice(end);
 		},
 		digest: () => sha.digest("hex"),
 	};

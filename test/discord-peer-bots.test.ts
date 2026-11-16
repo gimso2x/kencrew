@@ -11,6 +11,7 @@ import { DiscordBinding } from "../src/discord/binding";
 import { DiscordChannel } from "../src/discord/channel";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import { writeFreeze } from "../src/ops/freeze";
 import { redact } from "../src/redact";
 import { type FloorsSurface, spawnSystemPrompt } from "../src/safety/prompt";
 import { SlackBinding } from "../src/slack/binding";
@@ -214,6 +215,27 @@ describe("daemon: a Discord peer request (AC-5)", () => {
 		);
 	});
 
+	test("frozen: the peer row is recorded and the thread is made, with no turn and no ⏳ status", async () => {
+		writeFreeze(home.dir, { reason: "hold", by: "cli", now: Date.now() });
+		const discord = new WaitingDiscordTransport();
+		discord.setChannel({ id: CH, type: 0, guildId: GUILD });
+		const made = await boot(withPeers(), discord);
+		const root = "700000000000000011";
+		await discord.emitMessage({
+			id: root,
+			channel_id: CH,
+			guild_id: GUILD,
+			author: { id: PEER, bot: true },
+			content: `<@${BOT}> 이 스펙 검토해 줘`,
+			type: 0,
+		});
+		expect(made.store.getInbound(`${CH}:${root}`)).toMatchObject({ state: "pending", peerUserId: PEER });
+		expect(lines.filter((line) => line.includes("event=frozen_deferred"))).toHaveLength(1);
+		expect(lines.some((line) => line.includes("event=turn_start"))).toBe(false);
+		expect(discord.calls.filter((call) => call.method === "startThread")).toHaveLength(1);
+		expect(discord.posts()).toEqual([]);
+	});
+
 	test("a peer reply in a thread the owner's clean child already runs in reuses that child: no restart (AC-1)", async () => {
 		const discord = new WaitingDiscordTransport();
 		discord.setChannel({ id: CH, type: 0, guildId: GUILD });
@@ -248,6 +270,5 @@ describe("daemon: a Discord peer request (AC-5)", () => {
 		);
 		expect(daemon?.peerTouched(origin)).toBe(true);
 		expect(built.map((b) => b.origin)).toEqual([origin]);
-		expect(lines.filter((line) => line.includes("event=driver_restart_peer_touched"))).toEqual([]);
 	});
 });

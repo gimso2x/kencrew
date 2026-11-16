@@ -12,6 +12,7 @@ import { STAMP_FILE } from "../src/ops/backup";
 import { clearFreeze, writeFreeze } from "../src/ops/freeze";
 import {
 	collectGates,
+	GATE_NAMES,
 	gateOptionsFromConfig,
 	INBOUND_STARVATION_MS,
 	MONITOR_OVERDUE_MS,
@@ -263,10 +264,9 @@ describe("collectGates", () => {
 		expect(readSweepHeartbeat(home)).toBeUndefined();
 		writeHeartbeat(0, 137);
 		expect(readSweepHeartbeat(home)).toMatchObject({ loopMs: 137 });
+		// No usable ts= is no evidence of a sweep, not a fresh one from the file's mtime (qa-l #12).
 		writeFileSync(join(home, "sweep-heartbeat"), "ts=not-a-date loop_ms=x\n");
-		const parsed = readSweepHeartbeat(home);
-		expect(parsed?.loopMs).toBeUndefined();
-		expect(Number.isNaN(parsed?.ts.getTime() ?? NaN)).toBe(false); // mtime fallback
+		expect(readSweepHeartbeat(home)).toBeUndefined();
 	});
 
 	/** Writes a heartbeat stamped now with extra raw fields (socket, draining). */
@@ -569,6 +569,43 @@ describe("collectGates", () => {
 		db.run("UPDATE deliveries SET state = 'confirmed' WHERE op_ref = 'op1'");
 		db.close();
 		expect(gateState("deliveries_overdue").state).toBe("closed");
+	});
+
+	test("qa-l #12: empty or garbage stamp files are no evidence: sweep unknown, backup_age open, not closed by mtime", () => {
+		mkdirSync(join(home, "backups"), { recursive: true });
+		for (const content of ["", "\0\u0001binary\u00ff", "ts=not-a-date\n"]) {
+			writeFileSync(join(home, "backups", STAMP_FILE), content);
+			writeFileSync(join(home, "sweep-heartbeat"), content);
+			expect(gateState("backup_age")).toEqual({ state: "open", detail: "stamp=missing" });
+			expect(gateState("sweep_stalled")).toEqual({ state: "unknown", detail: "stamp=missing" });
+		}
+	});
+
+	test("qa-l #13: a lane whose last history `at` is not a number falls back to updated_at", () => {
+		writeStamp(0);
+		const old = now - 25 * 3_600_000;
+		seedDb((db) => {
+			db.run("ALTER TABLE lanes ADD COLUMN history TEXT");
+			for (const [name, at] of [
+				["iso", new Date(now - 60_000).toISOString()],
+				["nul", null],
+			] as const) {
+				db.run("INSERT INTO lanes (name, status, history, created_at, updated_at) VALUES (?, 'working', ?, ?, ?)", [
+					name,
+					JSON.stringify([{ at, event: "created" }]),
+					old,
+					old,
+				]);
+			}
+		});
+		expect(gateState("lanes_stuck").detail).toStartWith("working_old=2 ");
+	});
+
+	test("qa-l #14: with a daily ceiling and no ledger, cost_cap is unknown instead of missing", () => {
+		const gate = collectGates({ homeDir: home, now, dailyCap: { usd: 10, timezone: "Asia/Seoul" } }).find(
+			(g) => g.name === "cost_cap",
+		);
+		expect(gate).toEqual({ name: "cost_cap", state: "unknown", detail: "db=missing" });
 	});
 
 	test("an old working lane opens lanes_stuck", () => {
@@ -932,5 +969,25 @@ describe("gateOptionsFromConfig: the sweep, /status, `ompbot status` and the das
 		const options = gateOptionsFromConfig({ timezone: "Asia/Seoul", ompExecutable: join(home, "no-such-omp") });
 		const report = readStatusFromDb(join(home, "ompbot.db"), "omp-test 0", "Asia/Seoul", options, IDLE_HOST_LOAD);
 		expect(report.openGates.map((gate) => gate.name)).toContain("omp_runtime");
+	});
+
+	test("qa-l #11: an inbound row with state __proto__ stays in the status counts", () => {
+		seedDb((db) => {
+			db.run("CREATE TABLE origins (origin_key TEXT PRIMARY KEY, epoch INTEGER NOT NULL)");
+			db.run(
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at) VALUES ('m1', 'o', 1, 't', '__proto__', 1)",
+			);
+		});
+		const report = readStatusFromDb(join(home, "ompbot.db"), "omp-test 0", "Asia/Seoul", {}, IDLE_HOST_LOAD);
+		expect(Object.getOwnPropertyDescriptor(report.inbound, "__proto__")?.value).toBe(1);
+	});
+});
+
+describe("gateText", () => {
+	test("every gate `ompbot gates` can emit has a real Korean label, not the machine name", () => {
+		for (const name of GATE_NAMES) {
+			const { label } = gateText(name);
+			expect(label, name).not.toBe(name);
+		}
 	});
 });

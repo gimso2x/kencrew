@@ -865,7 +865,7 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 	};
 	/** Exits 0 at once from its second run on; the first run writes its pid to $1 and blocks until $2 (a FIFO) is written. */
 	const BLOCKING =
-		'#!/bin/sh\nif [ -f "$1" ]; then echo second; exit 0; fi\necho $$ > "$1.tmp"\nmv "$1.tmp" "$1"\nread line < "$2"\necho "done $line"\n';
+		'#!/bin/sh\nif [ -f "$1" ]; then echo second; exit 0; fi\necho $$ > "$1.tmp"\nmv "$1.tmp" "$1"\n: > "$1.ready"\nread line < "$2"\necho "done $line"\n';
 	const fifo = () => {
 		const path = join(dir, "release.fifo");
 		expect(spawnSync("mkfifo", [path]).status).toBe(0);
@@ -1108,7 +1108,9 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 		const monitor = commandMonitor(BLOCKING, { args: [pidFile, fifo()], timeoutMs: 1_800_000 });
 		clock.advance(MINUTE);
 		await scheduler.tick();
-		await fileAppears(pidFile);
+		// The script's own `.ready` stamp: when it exists the shell has finished the `mv`, so killing the group now
+		// cannot leave a lagging `mv` alive past `idle()` (a SIGKILL can outrun the shell itself, the stamp cannot).
+		await fileAppears(`${pidFile}.ready`);
 		const pid = Number(readFileSync(pidFile, "utf8").trim());
 		expect(stages()).toEqual(["dispatched"]);
 
@@ -1455,6 +1457,18 @@ describe("monitors: script runner", () => {
 		const script = writeScript("ok.sh", "#!/bin/sh\necho payload-text\nexit 0\n");
 		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir });
 		expect(result).toMatchObject({ fired: true, exitCode: 0, timedOut: false, stdout: "payload-text" });
+	});
+
+	test("a long whitespace run in the output hashes in linear time: no false timeout, hash of the trimmed text (qa-l 90)", async () => {
+		const spaces = "head -c 12000000 /dev/zero | tr '\\0' ' '";
+		const script = writeScript("ws.sh", `#!/bin/sh\nprintf a\n${spaces}\nprintf b\n${spaces}\n`);
+		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir, timeoutMs: 4000 });
+		expect(result).toMatchObject({ fired: true, exitCode: 0, timedOut: false });
+		expect(result.outputHash).toBe(
+			createHash("sha256")
+				.update(`a${" ".repeat(12_000_000)}b`)
+				.digest("hex"),
+		);
 	});
 
 	test("a NUL byte in a command argument is rejected by the spec and reported, not thrown, by the runner (qa-i 131)", async () => {
@@ -1901,6 +1915,30 @@ describe("monitors: spec validation", () => {
 			overlap: "queue",
 			enabled: true,
 		});
+	});
+
+	test("names with NUL or other control characters are rejected (qa-l 89)", () => {
+		const base = { trigger: { kind: "cron", schedule: "0 9 * * *" }, instruction: "x" };
+		for (const name of ["n\u0000tail", "a\nb", "a\u007fb"]) {
+			expect(() => parseMonitorSpec({ ...base, name }, ctx())).toThrow(MonitorSpecError);
+		}
+		expect(() => mergeMonitorSpec(undefined, { ...base, name: "n\u0000x" }, ctx())).toThrow(MonitorSpecError);
+	});
+
+	test("trigger.at rejects a time the calendar does not have instead of normalizing it (qa-l 48)", () => {
+		const base = { name: "n", instruction: "x" };
+		for (const at of [
+			"2026-02-30T10:00:00",
+			"2026-13-01T00:00:00",
+			"2026-01-01T25:00",
+			"2026-01-01T10:70",
+			"2026-01-01T10:00:61",
+			"2026-04-31 08:00",
+		]) {
+			expect(() => parseMonitorSpec({ ...base, trigger: { kind: "at", at } }, ctx())).toThrow(MonitorSpecError);
+		}
+		const ok = parseMonitorSpec({ ...base, trigger: { kind: "at", at: "2028-02-29T23:59:59" } }, ctx());
+		expect(ok.trigger.kind).toBe("at");
 	});
 
 	test("rejects an instruction over 4000 characters, a bad overlap and unknown keys", () => {

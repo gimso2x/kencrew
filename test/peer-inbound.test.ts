@@ -12,6 +12,7 @@ import { isTurnPromptFor, parseCommand, promptTextOf } from "../src/core/types";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import { clearFreeze, writeFreeze } from "../src/ops/freeze";
 import { redact } from "../src/redact";
 import { type HostToolDef, PEER_TOOL_DENIED } from "../src/safety/host-tools";
 import { peerTouchedTurnNotice } from "../src/safety/prompt";
@@ -296,6 +297,16 @@ describe("adapter: peer bot messages", () => {
 		expect(transport.calls).toEqual([]);
 	});
 
+	test("a core verdict of held:frozen records without the ⏳ status; a plain recorded verdict posts it", async () => {
+		const held = make({ hop: () => ({ held: "frozen" }) });
+		expect(await held.adapter.ingestRecovered(peerEvent("102.8", `<@${BOT}> a`))).toBe("recorded");
+		expect(held.peers).toHaveLength(1);
+		expect(held.transport.calls).toEqual([]);
+		const plain = make();
+		expect(await plain.adapter.ingestRecovered(peerEvent("102.9", `<@${BOT}> b`))).toBe("recorded");
+		expect(plain.transport.calls.length).toBeGreaterThan(0);
+	});
+
 	test("setChannelPolicy: peers, requireMention and the hop limit follow a reload", async () => {
 		const { adapter, peers, dropped } = make({ peerBots: [] });
 		expect(await adapter.ingestRecovered(peerEvent("102.7", `<@${BOT}> a`))).toBe("dropped");
@@ -495,6 +506,37 @@ describe("daemon: peer bot input", () => {
 		expect(prompt).not.toContain("cron 표현식");
 	});
 
+	test("frozen: a peer mention is recorded and logged frozen_deferred with no turn or status; an owner message behind it runs at once; the unfreeze sweep dispatches the peer row", async () => {
+		const realNow = Date.now;
+		let probeNow = realNow();
+		Date.now = () => probeNow; // the freeze probe captures Date.now at construction: a fake crosses its cache window
+		try {
+			writeFreeze(home.dir, { reason: "hold", by: "cli", now: probeNow });
+			await boot();
+			await send(peerEvent("500.1", `<@${BOT}> 검토해 줘`));
+			expect(row("500.1")).toMatchObject({ state: "pending", peerUserId: PEER, originKey: thread("500.1") });
+			expect(logs.count(/event=frozen_deferred /)).toBe(1);
+			expect(logs.count(/event=turn_start /)).toBe(0);
+			expect(transport.posts()).toEqual([]);
+
+			tick();
+			await send(ownerEvent("500.2", "오너 질문", { thread_ts: "500.1" }));
+			await logs.waitFor(() => logs.count(/event=turn_start /) >= 1, "owner turn_start");
+			await transport.waitForPosts((text) => text.endsWith("[현재 요청]\n오너 질문"));
+			expect(row("500.1")?.state).toBe("pending");
+			expect(row("500.2")?.state).not.toBe("pending");
+
+			clearFreeze(home.dir);
+			probeNow += 3_000;
+			tick(3_000);
+			await daemon?.sweep();
+			await logs.waitFor(() => logs.count(/event=turn_start /) >= 2, "peer turn_start after the unfreeze");
+			expect(row("500.1")?.state).not.toBe("pending");
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
 	test("(g) the fourth peer message within the window is dropped with one notice; an owner message lifts the cap; the window expires too", async () => {
 		await boot();
 		await send(peerEvent("300.1", `<@${BOT}> 1`));
@@ -627,7 +669,6 @@ describe("daemon: peer bot input", () => {
 		await logs.waitFor(() => logs.count(/event=turn_start /) >= 2, "peer turn_start");
 		// AC-1: no new child, no restart.
 		expect(built).toHaveLength(1);
-		expect(logs.count(/event=driver_restart_peer_touched /)).toBe(0);
 		expect(row("700.2")?.state).not.toBe("pending");
 		// AC-4: the first turn after the taint carries the notice as its first block and still ends with the request.
 		const prompts = () => (built[0]?.driver.calls ?? []).filter((c) => c.startsWith("prompt:")).map((c) => c.slice(7));

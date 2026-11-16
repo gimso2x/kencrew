@@ -74,7 +74,7 @@ function fenceTables(text: string): { text: string; spans: Array<[number, number
 		// A fence opens on a line of 3+ backticks and an info string without backticks, and closes on a line of backticks
 		// alone at least as long; a fence closed on its own line (```bash x```) opens nothing.
 		if (fenceRun === 0) fenceRun = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length ?? 0;
-		else if ((/^ {0,3}(`+)[ \t]*$/.exec(line)?.[1]?.length ?? 0) >= fenceRun) fenceRun = 0;
+		else if ((/^ {0,3}(`+)[ \t]*\r?$/.exec(line)?.[1]?.length ?? 0) >= fenceRun) fenceRun = 0;
 		const end = fenceRun > 0 ? undefined : tableEndAt(lines, i, 3);
 		if (end === undefined) {
 			push(line);

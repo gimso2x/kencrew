@@ -1,6 +1,6 @@
 # Discord 봇 만들기
 
-ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slack처럼 붙여넣을 매니페스트는 Discord에 없습니다. 대신 아래 순서대로 Developer Portal에서 설정하고, 고정된 초대 URL로 서버에 넣습니다. Discord에는 슬래시 명령이 없습니다. 명령은 `!status`처럼 메시지로 보냅니다.
+kencrew를 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slack처럼 붙여넣을 매니페스트는 Discord에 없습니다. 대신 아래 순서대로 Developer Portal에서 설정하고, 고정된 초대 URL로 서버에 넣습니다. Discord에는 슬래시 명령이 없습니다. 명령은 `!status`처럼 메시지로 보냅니다.
 
 진행 상태: 대화 연결(DM·서버 채널·스레드, `!` 명령, 👀·진행 표시, 2000자 분할, 승인·질문·TASK 카드 버튼, 카드(embed)·파일 첨부, 재시작 중 놓친 메시지 복구, `doctor` 점검)과 운영 기능(DM 모니터, 서버 채널 스레드의 작업 레인과 그 버튼, `inject --origin discord/…`)이 들어 있어 5절의 `channels.discord` 설정을 넣으면 켜집니다. 데몬 수준 알림(게이트·한도·재시작)은 Slack이 있으면 Slack 오너 DM, 없으면 오너의 가장 최근 1:1 대화(예: Discord DM)로 가고 `!home`으로 바꿀 수 있습니다.
 
@@ -23,7 +23,7 @@ ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slac
 ## 1. Application과 봇 만들기
 
 1. https://discord.com/developers/applications 에 오너 계정으로 로그인하고 **New Application**을 누릅니다. 이름을 넣고 약관에 동의합니다.
-2. **General Information**에서 **Application ID**를 복사해 둡니다(18~19자리 숫자). 5절의 `applicationId`와 3절의 초대 URL에 씁니다. 원하면 여기서 앱 아이콘도 바꿉니다.
+2. **General Information**에서 **Application ID**를 복사해 둡니다(17~20자리 숫자). 5절의 `applicationId`와 3절의 초대 URL에 씁니다. 원하면 여기서 앱 아이콘도 바꿉니다.
 3. 왼쪽 **Installation** 탭에서 먼저 정리합니다. 이걸 안 하면 다음 단계에서 Public Bot을 끌 때 "비공개 애플리케이션은 기본 승인 링크를 가질 수 없어요"(Private application cannot have a default authorization link) 오류가 나고 저장되지 않습니다.
    - **Install Link**를 `Discord Provided Link`에서 **None**으로 바꿉니다. 초대는 3절의 URL로 하므로 기본 링크가 필요 없습니다.
    - **Installation Contexts**에서 **User Install**을 끄고 **Guild Install**만 둡니다.
@@ -40,7 +40,7 @@ ompbot을 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Slac
 토큰은 한 번만 보입니다. 채팅·메모·셸 기록에 붙여넣지 말고 바로 파일에 넣습니다.
 
 1. **Bot** 탭에서 **Reset Token**을 누르고(2단계 인증이 켜져 있으면 코드 입력) 나온 토큰을 복사합니다.
-2. ompbot이 도는 서버의 터미널에서:
+2. kencrew가 도는 서버의 터미널에서:
 
 ```sh
 umask 077
@@ -76,7 +76,7 @@ https://discord.com/oauth2/authorize?client_id=<APP_ID>&scope=bot&permissions=30
 4. 멘션 없이 모든 글에 답할 채널이 있으면 채널 우클릭 → **채널 ID 복사**로 `mentionFreeChannels`에 넣습니다(선택).
 5. DM에서 `작업: …`으로 작업 레인을 열려면 레인 스레드를 만들 서버 텍스트 채널의 ID를 같은 방법으로 복사해 `laneChannelId`에 넣습니다(선택). 봇에게 그 채널의 Create Public Threads·Send Messages in Threads 권한이 있어야 합니다.
 
-## 5. ompbot 설정 (`channels.discord`)
+## 5. kencrew 설정 (`channels.discord`)
 
 Discord만 쓸 때는 홈을 만들 때 한 번에 넣습니다(Slack 설정 없이 Discord만으로 돕니다).
 
@@ -140,9 +140,9 @@ bun src/main.ts apply --detach  # 재시작
 - `bun src/main.ts inject --origin discord/dm/<DM 채널 ID> --as-owner --text '안녕'` → DM에 `🧪 inject` 마커와 답이 옵니다.
 - 데몬을 재시작하는 동안 DM을 보내 두면, 다시 뜬 뒤 그 DM에 답합니다.
 
-## 7. 피어 봇(두 번째 ompbot)
+## 7. 피어 봇(두 번째 kencrew)
 
-Slack의 [피어 봇](guide.md#피어-봇)과 같은 규칙으로, 같은 서버의 다른 ompbot(예: 검토를 맡은 설치본)과 서로 멘션해 요청·답을 주고받을 수 있습니다. 선택 기능이며 오너 권한은 주지 않습니다.
+Slack의 [피어 봇](guide.md#피어-봇)과 같은 규칙으로, 같은 서버의 다른 kencrew(예: 검토를 맡은 설치본)와 서로 멘션해 요청·답을 주고받을 수 있습니다. 선택 기능이며 오너 권한은 주지 않습니다.
 
 1. 피어용 앱을 1~3절대로 **따로** 만들고 같은 서버에 초대합니다(봇마다 토큰과 Application이 다릅니다).
 2. 두 봇의 사용자 ID를 4절 방법(봇 이름 우클릭 → ID 복사)으로 얻습니다.

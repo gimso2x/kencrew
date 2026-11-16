@@ -233,7 +233,8 @@ describe("[check: …] signals in the judgement", () => {
 		const first = await sweeper.check(t.row);
 		const second = await sweeper.check(t.ledger.require(t.row.taskId));
 		expect(host.runs).toHaveLength(1);
-		expect(host.heads.count).toBe(2);
+		// Two sweeps' HEAD reads, plus one after the only command run (a check must leave the worktree as it found it).
+		expect(host.heads.count).toBe(3);
 		expect([first.status, second.status]).toEqual(["working", "working"]);
 		expect(second.judgement?.problems).toEqual([expect.stringMatching(/^check AC-1 실패: exit 1: 1 fail$/)]);
 

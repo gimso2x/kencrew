@@ -67,6 +67,24 @@ async function namesChanged(git: GitRunner, repo: string, what: string, range: s
 	return nulRecords(stdout);
 }
 
+/**
+ * Every file the claim commit `sha` changed since its merge-base with `baseBranch` (no `top` cap: the scope check of
+ * `src/lanes/scope.ts` reads them all). Throws one short redacted line when git fails.
+ */
+export async function laneChangedFiles(
+	repo: string,
+	baseBranch: string,
+	sha: string,
+	git: GitRunner = changesGit,
+): Promise<string[]> {
+	try {
+		const mb = await mergeBase(git, repo, baseBranch, sha);
+		return await namesChanged(git, repo, "diff --name-only 실패", `${mb}..${sha}`);
+	} catch (error) {
+		throw new Error(messageOf(error));
+	}
+}
+
 /** Whether another lane can still be merged: open, or closed with its landing `pending` or `blocked`. */
 const stillUnmerged = (lane: LaneRow): boolean =>
 	lane.status !== "closed" || lane.meta.land?.state === "pending" || lane.meta.land?.state === "blocked";

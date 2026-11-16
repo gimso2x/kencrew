@@ -33,8 +33,11 @@ interface RenderedUnit {
 	text: string;
 }
 
+/** Characters that need no quoting in a unit file word. */
+const PLAIN_WORD = /^[\w/.,:@+=-]+$/;
+
 /** Fills `@BUN@`, `@REPO_DIR@`, `@HOME@`, `@PATH@`; `.service` units also get `Environment=OMPBOT_HOME=` when set. */
-function renderUnit(name: string, template: string, values: UnitValues): string {
+export function renderUnit(name: string, template: string, values: UnitValues): string {
 	const path = [
 		...new Set([
 			dirname(values.bun),
@@ -46,18 +49,29 @@ function renderUnit(name: string, template: string, values: UnitValues): string 
 		]),
 	].join(":");
 	// systemd expands `%` specifiers in ExecStart= and Environment=; replacers are functions so `$&` in a path stays literal.
-	const fill = (value: string) => () => value.replaceAll("%", "%%");
-	let text = template
-		.replaceAll("@BUN@", fill(values.bun))
-		.replaceAll("@REPO_DIR@", fill(values.repoDir))
-		.replaceAll("@HOME@", fill(values.home))
-		.replaceAll("@PATH@", fill(path));
+	// systemd splits an unquoted value at spaces: a word with anything but plain characters goes out double-quoted.
+	const word = (value: string) => (PLAIN_WORD.test(value) ? value : `"${value.replace(/[\\"]/g, "\\$&")}"`);
+	const plain: Record<string, string> = {
+		BUN: values.bun,
+		REPO_DIR: values.repoDir,
+		HOME: values.home,
+		PATH: path,
+	};
+	// One pass over the template: a substituted value is never scanned again, so a placeholder-looking path stays literal.
+	let text = template.replace(
+		/^Environment=PATH=@PATH@$|^(ExecStart=)@BUN@ @REPO_DIR@(\S*)|@(BUN|REPO_DIR|HOME|PATH)@/gm,
+		(_match, key: string | undefined, rest: string | undefined, name: string | undefined) => {
+			if (name !== undefined) return (plain[name] as string).replaceAll("%", "%%");
+			if (key !== undefined) {
+				return `${key}${word(values.bun).replaceAll("%", "%%")} ${word(`${values.repoDir}${rest ?? ""}`).replaceAll("%", "%%")}`;
+			}
+			return `Environment=${word(`PATH=${path}`).replaceAll("%", "%%")}`;
+		},
+	);
 	if (values.ompbotHome !== undefined && name.endsWith(".service")) {
 		// systemd splits an unquoted value at spaces and expands `%`; a plain path stays unquoted so installed units match.
 		const assignment = `OMPBOT_HOME=${values.ompbotHome}`;
-		const line = /^[\w/.,:@+=-]+$/.test(assignment)
-			? `Environment=${assignment}`
-			: `Environment="${assignment.replace(/[\\"]/g, "\\$&").replaceAll("%", "%%")}"`;
+		const line = `Environment=${word(assignment).replaceAll("%", "%%")}`;
 		text = text.replace(/^\[Service\]\n/m, () => `[Service]\n${line}\n`);
 	}
 	return text;
@@ -138,6 +152,13 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 	// An empty HOME is unset (as OMPBOT_HOME above): a relative one would put PATH entries and --out under the cwd.
 	const home = env.HOME || homedir();
 	if (CONTROL_CHARS.test(home)) return usage("HOME contains a control character; a unit file cannot carry it");
+	// bun and the checkout land in ExecStart= like HOME in Environment=: a line break would split the directive.
+	for (const [label, value] of [
+		["bun", process.execPath],
+		["the checkout path", REPO_DIR],
+	] as const) {
+		if (CONTROL_CHARS.test(value)) return usage(`${label} contains a control character; a unit file cannot carry it`);
+	}
 	const units = renderUnits(
 		{
 			bun: process.execPath,
@@ -154,9 +175,11 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 
 	const outDir = resolve(values.out ?? join(home, ".config", "systemd", "user"));
 	// The nearest existing ancestor must be a directory, or mkdir fails halfway with a raw EEXIST/ENOTDIR.
-	if (isDanglingLink(outDir)) return usage(`--out ${outDir} is a symlink to a missing path`);
 	let existing = outDir;
-	while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
+	while (!existsSync(existing) && dirname(existing) !== existing) {
+		if (isDanglingLink(existing)) return usage(`--out ${outDir}: ${existing} is a symlink to a missing path`);
+		existing = dirname(existing);
+	}
 	if (!statSync(existing).isDirectory()) return usage(`--out ${outDir}: ${existing} is not a directory`);
 	for (const unit of units) {
 		const path = join(outDir, unit.name);
@@ -176,10 +199,14 @@ export function unitsCommand(args: string[], env: Record<string, string | undefi
 		);
 		return 2;
 	}
-	mkdirSync(outDir, { recursive: true });
-	for (const unit of plan) {
-		if (unit.state === "new") writeFileSync(unit.path, unit.text, { mode: 0o644 });
-		process.stdout.write(`units ${unit.state === "new" ? "written" : "unchanged"} file=${unit.path}\n`);
+	try {
+		mkdirSync(outDir, { recursive: true });
+		for (const unit of plan) {
+			if (unit.state === "new") writeFileSync(unit.path, unit.text, { mode: 0o644 });
+			process.stdout.write(`units ${unit.state === "new" ? "written" : "unchanged"} file=${unit.path}\n`);
+		}
+	} catch (error) {
+		return usage(`--out ${outDir}: ${(error as NodeJS.ErrnoException).code ?? String(error)}`);
 	}
 	const base = instance === undefined ? "ompbot" : `ompbot-${instance}`;
 	process.stdout.write(

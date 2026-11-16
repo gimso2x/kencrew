@@ -3,6 +3,7 @@ import {
 	chmodSync,
 	cpSync,
 	existsSync,
+	lstatSync,
 	mkdirSync,
 	mkdtempSync,
 	readdirSync,
@@ -14,10 +15,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openMonitorLedger } from "../src/monitors/ledger";
-import { applyMonitors, exportMonitors } from "../src/monitors/portable";
+import { applyMonitors, exportMonitors, PortableApplyError } from "../src/monitors/portable";
 import { parseMonitorSpec } from "../src/monitors/spec";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
+import { isRoot } from "./helpers/privileges";
 
 const cleanups: Array<() => void> = [];
 
@@ -409,7 +411,9 @@ describe("monitors portable apply/export on odd entries (qa-i low)", () => {
 		]);
 	});
 
-	test("export --with-files warns for an unreadable referenced file and still finishes", () => {
+	// skipIf(isRoot): root reads a 0o200 file, so no warning is produced
+	// biome-ignore format: keeps the reason link on the skip line
+	test.skipIf(isRoot)("export --with-files warns for an unreadable referenced file and still finishes", () => { // root ignores permission bits, so this setup cannot fail
 		const h = home("portable-eacces-");
 		const scripts = join(h.dir, "scripts");
 		const locked = join(scripts, "locked.sh");
@@ -428,5 +432,49 @@ describe("monitors portable apply/export on odd entries (qa-i low)", () => {
 		expect(warnings.some((w) => w.includes("referenced file not copied") && w.includes(locked))).toBe(true);
 		expect(readFileSync(join(dir, "files", "scripts", "fine.md"), "utf8")).toBe("fine\n");
 		expect(existsSync(join(dir, "m.json"))).toBe(true);
+	});
+
+	test("export replaces a symlink in the export dir instead of writing through it (qa-l 46)", () => {
+		const h = home("portable-symlink-");
+		addMonitor(h, { name: "Foo", trigger: { kind: "cron", schedule: "30 9 * * *" }, instruction: "x" });
+		const outside = tempDir("portable-symlink-outside-");
+		const victim = join(outside, "victim.conf");
+		writeFileSync(victim, "ORIGINAL");
+		const dir = tempDir("portable-symlink-out-");
+		symlinkSync(victim, join(dir, "Foo.json"));
+		exportMonitors(ledgerOf(h), dir, portableCtx(h));
+		expect(readFileSync(victim, "utf8")).toBe("ORIGINAL");
+		expect(lstatSync(join(dir, "Foo.json")).isSymbolicLink()).toBe(false);
+		expect(JSON.parse(readFileSync(join(dir, "Foo.json"), "utf8")).name).toBe("Foo");
+	});
+
+	test("a lone surrogate in a name is rejected, so apply never half-applies or dies on the UNIQUE index (qa-l 87)", () => {
+		const h = home("portable-surrogate-");
+		const dir = tempDir("portable-surrogate-in-");
+		const spec = (name: string) => ({ name, trigger: { kind: "cron", schedule: "30 9 * * *" }, instruction: "x" });
+		writeFileSync(join(dir, "a.json"), JSON.stringify(spec("ok")));
+		writeFileSync(join(dir, "b.json"), JSON.stringify(spec("mon\ud800a")));
+		writeFileSync(join(dir, "c.json"), JSON.stringify(spec("mon\ud801a")));
+		expect(() => applyMonitors(ledgerOf(h), dir, portableCtx(h))).toThrow(PortableApplyError);
+		expect(ledgerOf(h).listMonitors()).toHaveLength(0);
+	});
+
+	test("apply writes adds, updates and removals in one transaction (qa-l 87)", () => {
+		const h = home("portable-atomic-");
+		addMonitor(h, { name: "gone", trigger: { kind: "cron", schedule: "30 9 * * *" }, instruction: "x" });
+		const ledger = ledgerOf(h);
+		const dir = tempDir("portable-atomic-in-");
+		const spec = (name: string) => ({ name, trigger: { kind: "cron", schedule: "30 9 * * *" }, instruction: "x" });
+		writeFileSync(join(dir, "a.json"), JSON.stringify(spec("first")));
+		writeFileSync(join(dir, "b.json"), JSON.stringify(spec("second")));
+		const original = ledger.addMonitor.bind(ledger);
+		let calls = 0;
+		ledger.addMonitor = (next) => {
+			if (++calls === 2) throw new Error("boom");
+			return original(next);
+		};
+		expect(() => applyMonitors(ledger, dir, portableCtx(h), { prune: true })).toThrow("boom");
+		ledger.addMonitor = original;
+		expect(ledger.listMonitors().map((row) => row.name)).toEqual(["gone"]);
 	});
 });

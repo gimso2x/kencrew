@@ -72,6 +72,14 @@ export interface DiscordHandlers {
 	interaction(interaction: DiscordInteraction): Promise<void>;
 	/** Every Ready (`resumed: false`: a new session, the events in between are lost) and Resumed (`resumed: true`). */
 	ready?(info: { resumed: boolean }): void;
+	/** Guild roles from `GUILD_CREATE` and `GUILD_ROLE_CREATE`/`GUILD_ROLE_UPDATE`. */
+	roles?(roles: ReadonlyArray<DiscordRole>): void;
+}
+
+/** A guild role; a bot's managed role carries the bot's user id under `tags.bot_id`. */
+export interface DiscordRole {
+	id: string;
+	tags?: { bot_id?: string | undefined } | undefined;
 }
 
 /** What the adapter caches per channel id: a thread (type 10/11/12) has `parentId`; DMs have no `guildId`. */

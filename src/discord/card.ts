@@ -32,14 +32,36 @@ export interface DiscordEmbed {
 /** A field name or value Discord requires non-empty: a zero-width space stands in. */
 const EMPTY = "\u200b";
 
-/** `text` cut to `limit`; a code fence the cut leaves open is closed inside the limit. */
+/** The backtick count of the fence still open at the end of `part` (0 when none), by the line-head rule of `codeBlock`. */
+function openFenceRun(part: string): number {
+	let open = 0;
+	for (const line of part.split("\n")) {
+		if (open === 0) open = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length ?? 0;
+		else if ((/^ {0,3}(`+)[ \t]*\r?$/.exec(line)?.[1]?.length ?? 0) >= open) open = 0;
+	}
+	return open;
+}
+
+/**
+ * `text` cut to `limit`; a code fence the cut leaves open is closed inside the limit with a fence as long as its own.
+ * When the closing fence would leave no body (a backtick run as long as the limit), the text is cut plainly instead
+ * (qa-l #61).
+ */
 function cutFenced(text: string, limit: number): string {
 	if (text.length <= limit) return text;
-	const balanced = (part: string): boolean => (part.match(/^```/gm) ?? []).length % 2 === 0;
 	const cut = cutCodePointSafe(text, limit);
-	if (balanced(cut)) return cut;
-	const shorter = cutCodePointSafe(text, limit - 4);
-	return balanced(shorter) ? shorter : `${shorter}\n\`\`\``;
+	let open = openFenceRun(cut);
+	if (open === 0) return cut;
+	let room = open + 1;
+	for (;;) {
+		if (limit - room <= 3) return cut;
+		const shorter = cutCodePointSafe(text, limit - room);
+		if (shorter.trim() === "") return cut;
+		open = openFenceRun(shorter);
+		if (open === 0) return shorter;
+		if (open + 1 <= room) return `${shorter}\n${"`".repeat(open)}`;
+		room = open + 1;
+	}
 }
 
 /**

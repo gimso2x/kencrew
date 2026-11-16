@@ -1,5 +1,5 @@
 import { isAbsolute, join } from "node:path";
-import type { DispatchHostConfig } from "../config";
+import { type DispatchHostConfig, LANE_MODEL_TIERS, type LaneModelTiers } from "../config";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
 import type { ApprovalDetail, ApprovalResult } from "../safety/approval";
@@ -10,6 +10,7 @@ import type { HerdrPromptInput } from "../store/db";
 import { notePrompt, resumeTask, startTask, type TaskDispatchDeps, taskSummaryLine } from "../tasks/dispatch";
 import { parseTaskSpecInput, TASK_ID_PATTERN } from "../tasks/docs";
 import { applyRiskFloor } from "../tasks/risk-floor";
+import { resolveWorkerTier } from "../tasks/worker-tier";
 import { auditContext } from "./audit";
 import { type BoardLinkResolver, boardCardLink, type HerdrBoardConfig } from "./board";
 import {
@@ -18,6 +19,7 @@ import {
 	herdrReadAgent,
 	herdrRemoteStart,
 	herdrStartAgent,
+	MAX_TASK_BYTES,
 	OWNER_NAME_PATTERN,
 	runOmpPrint,
 } from "./omp";
@@ -27,12 +29,16 @@ export interface DispatchToolDeps {
 	ompExecutable: string;
 	/** Config `ompProfile` of the simple `omp -p` run (absent: the inherited agent dir). */
 	ompProfile?: string;
+	/** Config `ompConfigOverlay`: the simple `omp -p` run's `--config` (absent: none). */
+	ompConfigOverlay?: string;
 	homeDir: string;
 	workspaceDir: string;
 	/** Remote dispatch targets (hub fleet pattern): herdr runs on that host over ssh. */
 	dispatchHosts?: Record<string, DispatchHostConfig>;
 	/** Config `workerOmpArgs`: extra omp arguments of local herdr workers (remote ones take their host's `ompArgs`). */
 	workerOmpArgs?: string[];
+	/** Config `lanes.models`, read at every new [TASK] (a reload applies to the next one); absent → no `--model`. */
+	laneModels?: () => LaneModelTiers | undefined;
 	/** Test seam: process runner override. */
 	run?: import("./omp").ProcessRunner;
 	/** herdr-web-ui task board (`config.herdrBoard`): started agents get a card link; absent → no links. */
@@ -70,6 +76,19 @@ const HERDR_OFF_MESSAGE = "herdr가 꺼져 있어 simple만 쓸 수 있습니다
 const TASK_AGENT_NAME = new RegExp(TASK_ID_PATTERN.source, "i");
 /** A brief the handoff risk scan found nothing in (or a call with no brief): the result goes out unchanged. */
 const CLEAR_GATE = { suffix: "", approved: false };
+
+/** Why `task` cannot go to a child as one argument (a control character other than tab/newline, or too long); else undefined. */
+function taskTextProblem(task: string): string | undefined {
+	for (const char of task) {
+		const code = char.codePointAt(0) as number;
+		if ((code < 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) || code === 0x7f)
+			return "task에 제어문자가 들어 있습니다(NUL 등). 지시문에서 빼고 다시 보내세요";
+	}
+	const bytes = Buffer.byteLength(task);
+	return bytes > MAX_TASK_BYTES
+		? `task가 너무 깁니다(${bytes}바이트, 상한 ${MAX_TASK_BYTES}). 파일로 저장하고 경로를 넘기세요`
+		: undefined;
+}
 
 /** The `ompbot_dispatch` host tool for chat origins; `undefined` when the omp binary is not provided. */
 export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
@@ -113,7 +132,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				taskSpec: {
 					type: "object",
 					description:
-						"여러 단계·하루 넘는 작업의 [TASK] 상태 문서 등록. 신규: title·risk·goal·acceptance·repo 필수(+scope·exclusions·background). 재개: {id}만. host가 있으면 그 호스트에, 없으면 로컬에 워크트리를 만든다",
+						"여러 단계·하루 넘는 작업의 [TASK] 상태 문서 등록. 신규: title·risk·goal·acceptance·repo 필수(+scope·exclusions·background·tier·tierReason). 재개: {id}만(tier 불가, 처음 모델로 뜬다). host가 있으면 그 호스트에, 없으면 로컬에 워크트리를 만든다",
 					properties: {
 						id: { type: "string", description: "재개할 TASKID(T-YYYYMMDD-NN). 이것만 준다" },
 						title: { type: "string" },
@@ -132,6 +151,13 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 							type: "string",
 							description: "오너 대신 정한 해석 한 줄(접수 카드의 [가정]). 없으면 생략",
 						},
+						tier: {
+							type: "string",
+							enum: [...LANE_MODEL_TIERS],
+							description:
+								"워커 모델 등급(config lanes.models). high: 설계·디버깅·넓은 변경·L3 이상, middle(기본): 일반 구현, low: 기계적 수선 묶음. L3 이상은 항상 high. 신규 등록에서만",
+						},
+						tierReason: { type: "string", description: "그 등급을 고른 이유 한 줄(카드에 보임). 신규 등록에서만" },
 					},
 					additionalProperties: false,
 				},
@@ -210,8 +236,21 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 		if (!herdrOn && herdrArgs) throw new Error(HERDR_OFF_MESSAGE);
 		const task = typeof params.task === "string" ? params.task.trim() : undefined;
 		const host = typeof params.host === "string" && params.host.trim() !== "" ? params.host.trim() : undefined;
-		const mode = params.mode === "herdr" ? "herdr" : "simple";
 		const name = typeof params.name === "string" && params.name.trim() !== "" ? params.name.trim() : undefined;
+		const givenCwd = typeof params.cwd === "string" && params.cwd.trim() !== "" ? params.cwd.trim() : undefined;
+		// A name or cwd is a herdr argument: dropping it on the simple path would run `omp -p` and forget the agent name.
+		if (params.mode === "simple" && (name !== undefined || givenCwd !== undefined))
+			throw new Error("simple 모드는 name·cwd를 받지 않습니다. herdr 에이전트는 mode=herdr로 부르세요");
+		const mode = params.mode === "herdr" || name !== undefined || givenCwd !== undefined ? "herdr" : "simple";
+		if (task !== undefined) {
+			const problem = taskTextProblem(task);
+			if (problem !== undefined) throw new Error(problem);
+			// herdr's `agent prompt <name> <task>` has no `--` before the task: a leading `-` would be read as an option.
+			if (task.startsWith("-") && (mode === "herdr" || host !== undefined || params.taskSpec !== undefined))
+				throw new Error(
+					"herdr로 보내는 task는 `-`로 시작할 수 없습니다(옵션으로 읽힙니다). 첫 글자를 바꿔 다시 보내세요",
+				);
+		}
 		// Own keys only: `constructor` or `__proto__` must not find an Object.prototype member.
 		const hostEntry =
 			host === undefined || deps.dispatchHosts === undefined || !Object.hasOwn(deps.dispatchHosts, host)
@@ -256,7 +295,14 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			if (floored.note !== undefined) {
 				deps.log.info("dispatch_risk_floor_raised", { origin: deps.originKey, from: approvedRisk, to: floored.risk });
 			}
-			const started = await startTask(taskDeps, { spec: { ...spec, risk: floored.risk }, task, host: host ?? null });
+			// The tier follows the final risk (approval and floor applied) and the live `lanes.models` of this call.
+			const worker = resolveWorkerTier(floored.risk, spec, deps.laneModels?.());
+			const started = await startTask(taskDeps, {
+				spec: { ...spec, risk: floored.risk },
+				task,
+				host: host ?? null,
+				worker,
+			});
 			return redact(started) + (floored.note === undefined ? "" : `\n${floored.note}`) + gate.suffix;
 		}
 		const herdrOptions = {
@@ -274,8 +320,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			const sshOptions = { ...herdrOptions, sshTarget: hostEntry.ssh };
 			if (name === undefined) throw new Error("원격 실행에는 name이 필요합니다");
 			if (!OWNER_NAME_PATTERN.test(name)) throw new Error(`name은 소문자·숫자·-·_ 32자 이내여야 합니다: ${name}`);
-			const cwd =
-				typeof params.cwd === "string" && params.cwd.trim() !== "" ? params.cwd.trim() : (hostEntry.workDir ?? "~");
+			const cwd = givenCwd ?? hostEntry.workDir ?? "~";
 			if (task === undefined || task === "") {
 				const read = await herdrReadAgent(name, sshOptions);
 				if (!read.ok) return `읽기 실패: ${read.error ?? "unknown"}`;
@@ -306,7 +351,8 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				task,
 				cwd,
 				...(hostEntry.ompArgs === undefined ? {} : { agentArgs: hostEntry.ompArgs }),
-				options: sshOptions,
+				closeOnPromptFailure: true,
+				options: { ...sshOptions, signal },
 			});
 			if (!start.ok) return `시작 실패: ${start.error}`;
 			notePrompt(deps, { host, agent: name, kind: "start", text: task, originKey: deps.originKey });
@@ -355,7 +401,6 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				);
 			}
 			if (!OWNER_NAME_PATTERN.test(name)) throw new Error(`name은 소문자·숫자·-·_ 32자 이내여야 합니다: ${name}`);
-			const givenCwd = typeof params.cwd === "string" && params.cwd.trim() !== "" ? params.cwd.trim() : undefined;
 			if (givenCwd !== undefined && !isAbsolute(givenCwd))
 				throw new Error(`로컬 cwd는 절대경로여야 합니다: ${givenCwd}`);
 			const cwd = givenCwd ?? deps.workspaceDir;
@@ -364,7 +409,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				task,
 				cwd,
 				...(deps.workerOmpArgs === undefined ? {} : { agentArgs: deps.workerOmpArgs }),
-				options: herdrOptions,
+				options: { ...herdrOptions, signal },
 			});
 			if (!start.ok) return `시작 실패: ${start.error}`;
 			notePrompt(deps, { host: null, agent: name, kind: "start", text: task, originKey: deps.originKey });
@@ -401,10 +446,14 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			),
 			ompBin: deps.ompExecutable,
 			...(deps.ompProfile === undefined ? {} : { ompProfile: deps.ompProfile }),
+			...(deps.ompConfigOverlay === undefined ? {} : { overlayConfig: deps.ompConfigOverlay }),
 			inheritedEnv: process.env,
 			signal,
 		});
-		deps.log.info("dispatch_simple_done", { ok: result.ok });
-		return redact(result.output) + gate.suffix;
+		deps.log.info("dispatch_simple_done", { ok: result.ok, code: result.code });
+		// A timeout already carries its own suffix; any other non-zero end must not read as a finished run.
+		const failed =
+			result.ok || result.timedOut ? "" : `\n\n[실패: omp -p exit ${result.code ?? "없음"} — 위 출력은 일부일 수 있음]`;
+		return redact(result.output) + failed + gate.suffix;
 	}
 }

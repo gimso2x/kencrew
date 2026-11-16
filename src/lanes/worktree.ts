@@ -1,5 +1,5 @@
 import { realpathSync } from "node:fs";
-import { relative } from "node:path";
+import { dirname, relative } from "node:path";
 import {
 	type AcceptanceItem,
 	acceptanceItems,
@@ -86,6 +86,18 @@ export async function resolveLaneRepo(cwd: string, git: GitRunner = defaultGit):
 			ok: false,
 			problem: `서브모듈 안에서는 레인을 시작할 수 없습니다: ${repo} (상위 저장소 ${superproject.stdout.trim()}) — 상위 저장소나 따로 clone한 경로에서 시작하세요.`,
 		};
+	}
+	// A repository nested in another work tree: its sibling worktree path lands inside the outer one and leaves it dirty
+	// for good, unless the outer repository ignores that path.
+	const outer = await git(["-C", dirname(repo), "rev-parse", "--show-toplevel"]);
+	if (outer.code === 0 && outer.stdout.trim() !== "") {
+		const ignored = await git(["-C", dirname(repo), "check-ignore", "-q", `${repo}-l-00000000-00`]);
+		if (ignored.code !== 0) {
+			return {
+				ok: false,
+				problem: `${repo}는 바깥 저장소(${outer.stdout.trim()}) 작업 트리 안에 있어 레인 worktree(${repo}-l-…)가 그 저장소를 계속 dirty로 만듭니다 — 바깥 저장소의 .gitignore에 \`${repo.split("/").pop()}-l-*\`를 추가하거나 따로 clone한 경로에서 시작하세요.`,
+			};
+		}
 	}
 	if (!TASK_PATH_PATTERN.test(repo) || repo.includes("..")) {
 		return {

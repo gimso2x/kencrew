@@ -10,11 +10,13 @@ import {
 	buildGuestPrompt,
 	GUEST_BUSY_TEXT,
 	GUEST_COMMAND_TEXT,
+	GUEST_UNAVAILABLE_TEXT,
 	GuestQueue,
 	QA_AGENT_CONFIG_YAML,
 } from "../../src/daemon/guest";
 import { OMP_ISOLATION_FLAGS, type ProcessRunner, type RunProcessOptions } from "../../src/dispatch/omp";
 import { ledgerDay } from "../../src/ops/cost-cap";
+import { writeFreeze } from "../../src/ops/freeze";
 import { gcSessions } from "../../src/ops/gc";
 import { teamsQaSystemPrompt } from "../../src/safety/prompt";
 import { renderTeamsParts } from "../../src/teams/format";
@@ -217,6 +219,22 @@ describe("guest path (AC-C1)", () => {
 		await answerTo("g-1", "명령을 쓸 수 없습니다");
 		expect(GUEST_COMMAND_TEXT).toContain("명령을 쓸 수 없습니다");
 		expect(calls).toEqual([]);
+	});
+});
+
+describe("frozen bot", () => {
+	test("a guest question starts no run and gets a neutral line without the reason; the owner's question still runs", async () => {
+		writeFreeze(home.dir, { reason: "hold", by: "cli", now: Date.now() });
+		const port = await boot();
+		await say(port, { id: "g-1", text: "환율 알려줘", aad: GUEST_AAD });
+		const answer = await answerTo("g-1", GUEST_UNAVAILABLE_TEXT);
+		expect(String(answer.body.text)).not.toMatch(/동결|FROZEN/i);
+		expect(GUEST_UNAVAILABLE_TEXT).not.toMatch(/동결|FROZEN/i);
+		expect(calls).toEqual([]);
+
+		await say(port, { id: "o-1", text: "오너 질문" });
+		await answerTo("o-1", "답변1");
+		expect(calls).toHaveLength(1);
 	});
 });
 

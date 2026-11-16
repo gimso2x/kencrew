@@ -1,3 +1,4 @@
+import type { LaneModelTier } from "../config";
 import { StoreError } from "../store/transitions";
 import type { TaskCheck } from "../tasks/checker";
 import type { AcceptanceItem, TaskRisk } from "../tasks/docs";
@@ -92,6 +93,22 @@ export interface LaneReview {
 }
 
 /**
+ * The run QA of a closed lane's claim commit (`taskAutoLand.qa`): a receipt for `sha` only, like `LaneReview`.
+ * Auto-merge needs `PASS`; `FAIL` and `inconclusive` (timed out, unparsable last line, no copy) go to the owner.
+ */
+export interface LaneQa {
+	/** The commit run (`meta.sha` at the time). */
+	sha: string;
+	verdict: "PASS" | "FAIL" | "inconclusive";
+	/** What the QA run reported (redacted, at most 10 of 200 characters each). */
+	findings: string[];
+	model: string;
+	at: number;
+	/** Why the QA is `inconclusive`. */
+	reason?: string;
+}
+
+/**
  * What the claim commit changed against the base branch (`computeLaneChanges`), shown on the Outcome card only: never
  * read by the auto-merge. Bound to `sha`: a lane whose `meta.sha` moved on shows none. Overlaps are a snapshot of the
  * moment the card went up (branch commits only, not uncommitted work in other worktrees).
@@ -112,6 +129,13 @@ export interface LaneChanges {
 	error?: string;
 	/** Why the base drift or another lane's diff could not be read (that part only is missing). */
 	overlapError?: string;
+}
+
+/** One item of work a lane's claim left undone: a `blocking` one holds the auto-merge, the rest go to `followups.jsonl`. */
+export interface LaneLeftover {
+	/** Redacted, at most 200 characters. */
+	text: string;
+	blocking: boolean;
 }
 
 /** Runtime facts of a lane that are not registry columns (kept as one JSON column). */
@@ -145,12 +169,30 @@ export interface LaneMeta {
 	baseBranch?: string;
 	/** The risk the starter named (or a keyword floor raised it to); absent = unrated, compared as `DEFAULT_LANE_RISK`. */
 	risk?: TaskRisk;
+	/** The worker tier the start chose, its reason and the exact `lanes.models` value; absent on a lane started before tiers. */
+	tier?: LaneModelTier;
+	tierReason?: string;
+	/** `lanes.models[tier]` at the start; absent = the bot's default model (tier not configured). */
+	workerModel?: string;
 	/** Acceptance criteria as given at the start; a trailing `[check: …]` is re-run by the core before closing. */
 	acceptance?: AcceptanceItem[];
 	/** The start's brief (redacted, at most 16000 characters): the spec the independent review reads. */
 	brief?: string;
+	/** Repository-relative globs the lane's changes must stay inside (`ompbot_work_start` `scope`); absent = no check. */
+	scope?: string[];
+	/**
+	 * Files of the claim commit (since the merge-base with the base branch) outside `scope`, at most
+	 * `SCOPE_VIOLATIONS_MAX`; set at close, dropped by `!reopen` and by a new claim.
+	 */
+	scopeViolations?: string[];
+	/** Why the close could not list the claim's changed files (one line): the scope check failed, not passed. */
+	scopeError?: string;
+	/** What the lane left undone (`ompbot_claim_done` `leftovers`) at its last claim; `!reopen` drops it. */
+	leftovers?: LaneLeftover[];
 	/** The independent review of the claim commit (`taskAutoLand.review`); `!reopen` drops it. */
 	review?: LaneReview;
+	/** The run QA of the claim commit (`taskAutoLand.qa`); `!reopen` drops it. */
+	qa?: LaneQa;
 	/** What the claim commit changed, computed once per claim commit when its card goes up; `!reopen` drops it. */
 	changes?: LaneChanges;
 	/**

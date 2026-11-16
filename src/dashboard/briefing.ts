@@ -57,19 +57,20 @@ function summaryCounts(snapshot: DashboardSnapshot): (readonly [string, number])
 	];
 }
 
-const CSS = `body{margin:0;padding:28px 32px;background:#f7f7f5;color:#1d1d1b;font-family:"NanumBarunGothic","NanumGothic",sans-serif;font-size:15px;line-height:1.5}
-h1{font-size:24px;margin:0 0 6px;font-weight:700}
-.meta{margin:0 0 12px;color:#5b5b57;font-size:14px}
-.summary{margin:0 0 20px;padding:10px 14px;border-radius:8px;background:#eceae4;font-size:16px;font-weight:700}
+const CSS = `:root{--sp-half:2px;--sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-6:24px;--sp-8:32px;--r-l:8px}
+body{margin:0;padding:var(--sp-8) var(--sp-8);background:#f7f7f5;color:#1d1d1b;font-family:"NanumBarunGothic","NanumGothic",sans-serif;font-size:15px;line-height:1.5}
+h1{font-size:24px;margin:0 0 var(--sp-2);font-weight:700}
+.meta{margin:0 0 var(--sp-3);color:#5b5b57;font-size:14px}
+.summary{margin:0 0 var(--sp-6);padding:var(--sp-2) var(--sp-4);border-radius:var(--r-l);background:#eceae4;font-size:16px;font-weight:700}
 .summary.warn{background:#fdecea;color:#a32216}
-section{margin:0 0 18px}
-h2{font-size:16px;margin:0 0 6px;padding-bottom:4px;border-bottom:1px solid #d8d5cd;font-weight:700}
-ul{margin:0;padding-left:18px}
-li{margin:2px 0;word-break:break-word}
-.more{color:#5b5b57;list-style:none;margin-left:-18px}
+section{margin:0 0 var(--sp-4)}
+h2{font-size:16px;margin:0 0 var(--sp-2);padding-bottom:var(--sp-1);border-bottom:1px solid #d8d5cd;font-weight:700}
+ul{margin:0;padding-left:var(--sp-4)}
+li{margin:var(--sp-half) 0;word-break:break-word}
+.more{color:#5b5b57;list-style:none;margin-left:calc(-1 * var(--sp-4))}
 .unread{color:#a32216}
 .empty{color:#7a7a75}
-footer{margin-top:18px;padding-top:10px;border-top:1px solid #d8d5cd;color:#5b5b57;font-size:13px}`;
+footer{margin-top:var(--sp-4);padding-top:var(--sp-3);border-top:1px solid #d8d5cd;color:#5b5b57;font-size:13px}`;
 
 /** One section: its lines, or the reason the section could not be read; always capped with `외 N개`. */
 function section(title: string, lines: string[], source?: Section<unknown>): string {

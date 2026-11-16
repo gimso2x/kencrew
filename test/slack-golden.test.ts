@@ -19,6 +19,7 @@ import type { TaskJudgement } from "../src/tasks/checker";
 import { acceptanceItems } from "../src/tasks/docs";
 import { buildBlockedCard, buildReviewWaitingCard, cardMessage } from "../src/tasks/notify";
 import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { ROOMY_STATFS } from "./helpers/disk";
 
 const FIXTURE = join(import.meta.dir, "fixtures", "slack-golden.json");
 const DM = "D1";
@@ -241,6 +242,7 @@ beforeAll(async () => {
 		bootId: "golden-boot",
 		clock,
 		hostLoad: IDLE_HOST_LOAD, // the frozen status lines never depend on this machine's load
+		statfs: ROOMY_STATFS, // ...nor on its free disk space
 		sweepMs: 3_600_000,
 		gateSweepMs: 0,
 		taskSweepMs: 0,

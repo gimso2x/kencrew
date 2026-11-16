@@ -1,3 +1,4 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -6,9 +7,9 @@ import type { TurnFailureEscalation } from "../src/core/mailbox";
 import { OriginRouter } from "../src/core/origin";
 import type { InboundRecord } from "../src/core/types";
 import { createLogger } from "../src/log";
-import type { OmpEvent } from "../src/omp/driver";
+import type { OmpEvent, OmpTurnUsage } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
-import { sessionWindowCost } from "../src/ops/cost-cap";
+import { budgetBreach, dailyBudgetState, sessionWindowCost } from "../src/ops/cost-cap";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
 import { localDay } from "../src/time";
@@ -56,7 +57,7 @@ beforeEach(() => {
 });
 
 /** A router over the current store/clock; `beforeEach` builds one, and a test may build another before routing. */
-function buildRouter(options: { sessionFile?: string } = {}): OriginRouter {
+function buildRouter(options: { sessionFile?: string; turnUsage?: () => OmpTurnUsage } = {}): OriginRouter {
 	return new OriginRouter({
 		timezone: "Asia/Seoul",
 		store,
@@ -73,6 +74,7 @@ function buildRouter(options: { sessionFile?: string } = {}): OriginRouter {
 				sessionDir,
 				store: sessionStore,
 				...(options.sessionFile === undefined ? {} : { sessionFile: options.sessionFile }),
+				...(options.turnUsage === undefined ? {} : { turnUsage: options.turnUsage }),
 			});
 			drivers.push(driver);
 			return driver;
@@ -318,5 +320,52 @@ describe("AC-2: daily ledger", () => {
 		const day = localDay(clock.now(), "Asia/Seoul");
 		expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.25, 6);
 		expect(logLines.some((line) => line.includes("event=usage_daily_failed"))).toBe(true);
+	});
+});
+
+describe("agy turns in the daily ledger", () => {
+	const AGY_TURN: OmpTurnUsage = {
+		calls: 3,
+		input: 3000,
+		cacheRead: 207_000,
+		output: 30,
+		contextTokens: 70_000,
+		rotated: false,
+	};
+
+	/** The origin's ledger row read straight from the database file (the store has no calls reader). */
+	function ledgerRow(day: string): { cost: number; calls: number } | null {
+		const db = new Database(join(dir, "ompbot.db"), { readonly: true });
+		try {
+			return db.query("SELECT cost, calls FROM usage_daily WHERE day = ? AND origin_key = ?").get(day, ORIGIN) as {
+				cost: number;
+				calls: number;
+			} | null;
+		} finally {
+			db.close();
+		}
+	}
+
+	test("an agy turn adds its model calls at cost 0 and logs agy_usage; the cost caps judge as before", async () => {
+		clock.t = Date.parse("2026-11-10T12:00:00Z");
+		costCap = { turnUsd: 1, dailyUsd: 10 };
+		router = buildRouter({ turnUsage: () => AGY_TURN });
+		const day = localDay(clock.now(), "Asia/Seoul");
+		const before = budgetBreach(dailyBudgetState({ store, day, cap: 10 }));
+
+		await finishTurn(await startTurn("서팍 검토 한 번"));
+		expect(ledgerRow(day)).toEqual({ cost: 0, calls: 3 });
+		await finishTurn(await startTurn("두 번째 턴"));
+		expect(ledgerRow(day)).toEqual({ cost: 0, calls: 6 });
+
+		expect(store.dailyCost(day, ORIGIN)).toBe(0);
+		expect(budgetBreach(dailyBudgetState({ store, day, cap: 10 }))).toEqual(before);
+		expect(drivers.flatMap((driver) => driver.calls).filter((call) => call.startsWith("steer:"))).toEqual([]);
+		const usage = logLines.filter((line) => line.includes("event=agy_usage"));
+		expect(usage).toHaveLength(2);
+		for (const field of [`origin=${ORIGIN}`, "input=3000", "cacheRead=207000", "output=30", "contextTokens=70000"]) {
+			expect(usage[0]).toContain(field);
+		}
+		expect(logLines.some((line) => line.includes("event=usage_daily_failed"))).toBe(false);
 	});
 });

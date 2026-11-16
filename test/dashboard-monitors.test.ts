@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { renderDashboardMain, renderItemDetail, renderMonitorDetail } from "../src/dashboard/html";
 import { readMonitorDetail } from "../src/dashboard/monitor-detail";
+import { resolvePeers } from "../src/dashboard/peers";
 import { startDashboardServer } from "../src/dashboard/server";
 import { buildSnapshot, type DashboardSnapshot, type MonitorInfo, type SnapshotDeps } from "../src/dashboard/snapshot";
 import { openStore } from "../src/store/db";
@@ -59,8 +60,8 @@ interface Ev {
 	error?: string;
 }
 
-function insert(table: string, rows: Array<Record<string, string | number | null>>): void {
-	const db = new Database(join(home, "ompbot.db"), { strict: true });
+function insert(table: string, rows: Array<Record<string, string | number | null>>, dir = home): void {
+	const db = new Database(join(dir, "ompbot.db"), { strict: true });
 	for (const row of rows) {
 		const keys = Object.keys(row);
 		db.run(`INSERT INTO ${table} (${keys}) VALUES (${keys.map(() => "?")})`, Object.values(row));
@@ -68,7 +69,7 @@ function insert(table: string, rows: Array<Record<string, string | number | null
 	db.close();
 }
 
-function addMonitors(monitors: Mon[]): void {
+function addMonitors(monitors: Mon[], dir = home): void {
 	insert(
 		"monitors",
 		monitors.map((m, index) => ({
@@ -85,6 +86,7 @@ function addMonitors(monitors: Mon[]): void {
 			created_at: NOW - 1_000 * (monitors.length - index),
 			updated_at: NOW,
 		})),
+		dir,
 	);
 }
 
@@ -670,5 +672,162 @@ describe("dashboard monitors view", () => {
 		]);
 		const linked = renderItemDetail((await monitorsOf()).snapshot, "monitors", "bad");
 		expect(linked).toContain('href="?view=turns&amp;item=monitor%2Fbad">이 모니터의 대화 보기</a>');
+	});
+});
+
+describe("dashboard peer monitors", () => {
+	let peer: string;
+	beforeEach(() => {
+		peer = mkdtempSync(join(tmpdir(), "ompbot-dash-peer-"));
+		openStore({
+			timezone: "Asia/Seoul",
+			path: join(peer, "ompbot.db"),
+			clock: { now: () => NOW },
+			redact: (text) => text,
+		}).close();
+	});
+	afterEach(() => rmSync(peer, { recursive: true, force: true }));
+
+	const peerDeps = (
+		peers = resolvePeers({ port: 1, peerHomes: [{ name: "서팍", home: peer }] }, "Asia/Seoul"),
+	): SnapshotDeps => ({
+		...deps(),
+		peers,
+	});
+	const peerSnapshot = async (peers?: ReturnType<typeof resolvePeers>) => {
+		const snapshot = await buildSnapshot(peerDeps(peers));
+		if (!snapshot.monitors.ok) throw new Error(snapshot.monitors.error);
+		return { snapshot, monitors: snapshot.monitors };
+	};
+
+	test("AC-1/AC-2/AC-7: peer monitors join the list with install, prefixed name and id; no peers = no install key", async () => {
+		addMonitors([{ id: "same", name: "송박 일", trigger: cron("0 9 * * *"), channel: "C0LOG" }]);
+		addMonitors([{ id: "same", name: "후속 장부 정리", trigger: cron("0 10 * * *"), channel: "C0LOG" }], peer);
+		const { monitors } = await peerSnapshot();
+		expect(monitors.items.map((item) => item.id).sort()).toEqual(["same", "서팍:same"]);
+		const own = monitors.items.find((item) => item.id === "same");
+		const theirs = monitors.items.find((item) => item.id === "서팍:same");
+		expect(own).toBeDefined();
+		expect("install" in (own as MonitorInfo)).toBe(false);
+		expect(own?.originKey).toBe("monitor/same");
+		expect(theirs).toMatchObject({
+			install: "서팍",
+			name: "서팍 · 후속 장부 정리",
+			originKey: null,
+			destination: "채널 C0LOG",
+		});
+		expect(own?.destination).toBe("로그 채널");
+		// The peer has no config.json: its reason is listed, and the monitors stay.
+		expect(monitors.peerErrors).toEqual([{ install: "서팍", error: "config.json이 없음" }]);
+
+		const plain = await monitorsOf();
+		expect(plain.items.map((item) => item.id)).toEqual(["same"]);
+		expect("peerErrors" in plain.snapshot.monitors).toBe(false);
+		expect(plain.json).not.toContain('"install"');
+	});
+
+	test("AC-3: a missing or broken peer db leaves the own monitors and one peerErrors line; none without errors", async () => {
+		addMonitors([{ id: "own", name: "송박 일", trigger: cron("0 9 * * *") }]);
+		writeFileSync(join(peer, "config.json"), "{}");
+		rmSync(join(peer, "ompbot.db"));
+		const missing = await peerSnapshot([
+			{ name: "서팍", home: peer, workspaceDir: join(peer, "workspace"), timezone: "Asia/Seoul" },
+		]);
+		expect(missing.monitors.items.map((item) => item.id)).toEqual(["own"]);
+		expect(missing.monitors.peerErrors).toEqual([{ install: "서팍", error: "ompbot.db가 없음" }]);
+		writeFileSync(join(peer, "ompbot.db"), "not a database".repeat(50));
+		const broken = await peerSnapshot([
+			{ name: "서팍", home: peer, workspaceDir: join(peer, "workspace"), timezone: "Asia/Seoul" },
+		]);
+		expect(broken.monitors.items.map((item) => item.id)).toEqual(["own"]);
+		expect(broken.monitors.peerErrors).toHaveLength(1);
+		expect(broken.monitors.peerErrors?.[0]?.error.includes("\n")).toBe(false);
+		rmSync(join(peer, "ompbot.db"));
+		openStore({
+			timezone: "Asia/Seoul",
+			path: join(peer, "ompbot.db"),
+			clock: { now: () => NOW },
+			redact: (t) => t,
+		}).close();
+		const fine = await peerSnapshot([
+			{ name: "서팍", home: peer, workspaceDir: join(peer, "workspace"), timezone: "Asia/Seoul" },
+		]);
+		expect("peerErrors" in fine.monitors).toBe(false);
+	});
+
+	test("AC-4/AC-7: detail of <install>:<id> reads the peer db, workspace and zone; unknown install is unknown_monitor", () => {
+		mkdirSync(join(peer, "workspace", "procedures"), { recursive: true });
+		writeFileSync(join(peer, "workspace", "procedures", "p.md"), "# 서팍 절차");
+		addMonitors([{ id: "m1", name: "후속", trigger: cron("0 9 * * *"), procedureFiles: ["procedures/p.md"] }], peer);
+		insert(
+			"monitor_events",
+			[
+				{
+					monitor_id: "m1",
+					slot_at: NOW,
+					stage: "delivered",
+					attempts: 0,
+					manual: 0,
+					created_at: NOW,
+					updated_at: NOW,
+				},
+			],
+			peer,
+		);
+		const peers = resolvePeers({ port: 1, peerHomes: [{ name: "서팍", home: peer }] }, "Asia/Seoul");
+		const roots = { workspaceDir: undefined, scriptsRoot: join(home, "scripts"), timezone: "UTC" };
+		const detail = readMonitorDetail(home, roots, "서팍:m1", peers);
+		if (!detail.ok) throw new Error(detail.error);
+		expect(detail.procedures).toEqual([{ name: "p.md", text: "# 서팍 절차", truncated: false }]);
+		// The peer's zone (the dashboard's, as it has no config), not the caller's roots zone.
+		expect(detail.runs[0]?.slotAt).toBe(localIso(NOW, "Asia/Seoul"));
+		expect(readMonitorDetail(home, roots, "뚱기:m1", peers)).toEqual({ ok: false, error: "unknown_monitor" });
+		expect(readMonitorDetail(home, roots, "서팍:nope", peers)).toEqual({ ok: false, error: "unknown_monitor" });
+		expect(readMonitorDetail(home, roots, "m1", peers)).toEqual({ ok: false, error: "unknown_monitor" });
+	});
+
+	test("AC-6: the peer row shows the install and no conversation link; the own row keeps its link", async () => {
+		addMonitors([{ id: "same", name: "송박 일", trigger: cron("0 9 * * *") }]);
+		addMonitors([{ id: "same", name: "후속 장부 정리", trigger: cron("0 10 * * *") }], peer);
+		insert("origins", [
+			{ origin_key: "monitor/same", epoch: 1, session_dir: join(home, "sessions", "same"), updated_at: NOW },
+		]);
+		insert("inbound", [
+			{
+				platform_message_id: "m0",
+				origin_key: "monitor/same",
+				epoch: 1,
+				text_ref: "실행",
+				state: "answered",
+				created_at: NOW - HOUR,
+				thread_ref: "C0LOG:-",
+				op_ref: "op0",
+			},
+		]);
+		const { snapshot } = await peerSnapshot();
+		const list = monitorsHtml(snapshot);
+		expect(textOf(rowHtml(list, "서팍:same"))).toContain("서팍 · 후속 장부 정리");
+		expect(textOf(list)).toContain("서팍 모니터를 읽지 못함(config.json이 없음)");
+		expect(renderItemDetail(snapshot, "monitors", "same")).toContain("이 모니터의 대화 보기");
+		expect(renderItemDetail(snapshot, "monitors", "서팍:same")).not.toContain("이 모니터의 대화 보기");
+		expect(renderDashboardMain(snapshot, undefined, NOW, { view: "system" })).toContain("(+피어 1)");
+	});
+
+	test("the server answers 404 for an unknown install", async () => {
+		const server = startDashboardServer({
+			port: 0,
+			hostname: "127.0.0.1",
+			snapshot: async () => buildSnapshot(deps()),
+			monitorDetail: (id) =>
+				readMonitorDetail(home, { workspaceDir: undefined, scriptsRoot: home, timezone: "Asia/Seoul" }, id),
+		});
+		try {
+			const response = await fetch(
+				`http://127.0.0.1:${server.port}/api/monitor/detail?id=${encodeURIComponent("뚱기:x")}`,
+			);
+			expect(response.status).toBe(404);
+		} finally {
+			server.stop(true);
+		}
 	});
 });

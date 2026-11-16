@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { computeLaneChanges } from "../src/lanes/changes";
+import { computeLaneChanges, laneChangedFiles } from "../src/lanes/changes";
+import { checkLaneScope, outsideScope, parseLaneLeftovers, parseLaneScope } from "../src/lanes/scope";
 import type { LaneLandState, LaneRow, LaneStatus } from "../src/lanes/status";
 import { defaultGit, type GitRunner } from "../src/lanes/verify";
+import { redact } from "../src/redact";
 import { git, makeRepo } from "./helpers/git-fixtures";
 
 // computeLaneChanges (doc/plans/lane-card-changes.md 설계 2): real git repositories in temp directories; the lane
@@ -179,5 +181,59 @@ describe("computeLaneChanges", () => {
 			{ path: "moved.ts", added: 21, deleted: 0 },
 			{ path: "keep.ts", added: 0, deleted: 20 },
 		]);
+	});
+});
+
+describe("scope check and leftovers (doc/plans/bot-org-risk-gates.md 단계 2)", () => {
+	test("AC-2: every changed file is listed (no top-5 cap), and all of them outside the scope are kept", async () => {
+		const repo = makeRepo(repos, "ompbot-lane-scope-");
+		const base = baseOf(repo);
+		mkdirSync(join(repo, "src", "lanes"), { recursive: true });
+		mkdirSync(join(repo, "src", "tasks"), { recursive: true });
+		const outside = Object.fromEntries(Array.from({ length: 7 }, (_, i) => [`src/tasks/x${i}.ts`, lines(i + 1)]));
+		const sha = branchWith(repo, base, "lane/me", { "src/lanes/in.ts": lines(2), ...outside });
+		const files = await laneChangedFiles(repo, base, sha);
+		expect(files).toHaveLength(8);
+		const row = laneRow("me", repo, base, { sha });
+		row.meta.scope = ["src/lanes/**"];
+		const result = await checkLaneScope(row, sha);
+		expect(result.scopeError).toBeUndefined();
+		expect(result.scopeViolations?.slice().sort()).toEqual(Object.keys(outside).sort());
+		// Inside the scope only: nothing recorded; no scope: no git at all.
+		expect(outsideScope(["src/lanes/a.ts", "src/lanes/sub/b.ts"], ["src/lanes/**"])).toEqual([]);
+		const unscoped = await checkLaneScope(laneRow("me", repo, base, { sha }), sha, () => {
+			throw new Error("git must not run");
+		});
+		expect(unscoped).toEqual({ scopeViolations: undefined, scopeError: undefined });
+	});
+
+	test("AC-3: a git failure is scopeError (one line), never an empty violation list", async () => {
+		const repo = makeRepo(repos, "ompbot-lane-scope-");
+		const base = baseOf(repo);
+		const sha = branchWith(repo, base, "lane/me", { "a.ts": "a\n" });
+		const failing: GitRunner = async (args) =>
+			args.includes("--name-only") ? { code: 128, stdout: "", stderr: "fatal: bad object\n" } : defaultGit(args);
+		const row = laneRow("me", repo, base, { sha });
+		row.meta.scope = ["src/**"];
+		const result = await checkLaneScope(row, sha, failing);
+		expect(result.scopeViolations).toBeUndefined();
+		expect(result.scopeError).toContain("fatal: bad object");
+	});
+
+	test("leftovers: at most 20 items of {text, blocking}; text redacted and cut to 200 characters", () => {
+		const long = "가".repeat(300);
+		const parsed = parseLaneLeftovers([
+			{ text: long, blocking: false },
+			{ text: "토큰 xoxb-TEST-0 정리", blocking: true },
+		]);
+		expect(parsed.ok).toBe(true);
+		if (!parsed.ok) return;
+		expect(parsed.value[0]?.text).toHaveLength(200);
+		expect(parsed.value[1]).toEqual({ text: redact("토큰 xoxb-TEST-0 정리"), blocking: true });
+		expect(parseLaneLeftovers(undefined)).toEqual({ ok: true, value: [] });
+		expect(parseLaneLeftovers([{ text: "a" }]).ok).toBe(false);
+		expect(parseLaneLeftovers(Array.from({ length: 21 }, () => ({ text: "a", blocking: false }))).ok).toBe(false);
+		expect(parseLaneScope(["/abs/**"]).ok).toBe(false);
+		expect(parseLaneScope(["./src/**"])).toEqual({ ok: true, value: ["src/**"] });
 	});
 });

@@ -8,6 +8,7 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
+	type DiscordRole,
 } from "../src/discord/transport";
 
 const WAIT_MS = 5_000;
@@ -171,6 +172,7 @@ function startHarness(): Harness {
 interface Recorded {
 	messages: DiscordMessageEvent[];
 	interactions: DiscordInteraction[];
+	roles: DiscordRole[][];
 	ready: Array<{ resumed: boolean }>;
 	fatal: DiscordGatewayFatalError[];
 	reconnects: string[];
@@ -198,6 +200,7 @@ function make(
 	const rec: Recorded = {
 		messages: [],
 		interactions: [],
+		roles: [],
 		ready: [],
 		fatal: [],
 		reconnects: [],
@@ -210,6 +213,10 @@ function make(
 		},
 		interaction: async (interaction) => {
 			rec.interactions.push(interaction);
+			h.notify();
+		},
+		roles: (roles) => {
+			rec.roles.push([...roles]);
 			h.notify();
 		},
 	};
@@ -562,6 +569,35 @@ describe("DiscordGateway", () => {
 		expect(gw.session().seq).toBe(5);
 	});
 
+	test("GUILD_CREATE and GUILD_ROLE_CREATE/UPDATE hand the guild roles to the roles handler", async () => {
+		const h = startHarness();
+		harness = h;
+		const timers = new FakeTimers();
+		const { gw, rec } = make(h, timers);
+		await gw.start();
+		const everyone = { id: "40", name: "@everyone" };
+		const managed = { id: "41", name: "뚱기", tags: { bot_id: "30" } };
+		h.send(0, { op: 0, t: "GUILD_CREATE", s: 2, d: { id: "40", roles: [everyone, managed] } });
+		h.send(0, {
+			op: 0,
+			t: "GUILD_ROLE_CREATE",
+			s: 3,
+			d: { guild_id: "40", role: { id: "42", tags: { bot_id: "31" } } },
+		});
+		h.send(0, {
+			op: 0,
+			t: "GUILD_ROLE_UPDATE",
+			s: 4,
+			d: { guild_id: "40", role: { id: "41", tags: { bot_id: "30" } } },
+		});
+		await h.until(() => rec.roles.length === 3);
+		expect(rec.roles).toEqual([
+			[everyone, managed],
+			[{ id: "42", tags: { bot_id: "31" } }],
+			[{ id: "41", tags: { bot_id: "30" } }],
+		] as DiscordRole[][]);
+	});
+
 	test("a throwing handler is reported and the connection stays", async () => {
 		const h = startHarness();
 		harness = h;
@@ -589,6 +625,33 @@ describe("DiscordGateway", () => {
 		await h.until(() => errors.includes("handler boom"));
 		expect(gw.connectionState().state).toBe("up");
 		expect(h.conns[0]?.closed).toBe(false);
+		expect(h.conns).toHaveLength(1);
+	});
+
+	test("a roles handler that throws is reported like any handler and the connection stays (qa-l #26, #59)", async () => {
+		const h = startHarness();
+		harness = h;
+		const timers = new FakeTimers();
+		const errors: string[] = [];
+		const { gw } = make(h, timers, {
+			handlers: {
+				message: async () => {},
+				interaction: async () => {},
+				roles: () => {
+					throw new Error("roles boom");
+				},
+			},
+			onError: (error) => {
+				errors.push(error.message);
+				h.notify();
+			},
+		});
+		await gw.start();
+		h.send(0, { op: 0, t: "GUILD_CREATE", s: 2, d: { id: "40", roles: [null] } });
+		h.send(0, { op: 0, t: "GUILD_ROLE_UPDATE", s: 3, d: { guild_id: "40", role: { id: "41" } } });
+		await h.until(() => errors.length === 2);
+		expect(errors).toEqual(["roles boom", "roles boom"]);
+		expect(gw.connectionState().state).toBe("up");
 		expect(h.conns).toHaveLength(1);
 	});
 

@@ -48,7 +48,15 @@ if (resume !== undefined && process.env.FAKE_AGY_UNKNOWN_CONVERSATION === "1") {
 out({ event: "init", conversation_id: conversationId, init: { model, cwd: process.cwd(), permission_mode: "fake" } });
 
 let turns = 0;
-const usage = { input_tokens: 100, output_tokens: 7, thinking_tokens: 3, cache_read_tokens: 40, total_tokens: 107 };
+const DEFAULT_CALL = {
+	input_tokens: 100,
+	output_tokens: 7,
+	thinking_tokens: 3,
+	cache_read_tokens: 40,
+	total_tokens: 107,
+};
+/** Model calls of the running turn; `result` sums them like agy. */
+let calls: Array<typeof DEFAULT_CALL> = [DEFAULT_CALL];
 let release: ((how: "done" | "interrupt") => void) | undefined;
 process.on("SIGUSR1", () => release?.("done"));
 process.on("SIGINT", () => {
@@ -57,6 +65,21 @@ process.on("SIGINT", () => {
 });
 
 function result(status: "SUCCESS" | "ERROR", response: string, error?: string): void {
+	const made = status === "SUCCESS" ? calls : [];
+	for (const [i, call] of made.entries()) {
+		out({
+			event: "step_update",
+			step_update: { step_index: 10 + i, state: "DONE", step_type: "agent_response", usage: call },
+		});
+	}
+	const sum = (key: keyof typeof DEFAULT_CALL): number => made.reduce((total, call) => total + call[key], 0);
+	const usage = {
+		input_tokens: sum("input_tokens"),
+		output_tokens: sum("output_tokens"),
+		thinking_tokens: sum("thinking_tokens"),
+		cache_read_tokens: sum("cache_read_tokens"),
+		total_tokens: sum("total_tokens"),
+	};
 	out({
 		event: "result",
 		result: {
@@ -72,6 +95,17 @@ function result(status: "SUCCESS" | "ERROR", response: string, error?: string): 
 
 async function runTurn(content: string): Promise<void> {
 	turns += 1;
+	const ctx = /@ctx=([\d,]+)/.exec(content)?.[1];
+	calls =
+		ctx === undefined
+			? [DEFAULT_CALL]
+			: ctx.split(",").map((size) => ({
+					input_tokens: 1000,
+					output_tokens: 10,
+					thinking_tokens: 0,
+					cache_read_tokens: Number(size) - 1000,
+					total_tokens: Number(size) + 10,
+				}));
 	out({ event: "step_update", step_update: { step_index: 0, state: "DONE", step_type: "user_input" } });
 	if (content.includes("@error")) {
 		result("ERROR", "", "boom");

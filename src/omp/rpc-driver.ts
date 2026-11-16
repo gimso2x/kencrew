@@ -212,7 +212,8 @@ export interface RpcOmpDriverOptions {
 	baseEnv?: Record<string, string | undefined>;
 	/**
 	 * Owner answers to omp's select/confirm/input/editor/ask dialogs (Slack cards). With it the driver opts in to the
-	 * `ask` dialog (`set_ask_dialog enabled:true`); without it every dialog is cancelled at once.
+	 * `ask` dialog (`set_ask_dialog enabled:true`) and spawns `--mode rpc-ui` so omp offers the `ask` tool; without it
+	 * the child stays headless `rpc` and every dialog is cancelled at once.
 	 */
 	answerDialog?: OmpDialogAnswerer;
 	/** Side question deadline (tests); default `BTW_TIMEOUT_MS`. */
@@ -511,7 +512,9 @@ export class RpcOmpDriver implements OmpSessionDriver {
 		mkdirSync(resolve(options.cwd), { recursive: true });
 		mkdirSync(resolve(options.sessionDir), { recursive: true });
 
-		const args = ["--no-title"];
+		// omp builds the `ask` tool only for a UI session; `--mode rpc` (RpcClient's own first flag) is headless, so a
+		// child whose dialogs reach the owner overrides it with `rpc-ui` (the last `--mode` wins).
+		const args = options.answerDialog === undefined ? ["--no-title"] : ["--mode", "rpc-ui", "--no-title"];
 		if (options.overlayConfig) args.push("--config", options.overlayConfig);
 		if (options.thinking) args.push("--thinking", options.thinking);
 		args.push(...(options.extraArgs ?? []));

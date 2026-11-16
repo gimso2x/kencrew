@@ -1,14 +1,24 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	statSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { ConfigError, loadConfig } from "../src/config";
+import { ConfigError, loadConfig, type OmpbotConfig } from "../src/config";
 import { RESTART_FIELDS } from "../src/daemon/reload";
-import { botRpcEnv } from "../src/daemon/run";
+import { botRpcEnv, rpcOverlayFor, teamsGroupOverlayPath } from "../src/daemon/run";
 import { dispatchEnv, type RunProcessOptions, runOmpPrint } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
 import { buildChildEnv } from "../src/omp/env";
 import { REQUIRED_RPC_METHODS, RpcOmpDriver, type RpcOmpDriverOptions } from "../src/omp/rpc-driver";
+import { teamsAlias } from "../src/teams/types";
 
 /** A parent env with every key the profile wiring touches: an inherited agent dir and bot secrets (fake values). */
 const BASE = {
@@ -38,7 +48,8 @@ function fakeClientSource(): string {
 	return [
 		"export class RpcClient {",
 		"\tconstructor(options) { this.options = options; }",
-		'\tstart() { this.options.spawn(["--mode", "rpc"]); return Promise.resolve(); }',
+		// Like omp's own client: `--mode rpc` then the driver's `args` (`--no-title`, `--config …`, extra args).
+		'\tstart() { this.options.spawn(["--mode", "rpc", ...(this.options.args ?? [])]); return Promise.resolve(); }',
 		"\tstop() { return Promise.resolve(); }",
 		"\tonEvent() { return () => {}; }",
 		"\tonSessionEvent() { return () => {}; }",
@@ -242,4 +253,120 @@ describe("AC-3: ompProfile follows omp's profile name rule", () => {
 		expect(load(homeWith({})).warnings).toBeUndefined();
 		expect(RESTART_FIELDS).toContain("ompProfile");
 	});
+});
+
+describe("ompConfigOverlay: one --config for every omp child of the install", () => {
+	const ORIGINS = ["slack/dm/D0123456789", "discord/ch/123456/t/789", "monitor/daily", "lane/L-20261115-01"];
+	const GROUP = `teams/ch/${teamsAlias("19:abcdef0123456789@thread.v2")}`;
+	const OLD_PRINT_ARGV = ["omp", "-p", "--no-session", "--append-system-prompt"];
+
+	/** A loaded config (tokens unchecked) whose home has `overlay` as `glm.omp.yml`, set as `ompConfigOverlay` unless `null`. */
+	function loaded(overlay: string | null, extra: Record<string, unknown> = {}): OmpbotConfig {
+		const home = tempDir("ompbot-overlay-cfg-");
+		if (overlay !== null) writeFileSync(join(home, "glm.omp.yml"), overlay);
+		writeFileSync(
+			join(home, "config.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				channels: { slack: { ownerUserId: "UOWNER0" } },
+				slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+				ompExecutable: "/usr/local/bin/omp",
+				workspaceDir: "workspace",
+				...(overlay === null ? {} : { ompConfigOverlay: "glm.omp.yml" }),
+				...extra,
+			}),
+		);
+		return loadConfig(home, { checkTokens: false });
+	}
+
+	/** `config` with Teams Graph chat tools on (the group memory-off overlay applies to `teams/ch/*`). */
+	function withTeamsGraph(config: OmpbotConfig): OmpbotConfig {
+		const teams = {
+			appId: "3e1d5752-881a-4244-b653-9d0dacfb9013",
+			tenantId: "72f988bf-86f1-41af-91ab-2d7cd011db47",
+			clientSecretFile: join(config.homeDir, "secrets", "teams-client-secret"),
+			ownerAadObjectId: "0f5f9a3c-7e8b-4b5e-9a0e-3c2d1b0a9f8e",
+			listen: "127.0.0.1:3978",
+			graph: { tokenFile: join(config.homeDir, "secrets", "teams-graph-token") },
+		};
+		return { ...config, channels: { teams } };
+	}
+
+	async function simpleDispatchArgv(ompConfigOverlay: string | undefined): Promise<string[]> {
+		const { calls, run } = recordingRunner();
+		const built = buildDispatchTool({
+			originKey: "slack/dm/D0123456789",
+			ompExecutable: "omp",
+			...(ompConfigOverlay === undefined ? {} : { ompConfigOverlay }),
+			homeDir: "/h",
+			workspaceDir: "/h/workspace",
+			log: { info() {}, warn() {} },
+			run,
+		});
+		await built.execute({ task: "빌드 상태 요약" }, { signal: new AbortController().signal });
+		expect(calls).toHaveLength(1);
+		return calls[0]?.cmd ?? [];
+	}
+
+	test("AC-1: chat, monitor and lane RPC children and the simple dispatch run get --config <overlay>", async () => {
+		const config = loaded("modelRoles:\n  default: zai/glm-5.3-flash\n");
+		const overlay = join(config.homeDir, "glm.omp.yml");
+		expect(config.ompConfigOverlay).toBe(overlay);
+		for (const origin of ORIGINS) expect(rpcOverlayFor(config, origin)).toBe(overlay);
+		const child = await rpcChild({
+			model: "m",
+			...botRpcEnv(undefined, BASE),
+			overlayConfig: overlay,
+			extraArgs: ["--x"],
+		});
+		expect(child.cmd).toEqual(["--mode", "rpc", "--no-title", "--config", overlay, "--x"]);
+		const argv = await simpleDispatchArgv(overlay);
+		expect(argv.slice(0, 6)).toEqual(["omp", "-p", "--no-session", "--config", overlay, "--append-system-prompt"]);
+		expect(argv.slice(-2)).toEqual(["--", "빌드 상태 요약"]);
+	});
+
+	test("AC-2: without the key the RPC child argv and the simple dispatch argv are byte for byte the old ones", async () => {
+		const config = loaded(null);
+		expect("ompConfigOverlay" in config).toBe(false);
+		for (const origin of [...ORIGINS, GROUP]) expect(rpcOverlayFor(config, origin)).toBeUndefined();
+		// The daemon spreads `rpcOverlayFor`'s result only when defined: the options are the old literal.
+		const before = await rpcChild({ model: "m", env: { OMP_WIKI_NOTE_DISABLE: "1" }, extraArgs: ["--x"] });
+		expect(before.cmd).toEqual(["--mode", "rpc", "--no-title", "--x"]);
+		const argv = await simpleDispatchArgv(undefined);
+		expect(argv.slice(0, 4)).toEqual(OLD_PRINT_ARGV);
+		expect(argv).toHaveLength(7);
+		expect(argv).not.toContain("--config");
+		// A Teams group keeps exactly its memory-off file when the install has no overlay.
+		const teams = withTeamsGraph(config);
+		expect(rpcOverlayFor(teams, GROUP)).toBe(teamsGroupOverlayPath(config.homeDir));
+		expect(rpcOverlayFor(teams, ORIGINS[0] as string)).toBeUndefined();
+	});
+
+	test("a Teams group child gets one merged file: the overlay with memory forced off, re-read for each new child", () => {
+		const config = withTeamsGraph(loaded('memory:\n  backend: "local"\nmodelRoles:\n  default: zai/glm-5.3-flash\n'));
+		const overlay = join(config.homeDir, "glm.omp.yml");
+		expect(rpcOverlayFor(config, ORIGINS[0] as string)).toBe(overlay);
+		const merged = rpcOverlayFor(config, GROUP) ?? "";
+		expect(dirname(merged)).toBe(config.homeDir);
+		expect(merged).toMatch(/\/rpc-overlay\.[0-9a-f]{16}\.omp\.yml$/);
+		expect(statSync(merged).mode & 0o777).toBe(0o600);
+		expect(Bun.YAML.parse(readFileSync(merged, "utf8"))).toEqual({
+			memory: { backend: "off" },
+			modelRoles: { default: "zai/glm-5.3-flash" },
+		});
+		writeFileSync(overlay, "modelRoles:\n  default: zai/glm-5.3\n");
+		const next = rpcOverlayFor(config, GROUP) ?? "";
+		expect(next).not.toBe(merged);
+		expect(Bun.YAML.parse(readFileSync(next, "utf8"))).toEqual({
+			modelRoles: { default: "zai/glm-5.3" },
+			memory: { backend: "off" },
+		});
+	});
+});
+
+test("a child whose dialogs reach the owner runs as rpc-ui (omp's ask tool needs a UI session); others stay rpc", async () => {
+	const headless = await rpcChild({ model: "m", extraArgs: ["--x"] });
+	expect(headless.cmd).toEqual(["--mode", "rpc", "--no-title", "--x"]);
+	const answered = await rpcChild({ model: "m", extraArgs: ["--x"], answerDialog: async () => ({ value: "x" }) });
+	expect(answered.cmd).toEqual(["--mode", "rpc", "--mode", "rpc-ui", "--no-title", "--x"]);
 });

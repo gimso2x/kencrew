@@ -1,6 +1,6 @@
-import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { constants, existsSync, realpathSync } from "node:fs";
+import { mkdir, open, writeFile } from "node:fs/promises";
+import { dirname, sep } from "node:path";
 import {
 	DEFAULT_STDOUT_CAP,
 	dispatchEnv,
@@ -42,8 +42,12 @@ export interface TaskHostOps {
 	writeFile(path: string, content: string): Promise<HostResult<null>>;
 	/** `value: undefined` = the file does not exist; an unreachable host is a failure, never "missing". */
 	readFile(path: string): Promise<HostResult<string | undefined>>;
-	/** `readFile` as the file's bytes (a `sha256` file check hashes them); over ssh they travel as base64. */
-	readBytes(path: string): Promise<HostResult<Uint8Array | undefined>>;
+	/**
+	 * `readFile` as the file's bytes (a `sha256` file check hashes them); over ssh they travel as base64. On the local host only
+	 * a regular file is read (a symlink, FIFO or device is a failure, never a wait) and `within` keeps the read inside
+	 * that directory.
+	 */
+	readBytes(path: string, within?: string): Promise<HostResult<Uint8Array | undefined>>;
 	/**
 	 * Whether `hash` is a commit on `branch` after the branch's `docs(task): <taskId> 4문서` commit; throws when the host
 	 * cannot be asked or git fails unexpectedly (never answers "no" for "unknown").
@@ -95,7 +99,12 @@ export interface CheckRun {
 	code: number | null;
 	output: string;
 	timedOut: boolean;
+	/** The output reached the collection cap: what follows the kept head is lost. */
+	truncated?: boolean;
 }
+
+/** stdout kept of one check: a test runner's summary comes last, so the cap is far above the 64KB default. */
+const CHECK_STDOUT_CAP = 8_000_000;
 
 export interface TaskHostOptions {
 	/** ssh target; absent = the bot's own machine. */
@@ -118,6 +127,42 @@ function assertPath(path: string): void {
 /** A task branch (`task/T-YYYYMMDD-NN`) or a work lane's branch (`lane/L-YYYYMMDD-NN`); nothing else reaches git. */
 function assertBranch(branch: string): void {
 	if (!/^(?:task\/T|lane\/L)-\d{8}-\d{2,}$/.test(branch)) throw new Error(`unsafe branch: ${branch}`);
+}
+
+/**
+ * A regular file's bytes, read without ever blocking or following the last path component: a FIFO opens at once
+ * (`O_NONBLOCK`) and is refused by `fstat`, a symlink fails to open (`O_NOFOLLOW`), `/dev/zero` is not a regular file.
+ * With `within`, the file's directory must resolve inside that directory (a symlinked directory leads out of it).
+ * `undefined` = the path does not exist.
+ */
+async function readRegularFile(path: string, within?: string): Promise<Buffer | undefined> {
+	if (within !== undefined) {
+		let real: string;
+		let root: string;
+		try {
+			real = realpathSync(dirname(path));
+			root = realpathSync(within);
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		}
+		if (real !== root && !real.startsWith(`${root}${sep}`)) throw new Error(`${path} is outside ${within}`);
+	}
+	let handle: Awaited<ReturnType<typeof open>>;
+	try {
+		handle = await open(path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT") return undefined;
+		if (code === "ELOOP") throw new Error(`${path} is a symbolic link, not a regular file`);
+		throw error;
+	}
+	try {
+		if (!(await handle.stat()).isFile()) throw new Error(`${path} is not a regular file`);
+		return await handle.readFile();
+	} finally {
+		await handle.close();
+	}
 }
 
 const fail = (error: unknown): { ok: false; error: string } => ({
@@ -219,9 +264,8 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 			assertPath(path);
 			if (sshTarget === undefined) {
 				try {
-					return { ok: true, value: await readFile(path, "utf8") };
+					return { ok: true, value: (await readRegularFile(path))?.toString("utf8") };
 				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, value: undefined };
 					return fail(error);
 				}
 			}
@@ -232,13 +276,12 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 			return { ok: true, value: result.stdout };
 		},
 
-		async readBytes(path) {
+		async readBytes(path, within) {
 			assertPath(path);
 			if (sshTarget === undefined) {
 				try {
-					return { ok: true, value: await readFile(path) };
+					return { ok: true, value: await readRegularFile(path, within) };
 				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, value: undefined };
 					return fail(error);
 				}
 			}
@@ -349,7 +392,7 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 			// shell skips the profile that puts `~/.local/bin` (npm, node, bun shims) on PATH, so the line adds it first.
 			const result =
 				sshTarget === undefined
-					? await run(argv, { cwd: worktree, timeoutMs, env, ...stop })
+					? await run(argv, { cwd: worktree, timeoutMs, env, stdoutCap: CHECK_STDOUT_CAP, ...stop })
 					: await run(
 							sshCommand(sshTarget, [
 								"export",
@@ -360,12 +403,17 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 								"&&",
 								...argv.map(remoteShellQuote),
 							]),
-							{ timeoutMs, ...stop },
+							{ timeoutMs, stdoutCap: CHECK_STDOUT_CAP, ...stop },
 						);
 			if (sshTarget !== undefined && !result.timedOut && (result.code === null || result.code === SSH_FAILURE))
 				throw new Error(`cannot run check: host unreachable: ${unreachableReason(result)}`);
 			const output = [result.stdout, result.stderr ?? ""].filter((part) => part.trim() !== "").join("\n");
-			return { code: result.code, output, timedOut: result.timedOut };
+			return {
+				code: result.code,
+				output,
+				timedOut: result.timedOut,
+				...(result.stdout.length >= CHECK_STDOUT_CAP ? { truncated: true as const } : {}),
+			};
 		},
 
 		async headOf(worktree) {

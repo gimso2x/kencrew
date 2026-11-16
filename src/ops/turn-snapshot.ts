@@ -107,21 +107,55 @@ export function turnRefName(id: number, which: "before" | "after"): string {
 /** No call here means a pathspec pattern: a file named `:(glob)**` is that one file, not every file (qa-d M-1). */
 const LITERAL_PATHSPECS = { GIT_LITERAL_PATHSPECS: "1" };
 
-/** Runs git in `repo`; a timeout is a non-zero outcome, never a throw (the caller decides what a failure means). */
+/** The daemon's environment without any `GIT_*`: an inherited `GIT_DIR`/`GIT_WORK_TREE` would retarget git (qa-j #23). */
+function gitFreeEnv(): Record<string, string | undefined> {
+	return Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
+}
+
+/**
+ * Runs git in `repo`; a timeout is a non-zero outcome, never a throw (the caller decides what a failure means). An
+ * inherited `GIT_*` (`GIT_DIR`, `GIT_WORK_TREE`) would point git at another repository, so none is passed on; the
+ * temporary index comes in through `options.env` only (qa-j #23). git runs in its own process group: at the deadline
+ * the whole group (a clean filter and what it started, which hold the pipes) is killed and the pipes are abandoned
+ * (qa-j #70/#22).
+ */
 export const runGit: GitRunner = async (repo, args, options = {}) => {
 	const timeoutMs = options.timeoutMs ?? TURN_SNAPSHOT_TIMEOUT_MS;
+	const inherited = gitFreeEnv();
+	let timer: Timer | undefined;
 	try {
 		const proc = Bun.spawn(["git", "-C", repo, ...args], {
-			env: { ...process.env, ...options.env, ...LITERAL_PATHSPECS },
+			env: { ...inherited, ...options.env, ...LITERAL_PATHSPECS },
+			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
-			signal: AbortSignal.timeout(timeoutMs),
+			detached: true,
 		});
-		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-		const code = await proc.exited;
+		const timedOut = Promise.withResolvers<"timeout">();
+		timer = setTimeout(() => {
+			try {
+				process.kill(-proc.pid, "SIGKILL");
+			} catch {
+				proc.kill("SIGKILL");
+			}
+			timedOut.resolve("timeout");
+		}, timeoutMs);
+		const finished = Promise.all([
+			new Response(proc.stdout).text(),
+			new Response(proc.stderr).text(),
+			proc.exited,
+		] as const);
+		const outcome = await Promise.race([finished, timedOut.promise]);
+		if (outcome === "timeout") {
+			finished.catch(() => undefined);
+			return { code: 124, stdout: "", stderr: `git ${args[0] ?? ""} timed out after ${timeoutMs}ms` };
+		}
+		const [stdout, stderr, code] = outcome;
 		return { code: code ?? 1, stdout, stderr };
 	} catch (error) {
 		return { code: 124, stdout: "", stderr: `git ${args[0] ?? ""} failed: ${String(error)}` };
+	} finally {
+		clearTimeout(timer);
 	}
 };
 
@@ -297,6 +331,9 @@ async function changedPaths(run: GitRunner, repo: string, from: string, to: stri
 	return paths;
 }
 
+/** The two git modes of a regular file; they differ only in the executable bit. */
+const REGULAR_MODES: ReadonlySet<string> = new Set(["100644", "100755"]);
+
 /** The git mode of a path in the work tree, or undefined when nothing (or a directory) is there. */
 function workTreeMode(full: string): string | undefined {
 	let stat: ReturnType<typeof lstatSync>;
@@ -312,19 +349,22 @@ function workTreeMode(full: string): string | undefined {
 
 /**
  * Whether the work tree still holds exactly the tree's entry for `path`. A turn-created file must be gone, a
- * turn-deleted file must not be back, and everything else must match blob and mode.
+ * turn-deleted file must not be back, and everything else must match blob and mode. With `core.fileMode=false`
+ * (`ignoreExecBit`) git itself ignores the executable bit, so 100644 against 100755 is no difference (qa-l #52).
  */
 async function stillMatches(
 	run: GitRunner,
 	repo: string,
 	entries: Map<string, { mode: string; blob: string }>,
 	path: string,
+	ignoreExecBit: boolean,
 ): Promise<boolean> {
 	const entry = entries.get(path);
 	const full = join(repo, path);
 	const mode = workTreeMode(full);
 	if (entry === undefined) return mode === undefined;
-	if (mode !== entry.mode) return false;
+	const execBitOnly = REGULAR_MODES.has(mode ?? "") && REGULAR_MODES.has(entry.mode);
+	if (mode !== entry.mode && !(ignoreExecBit && execBitOnly)) return false;
 	if (mode !== "120000") return (await required(run, repo, ["hash-object", "--", path])) === entry.blob;
 	// A symlink's blob is its target string; hash-object on the path would hash the file it points to instead.
 	const scratch = temporaryIndexPath(repo);
@@ -388,12 +428,15 @@ export async function planUndo(options: {
 			files: [],
 		};
 	}
-	const [paths, before, after, overlap] = await Promise.all([
+	const [paths, before, after, overlap, fileMode] = await Promise.all([
 		changedPaths(run, row.repo, row.treeBefore, row.treeAfter),
 		treeEntries(run, row.repo, row.treeBefore),
 		treeEntries(run, row.repo, row.treeAfter),
 		overlapPaths(run, row, options.others ?? []),
+		run(row.repo, ["config", "--bool", "core.fileMode"]),
 	]);
+	// Only an explicit false relaxes the check; unset or unreadable keeps comparing the executable bit.
+	const ignoreExecBit = fileMode.code === 0 && fileMode.stdout.trim() === "false";
 	const files: PlannedFile[] = [];
 	for (const path of paths) {
 		if (overlap.failed !== undefined || overlap.paths.has(path)) {
@@ -402,7 +445,7 @@ export async function planUndo(options: {
 		}
 		// A nested repository's checkout is its own history: it is reported, never restored or deleted.
 		const gitlink = before.get(path)?.mode === GITLINK_MODE || after.get(path)?.mode === GITLINK_MODE;
-		if (gitlink || !(await stillMatches(run, row.repo, after, path))) {
+		if (gitlink || !(await stillMatches(run, row.repo, after, path, ignoreExecBit))) {
 			files.push({ path, kind: "conflict" });
 			continue;
 		}
@@ -512,7 +555,7 @@ export function removeTurnRefsSync(rows: readonly Pick<TurnSnapshotRow, "id" | "
 		for (const which of ["before", "after"] as const) {
 			const ref = turnRefName(row.id, which);
 			const outcome = Bun.spawnSync(["git", "-C", row.repo, "update-ref", "-d", ref], {
-				env: { ...process.env, ...LITERAL_PATHSPECS },
+				env: { ...gitFreeEnv(), ...LITERAL_PATHSPECS },
 				stdout: "pipe",
 				stderr: "pipe",
 			});

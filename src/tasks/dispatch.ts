@@ -33,6 +33,7 @@ import type { TaskLedger, TaskRow } from "./ledger";
 import { buildAcceptedCard, postToThread, setStatusReaction, type TaskSlackLog } from "./notify";
 import { buildTaskPrompt, resumeCheckLines } from "./prompt";
 import { checkResume, type ResumeCheck, restatedHash } from "./resume-check";
+import { type WorkerTier, withWorkerModel, workerLine } from "./worker-tier";
 
 type HostEntry = DispatchHostConfig;
 
@@ -114,7 +115,8 @@ async function startAgent(
 ): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
 	const entry = hostEntryOf(deps, row.host);
 	const options = herdrOptionsFor(deps, entry);
-	const agentArgs = entry === undefined ? deps.workerOmpArgs : entry.ompArgs;
+	// The model fixed at registration, on a start and on every restart by resume alike.
+	const agentArgs = withWorkerModel(entry === undefined ? deps.workerOmpArgs : entry.ompArgs, row.workerModel);
 	const base = {
 		name: row.agent,
 		task: prompt,
@@ -155,9 +157,9 @@ async function threadLink(channels: ChannelRegistry, log: TaskSlackLog, threadRe
  */
 export async function startTask(
 	deps: TaskDispatchDeps,
-	input: { spec: NewTaskSpec; task: string | undefined; host: string | null },
+	input: { spec: NewTaskSpec; task: string | undefined; host: string | null; worker: WorkerTier },
 ): Promise<string> {
-	const { spec, host } = input;
+	const { spec, host, worker } = input;
 	if (input.task === undefined || input.task === "") throw new Error("신규 taskSpec에는 task(지시문)가 필요합니다");
 	const threadRef = deps.threadRef();
 	const parsed = threadRef === undefined ? undefined : parseThreadRef(threadRef);
@@ -184,6 +186,7 @@ export async function startTask(
 		host,
 		repo: spec.repo,
 		acceptance: acceptanceItems(spec.acceptance),
+		worker: { tier: worker.tier, tierReason: worker.tierReason, model: worker.model },
 	});
 	const git = { repo: row.repo, worktree: row.worktree, branch: row.branch };
 	let worktreeCreated = false;
@@ -249,8 +252,11 @@ export async function startTask(
 	const posted = await postToThread(deps.channels, deps.log, threadRef, buildAcceptedCard(row, spec, link));
 	await setStatusReaction(deps.channels, deps.log, threadRef, "working", []);
 	const where = `${row.host ?? "local"}:${row.worktree}`;
+	const workerText = workerLine(row);
 	return [
 		`${row.taskId} 등록·시작했습니다 (워크트리 ${where}, branch ${row.branch}, 에이전트 ${row.agent}, 기준 문서 ${docsDirOf(row.worktree, row.taskId)}).`,
+		...(workerText === undefined ? [] : [workerText]),
+		...(worker.note === undefined ? [] : [worker.note]),
 		...(link === undefined ? [] : [`진행 보기: ${link}`]),
 		posted
 			? "접수 카드(맡았습니다·진행 보기·[목표]·[가정])를 이 스레드에 이미 올렸습니다. 답에서 카드 내용을 되풀이하지 말고, 카드에 없는 것(오너가 지금 알아야 할 위험·확인 못 한 것)만 한두 줄로 씁니다."

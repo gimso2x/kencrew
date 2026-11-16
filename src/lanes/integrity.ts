@@ -28,12 +28,15 @@ const TEST_PATH =
 const LINKED_REASON = /(?:#\d+|https?:\/\/)/;
 const UNFINISHED = /\b(?:TODO|FIXME|XXX|HACK|WIP|TBD)\b/i;
 const SKIPPED_TEST =
-	/(?:\b(?:test|it|describe)(?:\.(?:concurrent|serial|failing|sequential))*\.(?:skip|only|todo|skipIf)(?:\(|\.)|\b(?:xit|xtest|xdescribe)\(|\b(?:test|it|describe)\b[^\n]*\{[^}]*\bskip\s*:\s*true\b)/;
+	/(?:\b(?:test|it|describe)(?:\.(?:concurrent|serial|failing|sequential))*\.(?:skip|only|todo|skipIf)(?:\(|\.)|\b(?:xit|xtest|xdescribe)\(|\b(?:test|it|describe)\b[^\n]*\{[^}]*\bskip\s*:\s*true\b|\bpytest\.(?:mark\.skip(?:if)?\b|skip\s*\()|@unittest\.skip|\bt\.Skip(?:Now|f)?\(|#\[ignore\b)/;
 /** A stub is a throwing/panicking body, judged on the raw line (its message is a string), or a stub macro/call outside string literals. */
 const STUB_THROW = /\b(?:throw|raise|panic)\b.*not[ _-]?implemented/i;
-const STUB_CALL = /(?:todo!\(|unimplemented[!]|\bnot_?implemented\s*\()/i;
+const STUB_CALL = /(?:\btodo\s*![([{]|unimplemented[!]|\bnot_?implemented\s*\()/i;
 const GUARD_WORD =
 	/\b(?:throw|refuse|deny|reject|validate|sanitize|permission|allowlist|forbid|guard|assert)\b|권한|거부|검증|금지/i;
+/** A line that declares or asserts in a test, so a negative word there names a case rather than a variable or comment. */
+const TEST_DECLARATION =
+	/\b(?:test|it|describe|specify)\s*(?:\.\w+)*\s*\(|\bexpect\s*\(|\bassert\w*|\bdef\s+test_|\bfn\s+\w+|\bfunc\s+Test|\bpytest\.raises|@Test\b/;
 const NEGATIVE_TEST = /\b(?:refuses?|rejects?|denies?|blocks?|invalid|권한 없음|거부)/i;
 const CLAIM_WORD =
 	/(?:통과|검증 완료|수정 완료|고쳤|해결됐|해결됨|(?<![A-Za-z0-9_-])(?:verified|passing|passed|fixed|green)(?![A-Za-z0-9_-]))/i;
@@ -151,13 +154,16 @@ function commentText(text: string): string | undefined {
 	return undefined;
 }
 
-/** Whether the line carries an unfinished-work marker; `inBlock` carries an open slash-star comment from the line before. */
-function isUnfinishedMarker(text: string, inBlock: boolean): { marker: boolean; inBlock: boolean } {
+/**
+ * Whether the line carries an unfinished-work marker, and its code with comments cut away; `inBlock` carries an open
+ * slash-star comment from the line before.
+ */
+function isUnfinishedMarker(text: string, inBlock: boolean): { marker: boolean; inBlock: boolean; code: string } {
 	let code = text;
 	let comment: string | undefined;
 	if (inBlock) {
 		const close = text.indexOf("*/");
-		if (close < 0) return { marker: UNFINISHED.test(text), inBlock: true };
+		if (close < 0) return { marker: UNFINISHED.test(text), inBlock: true, code: "" };
 		comment = text.slice(0, close);
 		code = text.slice(close + 2);
 	}
@@ -165,12 +171,26 @@ function isUnfinishedMarker(text: string, inBlock: boolean): { marker: boolean; 
 	const opensBlock = trailing?.startsWith("/*") === true && !trailing.includes("*/", 2);
 	const marker =
 		(comment !== undefined && UNFINISHED.test(comment)) || (trailing !== undefined && UNFINISHED.test(trailing));
-	return { marker, inBlock: opensBlock };
+	return { marker, inBlock: opensBlock, code: trailing === undefined ? code : code.slice(0, -trailing.length) };
 }
 
 /** Blanks string literals so words inside quotes are not read as code. */
 function withoutStrings(text: string): string {
 	return text.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, '""');
+}
+
+/**
+ * A guard line's code for telling an edit from a deletion: string literals without `${…}` and a trailing `//` comment
+ * become blanks, everything else stays as written. A template literal that interpolates holds code and is kept, which
+ * is why {@link withoutStrings} (it blanks those too) is not used here.
+ */
+function guardCode(text: string): string {
+	return text
+		.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`/g, (literal) =>
+			literal.startsWith("`") && literal.includes("${") ? literal : '""',
+		)
+		.replace(/\s*\/\/.*$/, "")
+		.trim();
 }
 
 function refusal(category: IntegrityRefusal["category"], file: string, text: string): IntegrityRefusal {
@@ -199,6 +219,8 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 
 	let blockKey = "";
 	let inBlock = false;
+	/** An added test line whose code (comments cut away) declares or asserts a negative case. */
+	let hasAdversarialTest = false;
 	for (const line of added) {
 		const key = `${line.file}\0${line.hunk}`;
 		if (key !== blockKey) {
@@ -207,17 +229,33 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 		}
 		const scan = isUnfinishedMarker(line.text, inBlock);
 		inBlock = scan.inBlock;
-		if (LINKED_REASON.test(line.text)) continue;
-		if (scan.marker) refusals.push(refusal("unfinished_work_marker", line.file, line.text));
-		if (SKIPPED_TEST.test(line.text)) refusals.push(refusal("skipped_test", line.file, line.text));
+		if (TEST_PATH.test(line.file) && NEGATIVE_TEST.test(scan.code) && TEST_DECLARATION.test(scan.code))
+			hasAdversarialTest = true;
+		// An issue link is a reason for a marker or a skip; a stub body has no such remedy.
+		if (!LINKED_REASON.test(line.text)) {
+			if (scan.marker) refusals.push(refusal("unfinished_work_marker", line.file, line.text));
+			if (SKIPPED_TEST.test(line.text)) refusals.push(refusal("skipped_test", line.file, line.text));
+		}
 		if (STUB_THROW.test(line.text) || STUB_CALL.test(withoutStrings(line.text)))
 			refusals.push(refusal("stub_implementation", line.file, line.text));
 	}
 
 	const addedText = new Set(added.map((line) => line.text.trim()));
-	const hasAdversarialTest = added.some((line) => TEST_PATH.test(line.file) && NEGATIVE_TEST.test(line.text));
 	const deletedGuards = removed.filter((line) => GUARD_WORD.test(line.text) || NEGATIVE_TEST.test(line.text));
-	const stillGone = deletedGuards.filter((line) => !addedText.has(line.text.trim()));
+	// A guard edited in place (same file and hunk) only in a plain string or a trailing comment is kept, not deleted:
+	// each added line answers for one deleted guard at most (qa-l #83).
+	const paired = new Set<DiffLine>();
+	const stillGone = deletedGuards.filter((line) => {
+		if (addedText.has(line.text.trim())) return false;
+		const code = guardCode(line.text);
+		const edit = added.find(
+			(other) =>
+				!paired.has(other) && other.file === line.file && other.hunk === line.hunk && guardCode(other.text) === code,
+		);
+		if (edit === undefined) return true;
+		paired.add(edit);
+		return false;
+	});
 	if (stillGone.length > 0 && !hasAdversarialTest) {
 		refusals.push(
 			refusal("guard_deletion_without_adversarial_regression", stillGone[0]?.file ?? "", stillGone[0]?.text ?? ""),
@@ -290,6 +328,7 @@ export async function collectLaneDiff(
 		"diff",
 		"--no-ext-diff",
 		"--no-textconv",
+		"--text",
 		`${from}..${sha}`,
 		"--no-color",
 		"--unified=0",

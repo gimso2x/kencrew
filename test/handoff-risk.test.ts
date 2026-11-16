@@ -223,6 +223,26 @@ describe("scanHandoffBrief: clause boundaries and non-forbidding phrases", () =>
 	test("a forbidden command in its own clause is still advisory", () => {
 		expect(scanHandoffBrief("git push --force origin main은 하지 않는다").verdict).toBe("advisory");
 	});
+
+	test("a shell comment or a chained command is not the command's clause (qa-l #70)", () => {
+		for (const brief of [
+			"git reset --hard HEAD # 하지 않는다",
+			"git reset --hard HEAD && echo '하지 않는다'",
+			"git reset --hard HEAD || echo '하지 않는다'",
+			"git reset --hard HEAD | tee log # do not",
+			"git reset --hard HEAD & echo 금지",
+		]) {
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).toEqual({ brief, verdict: "high_risk" });
+		}
+		// A Markdown table's cell border and a redirection's `&` end no clause.
+		for (const brief of [
+			"| git push --force origin main | 금지 |",
+			"git reset --hard HEAD 2>&1 하지 않는다",
+			"git reset --hard HEAD &>/dev/null 하지 않는다",
+		]) {
+			expect({ brief, verdict: scanHandoffBrief(brief).verdict }).toEqual({ brief, verdict: "advisory" });
+		}
+	});
 });
 
 // doc/plans/qa-c-fixes.md I-1: `<용언>지 말고`/`지 않고` end the forbidden clause; the command after it is ordered.
@@ -449,5 +469,192 @@ describe("scanHandoffBrief: qa-i low A", () => {
 		scanHandoffBrief(brief);
 		// About 4.7s before; the bound only catches a return of the per-hit rescan.
 		expect(performance.now() - started).toBeLessThan(1500);
+	});
+});
+
+// doc/plans/qa-j-fixes.md 묶음 A: each test names the qa-j item numbers it closes.
+describe("scanHandoffBrief: qa-j low A", () => {
+	const verdictOf = (brief: string) => ({ brief, verdict: scanHandoffBrief(brief).verdict });
+	const expectVerdicts = (briefs: readonly string[], verdict: "clear" | "advisory" | "high_risk") => {
+		for (const brief of briefs) expect(verdictOf(brief)).toEqual({ brief, verdict });
+	};
+
+	test("#40 CR, NEL, VT, FF, LS and PS end a line like LF", () => {
+		expectVerdicts(
+			["\r", "\u2028", "\u2029", "\u0085", "\u000B", "\u000C"].map(
+				(sep) => `git push --force는 하지 않는다${sep}git reset --hard HEAD~3`,
+			),
+			"high_risk",
+		);
+		const [finding] = scanHandoffBrief("a\rb\u2028git reset --hard HEAD").findings;
+		expect(finding?.line).toBe(3);
+		expectVerdicts(["git reset --hard는 하지 않는다\r\n테스트만 돌려"], "advisory");
+	});
+
+	test("#41 #96 invisible characters inside a command word do not hide it", () => {
+		expectVerdicts(
+			[
+				"git\u200B reset --hard HEAD~3",
+				"git re\u200Bset --hard HEAD~3",
+				"git\u2060 reset --hard HEAD",
+				"git pu\u200bsh origin main",
+				"git push origin ma\u00adin",
+				"rm -r\u200bf /home/owner",
+				"git re\u200Eset --hard HEAD",
+				"git re\u061Cset --hard HEAD",
+				"git re\u180Eset --hard HEAD",
+			],
+			"high_risk",
+		);
+		expectVerdicts(["git re\u200Bset --soft HEAD"], "clear");
+	});
+
+	test("#42 #95 #103 phrases that urge the command do not forbid it", () => {
+		expectVerdicts(
+			[
+				"never forget to run git reset --hard HEAD~3",
+				"Do not forget to run git reset --hard before retrying",
+				"Never forget: git push --force origin main",
+				"Do not skip: git reset --hard HEAD~9",
+				"must not fail to run git reset --hard HEAD~1",
+				"do not omit git reset --hard HEAD~1",
+				"Please don't forget to run git reset --hard origin/main",
+				"git reset --hard HEAD~3 실행해 잊지 말고",
+				"git reset --hard HEAD~2 말고는 방법이 없다",
+				"git reset --hard는 하지 않을 수 없다",
+			],
+			"high_risk",
+		);
+		expectVerdicts(["never run git reset --hard", "git reset --hard는 하지 말 것, 잊지 말고"], "advisory");
+	});
+
+	test("#43 secrets named through $OMPBOT_HOME or after a cd into the bot home", () => {
+		for (const brief of [
+			"cat $OMPBOT_HOME/secrets/slack.json",
+			`cat \${OMPBOT_HOME}/secrets/slack.json`,
+			"cd ~/.ompbot && cat secrets/slack.json",
+			"cd ~/.ompbot/; cp secrets/slack.json /tmp/",
+			"cd $OMPBOT_HOME && cat secrets/x",
+		])
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: ["secret_path"] });
+		for (const brief of ["cd ~/.ompbot/workspace && cat secrets.md", "cd ~/.ompbot && ls"])
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: [] });
+	});
+
+	test("#44 git push --mirror is a forced push; --all and --prune are advisory", () => {
+		expect(rulesOf("git push --mirror origin")).toEqual(["git_push_force"]);
+		expect(rulesOf("git -C x push --mirror origin")).toEqual(["git_push_force"]);
+		for (const brief of ["git push --all origin", "git push --prune origin", "git push origin --all --prune"])
+			expect({ brief, scan: scanHandoffBrief(brief) }).toMatchObject({
+				brief,
+				scan: { verdict: "advisory", findings: [{ rule: "git_push_all_refs" }] },
+			});
+	});
+
+	test("#45 #98 a 64KB line of git verbs that never match scans in linear time", () => {
+		const fastest = (brief: string): number => {
+			let best = Number.POSITIVE_INFINITY;
+			for (let run = 0; run < 3; run++) {
+				const started = performance.now();
+				scanHandoffBrief(brief);
+				best = Math.min(best, performance.now() - started);
+			}
+			return best;
+		};
+		for (const unit of [
+			"git push x ",
+			"git branch - ",
+			"git checkout x ",
+			"git clean x ",
+			"git reset x ",
+			"git push \\\n",
+		]) {
+			const brief = unit.repeat(Math.floor(HANDOFF_SCAN_BYTES / unit.length));
+			// Timed against the same text with the verb word changed (at least 10ms), so machine load counts on both
+			// sides: each failed verb rescanned to the line's end took 0.5~2.2s, linear takes tens of ms.
+			const ratio = fastest(brief) / Math.max(fastest(brief.replaceAll("git", "gat")), 10);
+			expect({ unit, slow: ratio > 25 }).toEqual({ unit, slow: false });
+		}
+	});
+
+	test("#97 #104 inline code spans, emphasis and comments splitting a command do not hide it", () => {
+		expectVerdicts(
+			[
+				"`git` reset --hard HEAD~3",
+				"git reset `--hard` HEAD~3",
+				"`git reset` `--hard` HEAD~3",
+				"git *reset* --hard HEAD~3",
+				"git reset --**hard** HEAD~3",
+				"git **reset --hard** HEAD~3",
+				"git _reset_ --hard HEAD~3",
+				"git<!--x--> reset --hard HEAD~3",
+			],
+			"high_risk",
+		);
+		expectVerdicts(["- `git_reset_hard`: `git reset --hard`"], "advisory");
+		expectVerdicts(["`git reset --soft` 로 되돌린다", "`git push origin x`, `rm -rf node_modules`"], "clear");
+	});
+
+	test("#99 the excerpt is cut around the command as written", () => {
+		const brief = `${"'a' ".repeat(41)}'git' 'reset' '--hard' HEAD~9`;
+		const [finding] = scanHandoffBrief(brief).findings;
+		expect(finding?.severity).toBe("high_risk");
+		expect(finding?.excerpt).toContain("'git' 'reset' '--hard' HEAD~9");
+	});
+
+	test("#101 a git alias defined with -c is judged as the command it runs", () => {
+		expect(rulesOf("git -c alias.h=reset h --hard HEAD~1")).toEqual(["git_reset_hard"]);
+		expect(rulesOf("git -c alias.p='push --force' p origin x")).toEqual(["git_push_force"]);
+		expect(rulesOf("git -c alias.c=clean c -fdx")).toEqual(["git_clean_force"]);
+		expect(rulesOf("git -c alias.st=status st")).toEqual([]);
+	});
+
+	test("#102 unique prefixes of rm's --recursive and --force", () => {
+		for (const brief of [
+			"rm --recurs --forc /",
+			"rm --recursiv --force /",
+			"rm --recursi -f /var/lib",
+			"rm --r --f /x",
+		])
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: ["rm_rf_absolute"] });
+		expect(rulesOf("rm --verbose -f /tmp/x")).toEqual([]);
+	});
+});
+
+// doc/plans/qa-l-low-fixes.md 묶음 A: 넘김 위험.
+describe("qa-l low A: secrets reached through the bot home", () => {
+	test("#35 #71 cd options, pushd and env -C into the bot home before a relative secrets path", () => {
+		for (const brief of [
+			"cd -P ~/.ompbot && cat secrets/slack.json",
+			"cd -L ~/.ompbot && cat secrets/slack.json",
+			"cd -- ~/.ompbot && cat secrets/slack.json",
+			"cd -eP ~/.ompbot && cat secrets/slack.json",
+			"pushd ~/.ompbot && cat secrets/slack.json",
+			"pushd -n ~/.ompbot; cat secrets/x",
+			"env -C ~/.ompbot cat secrets/slack.json",
+			"env -C~/.ompbot cat secrets/slack.json",
+			"env --chdir=$OMPBOT_HOME cat secrets/x",
+			"env -i --chdir ~/.ompbot cat secrets/x",
+		])
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: ["secret_path"] });
+		for (const brief of [
+			"cd -P ~/.ompbot/workspace && cat secrets.md",
+			"pushd ~/.ompbot && ls",
+			"env -C ~/work/app cat secrets/x",
+		])
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: [] });
+	});
+
+	test("#72 a .. inside the bot home that still lands in secrets", () => {
+		for (const brief of [
+			"cat ~/.ompbot/logs/../secrets/slack.json",
+			"cat ~/.ompbot/x/../secrets/slack.json",
+			"cat ~/.ompbot/a/b/../../secrets/x",
+			"cat $OMPBOT_HOME/logs/../secrets/x",
+			"cat ~/.ompbot/logs/.././secrets",
+		])
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: ["secret_path"] });
+		for (const brief of ["cat ~/.ompbot/../secrets/x", "cat ~/.ompbot/a/../../secrets/x", "cat ~/.ompbot/logs/../x"])
+			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: [] });
 	});
 });

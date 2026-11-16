@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parseThreadRef } from "../src/core/normalize";
 import { Daemon } from "../src/daemon/daemon";
 import { buildLaneOutcomeCard } from "../src/lanes/card";
@@ -11,10 +11,13 @@ import {
 	type LandLane,
 	type LandRequest,
 	laneLandBlockers,
+	QA_FAIL,
+	QA_MISSING,
 	REVIEW_BLOCK,
 	REVIEW_MISSING,
 } from "../src/lanes/land";
 import { CLAIM_GRACE_MS } from "../src/lanes/manager";
+import { appendFollowups } from "../src/lanes/scope";
 import { INCONCLUSIVE_APPROVED, type LaneChanges, type LaneRow } from "../src/lanes/status";
 import { classifyClosedLaneMessage } from "../src/lanes/trigger";
 import { defaultGit, type GitResult, type GitRunner } from "../src/lanes/verify";
@@ -144,7 +147,7 @@ function countingOps(): { ops: TaskHostOps; checks: () => number } {
 async function closeLane(
 	h: LaneHarness,
 	repo: string,
-	over: { title?: string; acceptance?: string[]; risk?: string; file?: string } = {},
+	over: { title?: string; acceptance?: string[]; risk?: string; file?: string; summary?: string } = {},
 ): Promise<{ lane: LaneRow; sha: string }> {
 	const started = await h.manager.start({
 		title: over.title ?? "land",
@@ -156,7 +159,11 @@ async function closeLane(
 	await h.settle();
 	const sha = commitIn(started.cwd, over.file ?? "a.txt");
 	expect(
-		await h.manager.claimDone(started.originKey, { repo: started.cwd, commit: "HEAD", summary: "a.txt 추가" }),
+		await h.manager.claimDone(started.originKey, {
+			repo: started.cwd,
+			commit: "HEAD",
+			summary: over.summary ?? "a.txt 추가",
+		}),
 	).toContain("검증 통과");
 	await h.settle();
 	return { lane: requireLane(h, started.name), sha };
@@ -912,6 +919,27 @@ describe("landLane: the lane worktree is checked before the merge and the cleanu
 		h.close();
 	});
 
+	test("(a2) changes git status hides (showUntrackedFiles=no, --assume-unchanged) still block the landing and survive (qa-j 112·113)", async () => {
+		const { repo } = repoWithOrigin();
+		git(repo, "config", "status.showUntrackedFiles", "no");
+		const h = laneHarness(home.dir);
+		const { lane } = await closeLane(h, repo);
+		const worktree = lane.meta.worktree ?? "";
+		writeFileSync(join(worktree, "late-wip.txt"), "wip\n");
+		git(worktree, "update-index", "--assume-unchanged", "README.md");
+		writeFileSync(join(worktree, "README.md"), "hidden edit\n");
+		expect(git(worktree, "status", "--porcelain")).toBe("");
+
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		const after = requireLane(h, lane.name);
+		expect(after.meta.land?.state).toBe("blocked");
+		expect(after.meta.land?.reason).toContain("late-wip.txt");
+		expect(after.meta.land?.reason).toContain("README.md");
+		expect(existsSync(join(worktree, "late-wip.txt"))).toBe(true);
+		h.close();
+	});
+
 	test("(b) a commit on a detached HEAD in the lane worktree: blocked; base unchanged; the worktree and the commit stay", async () => {
 		const { repo, bare, base } = repoWithOrigin();
 		const before = headOf(repo);
@@ -1627,6 +1655,100 @@ describe("closed → Outcome card and auto-merge (AC-5)", () => {
 		expect(shown()).toContain("🔎 독립 리뷰 CLEAR · m/x");
 		h.close();
 	});
+
+	test("run QA AC-2·AC-3·AC-4·AC-5 (bot-org-risk-gates 단계 3): the QA reasons of laneLandBlockers", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo, { risk: "L3" });
+		const review = { model: "m", timeoutMs: 1000, confident: { maxRisk: "L3" as const, minConfidence: 0.8 } };
+		const qa = { minRisk: "L3" as const, overlay: "/qa.omp.yml", model: "zai/glm-5.3-flash:high", timeoutMs: 1000 };
+		const policy = { repos: [repo], maxRisk: "L2" as const, review, qa };
+		const cleared: LaneRow = {
+			...lane,
+			meta: {
+				...lane.meta,
+				review: { sha, verdict: "CLEAR", model: "m", at: 0, notes: "", confidence: 0.9 },
+			},
+		};
+		const withQa = (row: LaneRow, over: Partial<NonNullable<LaneRow["meta"]["qa"]>> | undefined): LaneRow => ({
+			...row,
+			meta: {
+				...row.meta,
+				qa: over === undefined ? undefined : { sha, verdict: "PASS", findings: [], model: qa.model, at: 0, ...over },
+			},
+		});
+		// AC-1: the claim commit's PASS lets it through.
+		expect(laneLandBlockers(withQa(cleared, {}), policy, true, false)).toEqual([]);
+		expect(laneLandBlockers(withQa(cleared, undefined), policy, true, false)).toEqual([QA_MISSING]);
+		// AC-2
+		expect(laneLandBlockers(withQa(cleared, { verdict: "FAIL" }), policy, true, false)).toEqual([QA_FAIL]);
+		expect(
+			laneLandBlockers(withQa(cleared, { verdict: "inconclusive", reason: "시간 초과" }), policy, true, false),
+		).toEqual(["실행 QA 확인 불가(시간 초과)"]);
+		// AC-3: a new claim commit (its checks and review follow it) is not freed by the old commit's PASS.
+		const next = "f".repeat(40);
+		const passed = withQa(cleared, {});
+		const reclaimed: LaneRow = {
+			...passed,
+			meta: {
+				...passed.meta,
+				sha: next,
+				checks: { head: next, results: passed.meta.checks?.results ?? [] },
+				review: { sha: next, verdict: "CLEAR", model: "m", at: 0, notes: "", confidence: 0.9 },
+			},
+		};
+		expect(laneLandBlockers(reclaimed, policy, true, false)).toEqual([QA_MISSING]);
+		// AC-4: an L2 lane, and any lane without policy.qa, has no QA reason.
+		const l2: LaneRow = { ...cleared, meta: { ...cleared.meta, risk: "L2" } };
+		expect(laneLandBlockers(l2, policy, true, false)).toEqual([]);
+		const { qa: _off, ...withoutQa } = policy;
+		expect(laneLandBlockers(withQa(cleared, undefined), withoutQa, true, false)).toEqual([]);
+		expect(laneLandBlockers(withQa(cleared, { verdict: "FAIL" }), withoutQa, true, false)).toEqual([]);
+		// AC-5: an L4 (unreviewable) lane and an unrated one outside the band get the risk only, never a QA reason.
+		const l4: LaneRow = { ...cleared, meta: { ...cleared.meta, risk: "L4", review: undefined } };
+		expect(laneLandBlockers(l4, policy, true, false)).toEqual(["위험 L4 > L2"]);
+		const unrated: LaneRow = { ...cleared, meta: { ...cleared.meta, risk: undefined } };
+		expect(laneLandBlockers(unrated, policy, true, false)).toEqual(["위험 L3 > L2"]);
+		h.close();
+	});
+
+	test("run QA: the cards show the receipt under the review line with at most three redacted findings", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane, sha } = await closeLane(h, repo, { risk: "L3" });
+		const token = ["xoxb", "TEST", "0"].join("-");
+		const findings = ["bun test → 3 fail", `token ${token} 노출`, "셋째", "넷째"];
+		const row = (verdict: "PASS" | "FAIL" | "inconclusive", reason?: string): LaneRow => ({
+			...lane,
+			meta: {
+				...lane.meta,
+				review: { sha, verdict: "CLEAR", model: "m/x", at: 0, notes: "" },
+				qa: {
+					sha,
+					verdict,
+					findings,
+					model: "zai/glm-5.3-flash:high",
+					at: 0,
+					...(reason === undefined ? {} : { reason }),
+				},
+			},
+		});
+		const auto = buildLaneOutcomeCard(row("PASS"), { kind: "auto" }).text;
+		expect(auto).toContain("🔎 독립 리뷰 CLEAR · m/x\n🧪 실행 QA(뚱기 · glm-5.3-flash): PASS");
+		const ask = buildLaneOutcomeCard(row("FAIL"), { kind: "ask", skipped: [QA_FAIL] }).text;
+		expect(ask).toContain("🧪 실행 QA(뚱기 · glm-5.3-flash): FAIL");
+		expect(ask).toContain("> bun test → 3 fail");
+		expect(ask).toContain("> 셋째");
+		expect(ask).not.toContain("넷째");
+		expect(ask).not.toContain(token);
+		expect(ask).toContain("> token [REDACTED] 노출");
+		const unsure = buildLaneOutcomeCard(row("inconclusive", "시간 초과"), { kind: "ask" }).text;
+		expect(unsure).toContain("🧪 실행 QA(뚱기 · glm-5.3-flash): 확인 불가(시간 초과)");
+		// A receipt of another commit is not shown.
+		const stale: LaneRow = { ...row("PASS"), meta: { ...row("PASS").meta, sha: "f".repeat(40) } };
+		expect(buildLaneOutcomeCard(stale, { kind: "auto" }).text).not.toContain("실행 QA");
+		h.close();
+	});
 });
 
 describe("Outcome card: the claim commit's changes and overlaps (doc/plans/lane-card-changes.md)", () => {
@@ -1664,6 +1786,24 @@ describe("Outcome card: the claim commit's changes and overlaps (doc/plans/lane-
 		expect(JSON.stringify(cards[0]?.blocks ?? [])).toContain("1개 파일 · +1 −0");
 		expect(cards[0]?.text).toContain("변경: a.txt (+1 −0)");
 		expect(cards[0]?.text).not.toContain("겹침");
+		h.close();
+	});
+
+	test("the claim summary's mention syntax stays text on the Slack card; the title is not escaped twice (qa-l #82)", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane } = await closeLane(h, repo, { title: "R&D 정리", summary: "끝 <!channel> <@U999> 확인" });
+		const cards = cardPosts(h.transport, lane);
+		expect(cards).toHaveLength(1);
+		const blocks = (cards[0]?.blocks ?? []) as Array<{ type: string; text?: { text: string } }>;
+		const body = blocks.find((block) => block.type === "section")?.text?.text ?? "";
+		expect(body).toContain("• 끝 &lt;!channel&gt; &lt;@U999&gt; 확인");
+		for (const shown of [body, cards[0]?.text ?? ""]) {
+			expect(shown).not.toContain("<!channel>");
+			expect(shown).not.toContain("<@U999>");
+		}
+		expect(blocks.find((block) => block.type === "header")?.text?.text).toBe("🔍 머지 대기 · R&D 정리");
+		expect(JSON.stringify(blocks)).not.toContain("&amp;");
 		h.close();
 	});
 
@@ -2229,6 +2369,212 @@ describe("a not-done lane merged into the base branch outside the lane (doc/plan
 		await tick(h);
 		expectUntouched(h, lane, "not-done");
 		expect(h.logs.some((line) => line.includes("lane_external_land_check_failed"))).toBe(true);
+		h.close();
+	});
+});
+
+describe("lane scope and leftovers (doc/plans/bot-org-risk-gates.md 단계 2)", () => {
+	const CHECK_IN = 'src/lanes/in.ts가 있다 [check: command ["sh","-c","test -f src/lanes/in.ts"]]';
+
+	/** Writes `files` (repository-relative, directories made) in `dir` and commits them; returns the new HEAD. */
+	function commitPaths(dir: string, files: string[]): string {
+		for (const file of files) {
+			mkdirSync(dirname(join(dir, file)), { recursive: true });
+			writeFileSync(join(dir, file), `${file}\n`);
+		}
+		git(dir, "add", "--", ...files);
+		git(dir, "commit", "-q", "-m", `add ${files.length} files`);
+		return headOf(dir);
+	}
+
+	/** Starts a lane (risk L2, one check on `src/lanes/in.ts`), commits `files` and claims; the claim's reply is returned. */
+	async function scopedLane(
+		h: LaneHarness,
+		repo: string,
+		over: { scope?: string[]; files: string[]; leftovers?: unknown },
+	): Promise<{ lane: LaneRow; sha: string; reply: string }> {
+		const started = await h.manager.start({
+			title: "scope",
+			cwd: repo,
+			channel: "D1",
+			acceptance: [CHECK_IN],
+			risk: "L2",
+			...(over.scope === undefined ? {} : { scope: over.scope }),
+		});
+		await h.settle();
+		const sha = commitPaths(started.cwd, over.files);
+		const reply = await h.manager.claimDone(started.originKey, {
+			repo: started.cwd,
+			commit: "HEAD",
+			summary: "범위 작업",
+			...(over.leftovers === undefined ? {} : { leftovers: over.leftovers }),
+		});
+		await h.settle();
+		return { lane: requireLane(h, started.name), sha, reply };
+	}
+
+	const followupLines = (): string[] => {
+		const file = join(home.dir, "followups.jsonl");
+		return existsSync(file)
+			? readFileSync(file, "utf8")
+					.split("\n")
+					.filter((line) => line !== "")
+			: [];
+	};
+
+	test("AC-1·AC-7: a file outside `src/lanes/**` is recorded, holds the auto-merge and is named on the card; no scope, no reason", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const policy = { repos: [repo], maxRisk: "L2" as const };
+		const h = laneHarness(home.dir, { land: counted.land, autoLandPolicy: () => policy });
+		const { lane, reply } = await scopedLane(h, repo, {
+			scope: ["src/lanes/**"],
+			files: ["src/lanes/in.ts", "src/tasks/x.ts"],
+		});
+		expect(reply).toContain("검증 통과");
+		expect(lane.meta.scopeViolations).toEqual(["src/tasks/x.ts"]);
+		expect(lane.meta.scopeError).toBeUndefined();
+		expect(laneLandBlockers(lane, policy, true, false)).toEqual(["범위 밖 파일 1개"]);
+		expect(counted.calls).toHaveLength(0);
+		const card = cardPosts(h.transport, lane)[0];
+		expect(card?.text).toContain("자동 머지 안 함: 범위 밖 파일 1개");
+		expect(card?.text).toContain("⚠️ 범위 밖 파일 1개: src/tasks/x.ts");
+		expect(buildLaneOutcomeCard(lane, { kind: "ask" }).fields).toContainEqual({ label: "범위 밖", value: "1개" });
+
+		// The same change without a scope: no scope reason, and it merges.
+		const other = repoWithOrigin();
+		const unscoped = await scopedLane(h, other.repo, { files: ["src/lanes/in.ts", "src/tasks/x.ts"] });
+		expect(unscoped.lane.meta.scopeViolations).toBeUndefined();
+		expect(laneLandBlockers(unscoped.lane, { ...policy, repos: [other.repo] }, true, false)).toEqual([]);
+		h.close();
+	});
+
+	test("AC-2·AC-7: seven files outside are all kept; the card names the first five and counts the rest", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const outside = Array.from({ length: 7 }, (_, i) => `src/tasks/x${i}.ts`);
+		const { lane } = await scopedLane(h, repo, { scope: ["src/lanes/**"], files: ["src/lanes/in.ts", ...outside] });
+		expect(lane.meta.scopeViolations?.slice().sort()).toEqual(outside);
+		expect(laneLandBlockers(lane, { repos: [repo], maxRisk: "L2" }, true, false)).toEqual(["범위 밖 파일 7개"]);
+		const text = buildLaneOutcomeCard(lane, { kind: "ask" }).text;
+		const line = text.split("\n").find((entry) => entry.startsWith("⚠️ 범위 밖 파일 7개: ")) ?? "";
+		expect(line.endsWith(" 외 2개")).toBe(true);
+		expect(line.split(", ")).toHaveLength(5);
+		h.close();
+	});
+
+	test("AC-3: the changed-file list cannot be read: `범위 검사 실패(…)` holds the merge", async () => {
+		const { repo } = repoWithOrigin();
+		const failing: GitRunner = async (args) =>
+			args.includes("--name-only") ? { code: 128, stdout: "", stderr: "fatal: bad object\n" } : defaultGit(args);
+		const counted = countingLand();
+		const policy = { repos: [repo], maxRisk: "L2" as const };
+		const h = laneHarness(home.dir, { land: counted.land, autoLandPolicy: () => policy, changesGit: failing });
+		const { lane } = await scopedLane(h, repo, { scope: ["src/lanes/**"], files: ["src/lanes/in.ts"] });
+		expect(lane.status).toBe("closed");
+		expect(lane.meta.scopeViolations).toBeUndefined();
+		const blockers = laneLandBlockers(lane, policy, true, false);
+		expect(blockers).toHaveLength(1);
+		expect(blockers[0]).toStartWith("범위 검사 실패(");
+		expect(blockers[0]).toContain("fatal: bad object");
+		expect(counted.calls).toHaveLength(0);
+		expect(cardPosts(h.transport, lane)[0]?.text).toContain("⚠️ 범위 검사 실패: ");
+		h.close();
+	});
+
+	test("AC-4·AC-7: a blocking leftover holds the merge; non-blocking ones do not, and the card counts them", async () => {
+		const { repo } = repoWithOrigin();
+		const counted = countingLand();
+		const policy = { repos: [repo], maxRisk: "L2" as const };
+		const h = laneHarness(home.dir, { land: counted.land, autoLandPolicy: () => policy });
+		const { lane } = await scopedLane(h, repo, {
+			files: ["src/lanes/in.ts"],
+			leftovers: [
+				{ text: "마이그레이션 먼저", blocking: true },
+				{ text: "문서 정리", blocking: false },
+			],
+		});
+		expect(laneLandBlockers(lane, policy, true, false)).toEqual(["막는 남은 일 1개"]);
+		expect(counted.calls).toHaveLength(0);
+		const card = cardPosts(h.transport, lane)[0]?.text ?? "";
+		expect(card).toContain("자동 머지 안 함: 막는 남은 일 1개");
+		expect(card).toContain("남은 일 2개(막는 것 1개)");
+		const nonBlocking = { ...lane, meta: { ...lane.meta, leftovers: [{ text: "문서 정리", blocking: false }] } };
+		expect(laneLandBlockers(nonBlocking, policy, true, false)).toEqual([]);
+		// A malformed list records no claim at all.
+		const other = repoWithOrigin();
+		const bad = await scopedLane(h, other.repo, { files: ["src/lanes/in.ts"], leftovers: [{ text: "x" }] });
+		expect(bad.reply).toContain("claim not recorded");
+		expect(bad.lane.status).toBe("working");
+		h.close();
+	});
+
+	test("AC-5: a landing writes the non-blocking leftovers to followups.jsonl once; landing again adds no line", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			autoLandPolicy: () => ({ repos: [repo], maxRisk: "L2" }),
+		});
+		const { lane, sha } = await scopedLane(h, repo, {
+			files: ["src/lanes/in.ts"],
+			leftovers: [
+				{ text: "문서 정리", blocking: false },
+				{ text: "로그 문구 다듬기", blocking: false },
+			],
+		});
+		expect(counted.calls).toHaveLength(1);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(sha);
+		const landed = requireLane(h, lane.name);
+		expect(landed.meta.land?.state).toBe("landed");
+		const lines = followupLines();
+		expect(lines).toHaveLength(2);
+		expect(JSON.parse(lines[0] ?? "{}")).toMatchObject({
+			laneId: lane.meta.laneId,
+			title: "scope",
+			repo,
+			sha,
+			text: "문서 정리",
+		});
+		expect(h.transport.posts().some((post) => post.text === "후속 2건을 장부에 남김")).toBe(true);
+
+		// Landing again: the request is refused, and the ledger itself never takes the same lane, commit and text twice.
+		await h.manager.requestLand(lane.name, "owner");
+		await h.settle();
+		expect(appendFollowups(join(home.dir, "followups.jsonl"), landed, 0)).toBe(0);
+		expect(followupLines()).toHaveLength(2);
+		h.close();
+	});
+
+	test("AC-6: `!reopen` drops the scope result and leftovers, and the new claim records its own", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane } = await scopedLane(h, repo, {
+			scope: ["src/lanes/**"],
+			files: ["src/lanes/in.ts", "src/tasks/x.ts"],
+			leftovers: [{ text: "테스트 보강", blocking: true }],
+		});
+		expect(lane.meta.scopeViolations).toEqual(["src/tasks/x.ts"]);
+		expect(lane.meta.leftovers).toHaveLength(1);
+		h.manager.onOwnerMessage(requireLane(h, lane.name), "!reopen 범위 밖 파일 빼");
+		await h.settle();
+		const reopened = requireLane(h, lane.name);
+		expect(reopened.status).toBe("working");
+		expect(reopened.meta.scopeViolations).toBeUndefined();
+		expect(reopened.meta.leftovers).toBeUndefined();
+		expect(reopened.meta.scope).toEqual(["src/lanes/**"]);
+
+		git(reopened.cwd, "rm", "-q", "src/tasks/x.ts");
+		git(reopened.cwd, "commit", "-q", "-m", "범위 밖 파일 제거");
+		expect(
+			await h.manager.claimDone(reopened.originKey, { repo: reopened.cwd, commit: "HEAD", summary: "범위 정리" }),
+		).toContain("검증 통과");
+		await h.settle();
+		const reclaimed = requireLane(h, lane.name);
+		expect(reclaimed.status).toBe("closed");
+		expect(reclaimed.meta.scopeViolations).toBeUndefined();
+		expect(reclaimed.meta.scopeError).toBeUndefined();
+		expect(reclaimed.meta.leftovers).toBeUndefined();
 		h.close();
 	});
 });

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -122,6 +122,22 @@ describe("loadConfig", () => {
 		expect(error.code).toBe("config_invalid");
 		expect(error.message).toContain("field=timezone");
 		expect(RESTART_FIELDS).toContain("timezone");
+	});
+
+	test("ompConfigOverlay: absent → unset, relative → resolved against the home, absolute kept, no file → config error", () => {
+		expect("ompConfigOverlay" in loadConfig(home)).toBe(false);
+		writeFileSync(join(home, "glm.omp.yml"), "modelRoles:\n  default: zai/glm-5.3-flash\n");
+		writeConfig(baseConfig({ ompConfigOverlay: "glm.omp.yml" }));
+		expect(loadConfig(home).ompConfigOverlay).toBe(join(home, "glm.omp.yml"));
+		writeConfig(baseConfig({ ompConfigOverlay: join(home, "glm.omp.yml") }));
+		expect(loadConfig(home).ompConfigOverlay).toBe(join(home, "glm.omp.yml"));
+		expect(loadConfig(home).warnings).toBeUndefined();
+		for (const missing of ["nope.omp.yml", "secrets"]) {
+			writeConfig(baseConfig({ ompConfigOverlay: missing }));
+			const error = catchError(() => loadConfig(home));
+			expect(error.code).toBe("config_invalid");
+			expect(error.message).toContain("field=ompConfigOverlay");
+		}
 	});
 
 	test("agent claude with an absolute claudeExecutable is accepted", () => {
@@ -889,6 +905,37 @@ describe("taskAutoLand", () => {
 		expect(err.message).toContain("(field=taskAutoLand.review.confident)");
 	});
 
+	test("run QA (bot-org-risk-gates 단계 3): qa is kept as written (minRisk and timeoutMs optional)", () => {
+		const overlay = join(home, "qa.omp.yml");
+		writeFileSync(overlay, "modelRoles: {}\n");
+		const qa = { minRisk: "L3" as const, overlay, model: "zai/glm-5.3-flash:high", timeoutMs: 1_200_000 };
+		writeConfig(withHerdr({ repos: ["/srv/a"], qa }));
+		expect(loadConfig(home).taskAutoLand?.qa).toEqual(qa);
+		writeConfig(withHerdr({ repos: ["/srv/a"], qa: { overlay, model: "m" } }));
+		expect(loadConfig(home).taskAutoLand?.qa).toEqual({ overlay, model: "m" });
+	});
+
+	test.each([
+		["a relative overlay", { overlay: "qa.omp.yml", model: "m" }, "(field=taskAutoLand.qa.overlay)"],
+		["a missing overlay file", { overlay: "/nonexistent/qa.omp.yml", model: "m" }, "field=taskAutoLand.qa.overlay"],
+		["no overlay", { model: "m" }, "(field=taskAutoLand.qa.overlay)"],
+		["no model", { overlay: "<file>" }, "(field=taskAutoLand.qa.model)"],
+		["a cursor/ model", { overlay: "<file>", model: "cursor/x" }, "(field=taskAutoLand.qa.model)"],
+		["minRisk outside L0~L4", { overlay: "<file>", model: "m", minRisk: "L5" }, "(field=taskAutoLand.qa.minRisk)"],
+		["timeoutMs 1800001", { overlay: "<file>", model: "m", timeoutMs: 1_800_001 }, "(field=taskAutoLand.qa.timeoutMs)"],
+		["an unknown key", { overlay: "<file>", model: "m", tools: "bash" }, "(field=taskAutoLand.qa.tools)"],
+		["a non-object", "m", "(field=taskAutoLand.qa)"],
+	])("run QA: %s is rejected", (_name, qa, field) => {
+		const overlay = join(home, "qa.omp.yml");
+		writeFileSync(overlay, "modelRoles: {}\n");
+		const shaped =
+			typeof qa === "string" ? qa : { ...qa, ...("overlay" in qa && qa.overlay === "<file>" ? { overlay } : {}) };
+		writeConfig(withHerdr({ repos: ["/srv/a"], qa: shaped }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
+
 	test("AC-5: taskAutoLand is a live field (ompbot reload applies it without a restart)", () => {
 		expect(LIVE_FIELDS).toContain("taskAutoLand");
 	});
@@ -950,6 +997,41 @@ describe("dashboard", () => {
 		["7331", "field=dashboard"],
 	])("AC-8: %j is a ConfigError naming %s", (dashboard, field) => {
 		writeConfig(baseConfig({ dashboard }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
+
+	test("AC-5: peerHomes with absolute homes is accepted", () => {
+		const dashboard = {
+			port: 7331,
+			peerHomes: [
+				{ name: "서팍", home: "/h/seopak" },
+				{ name: "ttungi", home: "/h/t" },
+			],
+		};
+		writeConfig(baseConfig({ dashboard }));
+		expect(loadConfig(home).dashboard).toEqual(dashboard);
+	});
+
+	test.each([
+		[[{ name: "서팍", home: "rel/path" }], "dashboard.peerHomes.0.home"],
+		[
+			[
+				{ name: "a", home: "/h/a" },
+				{ name: "a", home: "/h/b" },
+			],
+			"dashboard.peerHomes.1.name",
+		],
+		[[{ name: "a:b", home: "/h/a" }], "dashboard.peerHomes.0.name"],
+		[[{ name: "a b", home: "/h/a" }], "dashboard.peerHomes.0.name"],
+		[[{ name: "", home: "/h/a" }], "dashboard.peerHomes.0.name"],
+		[[{ name: "   ", home: "/h/a" }], "dashboard.peerHomes.0.name"],
+		[[{ name: "a".repeat(21), home: "/h/a" }], "dashboard.peerHomes.0.name"],
+		[[{ name: "a", home: "/h/a", extra: 1 }], "dashboard.peerHomes.0.extra"],
+		["서팍", "field=dashboard.peerHomes"],
+	])("AC-5: peerHomes %j is a ConfigError naming %s", (peerHomes, field) => {
+		writeConfig(baseConfig({ dashboard: { port: 7331, peerHomes } }));
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain(field);
@@ -1171,5 +1253,43 @@ describe("qa50b lane I", () => {
 		expect(isOffsiteDir("/srv/../etc")).toBe(false);
 		expect(isOffsiteDir("~/")).toBe(false);
 		expect(isOffsiteDir("/")).toBe(false);
+	});
+});
+
+describe("qa-l low config (#1 #2 #3 #19)", () => {
+	test("#1: an ompConfigOverlay behind a symlink loop or a non-directory parent is a ConfigError, not a raw fs error", () => {
+		symlinkSync("loop-b", join(home, "loop-a"));
+		symlinkSync("loop-a", join(home, "loop-b"));
+		writeFileSync(join(home, "plain"), "x");
+		for (const overlay of ["loop-a", "plain/overlay.yml"]) {
+			writeConfig(baseConfig({ ompConfigOverlay: overlay }));
+			const error = catchError(() => loadConfig(home));
+			expect(error.code).toBe("config_invalid");
+			expect(error.message).toContain("field=ompConfigOverlay");
+		}
+	});
+
+	test("#2: an ompConfigOverlay regular file that cannot be read is rejected", () => {
+		writeConfig(baseConfig({ ompConfigOverlay: "/proc/self/mem" }));
+		const error = catchError(() => loadConfig(home));
+		expect(error.code).toBe("config_invalid");
+		expect(error.message).toContain("field=ompConfigOverlay");
+	});
+
+	test("#3: a workspaceDir symlinked to itself is config_invalid", () => {
+		symlinkSync("ws", join(home, "ws"));
+		writeConfig(baseConfig({ workspaceDir: "ws" }));
+		const error = catchError(() => loadConfig(home));
+		expect(error.code).toBe("config_invalid");
+		expect(error.message).toContain("field=workspaceDir");
+	});
+
+	test("#19: a turnSnapshot repo without any commit is rejected", async () => {
+		const repo = join(home, "empty-repo");
+		mkdirSync(repo);
+		await Bun.spawn(["git", "init", "-q", repo]).exited;
+		writeConfig(baseConfig({ turnSnapshot: { repos: [repo] } }));
+		const error = catchError(() => loadConfig(home));
+		expect(error.message).toContain("field=turnSnapshot.repos");
 	});
 });

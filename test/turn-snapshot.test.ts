@@ -3,6 +3,7 @@
 // the newest rows per origin.
 import { afterEach, describe, expect, test } from "bun:test";
 import {
+	chmodSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -23,6 +24,7 @@ import {
 	planUndo,
 	recordTurn,
 	removeTurnRefs,
+	removeTurnRefsSync,
 	runGit,
 	type TurnSnapshotRow,
 	undoPlanNotes,
@@ -424,6 +426,42 @@ describe("planUndo / applyUndo (AC-2)", () => {
 		expect(readFileSync(join(repo, magic), "utf8")).toBe("base-magic\n");
 		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("USER\n");
 	});
+
+	test("core.fileMode=false (every file 0777, tree 100644): the exec bit is no conflict and the undo applies (qa-l #52)", async () => {
+		const repo = makeRepo(repos);
+		git(repo, "config", "core.fileMode", "false");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		git(repo, "add", "--", "a.txt");
+		git(repo, "commit", "-q", "-m", "a");
+		chmodSync(join(repo, "a.txt"), 0o777);
+		chmodSync(join(repo, "README.md"), 0o777);
+		expect(git(repo, "status", "--porcelain")).toBe("");
+		const before = await captureTree(repo);
+		writeFileSync(join(repo, "a.txt"), "two\n");
+		const after = await captureTree(repo);
+
+		const plan = await planUndo({ row: rowOf({ before, after }) });
+		expect(plan.files.map((file) => [file.path, file.kind])).toEqual([["a.txt", "revert"]]);
+		expect(await applyUndo(plan)).toEqual({ reverted: 1, conflicts: [] });
+		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("one\n");
+	});
+
+	test("core.fileMode=true: a mode change after the turn is still a conflict", async () => {
+		const repo = makeRepo(repos);
+		git(repo, "config", "core.fileMode", "true");
+		writeFileSync(join(repo, "a.txt"), "one\n");
+		git(repo, "add", "--", "a.txt");
+		git(repo, "commit", "-q", "-m", "a");
+		const before = await captureTree(repo);
+		writeFileSync(join(repo, "a.txt"), "two\n");
+		const after = await captureTree(repo);
+		chmodSync(join(repo, "a.txt"), 0o755);
+
+		const plan = await planUndo({ row: rowOf({ before, after }) });
+		expect(plan.files.map((file) => [file.path, file.kind])).toEqual([["a.txt", "conflict"]]);
+		await applyUndo(plan);
+		expect(readFileSync(join(repo, "a.txt"), "utf8")).toBe("two\n");
+	});
 });
 
 describe("ledger retention and refs (AC-4)", () => {
@@ -462,6 +500,33 @@ describe("ledger retention and refs (AC-4)", () => {
 			endedAt: 2,
 		});
 		expect(store.listTurnSnapshots({ originKey: "slack/dm/D2" })).toHaveLength(1);
+	});
+
+	test("removeTurnRefsSync ignores an inherited GIT_DIR/GIT_WORK_TREE: only the named repository loses its refs (qa-l #18)", () => {
+		const repo = makeRepo(repos);
+		const other = makeRepo(repos);
+		for (const dir of [repo, other]) {
+			git(dir, "update-ref", "refs/ompbot/turns/7/before", "HEAD");
+			git(dir, "update-ref", "refs/ompbot/turns/7/after", "HEAD");
+		}
+		const saved = { dir: process.env.GIT_DIR, tree: process.env.GIT_WORK_TREE };
+		process.env.GIT_DIR = join(other, ".git");
+		process.env.GIT_WORK_TREE = other;
+		let removed: string[];
+		try {
+			removed = removeTurnRefsSync([{ id: 7, repo }]);
+		} finally {
+			if (saved.dir === undefined) delete process.env.GIT_DIR;
+			else process.env.GIT_DIR = saved.dir;
+			if (saved.tree === undefined) delete process.env.GIT_WORK_TREE;
+			else process.env.GIT_WORK_TREE = saved.tree;
+		}
+		expect(removed).toEqual(["refs/ompbot/turns/7/before", "refs/ompbot/turns/7/after"]);
+		expect(git(repo, "for-each-ref", "refs/ompbot/")).toBe("");
+		expect(git(other, "for-each-ref", "--format=%(refname)", "refs/ompbot/").split("\n")).toEqual([
+			"refs/ompbot/turns/7/after",
+			"refs/ompbot/turns/7/before",
+		]);
 	});
 
 	test("recordTurn keeps the turn's before/after trees under refs/ompbot/turns/<id>, and removeTurnRefs drops them", async () => {

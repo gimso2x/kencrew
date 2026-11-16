@@ -347,6 +347,19 @@ describe("backup bundle (sessions + config.json)", () => {
 			}
 		});
 
+		test("qa-l #17: a secrets/ link into another bundle source (workspace/, scripts/) fails as bundle_failed", () => {
+			for (const source of ["workspace", "scripts"]) {
+				rmSync(home, { recursive: true, force: true });
+				mkdirSync(home);
+				seedDb(home);
+				mkdirSync(join(home, source, "tokens"), { recursive: true });
+				writeFileSync(join(home, source, "tokens", "t"), "xoxb-TEST-0\n");
+				nodeFs.symlinkSync(join(home, source, "tokens"), join(home, "secrets"));
+				expect(() => runBackup({ homeDir: home, now })).toThrow(/bundle_failed.*secrets\//);
+				expect(readStamp(join(home, "backups"))).toBeUndefined();
+			}
+		});
+
 		test("a link to an empty directory (fresh install) still backs up", () => {
 			seedDb(home);
 			mkdirSync(join(home, "empty-sessions"));

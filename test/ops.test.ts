@@ -26,6 +26,7 @@ import {
 	type TurnProgress,
 	toolActivityText,
 } from "../src/core/mailbox";
+import { TOP_LEVEL_TS, threadRefOf } from "../src/core/normalize";
 import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
 import type { InboundRecord } from "../src/core/types";
 import {
@@ -56,6 +57,7 @@ import type { SlackTransport } from "../src/slack/transport";
 import { ALERT_INCIDENT_REPEAT_MS, type Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain, spawnDaemon } from "./helpers/daemon-process";
+import { isRoot } from "./helpers/privileges";
 
 const ORIGIN = "slack/dm/D1";
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -199,7 +201,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 			/ level=warn event=steer_failed origin=slack\/dm\/D1 id=m\d+ action=defer error=/,
 		);
 		expect(lines.find((l) => l.includes("event=omp_exit"))).toMatch(
-			/ level=warn event=omp_exit origin=slack\/dm\/D1 code=137 expected=false$/,
+			/ level=warn event=omp_exit origin=slack\/dm\/D1 code=137 expected=false stderr="fake crash"$/,
 		);
 	});
 
@@ -345,7 +347,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 			originKey: origin,
 			ownerVerified: true,
 			text: "check",
-			threadRef: store.topLevelThreadRef(),
+			threadRef: threadRefOf(store.ownerChannel(), TOP_LEVEL_TS),
 		});
 		await untilLine(() => lines.some((l) => l.includes("event=turn_start")));
 		const driver = drivers[0];
@@ -386,7 +388,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 			originKey: origin,
 			ownerVerified: true,
 			text: "check",
-			threadRef: store.topLevelThreadRef(),
+			threadRef: threadRefOf(store.ownerChannel(), TOP_LEVEL_TS),
 		});
 		await untilLine(() => lines.some((l) => l.includes("event=turn_start")));
 		store.recordTurnFailure = () => {
@@ -419,7 +421,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 				originKey: origin,
 				ownerVerified: true,
 				text: "check",
-				threadRef: store.topLevelThreadRef(),
+				threadRef: threadRefOf(store.ownerChannel(), TOP_LEVEL_TS),
 			});
 		};
 		await fire();
@@ -1349,20 +1351,20 @@ describe("ompbot doctor claude agent checks", () => {
 		const lines = await claudeLines();
 		expect(lines[0]).toContain("ok claude: ");
 		expect(lines[1]).toContain("ok claude auth:");
-	});
+	}, 30_000); // the doctor spawns child probes: slow on a 2-core machine
 
 	test("no credentials and no key env: auth fails naming the path", async () => {
 		const lines = await claudeLines();
 		expect(lines[0]).toContain("ok claude: ");
 		expect(lines[1]).toContain("fail claude auth:");
 		expect(lines[1]).toContain(join(dir, ".claude", ".credentials.json"));
-	});
+	}, 30_000);
 
 	test("agent claude never spawns omp: no omp runtime line (its ompExecutable here is a standalone binary)", async () => {
 		const lines: string[] = [];
 		await runDoctor(dir, (line) => lines.push(line));
 		expect(lines.filter((line) => line.includes("omp runtime"))).toEqual([]);
-	});
+	}, 30_000);
 });
 
 describe("ompbot doctor omp runtime check", () => {
@@ -1406,7 +1408,7 @@ describe("ompbot doctor omp runtime check", () => {
 		expect(await runtimeLine(launcher(">=999.0.0"))).toStartWith("fail omp runtime: bun_too_old ");
 		const ok = launcher(`>=${Bun.version}`);
 		expect(await runtimeLine(ok)).toBe(`ok omp runtime: launcher=${realpathSync(ok)}`);
-	});
+	}, 30_000);
 
 	test("an ompExecutable that is a directory is a failed line, and the rest of the report still runs", async () => {
 		const folder = mkdtempSync(join(dir, "omp-dir-"));
@@ -1428,7 +1430,7 @@ describe("ompbot doctor omp runtime check", () => {
 			`fail omp runtime: omp_launcher_unreadable ${folder} cannot be read`,
 		);
 		expect(lines.some((line) => line.includes("backup bundle"))).toBe(true);
-	});
+	}, 30_000);
 
 	test("token file problems get one line each with the fix, and every later check still runs", async () => {
 		rmSync(join(dir, "secrets", "slack-bot-token"));
@@ -1832,7 +1834,8 @@ describe("refusing to start when the log directory is unusable", () => {
 		expect(() => openLogSink(home.dir)).toThrow(/^log_dir_unwritable: .*logs/);
 	});
 
-	test.skipIf(process.getuid?.() === 0)("a read-only logs directory raises log_dir_unwritable", () => {
+	// biome-ignore format: keeps the reason link on the skip line
+	test.skipIf(isRoot)("a read-only logs directory raises log_dir_unwritable", () => { // root ignores permission bits, so this setup cannot fail
 		mkdirSync(join(home.dir, "logs"), { mode: 0o500 });
 		try {
 			expect(() => openLogSink(home.dir)).toThrow(/^log_dir_unwritable: .*logs \(EACCES\)/);

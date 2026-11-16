@@ -13,7 +13,13 @@ import {
 	peerSilenceMinutes,
 	primaryOwnerUserId,
 } from "../config";
-import type { DriverFactory, ProviderLimitInfo, ThreadSource, TurnFailureEscalation } from "../core/mailbox";
+import {
+	type DriverFactory,
+	isAutonomousRow,
+	type ProviderLimitInfo,
+	type ThreadSource,
+	type TurnFailureEscalation,
+} from "../core/mailbox";
 import { conversationKind, parseThreadRef, platformOfThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
 import { OriginRouter, sessionDirFor } from "../core/origin";
 import { type ChatPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
@@ -92,7 +98,7 @@ import {
 import { createFreezeProbe, type FreezeState } from "../ops/freeze";
 import { collectGates, type GateState, gateOptionsFromConfig } from "../ops/gates";
 import { HerdrHealthProbe } from "../ops/herdr-health";
-import type { HostLoadReader } from "../ops/host-resources";
+import { diskHeadroom, type HostLoadReader, type StatfsReader } from "../ops/host-resources";
 import { pruneMediaFiles } from "../ops/media";
 import { BRIEFING_TIMEOUT_MS, BRIEFING_WIDTH, renderPng } from "../ops/screenshot";
 import { allSessionFiles, conversationSessionFiles, renderUsage, summarizeSessionFiles } from "../ops/usage";
@@ -146,6 +152,7 @@ import {
 	GUEST_COMMAND_TEXT,
 	GUEST_CONTEXT_PAIRS,
 	GUEST_FAILED_TEXT,
+	GUEST_UNAVAILABLE_TEXT,
 	GuestQueue,
 	runGuestQuestion,
 } from "./guest";
@@ -263,6 +270,8 @@ export interface DaemonOptions {
 	gateSweepMs?: number;
 	/** Test seam for the `host_pressure` gate in sweeps and status (default this machine's readings). */
 	hostLoad?: Partial<HostLoadReader>;
+	/** Test seam for the `disk_low` gate in sweeps and status and for a [TASK] start's disk check (default `statfsSync`). */
+	statfs?: StatfsReader;
 	/**
 	 * The backup `start()` runs once when the home has no backup stamp yet (a first install), before the first gate
 	 * sweep; default {@link runBackup}. Tests inject a failing one.
@@ -473,6 +482,8 @@ export class Daemon {
 	#peerSilenceArmed = false;
 	/** Sweep-retry state per origin with stranded pending rows; progress deletes the entry. */
 	readonly #pendingRetries = new Map<string, PendingRetryState>();
+	/** Origins whose autonomous pending rows a freeze held: the first sweep after the unfreeze resumes them at once. */
+	readonly #frozenHeldOrigins = new Set<string>();
 	#reviewing = false;
 	readonly #reviewedTurns = new Map<string, number>();
 	/** A candidate pass (and so its approval cards) is running. */
@@ -613,7 +624,7 @@ export class Daemon {
 	floorsSurfaceFor(originKey: string): FloorsSurface {
 		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
 		const lanePlatform = lane === undefined ? undefined : platformOfThreadRef(lane.threadRef);
-		if (lanePlatform !== undefined) return { lanePlatform };
+		if (lanePlatform !== undefined) return { lanePlatform, laneCwd: this.cwdFor(originKey) };
 		// A persona session's monitor line quotes the bot's zone and the offset in force when it starts.
 		const timezone = isPersonaOrigin(originKey)
 			? {
@@ -715,9 +726,12 @@ export class Daemon {
 			workspaceDir: config.workspaceDir,
 			...(chatOrigin !== undefined ? { ompExecutable: config.ompExecutable } : {}),
 			...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
+			...(config.ompConfigOverlay === undefined ? {} : { ompConfigOverlay: config.ompConfigOverlay }),
 			...(channel === undefined ? {} : { channel }),
 			...(config.dispatchHosts === undefined ? {} : { dispatchHosts: config.dispatchHosts }),
 			...(config.workerOmpArgs === undefined ? {} : { workerOmpArgs: config.workerOmpArgs }),
+			// A live setting like the lane manager's: each new [TASK] reads the config the last reload left.
+			laneModels: () => this.#options.config.lanes?.models,
 			...(config.herdrBoard === undefined ? {} : { herdrBoard: config.herdrBoard }),
 			...(config.herdr === undefined ? {} : { herdr: config.herdr }),
 			...(teamsGraph === undefined ? {} : { teamsGraph }),
@@ -733,6 +747,9 @@ export class Daemon {
 							channels: this.#channels,
 							now: () => this.#clock.now(),
 							timezone: config.timezone,
+							...(this.#options.statfs === undefined
+								? {}
+								: { diskHeadroom: (path: string) => diskHeadroom(path, this.#options.statfs) }),
 						},
 						recordPrompt: (input: HerdrPromptInput) => this.#store?.recordHerdrPrompt(input),
 					}),
@@ -1021,6 +1038,7 @@ export class Daemon {
 			},
 			// The registry row is the single source of a lane's hold: a paused lane's mailbox dispatches nothing; nor
 			// does one whose worktree the core is rebasing (a not-ff landing).
+			isFrozen: () => this.#frozen() !== undefined,
 			isHeld: (originKey) =>
 				this.#store?.getLaneByOrigin(originKey)?.status === "paused" || this.#lanes?.isCoreRebasing(originKey) === true,
 			isAttached: (originKey) => this.#store?.getLaneByOrigin(originKey)?.meta.attach !== undefined,
@@ -1069,6 +1087,8 @@ export class Daemon {
 			// A live setting: `ompbot reload` changes it for the next lane turn end.
 			completionNudges: () => this.#options.config.lanes?.completionNudges ?? DEFAULT_COMPLETION_NUDGES,
 			laneModels: () => this.#options.config.lanes?.models,
+			// A merged lane's non-blocking leftovers (`ompbot_claim_done` `leftovers`).
+			followupsFile: join(config.homeDir, "followups.jsonl"),
 			// The independent review before a lane's auto-merge: a one-shot `omp -p` under the same safety floors.
 			reviewer: {
 				ompBin: config.ompExecutable,
@@ -1085,6 +1105,8 @@ export class Daemon {
 				reviewsDir: join(config.homeDir, "reviews"),
 				...(this.#options.laneReviewRun === undefined ? {} : { run: this.#options.laneReviewRun }),
 			},
+			// The run QA (`taskAutoLand.qa`) runs in detached copies here, under the reviewer's omp setup.
+			qaWorktreesDir: join(config.homeDir, "qa-worktrees"),
 			...(this.#options.maxLanes === undefined ? {} : { maxLanes: this.#options.maxLanes }),
 			...(this.#options.verifyClaim === undefined ? {} : { verify: this.#options.verifyClaim }),
 			...(this.#options.landLane === undefined ? {} : { land: this.#options.landLane }),
@@ -1230,6 +1252,12 @@ export class Daemon {
 					peerUserId: message.peer.userId,
 				});
 				if (!inserted) return { duplicate: true };
+				if (this.#frozen() !== undefined) {
+					// Recorded only: the mailbox holds autonomous rows while frozen, the first sweep after the unfreeze runs it.
+					log.info("frozen_deferred", { origin: message.originKey, id: row.platformMessageId });
+					this.#frozenHeldOrigins.add(message.originKey);
+					return { held: "frozen" };
+				}
 				if (this.#router?.draining === true) {
 					log.info("drain_deferred", { origin: message.originKey, id: row.platformMessageId });
 					return {};
@@ -1447,7 +1475,8 @@ export class Daemon {
 		}
 		this.#ipc = startIpcServer(this.socketPath, (request) => this.#handleIpc(request));
 
-		// Rule (1): rows still pending in the ledger are dispatched again.
+		// Rule (1): rows still pending in the ledger are dispatched again (a frozen bot's mailboxes hold autonomous rows).
+		this.#noteFrozenHeld(store.listInbound({ state: "pending" }));
 		for (const originKey of new Set(store.listInbound({ state: "pending" }).map((row) => row.originKey))) {
 			this.#dispatchPending(originKey);
 		}
@@ -1717,10 +1746,20 @@ export class Daemon {
 	#autoLandPolicy(): AutoLandPolicy | undefined {
 		const policy = this.#options.config.taskAutoLand;
 		if (policy === undefined) return undefined;
-		const { review } = policy;
+		const { review, qa } = policy;
 		return {
 			repos: policy.repos,
 			maxRisk: policy.maxRisk ?? "L2",
+			...(qa === undefined
+				? {}
+				: {
+						qa: {
+							minRisk: qa.minRisk ?? "L3",
+							overlay: qa.overlay,
+							model: qa.model,
+							timeoutMs: qa.timeoutMs ?? LANE_REVIEW_TIMEOUT_MS,
+						},
+					}),
 			...(review === undefined
 				? {}
 				: {
@@ -1731,6 +1770,12 @@ export class Daemon {
 						},
 					}),
 		};
+	}
+
+	#noteFrozenHeld(pending: readonly InboundRow[]): void {
+		const autonomous = pending.filter((row) => isAutonomousRow(row.originKey, row));
+		if (autonomous.length === 0 || this.#frozen() === undefined) return;
+		for (const row of autonomous) this.#frozenHeldOrigins.add(row.originKey);
 	}
 
 	#dispatchPending(originKey: string): void {
@@ -1762,7 +1807,21 @@ export class Daemon {
 		// deliberate wait as a failure and alert the owner; `setDraining(false)` dispatches them itself.
 		if (router.draining) return;
 		const now = this.#clock.now();
-		const stale = store.listInbound({ state: "pending" }).filter((row) => now - row.createdAt >= interval);
+		const pending = store.listInbound({ state: "pending" });
+		// The (cached) freeze probe is read only when a freeze could matter: an autonomous row waits or one was held.
+		const frozen =
+			(this.#frozenHeldOrigins.size > 0 || pending.some((row) => isAutonomousRow(row.originKey, row))) &&
+			this.#frozen() !== undefined;
+		// A freeze holds autonomous rows on purpose: no retry, no failure count, no `dispatch:` incident. The origins
+		// that had any resume at once (no age wait) in the first sweep after the unfreeze.
+		if (frozen) this.#noteFrozenHeld(pending);
+		const released = frozen ? new Set<string>() : new Set(this.#frozenHeldOrigins);
+		const stale = pending.filter((row) =>
+			frozen
+				? !isAutonomousRow(row.originKey, row) && now - row.createdAt >= interval
+				: now - row.createdAt >= interval || released.has(row.originKey),
+		);
+		if (!frozen) this.#frozenHeldOrigins.clear();
 		for (const originKey of new Set(stale.map((row) => row.originKey))) {
 			if (router.mailbox(originKey).state.busy) continue;
 			// A paused lane holds its owner messages on purpose until `계속`; a retry would count the wait as a failure.
@@ -2041,6 +2100,7 @@ export class Daemon {
 			now,
 			...gateOptionsFromConfig(config),
 			...(this.#options.hostLoad === undefined ? {} : { hostLoad: this.#options.hostLoad }),
+			...(this.#options.statfs === undefined ? {} : { statfs: this.#options.statfs }),
 		})) {
 			// Nothing to judge (stamp or ledger missing): keep the previous state untouched — no notice, no incident
 			// write or resolve — so a stamp deleted under an open gate never reads as a recovery.
@@ -2640,6 +2700,7 @@ export class Daemon {
 				this.#clock.now(),
 				gateOptionsFromConfig(this.#options.config),
 				this.#options.hostLoad,
+				this.#options.statfs,
 			),
 		);
 		const withFreeze = { ...report, ...frozenField(this.#options.config.homeDir) };
@@ -2663,6 +2724,11 @@ export class Daemon {
 				`inject origin must be slack/dm/<id>, slack/ch/<id>, discord/dm/<id> or discord/ch/<id>: ${request.origin}`,
 			);
 		if (!this.#adapters.has(ref.platform)) throw new Error(`${ref.platform} is not configured`);
+		// A Slack id's first letter names its kind (D = DM, C/G = channel); `slack/dm/U…` is a member id Slack cannot post to.
+		if (ref.platform === "slack" && !(ref.kind === "dm" ? /^D/ : /^[CG]/).test(ref.conversationId))
+			throw new Error(
+				`inject origin ${request.origin}: a Slack ${ref.kind} id starts with ${ref.kind === "dm" ? "D" : "C or G"}`,
+			);
 		const channel = ref.conversationId;
 		// A Slack thread is a message ts, a Discord one a message id (snowflake).
 		if (request.thread !== undefined && !(ref.platform === "slack" ? /^\d+\.\d+$/ : /^\d{17,20}$/).test(request.thread))
@@ -3125,6 +3191,12 @@ export class Daemon {
 			} else {
 				reply("guest-command", GUEST_COMMAND_TEXT);
 			}
+			return {};
+		}
+		if (!message.owner && this.#frozen() !== undefined) {
+			// A frozen bot starts no autonomous run; the guest gets a neutral line that does not name the reason.
+			this.#log.info("frozen_deferred", { alias, id: message.platformMessageId, guest: true });
+			reply("guest-held", GUEST_UNAVAILABLE_TEXT);
 			return {};
 		}
 		const teams = this.#options.config.channels.teams;

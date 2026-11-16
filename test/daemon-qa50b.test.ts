@@ -14,6 +14,7 @@ import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { makeRepo } from "./helpers/git-fixtures";
 import { removeRepoAndWorktrees } from "./helpers/lane-harness";
+import { isRoot } from "./helpers/privileges";
 
 let home: TestHome;
 let repos: string[];
@@ -96,7 +97,9 @@ describe("I-19: a lane whose worktree was deleted by hand", () => {
 });
 
 describe("I-22: an unreadable restart marker", () => {
-	test("is removed and the drop has a reason", () => {
+	// skipIf(isRoot): root reads a 0o000 marker, so no EACCES arises
+	// biome-ignore format: keeps the reason link on the skip line
+	test.skipIf(isRoot)("is removed and the drop has a reason", () => { // root ignores permission bits, so this setup cannot fail
 		const path = join(home.dir, RESTART_NOTICE_FILE);
 		writeFileSync(path, '{"at":1,"threads":[]}\n', { mode: 0o600 });
 		chmodSync(path, 0o000);

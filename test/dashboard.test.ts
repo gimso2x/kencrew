@@ -376,6 +376,19 @@ describe("dashboard snapshot", () => {
 		expect([closed.acceptance, closed.steps]).toEqual([undefined, undefined]);
 	});
 
+	// qa-l low B #81: a herdr state lookup that throws costs that row its state, never the whole tasks section.
+	test("a throwing herdr lookup degrades the rows' herdr state; the tasks section stays ok", async () => {
+		const healthy = fakeRunner().run;
+		const run: ProcessRunner = (cmd, opts) => {
+			if (cmd[0] === "herdr") throw new Error("herdr exploded");
+			return healthy(cmd, opts);
+		};
+		const snapshot = await buildSnapshot(deps({ run }));
+		expect(snapshot.tasks.ok).toBe(true);
+		expect(taskOf(snapshot, "T-20261104-01").herdr).toMatchObject({ ok: false });
+		expect(taskOf(snapshot, "T-20261104-03").herdr).toEqual({ ok: true, status: "idle" });
+	});
+
 	test("AC-6: a failing herdr host is only that host's ok:false; tasks and daemon stay ok", async () => {
 		const snapshot = await buildSnapshot(deps({ run: fakeRunner({ remoteFails: true }).run }));
 		if (!snapshot.herdr.ok) throw new Error(snapshot.herdr.error);

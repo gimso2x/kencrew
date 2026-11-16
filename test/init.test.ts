@@ -8,6 +8,7 @@ import {
 	readFileSync,
 	rmSync,
 	statSync,
+	symlinkSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -243,5 +244,19 @@ describe("ompbot init", () => {
 			expect(text).not.toContain("xoxb-");
 			expect(text).not.toContain("xapp-");
 		}
+	});
+
+	test("qa-l #5: a secrets symlink is refused and its target keeps its mode", () => {
+		const home = freshHome();
+		const outside = join(tempDir("ompbot-init-outside-"), "shared");
+		mkdirSync(outside, { mode: 0o755 });
+		chmodSync(outside, 0o755);
+		mkdirSync(home, { recursive: true, mode: 0o700 });
+		symlinkSync(outside, join(home, "secrets"));
+		const run = init(["--owner", OWNER, "--omp", process.execPath], home);
+		expect(run.code).toBe(2);
+		expect(run.err).toContain("secrets");
+		expect(mode(outside)).toBe(0o755);
+		expect(existsSync(join(home, "config.json"))).toBe(false);
 	});
 });

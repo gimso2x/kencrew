@@ -11,6 +11,7 @@ import { redact } from "../redact";
 import type { TaskCheck, TaskJudgement } from "./checker";
 import { TASK_RISKS, type TaskRisk } from "./docs";
 import { TASK_STATUSES, type TaskRow, type TaskStatus } from "./ledger";
+import { workerLine } from "./worker-tier";
 
 /** One status reaction lives on the task root: ⏳ working, 🔍 review, 🚧 blocked, ✅ done, ❌ cancelled. */
 export const STATUS_REACTIONS: Record<TaskStatus, string> = {
@@ -168,6 +169,12 @@ function cardNote(link: string | undefined, buttonNote?: string): string | undef
 	return parts.length === 0 ? undefined : parts.join(" · ");
 }
 
+/** The worker model line as a card's lines: none for a task registered before tiers existed. */
+const workerLines = (row: TaskRow): string[] => {
+	const line = workerLine(row);
+	return line === undefined ? [] : [line];
+};
+
 const branchField = (row: TaskRow) => ({ label: "브랜치", value: `\`${row.branch}\`` });
 const workerField = (row: TaskRow) => ({ label: "워커", value: ownerTag(row) });
 
@@ -182,6 +189,7 @@ export function buildAcceptedCard(
 ): TaskCard {
 	const goal = `[목표] ${spec.goal}`;
 	const assumptions = `[가정] ${spec.assumptions ?? "없음"}`;
+	const worker = workerLines(row);
 	const text = [
 		`\`${hostLabelOf(row)}\`에서 \`${row.agent}\`(${row.title})가 맡았습니다. 결정이 필요하거나 끝나면 이 스레드로 알려 드립니다.`,
 		...(link === undefined ? [] : [`진행 보기: ${link}`]),
@@ -189,12 +197,13 @@ export function buildAcceptedCard(
 		goal,
 		assumptions,
 		`[작업] ${row.taskId} · ${row.risk} · 브랜치 \`${row.branch}\` · 수락기준 ${row.acceptance.length}개 · 워크트리 \`${hostLabelOf(row)}:${row.worktree}\``,
+		...worker,
 	].join("\n");
 	const note = link === undefined ? undefined : `진행 보기: ${link}`;
 	return {
 		text,
 		title: `🚀 접수 · ${row.title}`,
-		body: [goal, assumptions].join("\n"),
+		body: [goal, assumptions, ...worker].join("\n"),
 		fields: [
 			{ label: "호스트·에이전트", value: `\`${hostLabelOf(row)}\` · \`${row.agent}\`` },
 			{ label: "위험", value: row.risk },
@@ -246,6 +255,17 @@ export interface AutoLandPolicy {
 	maxRisk: TaskRisk;
 	/** Lanes only: the independent review a lane's claim commit needs a `CLEAR` receipt from before it merges unasked. */
 	review?: { model: string; timeoutMs: number; confident?: LaneReviewConfident };
+	/** Lanes only: the run QA a reviewed lane at `minRisk` or above needs a `PASS` receipt from for its claim commit. */
+	qa?: LaneQaPolicy;
+}
+
+/** `taskAutoLand.qa` as the lanes apply it (`minRisk` defaults to L3, `timeoutMs` to the review's default). */
+export interface LaneQaPolicy {
+	minRisk: TaskRisk;
+	/** Absolute path of the omp yml overlay the QA run gets after the isolation overlay. */
+	overlay: string;
+	model: string;
+	timeoutMs: number;
 }
 
 /**
@@ -312,7 +332,7 @@ export function buildReachedCard(
 	link?: string,
 	autoLand?: ReachedAutoLandNote,
 ): TaskCard {
-	const summary = summaryLines(row, judgement);
+	const summary = [...summaryLines(row, judgement), ...workerLines(row)];
 	const lead = autoLand?.kind === "failed" ? [AUTO_LAND_FAILED_LINE] : [];
 	const skipped = autoLand?.kind === "skipped" ? [`자동 머지 안 함: ${autoLand.reasons.join(" · ")}`] : [];
 	const warnings = sharedCommitWarnings(row, judgement);
@@ -380,7 +400,7 @@ export const formatReachedNotice = (
  * button, no owner mention. The summary and the `*근거*` line are the reached card's.
  */
 export function buildAutoLandCard(row: TaskRow, judgement: TaskJudgement, link?: string): TaskCard {
-	const summary = summaryLines(row, judgement);
+	const summary = [...summaryLines(row, judgement), ...workerLines(row)];
 	const passed = judgement.checks.filter((check) => check.ok).length;
 	const lead = `Outcome 도달 · 수락기준 ${judgement.acChecked}/${row.acceptance.length} · 재실행 검사 ${passed}/${judgement.checks.length} 통과 — 개인 저장소라 바로 머지합니다(close→ff 머지→push→정리).`;
 	const title = `🚚 자동 머지 · ${row.title}`;

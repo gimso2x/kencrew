@@ -3,7 +3,7 @@ import { TASK_RISKS } from "../tasks/docs";
 import { type AutoLandPolicy, checkBlockers, type LaneReviewConfident } from "../tasks/notify";
 import { formatConfidence } from "./review";
 import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneRow } from "./status";
-import { defaultGit, type GitResult, type GitRunner, gitRunner } from "./verify";
+import { defaultGit, type GitResult, type GitRunner, gitRunner, hiddenChanges } from "./verify";
 import { DEFAULT_LANE_RISK } from "./worktree";
 
 /**
@@ -71,15 +71,18 @@ function failureLine(result: GitResult): string {
 	return (telling ?? lines[0] ?? `exit ${result.code}`).slice(0, 200);
 }
 
-/** The `git status --porcelain` lines of `dir`, or why git could not tell. */
+/** The `git status --porcelain` lines of `dir` plus edits the index flags hide from it, or why git could not tell. */
 async function statusOf(git: GitRunner, dir: string): Promise<{ dirty: string[] } | { failed: string }> {
-	const status = await git(["-C", dir, "status", "--porcelain"]);
+	// `--untracked-files=all`: a repository's `status.showUntrackedFiles=no` must not hide what the cleanup would delete.
+	const status = await git(["-C", dir, "status", "--porcelain", "--untracked-files=all"]);
 	if (status.code !== 0) return { failed: `git status 실패(${dir}): ${failureLine(status)}` };
 	const dirty = status.stdout
 		.split("\n")
 		.map((line) => line.trim())
 		.filter((line) => line !== "");
-	return { dirty };
+	const hidden = await hiddenChanges(git, dir);
+	if ("failed" in hidden) return { failed: hidden.failed };
+	return { dirty: [...dirty, ...hidden.map((path) => `${path} (status가 숨긴 변경)`)] };
 }
 
 const shownOf = (dirty: string[]): string =>
@@ -438,6 +441,18 @@ export const REVIEW_INCONCLUSIVE = "독립 리뷰 확인 불가";
 export const reviewUnsure = (confidence: number | undefined, minConfidence: number, risk: string): string =>
 	`독립 리뷰 CLEAR(${confidence === undefined ? "확신도 없음" : `확신도 ${formatConfidence(confidence)} < ${formatConfidence(minConfidence)}`}, 위험 ${risk})`;
 
+/** `laneLandBlockers` reasons of the run QA (`taskAutoLand.qa`); all start with `실행 QA`. */
+export const QA_MISSING = "실행 QA 없음";
+export const QA_FAIL = "실행 QA FAIL";
+export const QA_INCONCLUSIVE = "실행 QA 확인 불가";
+
+/** Whether `taskAutoLand.qa` is set and the lane's risk (`DEFAULT_LANE_RISK` without one) is at its `minRisk` or above. */
+export function laneQaRisk(lane: LaneRow, policy: AutoLandPolicy): boolean {
+	const qa = policy.qa;
+	if (qa === undefined) return false;
+	return TASK_RISKS.indexOf(lane.meta.risk ?? DEFAULT_LANE_RISK) >= TASK_RISKS.indexOf(qa.minRisk);
+}
+
 /**
  * `taskAutoLand.review.confident` when the lane is in its band: an explicit risk (never `DEFAULT_LANE_RISK` of a lane
  * without one) above `policy.maxRisk` and at most `confident.maxRisk`. Such a lane is reviewed, and merges unasked on
@@ -460,7 +475,10 @@ export function confidentBand(lane: LaneRow, policy: AutoLandPolicy): LaneReview
  * the merge too), and a lane the owner let through an integrity refusal or timed-out checks is never merged unasked. `frozen`: auto-merge is autonomous, so a freeze holds it. With `policy.review` only a `CLEAR` receipt for
  * the claim commit (`meta.review.sha === meta.sha`) lets the lane through; a lane in the `confidentBand` has no risk
  * reason and needs that receipt's confidence to reach `minConfidence`. A lane above `maxRisk` outside the band gets the
- * risk reason only: it is never reviewed, so a missing review is no reason of its own.
+ * risk reason only: it is never reviewed, so a missing review is no reason of its own. Files of the claim outside the
+ * lane's `scope`, a scope check that failed, and leftovers the claim marked `blocking` hold the merge too. With
+ * `policy.qa` a reviewable lane at its `minRisk` or above needs the claim commit's `PASS` QA receipt; an unreviewable
+ * one gets no QA reason (it is never run). Without `policy.qa` nothing here changes.
  */
 export function laneLandBlockers(
 	lane: LaneRow,
@@ -482,6 +500,14 @@ export function laneLandBlockers(
 	const held = lane.meta.land?.autoLandHeld;
 	if (held !== undefined)
 		blockers.push(held === INTEGRITY_APPROVED || held === INCONCLUSIVE_APPROVED ? `${held}으로 통과` : held);
+	// The close's scope check (`checkLaneScope`): a check that could not list the files is no pass.
+	const { scopeError, scopeViolations, leftovers } = lane.meta;
+	if (scopeError !== undefined) blockers.push(`범위 검사 실패(${scopeError})`);
+	else if (scopeViolations !== undefined && scopeViolations.length > 0) {
+		blockers.push(`범위 밖 파일 ${scopeViolations.length}개`);
+	}
+	const blocking = (leftovers ?? []).filter((item) => item.blocking).length;
+	if (blocking > 0) blockers.push(`막는 남은 일 ${blocking}개`);
 	if (policy.review !== undefined && !unreviewable) {
 		const review = lane.meta.review;
 		if (review === undefined || review.sha !== lane.meta.sha) blockers.push(REVIEW_MISSING);
@@ -490,6 +516,12 @@ export function laneLandBlockers(
 		else if (band !== undefined && !(review.confidence !== undefined && review.confidence >= band.minConfidence)) {
 			blockers.push(reviewUnsure(review.confidence, band.minConfidence, risk));
 		}
+	}
+	if (!unreviewable && laneQaRisk(lane, policy)) {
+		const qa = lane.meta.qa;
+		if (qa === undefined || qa.sha !== lane.meta.sha) blockers.push(QA_MISSING);
+		else if (qa.verdict === "FAIL") blockers.push(QA_FAIL);
+		else if (qa.verdict === "inconclusive") blockers.push(`${QA_INCONCLUSIVE}(${qa.reason ?? "?"})`);
 	}
 	if (frozen) blockers.push("동결 중");
 	return blockers;

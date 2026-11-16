@@ -30,14 +30,17 @@ export function listsBefore(a: ListedSession, b: ListedSession): boolean {
 
 /**
  * The session file omp resumes for a session dir: the first `*.jsonl` of {@link listsBefore}. ompbot keeps one active
- * session per epoch dir, so the newest file is the resumed one.
+ * session per epoch dir, so the newest file is the resumed one. A `.jsonl` that is not a regular file (a FIFO a child
+ * left there) is no session and is skipped: opening it would block the reader (qa-l #78).
  */
 export function newestSessionFile(sessionDir: string): string | undefined {
 	let newest: (ListedSession & { file: string }) | undefined;
 	for (const name of readdirSync(sessionDir)) {
 		if (!name.endsWith(".jsonl")) continue;
 		const file = join(sessionDir, name);
-		const { mtimeMs, birthtimeMs } = statSync(file);
+		const stat = statSync(file);
+		if (!stat.isFile()) continue;
+		const { mtimeMs, birthtimeMs } = stat;
 		const listed = { file, mtimeMs, createdMs: birthtimeMs, name };
 		if (newest === undefined || listsBefore(listed, newest)) newest = listed;
 	}

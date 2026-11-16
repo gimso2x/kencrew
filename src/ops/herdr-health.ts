@@ -1,8 +1,7 @@
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ProcessRunner } from "../dispatch/omp";
 import { TASK_SWEEP_MS } from "../tasks/sweeper";
-import { parseStampFields, parseStampTs, writeAtomic0600 } from "./stamp";
+import { parseStampFields, parseStampTs, readRegularText, writeAtomic0600 } from "./stamp";
 
 /** `<home>/herdr-health`: the daemon's last local `herdr status server` result, read by the `herdr_unreachable` gate. */
 export const HERDR_HEALTH_FILE = "herdr-health";
@@ -28,12 +27,12 @@ export function readHerdrHealth(homeDir: string): HerdrHealthStamp | undefined {
 	const path = join(homeDir, HERDR_HEALTH_FILE);
 	let text: string;
 	try {
-		text = readFileSync(path, "utf8");
+		text = readRegularText(path);
 	} catch {
 		return undefined;
 	}
 	const fields = parseStampFields(text);
-	const ts = parseStampTs(fields, path);
+	const ts = parseStampTs(fields);
 	if (ts === undefined) return undefined;
 	const fails = Number(fields.get("fails"));
 	const error = fields.get("error");

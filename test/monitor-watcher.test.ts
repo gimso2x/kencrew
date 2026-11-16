@@ -278,6 +278,26 @@ describe("watcher runtime", () => {
 		expect(lines.at(-1)).toBe("… and 7 more");
 	});
 
+	test("a literal \\u000a in a file name and a real newline stay two paths, each one payload line (qa-l 49)", () => {
+		const root = join(allowed, "proj");
+		const monitor = add(root, { debounceMs: 100 });
+		let emit: (rel: string) => void = () => {};
+		const set = new WatcherSet({
+			log: createLogger({ sink: () => {}, clock, redact }),
+			clock,
+			watchRoots: () => [allowed],
+			starter: (_root, onChange) => {
+				emit = onChange;
+				return { close() {} };
+			},
+		});
+		set.reconcile([monitor]);
+		emit("x\\u000ay.txt");
+		emit("x\ny.txt");
+		clock.advance(100);
+		expect((set.take(monitor.id, 100, clock.now()) ?? "").split("\n")).toEqual(["x\\u000ay.txt", "x\\u000ay.txt"]);
+	});
+
 	test("the `… and N more` count is distinct changed paths even past the tracked-path bound", () => {
 		const root = join(allowed, "proj");
 		const monitor = add(root, { debounceMs: 100 });

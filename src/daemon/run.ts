@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { ChannelBinding } from "../channel/adapter";
@@ -64,12 +65,51 @@ export const teamsGroupOverlayPath = (homeDir: string): string => join(homeDir, 
 
 /**
  * The overlay file of the RPC child of `origin`: {@link teamsGroupOverlayPath} for a `teams/ch/*` origin when
- * `channels.teams.graph` is set, `undefined` for every other origin and config (no `--config` as before).
+ * `channels.teams.graph` is set, else `config.ompConfigOverlay` (every origin: chat, monitor, lane). When both apply,
+ * one file merging the two (see {@link writeMergedOverlay}); with neither, `undefined` (no `--config`, as before).
  */
 export function rpcOverlayFor(config: OmpbotConfig, origin: string): string | undefined {
-	if (config.channels.teams?.graph === undefined) return undefined;
-	const ref = parseChatOrigin(origin);
-	return ref?.platform === "teams" && ref.kind === "ch" ? teamsGroupOverlayPath(config.homeDir) : undefined;
+	const ref = config.channels.teams?.graph === undefined ? undefined : parseChatOrigin(origin);
+	if (ref?.platform !== "teams" || ref.kind !== "ch") return config.ompConfigOverlay;
+	if (config.ompConfigOverlay === undefined) return teamsGroupOverlayPath(config.homeDir);
+	return writeMergedOverlay(config.homeDir, config.ompConfigOverlay, TEAMS_GROUP_OVERLAY_YAML);
+}
+
+/**
+ * `<homeDir>/rpc-overlay.<hash>.omp.yml`: the YAML mapping of `overlayPath` (read now, so a changed file reaches the
+ * next child) deep-merged with `top`, whose values win (the Teams group memory-off floor). One `--config` per child.
+ */
+export function writeMergedOverlay(homeDir: string, overlayPath: string, top: string): string {
+	const merged = Bun.YAML.stringify(
+		mergeMappings(yamlMapping(readFileSync(overlayPath, "utf8"), overlayPath), yamlMapping(top, "top")),
+		null,
+		2,
+	);
+	const path = join(homeDir, `rpc-overlay.${createHash("sha256").update(merged).digest("hex").slice(0, 16)}.omp.yml`);
+	writeFileSync(path, merged, { mode: 0o600 });
+	return path;
+}
+
+type Mapping = Record<string, unknown>;
+
+const isMapping = (value: unknown): value is Mapping =>
+	typeof value === "object" && value !== null && !Array.isArray(value);
+
+/** An overlay's top level: a mapping, or empty (an empty/comment-only file); anything else is no omp config. */
+function yamlMapping(text: string, what: string): Mapping {
+	const value = Bun.YAML.parse(text);
+	if (value === null) return {};
+	if (!isMapping(value)) throw new Error(`omp config overlay is not a YAML mapping: ${what}`);
+	return value;
+}
+
+function mergeMappings(base: Mapping, top: Mapping): Mapping {
+	const out: Mapping = { ...base };
+	for (const [key, value] of Object.entries(top)) {
+		const under = out[key];
+		out[key] = isMapping(under) && isMapping(value) ? mergeMappings(under, value) : value;
+	}
+	return out;
 }
 
 function pickTransport(config: OmpbotConfig, env: Record<string, string | undefined>, log: Logger): SlackTransport {
@@ -364,6 +404,7 @@ export async function runDaemon(
 						// No --append-system-prompt in agy: the driver prepends this to the first message of each child.
 						systemPrompt,
 						log,
+						originKey: origin,
 					})
 				: config.agent === "claude"
 					? new ClaudeOmpDriver({

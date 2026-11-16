@@ -5,6 +5,7 @@ import { type MonitorSql, toMonitor } from "../monitors/ledger";
 import { resolveProcedureFile } from "../monitors/spec";
 import { redact } from "../redact";
 import { localIso } from "../time";
+import type { PeerInstall } from "./peers";
 import { monitorDurationMs } from "./snapshot";
 
 /**
@@ -52,7 +53,30 @@ function head(text: string, limit: number): { text: string; truncated: boolean }
 	return { text: chars.slice(0, limit).join(""), truncated: chars.length > limit };
 }
 
-export function readMonitorDetail(homeDir: string, roots: MonitorDetailRoots, id: string): MonitorDetail {
+/**
+ * One monitor's detail. `<peer name>:<id>` reads that peer install's database and procedure roots (its zone too);
+ * a prefix naming no peer is an unknown monitor.
+ */
+export function readMonitorDetail(
+	homeDir: string,
+	roots: MonitorDetailRoots,
+	id: string,
+	peers: PeerInstall[] = [],
+): MonitorDetail {
+	const colon = id.indexOf(":");
+	if (colon >= 0) {
+		const peer = peers.find((candidate) => candidate.name === id.slice(0, colon));
+		if (peer === undefined) return { ok: false, error: "unknown_monitor" };
+		return readDetail(
+			peer.home,
+			{ workspaceDir: peer.workspaceDir, scriptsRoot: join(peer.home, "scripts"), timezone: peer.timezone },
+			id.slice(colon + 1),
+		);
+	}
+	return readDetail(homeDir, roots, id);
+}
+
+function readDetail(homeDir: string, roots: MonitorDetailRoots, id: string): MonitorDetail {
 	const dbPath = join(homeDir, "ompbot.db");
 	if (!existsSync(dbPath)) return { ok: false, error: "no_database" };
 	const db = new Database(dbPath, { readonly: true, strict: true });

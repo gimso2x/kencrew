@@ -115,17 +115,11 @@ export interface StuckDetector {
 }
 
 export interface StuckDetectorOptions {
-	steerAt?: number;
-	cancelAt?: number;
 	exempt?: (toolName: string, args: unknown) => boolean;
 }
 
 /** One detector per turn. */
-export function createStuckDetector({
-	steerAt = STUCK_STEER_AT,
-	cancelAt = STUCK_CANCEL_AT,
-	exempt = isStuckExempt,
-}: StuckDetectorOptions = {}): StuckDetector {
+export function createStuckDetector({ exempt = isStuckExempt }: StuckDetectorOptions = {}): StuckDetector {
 	const argsByCall = new Map<string, unknown>();
 	const counts = new Map<string, number>();
 	const steered = new Set<string>();
@@ -148,11 +142,11 @@ export function createStuckDetector({
 			const count = (counts.get(fingerprint) ?? 0) + 1;
 			counts.set(fingerprint, count);
 			const slack = isTransientError(event.result, isError) ? 2 : 1;
-			if (count >= cancelAt * slack) {
+			if (count >= STUCK_CANCEL_AT * slack) {
 				cancelled = true;
 				return { action: "cancel", toolName, count };
 			}
-			if (count >= steerAt * slack && !steered.has(fingerprint)) {
+			if (count >= STUCK_STEER_AT * slack && !steered.has(fingerprint)) {
 				steered.add(fingerprint);
 				return { action: "steer", toolName, count };
 			}

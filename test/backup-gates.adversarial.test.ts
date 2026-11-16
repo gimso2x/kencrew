@@ -40,6 +40,7 @@ import {
 import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
 import { MEDIA_MAX_AGE_MS, pruneMediaFiles } from "../src/ops/media";
 import { dailyBackupNames, seedDb } from "./helpers/backup-fixtures";
+import { isRoot } from "./helpers/privileges";
 
 const MAIN = join(import.meta.dir, "..", "src", "main.ts");
 
@@ -351,7 +352,9 @@ for (;;) { n += 1; tx(n); if (n === 1) console.log("ready"); }
 		expect(tmpLeftovers(home)).toEqual([]);
 	});
 
-	test("an unreadable bundle source fails the whole backup: no stamp, no partial db, no residue", () => {
+	// skipIf(isRoot): root reads a 0o000 file, so the failure cannot be provoked
+	// biome-ignore format: keeps the reason link on the skip line
+	test.skipIf(isRoot)("an unreadable bundle source fails the whole backup: no stamp, no partial db, no residue", () => { // root ignores permission bits, so this setup cannot fail
 		seedDb(home);
 		mkdirSync(join(home, "sessions"), { recursive: true });
 		writeFileSync(join(home, "config.json"), "{}\n", { mode: 0o600 });
@@ -404,28 +407,33 @@ for (;;) { n += 1; tx(n); if (n === 1) console.log("ready"); }
 		}
 	});
 
-	test("an unwritable backups dir fails as vacuum_failed, keeps the old stamp and leaves no residue", () => {
-		seedDb(home);
-		const first = runBackup({ homeDir: home, now: new Date(2026, 9, 23, 4, 30, 0) });
-		const backupsDir = join(home, "backups");
-		const stampBefore = readFileSync(join(backupsDir, STAMP_FILE), "utf8");
-		lowered.push(backupsDir);
-		chmodSync(backupsDir, 0o500);
+	// skipIf(isRoot): root writes into a 0o500 dir
+	// biome-ignore format: keeps the reason link on the skip line
+	test.skipIf(isRoot)( // root ignores permission bits, so this setup cannot fail
+		"an unwritable backups dir fails as vacuum_failed, keeps the old stamp and leaves no residue",
+		() => {
+			seedDb(home);
+			const first = runBackup({ homeDir: home, now: new Date(2026, 9, 23, 4, 30, 0) });
+			const backupsDir = join(home, "backups");
+			const stampBefore = readFileSync(join(backupsDir, STAMP_FILE), "utf8");
+			lowered.push(backupsDir);
+			chmodSync(backupsDir, 0o500);
 
-		let error: unknown;
-		try {
-			runBackup({ homeDir: home, now: new Date(2026, 9, 24, 4, 30, 0) });
-		} catch (e) {
-			error = e;
-		} finally {
-			chmodSync(backupsDir, 0o700);
-		}
-		expect(error).toBeInstanceOf(BackupError);
-		expect((error as BackupError).code).toBe("vacuum_failed");
-		expect(readFileSync(join(backupsDir, STAMP_FILE), "utf8")).toBe(stampBefore);
-		expect(dailyBackupNames(home)).toEqual([first.file.split("/").pop() as string]);
-		expect(tmpLeftovers(home)).toEqual([]);
-	});
+			let error: unknown;
+			try {
+				runBackup({ homeDir: home, now: new Date(2026, 9, 24, 4, 30, 0) });
+			} catch (e) {
+				error = e;
+			} finally {
+				chmodSync(backupsDir, 0o700);
+			}
+			expect(error).toBeInstanceOf(BackupError);
+			expect((error as BackupError).code).toBe("vacuum_failed");
+			expect(readFileSync(join(backupsDir, STAMP_FILE), "utf8")).toBe(stampBefore);
+			expect(dailyBackupNames(home)).toEqual([first.file.split("/").pop() as string]);
+			expect(tmpLeftovers(home)).toEqual([]);
+		},
+	);
 
 	test("unusable inputs (garbage db, db that is a directory, backups that is a file) leave no stamp and no residue", async () => {
 		// (a) garbage in place of the database
@@ -573,7 +581,7 @@ describe("pruneBackups direct", () => {
 // ===================================================================================================
 
 describe("readStamp adversarial", () => {
-	test("hostile stamp contents never throw and always yield a usable Date or undefined", () => {
+	test("hostile stamp contents never throw: a usable Date with a valid ts=, otherwise no stamp (no mtime stand-in)", () => {
 		const backupsDir = join(home, "backups");
 		mkdirSync(backupsDir);
 		const stampPath = join(backupsDir, STAMP_FILE);
@@ -590,8 +598,12 @@ describe("readStamp adversarial", () => {
 		for (const [label, content] of variants) {
 			writeFileSync(stampPath, content);
 			const info = readStamp(backupsDir);
-			expect(info, label).toBeDefined();
-			expect(Number.isNaN(info?.ts.getTime()), label).toBe(false);
+			if (/^ts=\d{4}-/.test(content.toString()) || label === "dup-ts") {
+				expect(info, label).toBeDefined();
+				expect(Number.isNaN(info?.ts.getTime()), label).toBe(false);
+			} else {
+				expect(info, label).toBeUndefined();
+			}
 		}
 		writeFileSync(stampPath, "ts=2026-10-23T04:30:00.000Z file=백업.db bytes=12 sha256=ab");
 		expect(readStamp(backupsDir)?.file).toBe("백업.db");
@@ -760,7 +772,7 @@ describe("collectGates adversarial", () => {
 			disk_low: "closed", // diskPaths: [] reads statfs=unavailable
 			host_pressure: "closed",
 			monitors_failed: "closed",
-			monitors_stalled: "closed", // no heartbeat stamp: cannot tell a drain from a stall
+			monitors_stalled: "unknown", // no heartbeat stamp: cannot tell a drain from a stall
 			turns_failing: "closed", // a pre-migration deliveries table has no body/created_at columns
 		});
 	});
@@ -851,9 +863,9 @@ describe("collectGates adversarial", () => {
 		expect(stale.code).toBe(1);
 		const lines = stale.out.trimEnd().split("\n");
 		expect(lines).toHaveLength(14);
-		// No heartbeat stamp in this home: the two heartbeat gates are unknown and named on the last line too.
+		// No heartbeat stamp in this home: the three heartbeat gates are unknown and named on the last line too.
 		expect(lines[lines.length - 1]).toMatch(
-			/^gates_done open=1 unknown=2 total=13 opened=backup_age\(hours=3[78]\.\d\) unknown_gates=sweep_stalled,slack_disconnected$/,
+			/^gates_done open=1 unknown=3 total=13 opened=backup_age\(hours=3[78]\.\d\) unknown_gates=sweep_stalled,slack_disconnected,monitors_stalled$/,
 		);
 		const json = gates(["--json"]);
 		expect(json.code).toBe(1);
@@ -863,7 +875,7 @@ describe("collectGates adversarial", () => {
 			gates: Array<{ name: string; state: string }>;
 		};
 		expect(parsed.open).toBe(1);
-		expect(parsed.unknown).toBe(2);
+		expect(parsed.unknown).toBe(3);
 		expect(parsed.gates.map((g) => g.name)).toEqual([
 			"backup_age",
 			"sweep_stalled",
@@ -884,7 +896,7 @@ describe("collectGates adversarial", () => {
 		const healthy = gates([]);
 		expect(healthy.code).toBe(0);
 		expect(healthy.out.trimEnd().split("\n").pop()).toBe(
-			"gates_done open=0 unknown=2 total=13 unknown_gates=sweep_stalled,slack_disconnected",
+			"gates_done open=0 unknown=3 total=13 unknown_gates=sweep_stalled,slack_disconnected,monitors_stalled",
 		);
 	});
 });

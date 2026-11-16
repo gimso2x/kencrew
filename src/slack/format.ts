@@ -116,8 +116,43 @@ function codeSpanText(span: string): string {
 	return inner.startsWith(" ") && inner.endsWith(" ") && inner.trim() !== "" ? inner.slice(1, -1) : inner;
 }
 
-/** `[label](url)`; the URL may hold one level of balanced parentheses (`/wiki/Foo_(bar)`). */
-const LINK = /\[([^\]\n]+)\]\((https?:\/\/(?:[^\s()]|\([^\s()]*\))+)\)/g;
+/**
+ * Replaces each `[label](url)` of `text` with `link(label, url)`. The label may hold balanced square brackets and the
+ * URL balanced parentheses (`/wiki/Foo_(bar_(baz))`); a candidate that does not close is left as it is.
+ */
+function replaceLinks(text: string, link: (label: string, url: string) => string): string {
+	let out = "";
+	let at = 0;
+	let from = 0;
+	for (let open = text.indexOf("[", from); open !== -1; open = text.indexOf("[", from)) {
+		from = open + 1;
+		let depth = 0;
+		let close = -1;
+		for (let i = open; i < text.length && text[i] !== "\n"; i++) {
+			if (text[i] === "[") depth += 1;
+			else if (text[i] === "]" && --depth === 0) {
+				close = i;
+				break;
+			}
+		}
+		if (close < 0 || close === open + 1 || !/^\(https?:\/\//.test(text.slice(close + 1, close + 10))) continue;
+		let end = -1;
+		depth = 0;
+		for (let i = close + 1; i < text.length && !/\s/.test(text[i] ?? ""); i++) {
+			if (text[i] === "(") depth += 1;
+			else if (text[i] === ")" && --depth === 0) {
+				end = i;
+				break;
+			}
+		}
+		if (end < 0 || end === close + 1) continue;
+		out += text.slice(at, open) + link(text.slice(open + 1, close), text.slice(close + 2, end));
+		at = end + 1;
+		from = at;
+	}
+	return out + text.slice(at);
+}
+
 /** `<@U…>`/`<#C…>`, optionally labelled (`<#C0123|general>`, `<@U0123|name>`). */
 const USER_MENTION = /<(?:@[UW]|#[CG])[A-Z0-9]+(?:\|[^<>\n]*)?>/g;
 /** Placeholder sentinels (private-use chars) so masked spans and links survive every later regex. */
@@ -128,15 +163,21 @@ function convertProse(text: string): string {
 	const spans: string[] = [];
 	const links: string[] = [];
 	// The input's own sentinel characters would be read back as placeholders (dropping or swapping text): drop them.
-	const masked = splitCodeSpans(text.replace(/[\uE000\uE001]/g, ""))
+	const withSpans = splitCodeSpans(text.replace(/[\uE000\uE001]/g, ""))
 		.map((piece, i) => (i % 2 === 1 ? `\uE001${spans.push(piece) - 1}\uE001` : piece))
-		.join("")
-		.replace(LINK, (_m, label: string, url: string) => {
-			links.push(
-				`<${url.replace(/\|/g, "%7C").replace(/</g, "%3C").replace(/>/g, "%3E")}|${label.replace(/[<>|]/g, "")}>`,
-			);
-			return `\uE000${links.length - 1}\uE000`;
-		})
+		.join("");
+	const masked = replaceLinks(withSpans, (label, url) => {
+		// A bracket in the label would end the link token early: escape it, in a code span label too.
+		const entities = (t: string): string => t.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+		const safeLabel = entities(
+			label.replace(SPAN_PLACEHOLDER, (placeholder, n: string) => {
+				spans[Number(n)] = entities(spans[Number(n)] ?? "");
+				return placeholder;
+			}),
+		);
+		links.push(`<${url.replace(/\|/g, "%7C").replace(/</g, "%3C").replace(/>/g, "%3E")}|${safeLabel}>`);
+		return `\uE000${links.length - 1}\uE000`;
+	})
 		// Only well-formed user mentions stay live Slack tokens; every other `<...>` is still escaped below.
 		.replace(USER_MENTION, (mention) => `\uE000${links.push(mention) - 1}\uE000`);
 	/** Puts masked code spans and links back; inside a rendered table they show verbatim, mrkdwn never applies. */
@@ -150,7 +191,7 @@ function convertProse(text: string): string {
 		.replace(/&/g, "&amp;")
 		.replace(/</g, "&lt;")
 		.replace(/>/g, "&gt;")
-		.replace(/^#{1,6}[ \t]+(.+?)[ \t]*#*$/gm, "*$1*")
+		.replace(/^#{1,6}[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$/gm, "*$1*")
 		.replace(/\*\*(.+?)\*\*/g, "*$1*")
 		.replace(/~~(.+?)~~/g, "~$1~")
 		.replace(/^([ \t]*)[-*][ \t]+/gm, "$1• ");
@@ -243,6 +284,8 @@ export const MARKDOWN_CHUNK_LIMIT = 11_000;
 const MARKDOWN_BLOCK_LIMIT = 12_000;
 /** `text` of a markdown message: what mobile notifications and block-less clients show. */
 const MARKDOWN_TEXT_LIMIT = 3_000;
+/** The cap of a `text` that keeps live tokens whole: Slack refuses a message whose `text` passes 40,000 characters. */
+const TOKEN_TEXT_LIMIT = 39_000;
 
 /** Slack caps a `header` block's plain text at 150 characters. */
 export const HEADER_LIMIT = 150;
@@ -505,8 +548,8 @@ export function renderMarkdownParts(
 		}
 		const fallback = `${i === 0 ? prefix : ""}${toMrkdwn(`${title}${piece.text}`)}`;
 		return {
-			// A message carrying live tokens keeps its whole fallback: a peer bot reads only `text`, mention and request.
-			text: withTokens[i] ? fallback : cutCodePointSafe(fallback, MARKDOWN_TEXT_LIMIT),
+			// A message carrying live tokens keeps its fallback up to Slack's own limit: a peer bot reads only `text`, mention and request.
+			text: cutCodePointSafe(fallback, withTokens[i] ? TOKEN_TEXT_LIMIT : MARKDOWN_TEXT_LIMIT),
 			blocks: [...head(i), { type: "markdown", text: markdowns[i] ?? piece.text }, ...tail(i)],
 		};
 	});

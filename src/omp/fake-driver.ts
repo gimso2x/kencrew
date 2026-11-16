@@ -9,6 +9,7 @@ import {
 	type OmpOpenResult,
 	type OmpSessionDriver,
 	type OmpState,
+	type OmpTurnUsage,
 	type TodoPhase,
 } from "./driver";
 
@@ -77,6 +78,8 @@ export interface FakeOmpDriverOptions {
 	 * (the script then sees no steers). `untilScripted()` resolves once they all went out.
 	 */
 	messageEvents?: boolean;
+	/** `usage` of each completed turn's final, like the agy driver reports it; absent = none (omp). */
+	turnUsage?: (prompt: string) => OmpTurnUsage | undefined;
 }
 
 /** One message of a scripted turn (`FakeOmpDriverOptions.script`). */
@@ -228,7 +231,8 @@ export class FakeOmpDriver implements OmpSessionDriver {
 				type: "message",
 				message: { role: "assistant", content: [{ type: "text", text: reply }], stopReason: "stop" },
 			});
-			this.#emitFinal({ opRef, status: "completed", text: reply });
+			const usage = this.#options.turnUsage?.(text);
+			this.#emitFinal({ opRef, status: "completed", text: reply, ...(usage === undefined ? {} : { usage }) });
 		})();
 		return opRef;
 	}

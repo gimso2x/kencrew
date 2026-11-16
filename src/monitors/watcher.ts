@@ -8,6 +8,8 @@ import { MonitorSpecError, resolveWatchRoot } from "./spec";
 export const MAX_WATCH_PATHS = 50;
 /** Distinct paths remembered per pending event (dedupes repeated writes); further new paths only join `overflow` (still deduped, so the count stays distinct paths). */
 const MAX_TRACKED_PATHS = 1000;
+/** Distinct overflow paths remembered per pending event; past it only a count of further changes grows, so memory stays bounded. */
+export const MAX_OVERFLOW_PATHS = 10_000;
 
 /** What a watch hands back; the test seam replaces `fs.watch`. */
 export interface WatchHandle {
@@ -45,6 +47,8 @@ interface Entry {
 	handle: WatchHandle;
 	paths: Set<string>;
 	overflow: Set<string>;
+	/** Changes past `MAX_OVERFLOW_PATHS` that are no longer deduped (a lower bound on distinct paths is all that is left). */
+	uncounted: number;
 	lastChangeAt: number;
 	/** Bumped when the watch died; the next reconcile starts a fresh one. */
 	failed: boolean;
@@ -117,11 +121,21 @@ export class WatcherSet {
 	take(id: string, debounceMs: number, now: number): string | undefined {
 		const entry = this.#entries.get(id);
 		if (entry === undefined || entry.paths.size === 0 || now - entry.lastChangeAt < debounceMs) return undefined;
-		const lines = [...entry.paths].slice(0, MAX_WATCH_PATHS);
+		// One path is one payload line: control characters (a newline in a file name) are written as \u escapes.
+		const lines = [...entry.paths]
+			.slice(0, MAX_WATCH_PATHS)
+			.map((path) =>
+				path.replace(
+					/[\p{Cc}\u2028\u2029]/gu,
+					(char) => `\\u${(char.codePointAt(0) as number).toString(16).padStart(4, "0")}`,
+				),
+			);
 		const more = entry.paths.size + entry.overflow.size - lines.length;
-		if (more > 0) lines.push(`… and ${more} more`);
+		if (entry.uncounted > 0) lines.push(`… and at least ${more + 1} more`);
+		else if (more > 0) lines.push(`… and ${more} more`);
 		entry.paths.clear();
 		entry.overflow.clear();
+		entry.uncounted = 0;
 		return lines.join("\n");
 	}
 
@@ -173,18 +187,21 @@ export class WatcherSet {
 				handle: { close() {} },
 				paths: new Set(),
 				overflow: new Set(),
+				uncounted: 0,
 				lastChangeAt: 0,
 				failed: false,
 			};
 			entry.handle = (this.deps.starter ?? fsWatchStarter)(
 				real,
 				(rel) => {
+					// Tracked raw: the \u escape is not one-to-one, so deduping on it would merge two distinct paths.
 					const path = rel === null || rel === "" ? "." : rel.split(sep).join("/");
 					if (path.split("/").includes(".git")) return;
 					entry.lastChangeAt = this.deps.clock.now();
 					if (entry.paths.has(path)) return;
 					if (entry.paths.size < MAX_TRACKED_PATHS) entry.paths.add(path);
-					else entry.overflow.add(path);
+					else if (entry.overflow.size < MAX_OVERFLOW_PATHS || entry.overflow.has(path)) entry.overflow.add(path);
+					else entry.uncounted++;
 				},
 				(error) => {
 					entry.failed = true;

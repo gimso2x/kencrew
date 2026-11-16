@@ -156,6 +156,23 @@ const LEDGER_GATES = [
 	"turns_failing",
 ] as const;
 
+/** Every known gate `collectGates` can emit; the dashboard's `gateText` must have a real label for each. */
+export const GATE_NAMES = [
+	...LEDGER_GATES,
+	"backup_age",
+	"offsite_age",
+	"sweep_stalled",
+	"slack_disconnected",
+	"discord_disconnected",
+	"omp_runtime",
+	"frozen",
+	"ledger_unreadable",
+	"disk_low",
+	"host_pressure",
+	"herdr_unreachable",
+	"cost_cap",
+] as const;
+
 function unknownGate(name: string, detail: string): Gate {
 	return { name, state: "unknown", detail };
 }
@@ -190,7 +207,7 @@ function cursorExists(db: Database, cursorKey: string): boolean {
 /**
  * Enabled monitors whose next fire is 15+ minutes past. Closed while draining (drain stops monitor ticks), while frozen
  * (the freeze holds every monitor back on purpose; the `frozen` gate reports it) and for a heartbeat without the
- * `draining` field (a daemon older than this gate: ops-check runs the new CLI against it). A fire the freeze held back
+ * `draining` field (a daemon older than this gate: ops-check runs the new CLI against it). Unknown without a stamp. A fire the freeze held back
  * counts as due at the unfreeze (`unfrozenAt`), so it only opens if it still has not fired 15 minutes after it.
  */
 function monitorsStalled(
@@ -201,7 +218,8 @@ function monitorsStalled(
 	unfrozenAt: number | undefined,
 ): Gate {
 	const name = "monitors_stalled";
-	if (heartbeat?.draining === undefined) return gate(name, false, "heartbeat=old");
+	if (heartbeat === undefined) return unknownGate(name, "stamp=missing");
+	if (heartbeat.draining === undefined) return gate(name, false, "heartbeat=old");
 	if (heartbeat.draining) return gate(name, false, "draining");
 	if (frozen) return gate(name, false, "frozen");
 	// A stamp from the future (clock jump, corruption) would hide stalls until then: ignore it.
@@ -404,6 +422,7 @@ export function collectGates(options: GatesOptions): Gate[] {
 	const dbPath = join(homeDir, "ompbot.db");
 	if (!existsSync(dbPath)) {
 		for (const name of LEDGER_GATES) gates.push(unknownGate(name, "db=missing"));
+		if (options.dailyCap !== undefined) gates.push(unknownGate("cost_cap", "db=missing"));
 		return gates;
 	}
 
@@ -469,7 +488,7 @@ export function collectGates(options: GatesOptions): Gate[] {
 		// `updated_at` moves on every 15-minute status-message redraw, so it never ages while the daemon runs; the
 		// newest history entry (created, progress, owner_reply, claim, not_done, reopened…) is the lane's real activity.
 		const laneActivity = columnExists(db, "lanes", "history")
-			? "COALESCE(json_extract(history, '$[#-1].at'), updated_at)"
+			? "CASE WHEN json_type(history, '$[#-1].at') = 'integer' THEN json_extract(history, '$[#-1].at') ELSE updated_at END"
 			: "updated_at";
 		// A quiet working lane is not stuck while a turn dispatched inside the same 24h window still runs on its origin,
 		// or while it waits on the owner (a live approval card for that origin); only the rest are orphans. A turn

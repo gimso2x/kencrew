@@ -99,7 +99,7 @@ export async function recordInbound(
 
 /**
  * Records a peer bot message under the thread's hop cap; `notice` posts the cap notice once per cap episode.
- * `undefined`: recorded, the caller starts its status.
+ * `undefined`: recorded, the caller starts its status; `"held"`: recorded but frozen, so no status.
  */
 export async function recordPeerInbound(
 	core: CoreSink,
@@ -108,11 +108,11 @@ export async function recordPeerInbound(
 	limit: { turns: number; windowMinutes: number },
 	drop: (reason: string) => IngestOutcome,
 	notice: () => Promise<void>,
-): Promise<IngestOutcome | undefined> {
+): Promise<IngestOutcome | "held" | undefined> {
 	const outcome = core.onPeerInbound?.(inbound, { turns: limit.turns, windowMs: limit.windowMinutes * 60_000 });
 	if (outcome === undefined) return drop("peer_unsupported");
 	if (outcome.duplicate) return duplicate(log, inbound.platformMessageId);
-	if (outcome.dropped === undefined) return undefined;
+	if (outcome.dropped === undefined) return outcome.held === undefined ? undefined : "held";
 	drop(outcome.dropped);
 	// No bot mention in the notice: it must not invite another peer reply.
 	if (outcome.dropped === "peer_hop_cap" && outcome.notice === true) await notice();

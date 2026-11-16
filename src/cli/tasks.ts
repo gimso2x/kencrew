@@ -2,11 +2,12 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig, timezoneOfHome } from "../config";
+import { escapeControl } from "../daemon/doctor";
 import { callDaemon, IpcNoResponse } from "../daemon/ipc";
 import { summarizeJudgement, taskChecksOf } from "../tasks/checker";
 import { evaluateTask } from "../tasks/evaluate";
 import { resolveTaskHost } from "../tasks/host";
-import { openTaskLedger, type TaskRow, TaskTransitionError } from "../tasks/ledger";
+import { openTaskLedger, type TaskLedger, type TaskRow, TaskTransitionError } from "../tasks/ledger";
 import { CHECK_TIMEOUT_MS } from "../tasks/signals";
 
 export const TASKS_USAGE = `  tasks list [--json]            [TASK] registry
@@ -17,9 +18,10 @@ export const TASKS_USAGE = `  tasks list [--json]            [TASK] registry
   tasks resume <id>              lifts the pause (sweep hold only; the worker is not prompted)
 `;
 
-function describe(row: TaskRow): string {
-	const where = `${row.host ?? "local"}:${row.worktree}`;
-	return `${row.taskId}  ${row.status.padEnd(9)}  ${row.risk}  ${row.title}  [${where} ${row.branch}]  agent=${row.agent}  AC=${row.acceptance.length}`;
+/** One `tasks list` line; ledger text is escaped so a title cannot start a forged line or move the cursor. */
+function describe(row: TaskRow, paused: boolean): string {
+	const where = escapeControl(`${row.host ?? "local"}:${row.worktree}`);
+	return `${row.taskId}  ${row.status.padEnd(9)}  ${row.risk}  ${escapeControl(row.title)}  [${where} ${escapeControl(row.branch)}]  agent=${escapeControl(row.agent)}  AC=${row.acceptance.length}${paused ? " (멈춤)" : ""}`;
 }
 
 function dispatchHostsOf(homeDir: string): Record<string, { ssh: string }> | undefined {
@@ -83,23 +85,34 @@ export async function tasksCommand(
 		options: { json: { type: "boolean" }, as: { type: "string" } },
 	});
 	const dbPath = join(homeDir, "ompbot.db");
-	if (!existsSync(dbPath)) {
-		// A read must not create a ledger holding only `tasks`: `gates` and `status` would call it unreadable.
+	// A read must not create a ledger holding only `tasks`: `gates` and `status` would call it unreadable.
+	const noLedger = (): number => {
 		if (sub === "list") {
 			process.stdout.write(values.json === true ? `${JSON.stringify({ tasks: [] })}\n` : "no tasks\n");
 			return 0;
 		}
 		process.stderr.write(`tasks ${sub}: task not found: ${positionals[0] ?? "(id required)"}\n`);
 		return 1;
+	};
+	if (!existsSync(dbPath)) return noLedger();
+	let ledger: TaskLedger;
+	try {
+		ledger = openTaskLedger(dbPath, timezoneOfHome(homeDir), undefined, {
+			readonly: sub === "list" || sub === "show",
+		});
+	} catch (error) {
+		process.stderr.write(
+			`tasks ${sub}: ledger ${dbPath} cannot be opened: ${escapeControl(String(error))} — check the file's permissions and that its directory is writable, or copy ompbot.db to a writable place\n`,
+		);
+		return 1;
 	}
-	const ledger = openTaskLedger(dbPath, timezoneOfHome(homeDir));
 	try {
 		const out = (value: unknown) => process.stdout.write(`${JSON.stringify(value)}\n`);
 		if (sub === "list") {
 			const rows = ledger.list();
-			if (values.json === true) out({ tasks: rows });
+			if (values.json === true) out({ tasks: rows.map((row) => ({ ...row, paused: ledger.isPaused(row) })) });
 			else if (rows.length === 0) process.stdout.write("no tasks\n");
-			else for (const row of rows) process.stdout.write(`${describe(row)}\n`);
+			else for (const row of rows) process.stdout.write(`${describe(row, ledger.isPaused(row))}\n`);
 			return 0;
 		}
 		const taskId = positionals[0];
@@ -116,7 +129,9 @@ export async function tasksCommand(
 			const closed = ledger.transition(row.taskId, values.as, "human", `close --as ${values.as}`);
 			out({ closed: closed.taskId, status: closed.status, closedAt: closed.closedAt });
 			const synced = await askDaemon(homeDir, { op: "tasks_sync", id: row.taskId });
-			if (typeof synced === "string")
+			if (synced === "no_response")
+				process.stderr.write("tasks close: no daemon answer — 응답 지연 — Slack reaction update unknown\n");
+			else if (synced === "unreachable")
 				process.stderr.write("tasks close: daemon not reachable — Slack reaction not updated\n");
 			else if (synced.ok !== true)
 				process.stderr.write(`tasks close: daemon refused: ${String(synced.error)} — Slack reaction not updated\n`);
@@ -131,8 +146,27 @@ export async function tasksCommand(
 				out(answered);
 				return answered.ok === true ? 0 : 1;
 			}
+			if (answered === "no_response") {
+				// The daemon has the request and may have applied it (even sent the Esc): marking here could contradict it.
+				process.stderr.write(
+					`tasks ${sub}: no daemon answer — 응답 지연 — ${sub} 적용 여부 모름 (not applied locally)\n`,
+				);
+				return 1;
+			}
 			// No daemon: the ledger mark alone holds the next sweep; the worker gets no Esc.
+			const wasPaused = ledger.isPaused(row);
 			const marked = sub === "pause" ? ledger.pauseTask(row.taskId) : ledger.unpauseTask(row.taskId);
+			if (sub === "resume" && !wasPaused) {
+				// Same wording as the daemon's answer: a TASK that was never paused was not resumed.
+				out({
+					ok: true,
+					task: marked.taskId,
+					paused: false,
+					resumed: false,
+					note: `${marked.taskId}는 멈춘 상태가 아닙니다.`,
+				});
+				return 0;
+			}
 			out({ ok: true, task: marked.taskId, paused: ledger.isPaused(marked) });
 			if (sub === "pause")
 				process.stderr.write("tasks pause: daemon not reachable — paused in the ledger, no Esc sent\n");
@@ -172,6 +206,9 @@ export async function tasksCommand(
 		});
 		return 0;
 	} catch (error) {
+		// A read-only handle does not create the table a ledger without TASKs never had.
+		if (error instanceof Error && /no such table: tasks/.test(error.message) && (sub === "list" || sub === "show"))
+			return noLedger();
 		if (!(error instanceof TaskTransitionError)) throw error;
 		process.stderr.write(`tasks ${sub}: ${error.message}\n`);
 		return 1;

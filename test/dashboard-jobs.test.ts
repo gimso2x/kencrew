@@ -28,7 +28,7 @@ function deps(overrides: Partial<SnapshotDeps> = {}): SnapshotDeps {
 		callDaemon: async () => {
 			throw new Error("no daemon");
 		},
-		run: async () => ({ code: 1, stdout: "", timedOut: false }),
+		run: async (cmd) => ({ code: cmd[0] === "systemctl" ? 0 : 1, stdout: "", timedOut: false }),
 		ompVersion: async () => "omp-stub 0.0.0",
 		hostOps: () => {
 			throw new Error("no hosts");
@@ -147,8 +147,12 @@ describe("dashboard jobs section", () => {
 	test("AC-4: old done jobs drop out, misnamed files are not read, title and detail are masked and cut", async () => {
 		writeJob("old-done.json", { state: "done", updatedAt: iso(NOW - 25 * 60 * MINUTE) });
 		writeJob("recent-done.json", { state: "done", updatedAt: iso(NOW - 23 * 60 * MINUTE) });
-		// An old failed job stays: only finished work leaves the list.
+		// A failed job stays a week, past the day finished work gets.
 		writeJob("old-failed.json", { state: "failed", updatedAt: iso(NOW - 25 * 60 * MINUTE) });
+		writeJob("week-failed.json", { state: "failed", updatedAt: iso(NOW - (7 * 24 * 60 + 1) * MINUTE) });
+		// A running job whose pid is gone leaves like finished work once old; a recent one stays to be seen.
+		writeJob("old-dead.json", { state: "running", updatedAt: iso(NOW - 25 * 60 * MINUTE), pid: 9999 });
+		writeJob("recent-dead.json", { state: "running", updatedAt: iso(NOW - 22 * 60 * MINUTE), pid: 9999 });
 		const valid = { state: "running", updatedAt: iso(NOW - MINUTE) };
 		writeFileSync(join(home, "x.json"), JSON.stringify(valid)); // `jobs/../x.json`
 		writeJob("A B.json", valid);
@@ -163,7 +167,7 @@ describe("dashboard jobs section", () => {
 			detail: `tokens=3298706 key=xoxb-TEST-0 ${"x".repeat(300)}`,
 		});
 		const jobs = await jobsOf();
-		expect(jobs.map((job) => job.name)).toEqual(["masked", "recent-done", "old-failed"]);
+		expect(jobs.map((job) => job.name)).toEqual(["masked", "recent-dead", "recent-done", "old-failed"]);
 		const masked = jobs[0] as JobInfo;
 		expect(masked.title).not.toContain("xoxb-TEST-0");
 		expect(masked.title).toContain("[REDACTED]");
@@ -289,5 +293,60 @@ describe("dashboard jobs section", () => {
 			expect(html).toMatch(/백그라운드 작업<\/h2><\/div><div class="notice is-danger">.*읽기 실패/);
 			expect(turnsNav(html).warn).toBe(true);
 		});
+	});
+});
+
+describe("dashboard jobs from systemd-run units", () => {
+	const unit = (fields: Record<string, string>): string =>
+		Object.entries(fields)
+			.map(([key, value]) => `${key}=${value}`)
+			.join("\n");
+	const transient = (id: string, pid: number, extra: Record<string, string> = {}): string =>
+		unit({
+			MainPID: String(pid),
+			Id: id,
+			Description: `/srv/${id}.sh`,
+			ActiveState: "active",
+			ActiveEnterTimestamp: "@1793800000",
+			Transient: "yes",
+			...extra,
+		});
+	const listing =
+		(stdout: string, code: number | null = 0) =>
+		async (cmd: string[]) =>
+			cmd[0] === "systemctl" ? { code, stdout, timedOut: false } : { code: 1, stdout: "", timedOut: false };
+
+	test("a running transient ompbot-* unit is a running job; services, helpers, inactive and file-backed units are not", async () => {
+		writeJob("audit.json", { state: "running", updatedAt: iso(NOW - MINUTE), pid: LIVE_PID });
+		const stdout = [
+			transient("ompbot-fable-diet7.service", 501),
+			unit({ MainPID: "502", Id: "ompbot.service", ActiveState: "active", Transient: "no" }),
+			transient("ompbot-job-fable-diet7.service", 503),
+			transient("ompbot-old.service", 0, { ActiveState: "inactive" }),
+			transient("ompbot-audit.service", 504),
+			transient("ompbot-same-pid.service", LIVE_PID),
+		].join("\n\n");
+		const jobs = await jobsOf({ run: listing(stdout) });
+		expect(jobs.map((job) => [job.name, job.state, job.health])).toEqual([
+			["fable-diet7", "running", "ok"],
+			["audit", "running", "ok"],
+		]);
+		expect(jobs[0]).toMatchObject({
+			title: "/srv/ompbot-fable-diet7.service.sh",
+			pid: 501,
+			startedAt: "2026-11-04T22:46:40+09:00",
+			detail: "systemd 유닛 ompbot-fable-diet7.service",
+		});
+	});
+
+	test("no systemctl on the host means no unit jobs; a failing systemctl is one invalid row beside the files", async () => {
+		writeJob("audit.json", { state: "running", updatedAt: iso(NOW - MINUTE), pid: LIVE_PID });
+		expect((await jobsOf({ run: listing("spawn failed: ENOENT", null) })).map((job) => job.name)).toEqual(["audit"]);
+		const jobs = await jobsOf({ run: listing("Failed to connect to bus", 1) });
+		expect(jobs.map((job) => [job.name, job.health])).toEqual([
+			["systemd", "invalid"],
+			["audit", "ok"],
+		]);
+		expect(jobs[0]?.detail).toContain("Failed to connect to bus");
 	});
 });

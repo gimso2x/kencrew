@@ -32,6 +32,8 @@ export const GUEST_MAX_QUEUED = 5;
 export const GUEST_BUSY_TEXT = "지금 질문이 많아 잠시 뒤 다시 물어 주세요.";
 /** What the asker gets when the run timed out or failed. */
 export const GUEST_FAILED_TEXT = "⚠️ 답을 만들지 못했습니다. 잠시 뒤 다시 물어 주세요.";
+/** What a guest gets while the bot is frozen: no reason is given. */
+export const GUEST_UNAVAILABLE_TEXT = "지금은 답할 수 없습니다. 잠시 뒤 다시 물어 주세요.";
 /** What a `!` command gets from a guest, or from the owner under `qa` (except `!home`). */
 export const GUEST_COMMAND_TEXT = "이 대화에서는 `!` 명령을 쓸 수 없습니다. 질문만 받습니다.";
 /** Earlier question/answer pairs of the same conversation put before the question, and their character budget. */

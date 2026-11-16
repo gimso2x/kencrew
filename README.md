@@ -1,8 +1,8 @@
 <div align="center">
 
-<h1>ompbot</h1>
+<h1>kencrew</h1>
 
-**Slack·Discord에서 부리는, 나만의 상주 코딩 에이전트**
+**Slack·Discord·Teams에서 부리는, 나만의 상주 코딩 에이전트**
 
 대화 · 승인 · 위임 · 모니터 · 자가진단까지 — 오너 한 명을 위한 운영형 에이전트 봇
 
@@ -12,7 +12,7 @@
 [![Workers](https://img.shields.io/badge/workers-herdr-bc8cff?style=flat-square&labelColor=black)](https://github.com/herdrdev/herdr)
 [![Slack](https://img.shields.io/badge/Slack-Socket%20Mode-4A154B?style=flat-square&labelColor=black&logo=slack)](https://api.slack.com/apis/socket-mode)
 [![Discord](https://img.shields.io/badge/Discord-Gateway-5865F2?style=flat-square&labelColor=black&logo=discord)](https://discord.com/developers/docs/events/gateway)
-![Tests](https://img.shields.io/badge/tests-3%2C000%2B%20passing-3fb950?style=flat-square&labelColor=black)
+![Tests](https://img.shields.io/badge/tests-3%2C800%2B%20passing-3fb950?style=flat-square&labelColor=black)
 
 [빠른 시작](#빠른-시작) · [핵심 기능](#핵심-기능) · [작동 방식](#작동-방식) · [명령](#명령-한눈에) · [사용 설명서](docs/guide.md)
 
@@ -20,9 +20,11 @@
 
 ---
 
-ompbot은 Slack이나 Discord(둘 중 하나 또는 둘 다)의 DM·채널에서 받은 말을 내 서버의 [omp](https://github.com/can1357/oh-my-pi) 코딩 에이전트에게 넘기고, 답을 같은 스레드로 돌려줍니다. 여기까지는 여느 챗봇과 같습니다. 다른 점은 **그 뒤의 운영**입니다. 되돌릴 수 없는 일은 버튼으로 묻고, 긴 일은 워커에게 맡겨 증거로 완료를 판정하고, 재시작·끊김에도 메시지를 잃지 않고, 스스로 이상을 감지해 알립니다. 봇의 안내·알림 문구와 문서는 한국어입니다.
+kencrew는 Slack·Discord·Teams(하나만 또는 여럿 함께)의 DM·채널에서 받은 말을 내 서버의 [omp](https://github.com/can1357/oh-my-pi) 코딩 에이전트에게 넘기고, 답을 같은 스레드로 돌려줍니다. 여기까지는 여느 챗봇과 같습니다. 다른 점은 **그 뒤의 운영**입니다. 되돌릴 수 없는 일은 버튼으로 묻고, 긴 일은 워커에게 맡겨 증거로 완료를 판정하고, 재시작·끊김에도 메시지를 잃지 않고, 스스로 이상을 감지해 알립니다. 봇의 안내·알림 문구와 문서는 한국어입니다.
 
-> omp는 한 줄도 고치지 않습니다. omp 위에 채팅(Slack · Discord) · 장부 · 승인 · 운영 계층을 얹습니다.
+> omp는 한 줄도 고치지 않습니다. omp 위에 채팅(Slack · Discord · Teams) · 장부 · 승인 · 운영 계층을 얹습니다.
+
+> 예전 이름은 ompbot입니다. CLI(`ompbot`), 홈 디렉터리(`~/.ompbot`·`OMPBOT_HOME`), systemd 유닛, 도구 이름(`ompbot_*`)은 아직 예전 이름을 그대로 씁니다.
 
 ## 대화창에서는 이렇게 보입니다
 
@@ -61,11 +63,11 @@ omp login                                  # 모델 공급자 하나 이상 로�
 omp models                                 # 모델이 하나 이상 보여야 합니다. 비어 있으면 봇의 모든 답이 실패합니다
 ```
 
-**2. 소스 받기**
+**2. 소스 받기** — `<이 저장소의 clone URL>`은 GitHub 페이지 Code 버튼의 HTTPS 주소입니다.
 
 ```sh
 git clone <이 저장소의 clone URL> ~/work/ompbot && cd ~/work/ompbot
-bun install && bun test   # fail 0이면 됩니다(실제 omp·gitleaks가 필요한 테스트 30여 개는 skip)
+bun install && bun test   # fail 0이면 됩니다. 실제 omp·gitleaks·root 전용 조건이 필요한 테스트 수십 개는 skip
 bun link                  # (선택) 이후 'bun src/main.ts <명령>' 대신 'ompbot <명령>'으로 씁니다(~/.bun/bin이 PATH에 있어야 함)
 ```
 
@@ -133,7 +135,7 @@ flowchart LR
     O["👤 오너<br/>DM · 채널 · 스레드"]
   end
   subgraph Host["내 서버 · systemd user"]
-    D["ompbot 데몬<br/>SQLite 수신·전달 장부"]
+    D["kencrew 데몬<br/>SQLite 수신·전달 장부"]
     S["omp 세션<br/>대화방마다 1개"]
     M["모니터<br/>cron · script · watcher · webhook"]
     G["건강 게이트 · 백업"]
@@ -197,7 +199,9 @@ Slack으로 설치한 봇에 Discord를 더할 때:
 | `!undo` | 이 대화의 가장 최근 변경 턴을 되돌립니다(`turnSnapshot.repos`가 있어야 하며, 승인 카드 뒤에 실행) |
 | `!brief` (`!브리핑`) | 지금 상태(주의·진행·모니터·백업)를 폭 1080px 한 장 PNG로 그려 이 스레드에 올립니다(모델 호출 없음, 작업 중에도 사용 가능) |
 | `작업: <제목> @<경로>` | 그 저장소 옆 전용 worktree·브랜치(`lane/L-YYYYMMDD-NN`)에서 일하고 커밋으로 검증되는 작업 레인을 엽니다. 닫히면 `머지`·`폐기` 버튼 카드가 올라옵니다 |
-| `멈춰` · `계속` | 작업 레인·`[TASK]` 스레드에서 그 일을 멈추거나 다시 돌립니다(레인은 ⏸·▶ 버튼도 됨) |
+| `멈춰` · `계속` (`!pause` · `!unpause`) | 작업 레인·`[TASK]` 스레드에서 그 일을 멈추거나 다시 돌립니다(레인은 ⏸·▶ 버튼도 됨) |
+| `!reopen` · `!reopen <지시>` | 작업 레인 스레드 전용. 닫히고 아직 머지·폐기되지 않은 레인을 같은 세션으로 다시 엽니다 |
+| `!home` | 보낸 대화를 데몬 알림과 채널 없는 모니터 결과를 받을 곳으로 정합니다 |
 
 위 표의 `!` 명령은 `!btw`·`!distill`·`!stop`·`!restart`를 빼고 Slack에서는 `/new-ompbot` 같은 슬래시 명령으로도 쓸 수 있습니다(Discord는 `!`만).
 

@@ -30,6 +30,7 @@ import type {
 import { STYLE } from "./style";
 import { TRACE_CLIENT } from "./trace-client";
 import { renderTrace } from "./trace-view";
+import { resetIn, usageLevel } from "./usage-limits";
 
 /** The gate thresholds the screens put into words; shipped to the page as JSON next to the renderers. */
 const GATE_LIMITS = {
@@ -147,6 +148,10 @@ export function gateText(name: string): { label: string; todo: string } {
 		omp_runtime: ["omp 실행 환경 이상", "`omp --version`·`bun --version` 확인"],
 		frozen: ["동결 켜짐", "동결 사유 확인 뒤 `ompbot unfreeze`"],
 		ledger_unreadable: ["장부(DB)를 읽지 못함", "DB 파일 권한·디스크 확인"],
+		herdr_unreachable: ["herdr에 연결하지 못함", "herdr 서버 상태·`herdr.bin` 설정 확인"],
+		disk_low: ["디스크 여유 공간 부족", "`df -h` 확인·`ompbot gc`·백업 정리"],
+		host_pressure: ["호스트 부하·메모리 압박", "`uptime`·`free -m` 확인"],
+		cost_cap: ["오늘 비용이 하루 상한을 넘어 모니터가 멈춤", "`!budget`으로 확인, 오늘만 풀려면 `!budget off`"],
 	};
 	const known = TEXT[name];
 	return known === undefined ? { label: name, todo: "`ompbot gates` 확인" } : { label: known[0], todo: known[1] };
@@ -679,8 +684,11 @@ export function renderDashboardMain(
 		admitted: ["대기", ""],
 		authored: ["작성됨", "is-info"],
 	};
-	const badge = (text: string, tone: string): string =>
-		`<span class="status-pill ${tone}">${statusIcon(tone)}<span class="badge ${tone}">${esc(text)}</span></span>`;
+	const badge = (text: string, tone: string, html = esc(text)): string =>
+		`<span class="status-pill ${tone}">${statusIcon(tone)}<span class="badge ${tone}">${html}</span></span>`;
+	/** A header number the page rolls when it changes: `bad` says which way is worse (see `rollLabel`). */
+	const roll = (key: string, value: number | string, bad: string): string =>
+		`<span class="roll-n" data-roll="${esc(key)}" data-roll-v="${esc(value)}" data-roll-bad="${bad}">${esc(value)}</span>`;
 	const state = (name: string, prefix = ""): string => {
 		const known = STATES[name];
 		return known === undefined ? badge(`${prefix}${name || "?"}`, "") : badge(`${prefix}${known[0]}`, known[1]);
@@ -1486,8 +1494,17 @@ export function renderDashboardMain(
 				monitors.items.reduce((total, monitor) => total + pick(monitor), 0);
 			const failedRuns = sum((monitor) => monitor.stats.failed);
 			const skippedRuns = sum((monitor) => monitor.stats.skipped);
+			const peerLead = (monitors.peerErrors ?? [])
+				.map(
+					(peer) =>
+						`<div class="notice is-danger">${badge("읽기 실패", "is-danger")}<span>${esc(
+							`${peer.install} 모니터를 읽지 못함(${peer.error})`,
+						)}</span></div>`,
+				)
+				.join("");
 			const lead =
-				monitors.items.length === 0
+				peerLead +
+				(monitors.items.length === 0
 					? ""
 					: `<p class="list-lead">${[
 							`오늘 남은 실행 ${monitors.items.filter((monitor) => dayOf(monitor) === "today").length}`,
@@ -1498,7 +1515,7 @@ export function renderDashboardMain(
 							.map((text) => `<span>${esc(text)}</span>`)
 							.join("")}<span${failedRuns > 0 ? ' class="is-danger"' : ""}>실패 ${failedRuns}</span>${
 							monitors.items.some((monitor) => monitor.running) ? "<span>지금 실행 중 있음</span>" : ""
-						}</p>`;
+						}</p>`);
 			const rows = GROUPS.flatMap(([key, label]) => {
 				const group = shown.filter((monitor) => dayOf(monitor) === key);
 				return group.length === 0
@@ -1735,7 +1752,8 @@ export function renderDashboardMain(
 			}
 		}
 
-		const monitorCount = d.ok ? d.monitors.count : s.monitors.ok ? s.monitors.items.length : 0;
+		const peerMonitors = s.monitors.ok ? s.monitors.items.filter((monitor) => monitor.install !== undefined).length : 0;
+		const monitorCount = d.ok ? d.monitors.count : s.monitors.ok ? s.monitors.items.length - peerMonitors : 0;
 		const troubled = s.monitors.ok
 			? s.monitors.items.filter((monitor) => monitor.openIncidents > 0 || monitor.failStreak > 0).length
 			: 0;
@@ -1775,7 +1793,10 @@ export function renderDashboardMain(
 			"모니터·herdr 머신",
 			herdrDown || troubled > 0 || !s.monitors.ok ? "warn" : "ok",
 			facts([
-				["모니터", `${monitorCount}개${troubled > 0 ? ` · 사건 ${troubled}` : ""}`],
+				[
+					"모니터",
+					`${monitorCount}개${peerMonitors > 0 ? `(+피어 ${peerMonitors})` : ""}${troubled > 0 ? ` · 사건 ${troubled}` : ""}`,
+				],
 				["herdr 머신", machines],
 			]),
 		);
@@ -1858,7 +1879,7 @@ export function renderDashboardMain(
 		chips.push(
 			d.openGates.length === 0
 				? badge("게이트 정상", "is-success")
-				: badge(`게이트 ${d.openGates.length}개 열림`, "is-warning"),
+				: badge("", "is-warning", `<span>게이트 ${roll("gate", d.openGates.length, "up")}개 열림</span>`),
 		);
 		if (d.frozen) chips.push(badge("동결", "is-warning"));
 		if (d.drain || d.heartbeat?.draining) chips.push(badge("drain", "is-warning"));
@@ -1925,9 +1946,96 @@ export function renderDashboardMain(
 		: "";
 	const themeBtn = (mode: string, text: string): string =>
 		`<button type="button" class="seg-item" data-theme-set="${mode}" aria-pressed="${theme === mode}">${text}</button>`;
+	// Model limits (config `dashboard.usageLimits`) in the top bar: a chip per source with its lowest five-hour and weekly
+	// remaining share; hover or focus opens a panel with a tile per source (five-hour and weekly windows only, other
+	// windows left out). 20% remaining warns, 5% is danger.
+	const limitsPop = (): string => {
+		const usage = s.usageLimits;
+		if (usage === undefined) return "";
+		const wrap = (chips: string, tiles: string): string =>
+			`<div class="limits-pop"><button type="button" class="limits-trigger" aria-label="모델 한도 자세히">${chips}</button><div class="limits-panel" role="tooltip">${tiles}</div></div>`;
+		if (!usage.ok) {
+			return wrap(
+				`<span class="limit-chip is-muted"><i class="dot is-muted" aria-hidden="true"></i>한도 ?</span>`,
+				`<div class="limit-tile is-failed"><div class="limit-head"><b>모델 한도</b></div><p class="limit-error">읽지 못했어요: ${esc(usage.error)}</p></div>`,
+			);
+		}
+		const parts = usage.sources.map((source) => {
+			const headOf = (tone: string): string =>
+				`<div class="limit-head"><i class="dot is-${tone}" aria-hidden="true"></i><b>${esc(source.name)}</b>${
+					source.account === undefined ? "" : `<span class="limit-acct">${esc(source.account)}</span>`
+				}</div>`;
+			if (!source.ok) {
+				return {
+					chip: `<span class="limit-chip is-muted" data-source="${esc(source.name)}"><i class="dot is-muted" aria-hidden="true"></i>${esc(source.name)} ?</span>`,
+					tile: `<div class="limit-tile is-failed" data-source="${esc(source.name)}">${headOf("muted")}<p class="limit-error">${esc(source.error)}</p></div>`,
+					tone: "muted",
+					least: undefined,
+				};
+			}
+			// A row's group: the parenthesised part of an omp label ("Claude 7 Day (Fable)"), the model family of an agy
+			// label ("Gemini Models" → "Gemini"), else none; rows keep their group's first place, five-hour first.
+			const groupOf = (label: string): string => {
+				const paren = /\(([^)]+)\)/.exec(label);
+				if (paren) return paren[1] ?? "";
+				if (source.name !== "Antigravity") return "";
+				return label.replace(/\s+models$/i, "").replace(/\s+and\s+/i, "·");
+			};
+			const picked = source.rows.filter((row) => row.window !== "other");
+			const rows = (picked.length === 0 ? source.rows : picked).map((row) => ({ row, group: groupOf(row.label) }));
+			const order = [...new Set(rows.map((r) => r.group))];
+			rows.sort(
+				(a, b) =>
+					order.indexOf(a.group) - order.indexOf(b.group) ||
+					(a.row.window === "5h" ? 0 : 1) - (b.row.window === "5h" ? 0 : 1),
+			);
+			let worst = "ok";
+			const lines = rows.map(({ row, group }) => {
+				const tone = usageLevel(row.remainingPct);
+				if (tone === "danger" || (tone === "warn" && worst === "ok")) worst = tone;
+				const win = row.window === "5h" ? "5시간" : row.window === "weekly" ? "주간" : row.windowLabel;
+				const left = resetIn(row.resetsAt, clock);
+				return `<div class="limit-row is-${tone}" data-window="${row.window}"><span class="limit-name">${esc(
+					group === "" ? win : `${group} ${win}`,
+				)}</span><span class="meter" role="img" aria-label="남은 ${row.remainingPct}%"><i style="width:${row.remainingPct}%"></i></span><b class="limit-pct">${row.remainingPct}%</b><span class="limit-reset"${
+					left === "" ? "" : ` title="${esc(`${left} 뒤 초기화`)}"`
+				}>${esc(left)}</span></div>`;
+			});
+			const lowest = (window: string): string => {
+				const pcts = rows.filter((r) => r.row.window === window).map((r) => r.row.remainingPct);
+				return pcts.length === 0 ? "" : String(Math.min(...pcts));
+			};
+			const short = lowest("5h");
+			const week = lowest("weekly");
+			const least = Math.min(...rows.map((r) => r.row.remainingPct));
+			// Wide top bars show both windows (`lc-full`), narrower ones only the least remaining share (`lc-min`).
+			return {
+				chip: `<span class="limit-chip is-${worst}" data-source="${esc(source.name)}"><i class="dot is-${worst}" aria-hidden="true"></i><b>${esc(
+					source.name === "Antigravity" ? "AG" : source.name,
+				)}</b><span class="lc-full">${short === "" ? "" : `<small>5h</small>${roll(`lim:${source.name}:5h`, short, "down")}`}${
+					week === "" ? "" : `<small>주</small>${roll(`lim:${source.name}:week`, week, "down")}`
+				}</span><span class="lc-min">${rows.length === 0 ? "" : `${roll(`lim:${source.name}:min`, least, "down")}%`}</span></span>`,
+				tile: `<div class="limit-tile is-${worst}" data-source="${esc(source.name)}">${headOf(worst)}${lines.join("")}</div>`,
+				tone: worst,
+				least: rows.length === 0 ? undefined : least,
+			};
+		});
+		// The narrowest desktop bars show one summary instead of the chips: a dot per source and the least share overall.
+		const leasts = parts.flatMap((part) => (part.least === undefined ? [] : [part.least]));
+		const tones = parts.map((part) => part.tone);
+		const sumTone = tones.includes("danger")
+			? "danger"
+			: tones.includes("warn") || tones.includes("muted")
+				? "warn"
+				: "ok";
+		const summary = `<span class="limit-sum limit-chip is-${sumTone}">${tones
+			.map((tone) => `<i class="dot is-${tone}" aria-hidden="true"></i>`)
+			.join("")}${leasts.length === 0 ? "?" : `${roll("lim:sum", Math.min(...leasts), "down")}%`}</span>`;
+		return wrap(parts.map((part) => part.chip).join("") + summary, parts.map((part) => part.tile).join(""));
+	};
 	const topbar = `<header class="topbar"><nav class="crumbs" aria-label="위치"><span>ompbot</span><span aria-hidden="true">/</span><span aria-current="page">${esc(
 		viewLabel,
-	)}</span></nav><div class="status-chips" aria-label="봇 상태">${chips.join("")}</div><div class="top-tools">${layoutSeg}<div class="seg" role="group" aria-label="테마">${themeBtn("system", "시스템")}${themeBtn("light", "라이트")}${themeBtn("dark", "다크")}</div><button type="button" class="cmd-trigger" data-cmd-open aria-label="명령 팔레트 열기"><span>명령</span><kbd>⌘K</kbd></button></div></header>`;
+	)}</span></nav><div class="status-chips" aria-label="봇 상태">${chips.join("")}</div>${limitsPop()}<div class="top-tools">${layoutSeg}<div class="seg" role="group" aria-label="테마">${themeBtn("system", "시스템")}${themeBtn("light", "라이트")}${themeBtn("dark", "다크")}</div><button type="button" class="cmd-trigger" data-cmd-open aria-label="명령 팔레트 열기"><span>명령</span><kbd>⌘K</kbd></button></div></header>`;
 	const content = view === "inbox" ? inboxView() : view === "list" ? listView() : sectionView();
 	return `${topbar}<nav class="sidenav" aria-label="보기">${nav}</nav><main class="view" id="view" aria-label="${esc(
 		viewLabel,
@@ -2668,7 +2776,9 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 				],
 			])}${
 				// The monitor's own conversation, while the turn board still lists it.
-				s.turns.ok && s.turns.threads.some((thread) => thread.originKey === monitor.originKey)
+				monitor.originKey !== null &&
+				s.turns.ok &&
+				s.turns.threads.some((thread) => thread.originKey === monitor.originKey)
 					? `<div class="detail-actions"><a class="button is-ghost" href="?view=turns&amp;item=${esc(
 							encodeURIComponent(monitor.originKey),
 						)}">이 모니터의 대화 보기</a></div>`
@@ -2939,17 +3049,19 @@ export function renderLiveTurn(
 		thinking?: unknown;
 		toolCalls?: unknown;
 		running?: unknown;
+		done?: unknown;
 		retry?: { attempt?: unknown; error?: unknown } | null;
 	};
 	const text = typeof view.text === "string" ? view.text : "";
 	const thinking = typeof view.thinking === "string" ? view.thinking : "";
 	const calls = Array.isArray(view.toolCalls) ? view.toolCalls : [];
 	const running = Array.isArray(view.running) ? view.running : [];
+	const done = Array.isArray(view.done) ? view.done : [];
 	const retry = view.retry ?? undefined;
 	if (text === "" && thinking === "" && calls.length === 0 && running.length === 0 && retry === undefined) return "";
 	const extra = Math.max(0, state.elapsedMs ?? 0);
-	const age = (ms: unknown): string => {
-		const seconds = Math.floor(((typeof ms === "number" ? ms : 0) + extra) / 1000);
+	const age = (ms: unknown, plus = extra): string => {
+		const seconds = Math.floor(((typeof ms === "number" ? ms : 0) + plus) / 1000);
 		return seconds < 60 ? `${seconds}초` : `${Math.floor(seconds / 60)}분 ${seconds % 60}초`;
 	};
 	const head = state.settling
@@ -2965,7 +3077,25 @@ export function renderLiveTurn(
 			(call: { name?: unknown; summary?: unknown } | null) =>
 				`<p class="live-tool"><code class="mono"><b>${esc(call?.name)}</b></code> <span>${esc(call?.summary)}</span> <span class="badge">준비 중</span></p>`,
 		),
-		...running.map(
+		done.length === 0
+			? ""
+			: `<ol class="live-steps" aria-label="도구 단계">${[
+					...done.map(
+						(step: { name?: unknown; summary?: unknown; ms?: unknown; failed?: unknown } | null, i: number) =>
+							`<li class="live-step is-${step?.failed === true ? "failed" : "done"}" data-step="${i}"><span class="step-mark" aria-hidden="true">${
+								step?.failed === true
+									? '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="m5 5 6 6M11 5l-6 6"/></svg>'
+									: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path class="step-tick" d="m4.5 8.4 2.2 2.2 4.8-5"/></svg>'
+							}</span><code class="mono"><b>${esc(step?.name)}</b></code> <span class="step-sum">${esc(step?.summary)}</span><span class="step-time">${
+								step?.failed === true ? "실패 · " : ""
+							}${age(step?.ms, 0)}</span></li>`,
+					),
+					...running.map(
+						(tool: { name?: unknown; summary?: unknown; ageMs?: unknown } | null) =>
+							`<li class="live-step is-running"><span class="step-mark" aria-hidden="true"><span class="live-spin"></span></span><code class="mono"><b>${esc(tool?.name)}</b></code> <span class="step-sum is-shimmer">${esc(tool?.summary)}</span><span class="step-time">${age(tool?.ageMs)}</span></li>`,
+					),
+				].join("")}</ol>`,
+		...(done.length > 0 ? [] : running).map(
 			(tool: { name?: unknown; summary?: unknown; ageMs?: unknown; outputTail?: unknown } | null, i: number) =>
 				`<details class="fold tool-call" data-fold="run-${i}" open><summary><code class="mono"><b>${esc(tool?.name)}</b></code> <span>${esc(tool?.summary)}</span> <span class="badge is-info">진행 중 · ${age(tool?.ageMs)}</span></summary>${
 					typeof tool?.outputTail === "string" && tool.outputTail !== ""
@@ -2976,6 +3106,178 @@ export function renderLiveTurn(
 		state.fail ? `<p class="turn-note">${esc(state.fail)}</p>` : "",
 	];
 	return `<article class="turn is-live${state.settling ? " is-settling" : ""}" aria-busy="${state.settling ? "false" : "true"}"><p class="turn-head"><b>omp</b>${head}</p>${parts.join("")}</article>`;
+}
+
+/** Where a number's change is bad news: a count that grew (`up`) or a remaining share that fell (`down`). */
+export type RollBad = "up" | "down";
+
+/** One header number that changed between two draws. */
+export interface RollChange {
+	key: string;
+	from: number;
+	to: number;
+	delta: number;
+}
+
+/**
+ * Header number roll: the keys whose value differs from the last draw, with the step. `prev` is the page's memory of
+ * the last values (never read back from the DOM); `next` is the memory to keep. The first draw (empty `prev`) changes
+ * nothing, and a key that was not there before is not a change. Self-contained (shipped to the page).
+ */
+export function rollDiff(
+	prev: Map<string, number>,
+	items: Array<{ key: string; value: number }>,
+): { changes: RollChange[]; next: Map<string, number> } {
+	const next = new Map<string, number>();
+	const changes: RollChange[] = [];
+	for (const item of items) {
+		next.set(item.key, item.value);
+		const from = prev.get(item.key);
+		if (prev.size === 0 || from === undefined || from === item.value) continue;
+		changes.push({ key: item.key, from, to: item.value, delta: item.value - from });
+	}
+	return { changes, next };
+}
+
+/** The effects the page plays for `changes`: none when the reader asked for less motion (it draws the final numbers). Self-contained. */
+export function rollEffects(changes: RollChange[], reduced: boolean): RollChange[] {
+	return reduced ? [] : changes;
+}
+
+/** A change's step as shown (`+2`, `−1`) and its tone: `bad` when it moved the way `bad` names. Self-contained. */
+export function rollLabel(change: RollChange, bad: RollBad | undefined): { text: string; tone: "good" | "bad" } {
+	const up = change.delta > 0;
+	return {
+		text: `${up ? "+" : "−"}${Math.abs(change.delta)}`,
+		tone: bad === undefined ? "good" : (bad === "up") === up ? "bad" : "good",
+	};
+}
+
+/** An inbox card the owner should see arrive: a card not in the last draw, or one that moved to another column. */
+export interface FreshCard {
+	id: string;
+	kind: "card" | "task";
+	col: string;
+	title: string;
+	why: "new" | "moved";
+}
+
+/**
+ * New event cards: of `entries`, those whose id was not in the last draw (`prev`: id → column memory) and those whose
+ * column changed. The first draw (empty `prev`) and `quiet` (the read marks' first visit) give none. `next` is the
+ * memory to keep. Self-contained (shipped to the page).
+ */
+export function freshCards(
+	prev: Map<string, string>,
+	entries: Array<{ id: string; kind: "card" | "task"; col: string; title: string }>,
+	quiet: boolean,
+): { cards: FreshCard[]; next: Map<string, string> } {
+	const next = new Map<string, string>();
+	const cards: FreshCard[] = [];
+	for (const entry of entries) {
+		next.set(entry.id, entry.col);
+		if (prev.size === 0 || quiet) continue;
+		const was = prev.get(entry.id);
+		if (was === entry.col) continue;
+		cards.push({
+			id: entry.id,
+			kind: entry.kind,
+			col: entry.col,
+			title: entry.title,
+			why: was === undefined ? "new" : "moved",
+		});
+	}
+	return { cards, next };
+}
+
+/** A card on the event stack. */
+export interface StackCard extends FreshCard {
+	at: number;
+}
+
+/** The stack after `fresh` cards arrive: newest first, one per id, at most six kept. Self-contained. */
+export function pushStack(list: StackCard[], fresh: FreshCard[], now: number): StackCard[] {
+	const ids = new Set(fresh.map((card) => card.id));
+	return [...fresh.map((card) => ({ ...card, at: now })).reverse(), ...list.filter((card) => !ids.has(card.id))].slice(
+		0,
+		6,
+	);
+}
+
+/**
+ * The stack after untouched time: the oldest card goes once `ttl` has passed since the later of its arrival and
+ * `since` (the last touch or the last card that went), one card per call. Nothing goes when the reader asked for less
+ * motion — the cards then stay until closed. Self-contained.
+ */
+export function expireStack(list: StackCard[], now: number, since: number, ttl: number, reduced: boolean): StackCard[] {
+	const oldest = list[list.length - 1];
+	if (reduced || oldest === undefined || now - Math.max(since, oldest.at) < ttl) return list;
+	return list.slice(0, -1);
+}
+
+/** The stack's cards as HTML (front card first, three shown) and its one-line announcement. Self-contained. */
+export function stackHtml(list: StackCard[]): { html: string; say: string } {
+	const esc = (value: unknown): string =>
+		String(value ?? "")
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#39;");
+	const COLS: Record<string, string> = { attention: "확인 필요", working: "진행 중", wait: "완료·대기" };
+	const shown = list.slice(0, 3);
+	const cards = shown.map((card, i) => {
+		const kind = card.kind === "task" ? "task" : "card";
+		return `<a class="es-card is-${card.col === "attention" ? "attention" : "plain"}" style="--i:${i}" href="?${kind}=${esc(
+			encodeURIComponent(card.id),
+		)}" data-${kind}="${esc(card.id)}" data-es-card="${esc(card.id)}"><span class="es-tag">${card.why === "new" ? "새 카드" : "상태 바뀜"} · ${esc(
+			COLS[card.col] ?? card.col,
+		)}</span><span class="es-title">${esc(card.title)}</span></a>`;
+	});
+	const first = list[0];
+	const say =
+		first === undefined
+			? ""
+			: `${first.why === "new" ? "새 카드" : "상태 바뀜"}: ${first.title}${list.length > 1 ? ` 외 ${list.length - 1}건` : ""}`;
+	return {
+		html:
+			list.length === 0
+				? ""
+				: `<div class="es-list" style="--n:${shown.length}">${cards.join("")}</div><button type="button" class="es-x" data-es-close aria-label="알림 닫기">×</button>`,
+		say,
+	};
+}
+
+/**
+ * How a card's state pill moves when its state key (`column:card status:TASK status`) changes: `ok` (check draw) when
+ * the new status is done or delivered, `bad` (shake) when failed or gone, else empty (the plain flash). No previous
+ * key or the same key gives empty. Self-contained.
+ */
+export function pillMotion(prev: string | undefined, next: string): "ok" | "bad" | "" {
+	if (prev === undefined || prev === next) return "";
+	const parts = next.split(":");
+	const status = parts[2] || parts[1] || "";
+	if (new Set(["done", "done-claimed", "delivered", "answered", "approved"]).has(status)) return "ok";
+	if (new Set(["failed", "failed_no_retry", "gone", "dead", "denied"]).has(status)) return "bad";
+	return "";
+}
+
+/**
+ * Live steps: a key per finished step (`name`, `summary`, time and failure, counted when they repeat) and the keys not
+ * seen before. `seen` null is the first look at a block: nothing is new. Self-contained.
+ */
+export function freshSteps(
+	seen: Set<string> | null,
+	steps: Array<{ name?: unknown; summary?: unknown; ms?: unknown; failed?: unknown }>,
+): { keys: string[]; fresh: number[] } {
+	const counts = new Map<string, number>();
+	const keys = steps.map((step) => {
+		const base = [step.name, step.summary, step.ms, step.failed === true].join("\u0000");
+		const n = (counts.get(base) ?? 0) + 1;
+		counts.set(base, n);
+		return `${base}#${n}`;
+	});
+	return { keys, fresh: seen === null ? [] : keys.flatMap((key, i) => (seen.has(key) ? [] : [i])) };
 }
 
 /**
@@ -3020,6 +3322,8 @@ const formatTypicalRange = ${formatTypicalRange.toString()};
 const typicalNote = ${typicalNote.toString()};
 const hostChecksLevel = ${hostChecksLevel.toString()};
 const repoCountsText = ${repoCountsText.toString()};
+const usageLevel = ${usageLevel.toString()};
+const resetIn = ${resetIn.toString()};
 const renderDashboardMain = ${renderDashboardMain.toString()};
 const renderTaskFacts = ${renderTaskFacts.toString()};
 const renderFlowChain = ${renderFlowChain.toString()};
@@ -3033,6 +3337,15 @@ const renderDetailTabs = ${renderDetailTabs.toString()};
 const renderPlan = ${renderPlan.toString()};
 const renderConversation = ${renderConversation.toString()};
 const renderLiveTurn = ${renderLiveTurn.toString()};
+const rollDiff = ${rollDiff.toString()};
+const rollEffects = ${rollEffects.toString()};
+const rollLabel = ${rollLabel.toString()};
+const freshCards = ${freshCards.toString()};
+const pushStack = ${pushStack.toString()};
+const expireStack = ${expireStack.toString()};
+const stackHtml = ${stackHtml.toString()};
+const pillMotion = ${pillMotion.toString()};
+const freshSteps = ${freshSteps.toString()};
 const renderMarkdown = ${renderMarkdown.toString()};
 const renderTrace = ${renderTrace.toString()};
 ${TRACE_CLIENT}
@@ -3053,6 +3366,9 @@ function boot() {
 	const cmdList = document.getElementById("cmd-list");
 	const helpModal = document.getElementById("kb-help");
 	const toast = document.getElementById("toast");
+	const stackEl = document.getElementById("event-stack");
+	const stackBody = document.getElementById("es-body");
+	const stackSay = document.getElementById("es-say");
 	const boardOn = main.getAttribute("data-board") === "1";
 	const LABELS = { card: "카드 상세", task: "TASK 상세", item: "항목 상세" };
 	let snapshot = null;
@@ -3099,6 +3415,22 @@ function boot() {
 	const changedUntil = new Map();
 	// Cards that newly need the owner or moved column: a 1.6 s ring, once (not on the first draw).
 	const ringUntil = new Map();
+	// Motion memory, kept here and never read back from the DOM (a rolling digit or a "+n" would pollute it): the header
+	// numbers, each inbox card's column, the event stack, and the live steps already shown.
+	const reducedMotion = () => !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+	let rollPrev = new Map();
+	let rollView = null;
+	const rollActive = new Map();
+	let colPrev = new Map();
+	let stack = [];
+	let stackTouched = 0;
+	let stackDropped = 0;
+	let stackTimer = null;
+	let stackDrawn = "";
+	const pillUntil = new Map();
+	let stepSeen = null;
+	let stepFor = "";
+	const popUntil = new Map();
 
 	// The inbox read marks live in this browser's localStorage only; a storage that cannot be used turns them off.
 	let unreadStore = null;
@@ -3272,6 +3604,9 @@ function boot() {
 			const prev = prevStates.get(id);
 			if (hadPrev && prev !== undefined && prev !== state) {
 				changedUntil.set(id, now + 1300);
+				const kind = pillMotion(prev, state);
+				if (kind) pillUntil.set(id, { kind: kind, until: now + 1300 });
+				else pillUntil.delete(id);
 			}
 			const col = state.split(":")[0];
 			if (hadPrev && (prev === undefined ? col === "attention" : prev.split(":")[0] !== col)) {
@@ -3280,8 +3615,115 @@ function boot() {
 			prevStates.set(id, state);
 			const until = changedUntil.get(id) || 0;
 			if (until > now) el.classList.add("is-changed");
+			const pill = pillUntil.get(id);
+			if (pill && pill.until > now) el.classList.add("pill-" + pill.kind);
 			if ((ringUntil.get(id) || 0) > now) el.classList.add("is-ring");
 		}
+	}
+	/** Plays one header number's roll (digit strips, then a "+n" at the chip's end that goes after what is left of 1.4 s). */
+	function playRoll(el, change, remaining) {
+		const to = String(change.to);
+		const from = String(change.from).padStart(to.length, "0").slice(-to.length);
+		el.textContent = "";
+		el.setAttribute("role", "img");
+		el.setAttribute("aria-label", to);
+		const strips = [];
+		for (let i = 0; i < to.length; i++) {
+			const col = document.createElement("span");
+			col.className = "roll-col";
+			col.setAttribute("aria-hidden", "true");
+			const strip = document.createElement("span");
+			strip.className = "roll-strip";
+			for (let d = 0; d < 10; d++) {
+				const cell = document.createElement("i");
+				cell.textContent = String(d);
+				strip.appendChild(cell);
+			}
+			strip.style.transform = "translateY(" + -Number(from[i]) * 1.2 + "em)";
+			col.appendChild(strip);
+			el.appendChild(col);
+			strips.push([strip, Number(to[i])]);
+		}
+		requestAnimationFrame(() =>
+			requestAnimationFrame(() => {
+				for (const [strip, digit] of strips) strip.style.transform = "translateY(" + -digit * 1.2 + "em)";
+			}),
+		);
+		const label = rollLabel(change, el.getAttribute("data-roll-bad") || undefined);
+		const tag = document.createElement("small");
+		tag.className = "roll-delta is-" + label.tone;
+		tag.textContent = label.text;
+		const chip = el.closest(".badge, .limit-chip") || el.parentNode;
+		const twin = [...chip.querySelectorAll(".roll-delta")].some((other) => other.textContent === label.text);
+		if (!twin) chip.append(tag);
+		setTimeout(() => {
+			tag.remove();
+			el.textContent = to;
+			el.removeAttribute("role");
+			el.removeAttribute("aria-label");
+		}, remaining);
+	}
+	/** Right after a redraw: compares the header numbers with the last draw's and rolls the ones that changed. */
+	function drawRolls() {
+		const els = main.querySelectorAll("[data-roll]");
+		const items = [];
+		const keys = new Set();
+		for (const el of els) {
+			const key = el.getAttribute("data-roll");
+			const value = Number(el.getAttribute("data-roll-v"));
+			if (!key || !Number.isFinite(value) || keys.has(key)) continue;
+			keys.add(key);
+			items.push({ key: key, value: value });
+		}
+		const result = rollDiff(rollView === ui.view ? rollPrev : new Map(), items);
+		rollPrev = result.next;
+		rollView = ui.view;
+		const now = Date.now();
+		for (const change of rollEffects(result.changes, reducedMotion())) rollActive.set(change.key, { change: change, until: now + 1400 });
+		for (const el of els) {
+			const active = rollActive.get(el.getAttribute("data-roll"));
+			if (active && active.until > now) playRoll(el, active.change, active.until - now);
+		}
+		for (const [key, active] of rollActive) if (active.until <= now) rollActive.delete(key);
+	}
+	/** Draws the stack's cards (three at most) and says the newest in one line. */
+	function drawStack() {
+		const out = stackHtml(stack);
+		// Only a changed stack is redrawn, so the front card's entrance does not replay on every clock tick.
+		if (out.html !== stackDrawn) {
+			stackDrawn = out.html;
+			stackBody.innerHTML = out.html;
+			stackSay.textContent = out.say;
+		}
+		stackEl.hidden = stack.length === 0;
+		if (stack.length === 0) stackEl.classList.remove("is-open");
+		if (stackTimer) clearTimeout(stackTimer);
+		stackTimer = stack.length === 0 || reducedMotion() ? null : setTimeout(tickStack, 1000);
+	}
+	function tickStack() {
+		const now = Date.now();
+		if (stackEl.matches(":hover, :focus-within, .is-open")) stackTouched = now;
+		const left = expireStack(stack, now, Math.max(stackTouched, stackDropped), 6000, reducedMotion());
+		if (left.length !== stack.length) {
+			stackDropped = now;
+			stack = left;
+		}
+		drawStack();
+	}
+	/** New inbox cards and cards that changed column go on the event stack; \`quiet\` is the read marks' first visit. */
+	function syncStack(quiet) {
+		const entries = inboxEntries(snapshot, board === null ? undefined : board).map((entry) => ({
+			id: entry.id,
+			kind: entry.kind,
+			col: entry.col,
+			title: entry.title,
+		}));
+		const result = freshCards(colPrev, entries, quiet);
+		colPrev = result.next;
+		const fresh = result.cards.filter((card) => !open || open.id !== card.id);
+		if (fresh.length === 0) return;
+		stack = pushStack(stack, fresh, Date.now());
+		drawStack();
 	}
 	/**
 	 * Tab title, tab icon and the quiet next line from the last snapshot and board; \`failed\` (or #stale showing) marks
@@ -3333,7 +3775,9 @@ function boot() {
 	function drawMain(top) {
 		if (!snapshot) return;
 		const now = Date.now();
+		const firstVisit = unreadStore !== null && !readUnread(unreadStore).seeded;
 		const unread = syncUnread(now);
+		syncStack(firstVisit);
 		const html = renderDashboardMain(snapshot, board === null ? undefined : board, now, {
 			view: ui.view,
 			q: ui.q,
@@ -3357,6 +3801,7 @@ function boot() {
 		main.innerHTML = html;
 		drawnMain = html;
 		markChanges();
+		drawRolls();
 		updateTabSignal();
 		scrollToHere(main);
 		const next = document.getElementById("view");
@@ -3542,6 +3987,23 @@ function boot() {
 			elapsedMs: Date.now() - liveAt,
 		});
 	}
+	/** Finished steps seen for the first time get their check popped (once; a redraw does not replay older ones). */
+	function popSteps(slot) {
+		const done = liveView && Array.isArray(liveView.done) ? liveView.done : [];
+		if (liveView && liveView.inboundId !== stepFor) {
+			stepFor = liveView.inboundId;
+			stepSeen = null;
+		}
+		const result = freshSteps(stepSeen, done);
+		stepSeen = new Set(result.keys);
+		const now = Date.now();
+		if (!reducedMotion()) for (const i of result.fresh) popUntil.set(result.keys[i], now + 420);
+		const items = slot.querySelectorAll(".live-step[data-step]");
+		for (let i = 0; i < items.length; i++) {
+			const until = popUntil.get(result.keys[i]) || 0;
+			if (until > now) items[i].classList.add("is-new");
+		}
+	}
 	/** Redraws only the live block; keeps its open folds, and the reader's place unless they were at the bottom. */
 	function drawLive() {
 		const slot = conv.querySelector("[data-live]");
@@ -3554,6 +4016,7 @@ function boot() {
 		const top = detail.scrollTop;
 		slot.innerHTML = html;
 		drawnLive = html;
+		popSteps(slot);
 		for (const fold of slot.querySelectorAll("details[data-fold]")) {
 			const was = folds.get(fold.getAttribute("data-fold"));
 			if (was !== undefined) fold.open = was;
@@ -3866,10 +4329,34 @@ function boot() {
 		if (target && target.link) target.link.focus();
 	}
 
+	const touchStack = () => {
+		stackTouched = Date.now();
+	};
+	stackEl.addEventListener("mouseenter", touchStack);
+	stackEl.addEventListener("focusin", touchStack);
 	const plain = (event) => event.button === 0 && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey;
 	document.addEventListener("click", (event) => {
 		const target = event.target instanceof Element ? event.target : null;
 		if (!target) return;
+		if (!target.closest("#event-stack")) stackEl.classList.remove("is-open");
+		if (target.closest("[data-es-close]")) {
+			event.preventDefault();
+			stack = [];
+			return drawStack();
+		}
+		const stacked = target.closest("[data-es-card]");
+		if (stacked) {
+			// On a touch screen the first tap unfolds the stack; the next opens the card.
+			if (window.matchMedia("(hover: none)").matches && !stackEl.classList.contains("is-open")) {
+				event.preventDefault();
+				stackEl.classList.add("is-open");
+				stackTouched = Date.now();
+				return;
+			}
+			const gone = stacked.getAttribute("data-es-card");
+			stack = stack.filter((card) => card.id !== gone);
+			drawStack();
+		}
 		const copyBtn = target.closest("[data-copy]");
 		if (copyBtn) {
 			event.preventDefault();
@@ -4356,6 +4843,7 @@ ${open === undefined ? `<aside id="detail" class="detail" aria-label="${label}" 
 <div id="cmd-palette" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="명령 팔레트" hidden><div class="modal-card"><div class="cmd-head"><input id="cmd-input" type="text" placeholder="보기 전환, TASK ID·카드 이동, 테마 전환…" aria-label="명령 또는 TASK 검색" autocomplete="off"><button type="button" class="detail-close" data-cmd-close>닫기 <kbd>Esc</kbd></button></div><div id="cmd-list" class="cmd-list" role="listbox" aria-label="명령 목록"></div></div></div>
 <div id="kb-help" class="modal-backdrop" role="dialog" aria-modal="true" aria-label="단축키 도움말" hidden><div class="modal-card"><div class="help-head"><h2 class="h3">키보드 단축키</h2><button type="button" class="detail-close" data-help-close>닫기 <kbd>Esc</kbd></button></div><div class="help-body"><div class="help-group"><h3 class="h3">목록·상세 탐색</h3><div class="help-row"><span>다음·이전 항목</span><span><kbd>j</kbd> <kbd>k</kbd> / <kbd>↓</kbd> <kbd>↑</kbd></span></div><div class="help-row"><span>상세 열기</span><kbd>Enter</kbd></div><div class="help-row"><span>상세·창 닫기</span><kbd>Esc</kbd></div><div class="help-row"><span>검색창 포커스</span><kbd>/</kbd></div><div class="help-row"><span>확인 필요 n번째 열기</span><span><kbd>1</kbd>–<kbd>9</kbd></span></div><div class="help-row"><span>다음 항목에 답하기(herdr)</span><kbd>r</kbd></div><div class="help-row"><span>명령 팔레트</span><span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd></span></div><div class="help-row"><span>단축키 도움말</span><kbd>?</kbd></div></div><div class="help-group"><h3 class="h3">턴 트레이스</h3><div class="help-row"><span>단계 이동</span><span><kbd>↓</kbd> <kbd>↑</kbd> · <kbd>Home</kbd> <kbd>End</kbd></span></div><div class="help-row"><span>펼치기·자식으로</span><kbd>→</kbd></div><div class="help-row"><span>접기·부모로</span><kbd>←</kbd></div><div class="help-row"><span>단계 상세 열고 닫기</span><span><kbd>Enter</kbd> / <kbd>Space</kbd></span></div><div class="help-row"><span>단계 상세 닫기</span><kbd>Esc</kbd></div></div><div class="help-group"><h3 class="h3">보기 바로 이동</h3><div class="help-row"><span>에이전트 인박스 (Board)</span><span><kbd>g</kbd> <kbd>i</kbd></span></div><div class="help-row"><span>에이전트 목록 (List)</span><span><kbd>g</kbd> <kbd>l</kbd></span></div><div class="help-row"><span>진행 중 턴</span><span><kbd>g</kbd> <kbd>t</kbd></span></div><div class="help-row"><span>흐름</span><span><kbd>g</kbd> <kbd>f</kbd></span></div><div class="help-row"><span>레인</span><span><kbd>g</kbd> <kbd>n</kbd></span></div><div class="help-row"><span>승인 대기</span><span><kbd>g</kbd> <kbd>a</kbd></span></div><div class="help-row"><span>모니터 / 알림 / 시스템</span><span><kbd>g</kbd> <kbd>m</kbd> / <kbd>e</kbd> / <kbd>s</kbd></span></div></div></div></div></div>
 <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<div id="event-stack" class="event-stack" hidden><p id="es-say" class="es-say" aria-live="polite"></p><div id="es-body"></div></div>
 <p id="stale" class="stale" role="status" hidden></p>
 ${board === undefined ? "" : `<script type="application/json" id="board-data">${JSON.stringify(board).replace(/</g, "\\u003c")}</script>\n`}<script>${SCRIPT}</script>
 </body>

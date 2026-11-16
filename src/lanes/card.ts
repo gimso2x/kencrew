@@ -1,8 +1,11 @@
 import type { ActionButton } from "../channel/port";
 import { mentionToken } from "../channel/port";
+import { escapeMrkdwn } from "../channel/text";
+import type { ChatPlatform } from "../core/origin-key";
 import { redact } from "../redact";
 import type { TaskCard } from "../tasks/notify";
 import { CHECK_TIMEOUT_MS } from "../tasks/signals";
+import { workerLine } from "../tasks/worker-tier";
 import { REVIEW_BLOCK } from "./land";
 import { formatConfidence } from "./review";
 import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneChanges, type LaneRow } from "./status";
@@ -24,6 +27,10 @@ const LANE_NAME = /^[a-z0-9가-힣-]{1,64}$/;
 const SUMMARY_MAX = 300;
 /** Characters of the reviewer's findings quoted on an ask card. */
 const REVIEW_NOTES_SHOWN = 600;
+/** Run QA findings quoted on a card (doc/plans/bot-org-risk-gates.md 단계 3). */
+const QA_FINDINGS_SHOWN = 3;
+/** Paths outside the lane's scope named on a card (the rest are counted). */
+const SCOPE_SHOWN = 5;
 
 export const laneMergeActionId = (name: string): string => `${LANE_MERGE_ACTION_PREFIX}${name}`;
 export const laneDiscardActionId = (name: string): string => `${LANE_DISCARD_ACTION_PREFIX}${name}`;
@@ -112,8 +119,14 @@ function overlapLine(changes: LaneChanges): string[] {
 	return changes.overlapError === undefined ? [] : ["⚠️ 겹침: 일부 확인 실패"];
 }
 
-export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCard {
+/**
+ * `platform` is the chat the card goes to: on Slack the body is mrkdwn, so the text the model wrote (claim summary,
+ * review notes) and the landing's reasons are escaped there — `<!channel>` stays text (qa-l #82). The title is a
+ * plain-text header and is left as it is.
+ */
+export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform: ChatPlatform = "slack"): TaskCard {
 	const { meta } = lane;
+	const mrkdwn = (text: string): string => (platform === "slack" ? escapeMrkdwn(text) : text);
 	const base = meta.baseBranch ?? "?";
 	const sha = (meta.sha ?? "").slice(0, 12);
 	const acceptance = meta.acceptance ?? [];
@@ -127,8 +140,16 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 		const own = checks.filter((check) => check.id === item.id);
 		return own.length > 0 && own.every((check) => check.ok);
 	}).length;
-	const summary =
-		meta.claim === undefined ? [] : [`• ${clip(redact(meta.claim.summary).replace(/\s+/g, " ").trim(), SUMMARY_MAX)}`];
+	const claimed =
+		meta.claim === undefined
+			? []
+			: [`• ${mrkdwn(clip(redact(meta.claim.summary).replace(/\s+/g, " ").trim(), SUMMARY_MAX))}`];
+	const worker = workerLine({
+		tier: meta.tier ?? null,
+		tierReason: meta.tierReason ?? null,
+		workerModel: meta.workerModel ?? null,
+	});
+	const summary = worker === undefined ? claimed : [...claimed, mrkdwn(worker)];
 	const checkLine =
 		checks.length === 0
 			? ["재실행 검사 없음 — 봇이 직접 확인한 수락기준이 없습니다."]
@@ -136,6 +157,32 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 	// What the claim commit changed (`computeLaneChanges`): only the record of this very commit is shown.
 	const changes = meta.changes !== undefined && meta.changes.sha === meta.sha ? meta.changes : undefined;
 	const changeLines = changes === undefined ? [] : [...topLine(changes), ...overlapLine(changes)];
+	// The close's scope check and the claim's leftovers (doc/plans/bot-org-risk-gates.md 단계 2).
+	const outside = meta.scopeViolations ?? [];
+	const leftovers = meta.leftovers ?? [];
+	const blockingLeft = leftovers.filter((item) => item.blocking).length;
+	const scopeLines =
+		meta.scopeError !== undefined
+			? [`⚠️ 범위 검사 실패: ${mrkdwn(meta.scopeError)}`]
+			: outside.length === 0
+				? []
+				: [
+						`⚠️ 범위 밖 파일 ${outside.length}개: ${mrkdwn(outside.slice(0, SCOPE_SHOWN).join(", "))}${
+							outside.length > SCOPE_SHOWN ? ` 외 ${outside.length - SCOPE_SHOWN}개` : ""
+						}`,
+					];
+	const leftoverCount = `${leftovers.length}개${blockingLeft === 0 ? "" : `(막는 것 ${blockingLeft}개)`}`;
+	// The run QA (`taskAutoLand.qa`) of this very commit: its verdict under the review line, at most three findings.
+	const qa = meta.qa !== undefined && meta.qa.sha === meta.sha ? meta.qa : undefined;
+	const qaLines =
+		qa === undefined
+			? []
+			: [
+					`🧪 실행 QA(뚱기 · ${qa.model.replace(/^.*\//, "").replace(/:[^:]*$/, "")}): ${
+						qa.verdict === "inconclusive" ? `확인 불가(${mrkdwn(qa.reason ?? "?")})` : qa.verdict
+					}`,
+					...qa.findings.slice(0, QA_FINDINGS_SHOWN).map((finding) => `> ${mrkdwn(clip(redact(finding), 200))}`),
+				];
 	const held = meta.land?.autoLandHeld;
 	const integrity =
 		held === INTEGRITY_APPROVED
@@ -159,6 +206,10 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 								: "확인 실패",
 					},
 				]),
+		...(meta.scope === undefined
+			? []
+			: [{ label: "범위 밖", value: meta.scopeError === undefined ? `${outside.length}개` : "검사 실패" }]),
+		...(leftovers.length === 0 ? [] : [{ label: "남은 일", value: leftoverCount }]),
 	];
 	const mention = (ownerUserId: string | undefined): string =>
 		ownerUserId === undefined ? "" : ` ${mentionToken(ownerUserId)}`;
@@ -180,7 +231,7 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 			view.skipped?.includes(REVIEW_BLOCK) === true && review?.verdict === "BLOCK" && review.notes !== ""
 				? [
 						"*리뷰 지적*",
-						...clip(redact(review.notes), REVIEW_NOTES_SHOWN)
+						...mrkdwn(clip(redact(review.notes), REVIEW_NOTES_SHOWN))
 							.split("\n")
 							.map((line) => `> ${line}`),
 					]
@@ -191,9 +242,12 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 				...summary,
 				...skipped,
 				...findings,
+				...qaLines,
 				...integrity,
 				...checkLine,
 				...changeLines,
+				...scopeLines,
+				...(leftovers.length === 0 ? [] : [`남은 일 ${leftoverCount}`]),
 				`브랜치 \`${meta.branch ?? "?"}\`를 \`${base}\`에 머지할까요?${mention(view.ownerUserId)}`,
 				'버튼을 누르거나 이 스레드에 "머지해" 또는 "폐기해"라고만 답해 주세요. 고칠 점이 있으면 `!reopen <지시>`로 적어 주세요.',
 			],
@@ -208,6 +262,7 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 						`🔎 독립 리뷰 CLEAR${review.confidence === undefined ? "" : ` ${formatConfidence(review.confidence)}`} · ${review.model}`,
 					]
 				: []),
+			...qaLines,
 			...summary,
 		]);
 	}
@@ -232,7 +287,7 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 		const push =
 			land.pushed === undefined ? "push 없음(origin 원격이 없거나 push 대상이 아님)" : `push \`${land.pushed}\``;
 		return card(`✅ 머지 완료 · ${lane.title}`, [
-			`\`${base}\` ← \`${sha}\` (${how}) · ${push} · ${land.cleanup === undefined ? "worktree·브랜치 정리" : `⚠️ ${redact(land.cleanup)}`}`,
+			`\`${base}\` ← \`${sha}\` (${how}) · ${push} · ${land.cleanup === undefined ? "worktree·브랜치 정리" : `⚠️ ${mrkdwn(redact(land.cleanup))}`}`,
 			...summary,
 			undoLine(lane),
 			"서비스 반영(재시작)이 필요하면 따로 승인해 주세요.",
@@ -241,8 +296,8 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 	if (land?.state === "merged-not-pushed") {
 		return card(`⚠️ 머지됨 · push 안 됨 · ${lane.title}`, [
 			`\`${base}\` ← \`${sha}\` (${how}) ${land.cleanup === undefined ? "머지와 worktree 정리는" : "머지는"} 끝났지만 push origin/${base}가 되지 않았습니다.${mention(view.ownerUserId)}`,
-			`사유: ${redact(land.reason ?? "(알 수 없음)")}`,
-			...(land.cleanup === undefined ? [] : [`⚠️ ${redact(land.cleanup)}`]),
+			`사유: ${mrkdwn(redact(land.reason ?? "(알 수 없음)"))}`,
+			...(land.cleanup === undefined ? [] : [`⚠️ ${mrkdwn(redact(land.cleanup))}`]),
 			`직접 확인한 뒤 \`git -C ${meta.repo ?? "<repo>"} push origin ${base}\`로 올려 주세요.`,
 			undoLine(lane),
 		]);
@@ -258,7 +313,7 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView): TaskCar
 		`🚧 머지 막힘 · ${lane.title}`,
 		[
 			`머지를 끝내지 못했습니다.${mention(view.ownerUserId)}`,
-			`사유: ${redact(land?.reason ?? "(알 수 없음)")}`,
+			`사유: ${mrkdwn(redact(land?.reason ?? "(알 수 없음)"))}`,
 			...summary,
 			'원인을 치운 뒤 `머지`를 다시 누르거나 "머지해"라고 답해 주세요. 버리려면 `폐기`입니다.',
 		],

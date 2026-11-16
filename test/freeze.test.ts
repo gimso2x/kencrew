@@ -3,7 +3,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, st
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runCli } from "../src/cli/index";
-import { Daemon } from "../src/daemon/daemon";
+import { openBotStore } from "../src/core/origin";
+import { Daemon, PENDING_ALERT_AFTER } from "../src/daemon/daemon";
 import { auditContext, createDispatchAudit, describeCall, installProcessAudit } from "../src/dispatch/audit";
 import { realProcessRunner } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
@@ -16,6 +17,7 @@ import { SKILL_REVIEW_ORIGIN } from "../src/review/skills";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { isRoot } from "./helpers/privileges";
 
 let dir: string;
 
@@ -61,7 +63,9 @@ describe("FROZEN file", () => {
 		expect(readFileSync(join(dir, "unfrozen-at"), "utf8").trim()).toBe("2026-11-12T01:00:00.000Z");
 	});
 
-	test("a failed unfreeze does not stamp unfrozen-at (J-4)", () => {
+	// skipIf(isRoot): root removes a 0o500 dir, and clearFreeze has no rm seam to fail it another way
+	// biome-ignore format: keeps the reason link on the skip line
+	test.skipIf(isRoot)("a failed unfreeze does not stamp unfrozen-at (J-4)", () => { // root ignores permission bits, so this setup cannot fail
 		const locked = join(freezePath(dir), "locked");
 		mkdirSync(locked, { recursive: true });
 		writeFileSync(join(locked, "f"), "x");
@@ -227,6 +231,32 @@ describe("gate and CLI", () => {
 		expect(gate()?.state).toBe("closed");
 	});
 
+	test("qa-l #16: an unfrozen-at that is a directory or a FIFO makes unfreeze exit 1 with the errno, FROZEN kept", async () => {
+		const stamp = join(dir, "unfrozen-at");
+		for (const kind of ["dir", "fifo"] as const) {
+			writeFreeze(dir, { reason: "x", by: "cli", now: Date.now() });
+			if (kind === "dir") mkdirSync(stamp);
+			else expect(Bun.spawnSync(["mkfifo", stamp]).exitCode).toBe(0);
+			const err: string[] = [];
+			const write = process.stderr.write.bind(process.stderr);
+			process.stderr.write = ((chunk: string) => {
+				err.push(String(chunk));
+				return true;
+			}) as typeof process.stderr.write;
+			let code: number;
+			try {
+				code = await runCli(["unfreeze"], { OMPBOT_HOME: dir });
+			} finally {
+				process.stderr.write = write;
+			}
+			expect(code).toBe(1);
+			expect(err.join("")).toContain(`unfreeze: ${stamp}: ${kind === "dir" ? "EISDIR" : "EINVAL"}`);
+			expect(readFreeze(dir)).toBeDefined();
+			rmSync(stamp, { recursive: true, force: true });
+			rmSync(freezePath(dir), { force: true });
+		}
+	});
+
 	test("ompbot freeze / gates --json / unfreeze round trip", async () => {
 		const out: string[] = [];
 		const write = process.stdout.write.bind(process.stdout);
@@ -328,5 +358,129 @@ describe("daemon under freeze", () => {
 		expect(origins).not.toContain(SKILL_REVIEW_ORIGIN);
 		expect(lines.filter((line) => line.includes("event=skill_review_skipped_frozen"))).toHaveLength(1);
 		expect(daemon?.drainCounts().turns).toBe(0);
+	});
+});
+
+describe("autonomous rows under freeze", () => {
+	const realNow = Date.now;
+	let home: TestHome;
+	let daemon: Daemon | undefined;
+	let lines: string[];
+	let started: string[];
+	let waiters: Set<() => void>;
+	let t: number;
+
+	beforeEach(() => {
+		home = makeHome("ompbot-freeze-hold-");
+		lines = [];
+		started = [];
+		waiters = new Set();
+		t = realNow();
+		// The freeze probe reads `Date.now` captured at construction: a fake lets a test cross its cache window.
+		Date.now = () => t;
+	});
+	afterEach(async () => {
+		Date.now = realNow;
+		await daemon?.stop();
+		home.remove();
+	});
+
+	const seed = (rows: Array<{ originKey: string; id: string; text: string }>) => {
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => t }, "Asia/Seoul");
+		for (const row of rows) {
+			store.ensureOrigin(row.originKey, join(home.dir, "sess", row.originKey.replace(/\W/g, "_")));
+			store.recordInbound({
+				originKey: row.originKey,
+				platformMessageId: row.id,
+				textRef: row.text,
+				threadRef: row.id,
+			});
+		}
+		store.close();
+	};
+	const boot = async (): Promise<Daemon> => {
+		const sessions = new FakeSessionStore();
+		const clock = { now: () => t };
+		daemon = new Daemon({
+			config: home.config,
+			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			clock,
+			log: createLogger({
+				sink: (line) => {
+					lines.push(line);
+					for (const wake of [...waiters]) wake();
+				},
+				clock,
+				redact,
+			}),
+			ompVersion: "omp-test 0",
+			bootId: "boot",
+			sweepMs: 3_600_000,
+			gateSweepMs: 0,
+			taskSweepMs: 0,
+			pendingRetryMs: 60_000,
+			driverFactory: (origin, sessionDir) => {
+				started.push(origin);
+				return new FakeOmpDriver({ sessionDir, store: sessions });
+			},
+		});
+		await daemon.start();
+		return daemon;
+	};
+	const waitForStarted = (count: number): Promise<void> => {
+		const { promise, resolve, reject } = Promise.withResolvers<void>();
+		const check = () => {
+			if (started.length < count) return;
+			clearTimeout(timer);
+			waiters.delete(check);
+			resolve();
+		};
+		const timer = setTimeout(() => {
+			waiters.delete(check);
+			reject(new Error(`only ${started.length} turns started`));
+		}, 4_000);
+		waiters.add(check);
+		check();
+		return promise;
+	};
+	const stateOf = (id: string) => daemon?.store.getInbound(id)?.state;
+	const MONITOR = { originKey: "monitor/m1", id: "monitor:m1:1", text: "tick" };
+	const LANE = { originKey: "slack/dm/D1", id: "lane:l1:nudge:1", text: "자동 재촉" };
+
+	test("AC-1/AC-5: start frozen leaves monitor and lane rows pending with no turn and no retry or alert; after the unfreeze the first sweep dispatches them even under 60s old", async () => {
+		writeFreeze(home.dir, { reason: "hold", by: "cli", now: t });
+		seed([MONITOR, LANE]);
+		const d = await boot();
+		expect(started).toEqual([]);
+		expect(stateOf(MONITOR.id)).toBe("pending");
+		expect(stateOf(LANE.id)).toBe("pending");
+
+		// More sweeps than the alert threshold, each past the retry age: nothing is retried, nothing is reported.
+		for (let i = 0; i < PENDING_ALERT_AFTER + 2; i++) {
+			t += 61_000;
+			await d.sweep();
+		}
+		expect(started).toEqual([]);
+		expect(lines.some((line) => /event=(pending_retry_failed|pending_dispatch_notified)/.test(line))).toBe(false);
+		expect(d.store.recordAlertIncident("dispatch:monitor/m1", "x", t)).toMatchObject({ count: 1 });
+		d.store.resolveAlertIncidents("dispatch:monitor/m1");
+
+		// A row younger than the retry age when the freeze lifts is still resumed by the very next sweep.
+		d.store.recordInbound({ originKey: LANE.originKey, platformMessageId: "lane:l1:nudge:2", textRef: "새 지시" });
+		clearFreeze(home.dir);
+		t += 3_000;
+		await d.sweep();
+		await waitForStarted(2);
+		expect(started.sort()).toEqual([LANE.originKey, MONITOR.originKey].sort());
+	});
+
+	test("AC-6: an owner !stop while frozen leaves the held autonomous row pending", async () => {
+		writeFreeze(home.dir, { reason: "hold", by: "cli", now: t });
+		seed([LANE]);
+		const d = await boot();
+		await d.inject({ origin: LANE.originKey, asOwner: true, text: "!stop" });
+		expect(stateOf(LANE.id)).toBe("pending");
+		await d.inject({ origin: LANE.originKey, asOwner: true, text: "!queue" });
+		expect(started).toEqual([]);
 	});
 });

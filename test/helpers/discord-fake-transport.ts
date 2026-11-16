@@ -7,6 +7,7 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
+	type DiscordRole,
 	type DiscordTransport,
 	type DownloadAttachmentArgs,
 	type EditMessageArgs,
@@ -181,6 +182,11 @@ export class FakeDiscordTransport implements DiscordTransport {
 	/** A gateway Ready (`resumed: false`, a new session) or Resumed after `start`. */
 	emitReady(info: { resumed: boolean }): void {
 		this.handlers?.ready?.(info);
+	}
+
+	/** Guild roles as GUILD_CREATE / GUILD_ROLE_CREATE would bring them. */
+	emitRoles(roles: ReadonlyArray<DiscordRole>): void {
+		this.handlers?.roles?.(roles);
 	}
 
 	async emitMessage(event: DiscordMessageEvent): Promise<void> {

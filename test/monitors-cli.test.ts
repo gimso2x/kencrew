@@ -411,6 +411,30 @@ describe("ompbot monitors (CLI)", () => {
 		}
 	});
 
+	test("test on a script monitor stores the payload redacted, like the daemon does (qa-l 47)", async () => {
+		const token = `xoxb-${"1234567890-".repeat(3)}abcdefghij`;
+		const script = writeScript("secret.sh", `#!/bin/sh\necho 'token=${token} end'\n`);
+		const added = await monitors(
+			"add",
+			"--json",
+			JSON.stringify({
+				name: "sec",
+				trigger: { kind: "script", command: [script], intervalMs: 60_000 },
+				instruction: "i",
+			}),
+		);
+		expect(added.code).toBe(0);
+		expect((await monitors("test", "sec")).code).toBe(0);
+		const ledger = openMonitorLedger(join(home.dir, "ompbot.db"));
+		try {
+			const payload = ledger.listEvents()[0]?.payload ?? "";
+			expect(payload).not.toContain(token);
+			expect(payload).toContain("[REDACTED]");
+		} finally {
+			ledger.close();
+		}
+	});
+
 	test("test on a script monitor runs with config.workspaceDir as cwd, like the sweep", async () => {
 		// The sweep passes cwd = config.workspaceDir (monitors/scheduler.ts); a relative-path script must pass here too.
 		writeFileSync(join(home.dir, "workspace", "marker.txt"), "x");

@@ -215,19 +215,43 @@ function graphIssues(spec: Record<string, unknown>): string[] {
 	const issues = Object.keys(elements)
 		.filter((id) => id.includes("#"))
 		.map((id) => `element id "${id}" must not contain "#"`);
+	// `children` is a list of element ids; a string would be read as one reference per character.
+	for (const [id, element] of Object.entries(elements))
+		if (isRecord(element) && !(Array.isArray(element.children) && element.children.every((c) => typeof c === "string")))
+			issues.push(`element "${id}": children must be an array of element ids`);
 	const reached = new Set<string>();
-	const visit = (id: unknown): void => {
-		if (typeof id !== "string") return;
+	// Walked with a stack, not recursion: a card nested tens of thousands deep must not overflow the call stack.
+	const pending: unknown[] = [spec.root];
+	while (pending.length > 0) {
+		const id = pending.pop();
+		if (typeof id !== "string") continue;
 		if (reached.has(id)) {
 			issues.push(`element "${id}" is referenced more than once (cycle or shared child)`);
-			return;
+			continue;
 		}
 		reached.add(id);
 		const element = elements[id];
-		if (isRecord(element) && Array.isArray(element.children)) for (const child of element.children) visit(child);
-	};
-	visit(spec.root);
+		if (!isRecord(element) || !Array.isArray(element.children)) continue;
+		for (let i = element.children.length - 1; i >= 0; i--) pending.push(element.children[i]);
+	}
 	return [...new Set(issues)];
+}
+
+/** One issue per image URL (the card's own and every Image) that is not an `http(s)` URL, which no platform may be handed. */
+function imageUrlIssues(card: CardElement): string[] {
+	const issues: string[] = [];
+	const check = (url: string): void => {
+		if (!/^https?:\/\//i.test(url)) issues.push(`image url "${url.slice(0, 60)}" must be an http(s) URL`);
+	};
+	const walk = (children: readonly CardChild[]): void => {
+		for (const child of children) {
+			if (child.type === "image") check(child.url);
+			else if (child.type === "section") walk(child.children);
+		}
+	};
+	if (card.imageUrl) check(card.imageUrl);
+	walk(card.children);
+	return issues;
 }
 
 /**
@@ -276,6 +300,8 @@ export function validateCard(json: string): ValidatedCard {
 			components: CARD_COMPONENTS,
 			limits: CARD_LIMITS,
 		});
+		const badUrls = imageUrlIssues(card);
+		if (badUrls.length > 0) return { ok: false, issues: badUrls };
 		const repeated = repeatedCategories(card.children);
 		if (repeated.length > 0) return { ok: false, issues: repeated };
 		return tone === undefined ? { ok: true, card } : { ok: true, card, tone };

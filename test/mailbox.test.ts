@@ -134,7 +134,10 @@ class SteerFailingDriver extends FakeOmpDriver {
 		this.stateCalls += 1;
 		return { ...(await super.state()), queuedMessageCount: this.queued };
 	}
+	/** A driver stopped under the mailbox (rpc `stop()` after an unreadable line): `prompt()` throws `not_started`. */
+	stopped = false;
 	override async prompt(text: string): Promise<string> {
+		if (this.stopped) throw new OmpDriverError("not_started", "driver not started");
 		if (this.stale) throw new OmpDriverError("rpc_error", "Could not restore model: fake/alpha");
 		this.lastOpRef = await super.prompt(text);
 		return this.lastOpRef;
@@ -1024,6 +1027,18 @@ describe("mailbox: consecutive failure escalation (무인 신뢰성 루프)", ()
 		expect(drivers).toHaveLength(1); // the child itself was never restarted, nor the session reopened
 	});
 
+	test("a prompt that finds its driver stopped (not_started) is retried once on a new driver (qa-l #63)", async () => {
+		await router.route(msg("fine first"));
+		await router.mailbox(ORIGIN).sweepIdle();
+		const dead = drivers[0] as SteerFailingDriver;
+		dead.stopped = true;
+		const next = msg("after the stop");
+		await router.route(next);
+		await router.mailbox(ORIGIN).sweepIdle();
+		expect(drivers).toHaveLength(2);
+		expect(store.getInbound(next.platformMessageId)?.state).toBe("answered");
+	});
+
 	test("model-sign failures without any fallback escalate at the default threshold", async () => {
 		await router.route(msg("fine first"));
 		await router.mailbox(ORIGIN).sweepIdle();
@@ -1111,6 +1126,16 @@ describe("mailbox: consecutive failure escalation (무인 신뢰성 루프)", ()
 		await router.route(msg("fail e")); // 3rd of the new run
 		expect(escalations).toHaveLength(1);
 		expect(escalations[0]?.failures).toBe(3);
+	});
+
+	test("the omp_exit log line carries the dead child's stderr tail (qa-l #62)", async () => {
+		driverOptions = { holdTurns: true };
+		await router.route(msg("job"));
+		const driver = drivers.at(-1);
+		if (!driver) throw new Error("no driver was started");
+		driver.crash(137);
+		await router.mailbox(ORIGIN).sweepIdle();
+		expect(logLines.some((line) => line.includes("event=omp_exit") && line.includes("fake crash"))).toBe(true);
 	});
 
 	test("a child dying mid-turn counts too (omp_exited sign, no live driver to re-heal)", async () => {
@@ -2190,7 +2215,6 @@ describe("mailbox: a child started before a peer bot wrote in its conversation",
 		await mailbox.sweepIdle();
 		expect(prompts()).toEqual(["first", told ?? "", "fourth"]);
 		expect(drivers).toHaveLength(1);
-		expect(logLines.some((line) => line.includes("driver_restart_peer_touched"))).toBe(false);
 	});
 
 	test("a child without host tools (agy, claude) is kept and gets no notice", async () => {

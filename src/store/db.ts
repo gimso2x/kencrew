@@ -234,8 +234,8 @@ type ExpiredApproval = {
 };
 
 /**
- * Written by older versions (owner 👍/👎 on answers): nothing reads or writes these tables now. `delivery_posts` rows
- * still go with their delivery in `gc`; `turn_feedback` is never pruned.
+ * Written by older versions (delivery pinning): nothing reads or writes this table now. Its rows still go with their
+ * delivery in `gc`.
  */
 const LEGACY_FEEDBACK_DDL = `
 CREATE TABLE IF NOT EXISTS delivery_posts (
@@ -246,20 +246,6 @@ CREATE TABLE IF NOT EXISTS delivery_posts (
 	created_at INTEGER NOT NULL,
 	PRIMARY KEY (channel, ts)
 );
-CREATE TABLE IF NOT EXISTS turn_feedback (
-	channel TEXT NOT NULL,
-	ts TEXT NOT NULL,
-	delivery_id INTEGER NOT NULL,
-	origin_key TEXT NOT NULL,
-	op_ref TEXT NOT NULL,
-	inbound_id INTEGER,
-	verdict TEXT NOT NULL CHECK (verdict IN ('up','down')),
-	last_event_ts TEXT NOT NULL,
-	created_at INTEGER NOT NULL,
-	removed_at INTEGER,
-	PRIMARY KEY (channel, ts)
-);
-CREATE INDEX IF NOT EXISTS turn_feedback_turn ON turn_feedback(origin_key, op_ref);
 `;
 
 /**
@@ -416,21 +402,6 @@ export const HERDR_PROMPT_ROWS_KEPT = 20;
 export const HERDR_PROMPT_KEEP_MS = 30 * 24 * 60 * 60_000;
 /** Longest stored preview. */
 export const HERDR_PROMPT_PREVIEW_CHARS = 120;
-
-/** Left from the removed Discord forum board: nothing reads or writes it any more; existing installs keep their rows. */
-const DISCORD_BOARD_DDL = `CREATE TABLE IF NOT EXISTS discord_board_posts (
-	forum_id TEXT NOT NULL,
-	item_key TEXT NOT NULL,
-	thread_id TEXT NOT NULL,
-	message_id TEXT NOT NULL,
-	status TEXT NOT NULL,
-	last_comment_status TEXT,
-	rendered_hash TEXT NOT NULL,
-	status_since INTEGER NOT NULL,
-	archived_at INTEGER,
-	updated_at INTEGER NOT NULL,
-	PRIMARY KEY (forum_id, item_key)
-);`;
 
 /**
  * One peer bot mentioned by one confirmed delivery (doc/plans/peer-silence-alert.md): `pending` until a post of that
@@ -605,10 +576,6 @@ CREATE TABLE IF NOT EXISTS teams_qa (
 	at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS teams_qa_alias_at ON teams_qa(alias, at);
-CREATE TABLE IF NOT EXISTS thread_mutes (
-	thread_ref TEXT PRIMARY KEY,
-	muted_at INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS usage_daily (
 	day TEXT NOT NULL,
 	origin_key TEXT NOT NULL,
@@ -619,7 +586,6 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 ${LEGACY_FEEDBACK_DDL}
 ${TURN_SNAPSHOTS_DDL}
 ${HERDR_PROMPTS_DDL}
-${DISCORD_BOARD_DDL}
 ${PEER_CALLS_DDL}
 ${LANE_BOARD_DDL}
 `;
@@ -817,6 +783,7 @@ export class Store {
 			clock: options.clock,
 			redact: options.redact,
 			onCheckErrorAlert: (alert) => this.postCheckErrorNotice(alert),
+			canAlert: (monitorId) => this.ownerHome() !== undefined || this.noteUnroutableCheckError(monitorId),
 		});
 		this.tasks = new TaskLedger(this.db, { clock: options.clock, timezone: options.timezone });
 		this.recoveredInflight = this.db
@@ -1024,11 +991,6 @@ export class Store {
 		return rows.map((row) => row.origin_key);
 	}
 
-	/** `listOrigins("slack")`: the Slack backfill's channel targets. */
-	listSlackOrigins(): string[] {
-		return this.listOrigins("slack");
-	}
-
 	/**
 	 * Threads the bot answered in recently on one chat platform's origins (deliveries carry `<channel>:<rootTs>`),
 	 * newest first — backfill thread targets. The 7-day window and cap mirror the upstream participated-thread
@@ -1050,11 +1012,6 @@ export class Store {
 			targets.push({ channel: parsed.channel, rootTs: parsed.threadTs });
 		}
 		return targets;
-	}
-
-	/** `listThreadTargets("slack", …)`: the Slack backfill's thread targets. */
-	listSlackThreadTargets(since: number, limit: number): Array<{ channel: string; rootTs: string }> {
-		return this.listThreadTargets("slack", since, limit);
 	}
 
 	/**
@@ -1591,11 +1548,6 @@ export class Store {
 		return dm ?? this.slackOwnerUserId ?? "";
 	}
 
-	/** Slack only: thread ref of a top-level post in the Slack owner DM (`ownerChannel()`). */
-	topLevelThreadRef(): string {
-		return `${this.ownerChannel()}:${TOP_LEVEL_TS}`;
-	}
-
 	/** `!home`: the conversation owner notices go to from now on, ahead of every fallback of `ownerHome()`. */
 	setOwnerHome(home: OwnerHome): void {
 		this.db
@@ -1912,20 +1864,30 @@ export class Store {
 		return this.db.transaction(() => {
 			const settled = this.monitors.settleFailed(eventId, error, options);
 			if (!settled?.terminal) return undefined;
+			// Without an owner destination the incident is not consumed: a later failure must still alert.
+			const target = { originKey: monitorOrigin(settled.event.monitorId), opRef: `monitor-notice:${eventId}` };
+			const threadRef = this.ownerTopLevelThreadRef(target);
+			if (threadRef === undefined) return undefined;
 			// Same monitor + same normalized error inside the repeat window stays quiet (hermes incident dedup).
 			const incident = this.monitors.recordMonitorIncident(settled.event.monitorId, error, this.clock.now());
 			if (!incident.notify) return undefined;
 			const reason = error.replace(/^\[(?:turn|command) failed\]\s*/, "").replace(/\s+—.*$/, "");
 			const repeat = incident.count > 1 ? ` · 반복 ${incident.count}회차` : "";
-			const target = { originKey: monitorOrigin(settled.event.monitorId), opRef: `monitor-notice:${eventId}` };
-			const threadRef = this.ownerTopLevelThreadRef(target);
-			if (threadRef === undefined) return undefined;
 			return this.insertDelivery(
 				{ ...target, threadRef },
 				0,
 				`⏰ ${settled.monitorName}\n⚠️ 모니터 실행이 ${settled.event.attempts}번 실패해 재시도를 멈췄습니다 (failed_no_retry${repeat}): ${reason}`,
 			);
 		})();
+	}
+
+	/** Reports a check-error alert that has no owner destination; always false so `canAlert` can chain it. */
+	private noteUnroutableCheckError(monitorId: string): false {
+		this.hooks.onOwnerNoticeUnroutable?.({
+			originKey: monitorOrigin(monitorId),
+			opRef: `monitor-check-error:${this.clock.now()}`,
+		});
+		return false;
 	}
 
 	/** A script check or watch that keeps failing: one notice at the top of the owner home, like a failed_no_retry one. */
@@ -2095,16 +2057,6 @@ export class Store {
 			.run(at, originKey, opRef).changes;
 	}
 
-	/** Deletes the rows older than `cutoff` (by `ended_at`) and returns them, so `ompbot gc` can drop their refs. */
-	deleteTurnSnapshotsBefore(cutoff: number): TurnSnapshotRow[] {
-		const rows = this.db
-			.query("SELECT * FROM turn_snapshots WHERE ended_at < ? ORDER BY id")
-			.all(cutoff) as TurnSnapshotSql[];
-		if (rows.length === 0) return [];
-		this.db.query("DELETE FROM turn_snapshots WHERE ended_at < ?").run(cutoff);
-		return rows.map(toTurnSnapshot);
-	}
-
 	// ---- deliveries ----
 
 	getDelivery(deliveryId: number): DeliveryRow | undefined {
@@ -2134,6 +2086,40 @@ export class Store {
 			)
 			.all(threadRef, excludeOriginKey, limit) as DeliverySql[];
 		return rows.map(toDelivery).reverse();
+	}
+
+	/**
+	 * The origin's newest answered exchanges of `epoch`, oldest first: each confirmed first answer part with the first
+	 * message of the turn it answered (a rotated agy conversation is re-fed these).
+	 */
+	listOriginExchanges(
+		originKey: string,
+		epoch: number,
+		limit: number,
+	): Array<{ question: string; askedAt: number; answer: string; answeredAt: number }> {
+		const rows = this.db
+			.query(
+				`SELECT i.text_ref AS question, i.created_at AS asked_at, d.body AS answer, d.created_at AS answered_at
+				 FROM deliveries d JOIN inbound i ON i.inbound_id = (
+					SELECT MIN(inbound_id) FROM inbound WHERE origin_key = d.origin_key AND op_ref = d.op_ref AND epoch = ?
+				 )
+				 WHERE d.origin_key = ? AND d.state = 'confirmed' AND d.part = 0
+				 ORDER BY d.delivery_id DESC LIMIT ?`,
+			)
+			.all(epoch, originKey, limit) as Array<{
+			question: string;
+			asked_at: number;
+			answer: string;
+			answered_at: number;
+		}>;
+		return rows
+			.map((row) => ({
+				question: row.question,
+				askedAt: row.asked_at,
+				answer: row.answer,
+				answeredAt: row.answered_at,
+			}))
+			.reverse();
 	}
 
 	/** Per-state delivery row counts (`GROUP BY`); lets /status count without loading every body. */

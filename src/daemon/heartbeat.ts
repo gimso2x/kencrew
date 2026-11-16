@@ -1,7 +1,6 @@
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import { parseStampFields, parseStampTs, writeAtomic0600 } from "../ops/stamp";
+import { parseStampFields, parseStampTs, readRegularText, writeAtomic0600 } from "../ops/stamp";
 
 /** The histogram type `monitorEventLoopDelay` returns (derived: bun-types does not export `IntervalHistogram`). */
 type LoopHistogram = ReturnType<typeof monitorEventLoopDelay>;
@@ -16,7 +15,7 @@ export const EVENT_LOOP_WARN_MS = 5_000;
 const LOOP_RESOLUTION_MS = 20;
 
 export interface SweepHeartbeat {
-	/** Parsed from the stamp's `ts=` field; falls back to the file mtime. */
+	/** Parsed from the stamp's `ts=` field;  */
 	ts: Date;
 	/** Max observed event-loop delay since the previous sweep, milliseconds (`loop_ms=` in the stamp). */
 	loopMs: number | undefined;
@@ -40,12 +39,12 @@ export function readSweepHeartbeat(homeDir: string): SweepHeartbeat | undefined 
 	const path = join(homeDir, SWEEP_HEARTBEAT_FILE);
 	let text: string;
 	try {
-		text = readFileSync(path, "utf8");
+		text = readRegularText(path);
 	} catch {
 		return undefined;
 	}
 	const fields = parseStampFields(text);
-	const ts = parseStampTs(fields, path);
+	const ts = parseStampTs(fields);
 	if (ts === undefined) return undefined;
 	const loopMs = fields.get("loop_ms");
 	const result: SweepHeartbeat = {

@@ -39,11 +39,21 @@ const CHECK_OPEN = "[check:";
 /** Worktree-relative file path: the host interpolates it into a path check, so only these characters pass. */
 const RELATIVE_PATH = /^[A-Za-z0-9_./-]+$/;
 
-/** Index just past the closing quote of the JSON string opening at `i`. */
+/** Index just past the closing quote of the JSON string opening at `i`; `-1` when it is never closed. */
 function skipString(s: string, i: number): number {
 	let end = i + 1;
 	while (end < s.length && s[end] !== '"') end += s[end] === "\\" ? 2 : 1;
-	return end + 1;
+	return end < s.length ? end + 1 : -1;
+}
+
+/** Double quotes of `s` that a backslash does not escape (a backslash pair, then a quote, still counts). */
+function unescapedQuotes(s: string): number {
+	let count = 0;
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] === "\\") i += 1;
+		else if (s[i] === '"') count += 1;
+	}
+	return count;
 }
 
 /** Index of the bracket closing the one at `open` (quotes and nesting respected); `-1` when it never closes. */
@@ -51,8 +61,11 @@ function closingBracket(s: string, open: number): number {
 	let depth = 0;
 	for (let i = open; i < s.length; i++) {
 		const c = s[i];
-		if (c === '"') i = skipString(s, i) - 1;
-		else if (c === "[" || c === "{") depth += 1;
+		if (c === '"') {
+			const past = skipString(s, i);
+			if (past === -1) return -1;
+			i = past - 1;
+		} else if (c === "[" || c === "{") depth += 1;
 		else if ((c === "]" || c === "}") && --depth === 0) return i;
 	}
 	return -1;
@@ -80,7 +93,8 @@ export function checkSignalsOf(text: string): string[] {
 	let start = 0;
 	for (let i = 0; i < body.length; i++) {
 		const c = body[i];
-		if (c === '"') i = skipString(body, i) - 1;
+		// An unpaired quote is a character, not a string that swallows the rest.
+		if (c === '"') i = Math.max(skipString(body, i) - 1, i);
 		else if (c === "[" || c === "{") i = Math.max(closingBracket(body, i), i);
 		else if (c === ";") {
 			parts.push(body.slice(start, i));
@@ -108,11 +122,15 @@ export function withoutCheckTail(text: string): string {
  * quotation and does not count. Throws `SignalSyntaxError` on a second block or on text after the block.
  */
 export function assertCheckPlacement(text: string): void {
+	// Quotes that do not pair up shift every later string boundary, so which `[check:` is quoted is anyone's guess.
+	if (text.split(CHECK_OPEN).length > 2 && unescapedQuotes(text) % 2 === 1)
+		throw new SignalSyntaxError('큰따옴표(")의 짝이 맞지 않아 [check: …] 블록을 가릴 수 없습니다 — 따옴표를 닫으세요');
 	const blocks: Array<[number, number]> = [];
 	for (let i = 0; i < text.length; i++) {
 		const c = text[i];
 		if (c === '"') {
-			i = skipString(text, i) - 1;
+			// An unpaired quote is a character: the blocks after it still count.
+			i = Math.max(skipString(text, i) - 1, i);
 		} else if (c === "`") {
 			let run = i;
 			while (text[run] === "`") run += 1;
@@ -150,7 +168,7 @@ export function parseChecks(text: string): Signal[] {
 function readValue(s: string, i: number): { value: unknown; text: string; end: number } {
 	const open = s[i];
 	let end: number;
-	if (open === '"') end = skipString(s, i);
+	if (open === '"') end = skipString(s, i) === -1 ? s.length : skipString(s, i);
 	else if (open === "[" || open === "{") end = closingBracket(s, i) + 1 || s.length;
 	else {
 		end = i;
@@ -254,7 +272,7 @@ export function parseSignal(raw: string): Signal {
 /** What the host gives a signal: the worktree is implied. */
 export interface SignalIo {
 	/** `argv` without a shell in the worktree under `CHECK_TIMEOUT_MS`; `output` is stdout then stderr. */
-	runCheck(argv: string[]): Promise<{ code: number | null; output: string; timedOut: boolean }>;
+	runCheck(argv: string[]): Promise<{ code: number | null; output: string; timedOut: boolean; truncated?: boolean }>;
 	/**
 	 * A worktree-relative file's bytes; `undefined` when it does not exist (an unreadable host throws). Bytes, not text:
 	 * `sha256` must hash the file itself, which a UTF-8 decode would change for a binary file (qa-i #126).
@@ -299,6 +317,9 @@ export async function runSignal(raw: string, io: SignalIo): Promise<SignalCheck>
 				inconclusive: true,
 			};
 		if (result.code !== 0) return verdict(false, `exit ${result.code}: ${tail(result.output) || "(출력 없음)"}`);
+		// Only the head of an over-cap output was kept: a regex on it (a tail anchor above all) proves nothing.
+		if (parsed.stdout !== undefined && result.truncated === true)
+			return verdict(false, "출력이 수집 상한을 넘어 끝부분을 볼 수 없어 stdout~ 검사를 판정하지 못했습니다");
 		if (parsed.stdout !== undefined && !parsed.stdout.test(result.output))
 			return verdict(false, `exit 0, 출력이 ${parsed.stdout}와 맞지 않습니다: ${tail(result.output) || "(출력 없음)"}`);
 		return verdict(true, parsed.stdout === undefined ? "exit 0" : `exit 0, 출력이 ${parsed.stdout}와 맞습니다`);

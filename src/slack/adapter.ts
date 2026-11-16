@@ -391,9 +391,9 @@ export class SlackAdapter implements ChannelAdapter {
 		const refused = await recordPeerInbound(this.core, this.log, inbound, this.peerHopLimit, drop, () =>
 			this.postNotice(event.channel, PEER_HOP_NOTICE, event.thread_ts ?? event.ts),
 		);
-		if (refused !== undefined) return refused;
+		if (refused !== undefined && refused !== "held") return refused;
 		const parsed = parseThreadRef(inbound.threadRef);
-		if (parsed) {
+		if (parsed && refused === undefined) {
 			await this.beginStatus(inbound.threadRef, parsed.channel, parsed.threadTs, event, inbound.originKey, true);
 		}
 		return "recorded";

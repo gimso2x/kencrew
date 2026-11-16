@@ -1,4 +1,15 @@
-import { chmodSync, copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	copyFileSync,
+	existsSync,
+	lstatSync,
+	mkdirSync,
+	readdirSync,
+	readFileSync,
+	renameSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { open, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -486,13 +497,22 @@ export function installSkill(dir: string, proposal: SkillProposal, now: number):
 	return revision;
 }
 
-/** Revision files of a skill, newest first (timestamp names sort chronologically); empty when there are none. */
+/** `<stamp>.md` or `<stamp>-<n>.md` (a second revision in the same millisecond) as `[stamp, n]`. */
+function revisionOrder(name: string): [string, number] {
+	const match = /^(.*?)(?:-(\d+))?\.md$/.exec(name);
+	return [match?.[1] ?? name, match?.[2] === undefined ? 1 : Number(match[2])];
+}
+
+/** Revision files of a skill, newest first (timestamp, then the same-millisecond counter); empty when there are none. */
 export function listSkillRevisions(dir: string): string[] {
 	try {
 		return readdirSync(join(dir, SKILL_REVISIONS_DIR))
 			.filter((name) => name.endsWith(".md"))
-			.sort()
-			.reverse()
+			.sort((a, b) => {
+				const [stampA, nA] = revisionOrder(a);
+				const [stampB, nB] = revisionOrder(b);
+				return stampA < stampB ? 1 : stampA > stampB ? -1 : nB - nA;
+			})
 			.map((name) => join(dir, SKILL_REVISIONS_DIR, name));
 	} catch {
 		return [];
@@ -508,9 +528,36 @@ export function rollbackSkill(dir: string): string {
 	if (!existsSync(current)) throw new Error(`skill not installed: ${dir}`);
 	const newest = listSkillRevisions(dir)[0];
 	if (newest === undefined) throw new Error(`no saved revision for ${dir}`);
+	// The swap writes both files, so a link there would carry the write (or the read) outside the skill directory.
+	for (const path of [dir, join(dir, SKILL_REVISIONS_DIR), current, newest]) {
+		if (lstatSync(path).isSymbolicLink()) throw new Error(`rollback refused: ${path} is a symbolic link`);
+	}
+	for (const path of [current, newest]) {
+		if (lstatSync(path).nlink > 1) throw new Error(`rollback refused: ${path} has more than one hard link`);
+	}
 	const outgoing = readFileSync(current);
 	const previous = readFileSync(newest);
-	writeFileSync(current, previous, { mode: 0o600 });
-	writeFileSync(newest, outgoing, { mode: 0o600 });
+	const currentMode = lstatSync(current).mode & 0o777;
+	const slotMode = lstatSync(newest).mode & 0o777;
+	// Both new contents land in temp files first: a failed write (full disk, read-only slot) leaves SKILL.md as it was.
+	const stagedSlot = `${newest}.rollback-tmp`;
+	const stagedCurrent = `${current}.rollback-tmp`;
+	try {
+		writeFileSync(stagedSlot, outgoing, { mode: slotMode });
+		writeFileSync(stagedCurrent, previous, { mode: currentMode });
+		renameSync(stagedSlot, newest);
+	} catch (error) {
+		rmSync(stagedSlot, { force: true });
+		rmSync(stagedCurrent, { force: true });
+		throw error;
+	}
+	try {
+		renameSync(stagedCurrent, current);
+	} catch (error) {
+		// The slot already holds today's content: put the old revision back so nothing is lost.
+		writeFileSync(newest, previous, { mode: slotMode });
+		rmSync(stagedCurrent, { force: true });
+		throw error;
+	}
 	return newest;
 }

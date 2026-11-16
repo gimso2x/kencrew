@@ -36,3 +36,14 @@ describe("renderMarkdownParts qa-i low", () => {
 		}
 	});
 });
+
+describe("toMrkdwn qa-l", () => {
+	test("a link with nested square brackets in the label or nested parentheses in the url converts (qa-l #56)", () => {
+		expect(toMrkdwn("[API [v2] 문서](https://x.test/p)")).toBe("<https://x.test/p|API [v2] 문서>");
+		expect(toMrkdwn("[a](https://x.test/a_(b_(c)))")).toBe("<https://x.test/a_(b_(c))|a>");
+		expect(toMrkdwn("[a](https://x.test/1) and [b](https://x.test/2)")).toBe(
+			"<https://x.test/1|a> and <https://x.test/2|b>",
+		);
+		expect(toMrkdwn("[unclosed](https://x.test/a_(b")).toBe("[unclosed](https://x.test/a_(b");
+	});
+});

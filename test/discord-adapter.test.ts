@@ -154,6 +154,15 @@ describe("owner DM", () => {
 			},
 		]);
 	});
+
+	test("ingestOwner on a DM the daemon calls `ch` with a threadId: the DM's own channel id is the origin, the thread id only the reply reference", async () => {
+		const made = await adapter();
+		transport.setChannel({ id: DM, type: 1 });
+		const marker = nextId();
+		const root = nextId();
+		await made.ingestOwner({ conversationId: DM, kind: "ch", threadId: root, messageId: marker, text: "머지해" });
+		expect(inbound.map((entry) => entry.originKey)).toEqual([`discord/dm/${DM}`]);
+	});
 });
 
 describe("slash commands are gone", () => {
@@ -261,6 +270,23 @@ describe("server channel", () => {
 		await transport.emitMessage(root);
 		await transport.emitMessage(message("스레드 안 멘션 없이", { channel_id: root.id }));
 		expect(inbound.map((m) => m.text)).toEqual(["멘션"]);
+	});
+
+	test("④ requireMention: the bot's managed role mention addresses it, another role does not", async () => {
+		await adapter({ requireMention: true });
+		transport.emitRoles([{ id: "900000000000000001", tags: { bot_id: BOT } }, { id: "900000000000000002" }]);
+		await transport.emitMessage(message("<@&900000000000000002> 남의 역할"));
+		await transport.emitMessage(message("<@&900000000000000001> 역할로 부름"));
+		expect(inbound.map((m) => m.text)).toEqual(["역할로 부름"]);
+	});
+
+	test("a malformed role element is skipped without throwing; the valid roles of the same event still count (qa-l #59)", async () => {
+		await adapter({ requireMention: true });
+		expect(() =>
+			transport.emitRoles([null, "x", { name: "no id" }, { id: "900000000000000001", tags: { bot_id: BOT } }] as never),
+		).not.toThrow();
+		await transport.emitMessage(message("<@&900000000000000001> 역할로 부름"));
+		expect(inbound.map((m) => m.text)).toEqual(["역할로 부름"]);
 	});
 
 	test("⑤ strangers, bots and servers outside guildIds are never taken", async () => {
@@ -470,6 +496,14 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 		await transport.emitMessage(message(`<@${BOT}> <@${PEER}> 둘 다`, { channel_id: root.id }));
 		expect(inbound.map((m) => m.text)).toEqual(["시작", `<@${PEER}> 둘 다`]);
 		expect(logs.filter((line) => line.includes("reason=not_addressed"))).toHaveLength(2);
+	});
+
+	test("an owner message that mentions only the peer's managed role is the peer's in a mention-free channel", async () => {
+		await peerAdapter(undefined, { mentionFreeChannels: [CH] });
+		transport.emitRoles([{ id: "900000000000000003", tags: { bot_id: PEER } }]);
+		await transport.emitMessage(message("<@&900000000000000003> 봐줘"));
+		expect(inbound).toHaveLength(0);
+		expect(logged("reason=not_addressed")).toBe(true);
 	});
 
 	test("setChannelPolicy takes the shared peerHopLimit for the next peer message", async () => {

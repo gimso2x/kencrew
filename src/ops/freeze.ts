@@ -1,5 +1,6 @@
-import { existsSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { readRegularText } from "./stamp";
 
 /** `<home>/FROZEN`: while it exists the bot takes no autonomous action; owner conversation turns stay allowed. */
 export interface FreezeState {
@@ -30,7 +31,7 @@ export function unfrozenAtPath(homeDir: string): string {
 /** When the last freeze was lifted (ms epoch); `undefined` without a readable stamp. */
 export function readUnfrozenAt(homeDir: string): number | undefined {
 	try {
-		const at = Date.parse(readFileSync(unfrozenAtPath(homeDir), "utf8").trim());
+		const at = Date.parse(readRegularText(unfrozenAtPath(homeDir)).trim());
 		return Number.isNaN(at) ? undefined : at;
 	} catch {
 		return undefined;
@@ -45,7 +46,7 @@ export function readFreeze(homeDir: string): FreezeState | undefined {
 	const path = freezePath(homeDir);
 	if (!existsSync(path)) return undefined;
 	try {
-		const raw = JSON.parse(readFileSync(path, "utf8")) as Partial<FreezeState>;
+		const raw = JSON.parse(readRegularText(path)) as Partial<FreezeState>;
 		return {
 			since: typeof raw.since === "string" ? raw.since : "unknown",
 			reason: typeof raw.reason === "string" ? raw.reason : "",
@@ -89,9 +90,14 @@ export function clearFreeze(homeDir: string, now: number = Date.now()): boolean 
 	const was = lstatSync(path, { throwIfNoEntry: false }) !== undefined;
 	if (!was) return false;
 	const stampPath = unfrozenAtPath(homeDir);
+	// Opening a FIFO for writing blocks for good; refuse before touching anything so FROZEN stays and the CLI can report it.
+	const stampKind = statSync(stampPath, { throwIfNoEntry: false });
+	if (stampKind !== undefined && !stampKind.isFile() && !stampKind.isDirectory()) {
+		throw Object.assign(new Error(`${stampPath} is not a regular file`), { code: "EINVAL", path: stampPath });
+	}
 	let previous: string | undefined;
 	try {
-		previous = readFileSync(stampPath, "utf8");
+		previous = readRegularText(stampPath);
 	} catch {
 		previous = undefined;
 	}

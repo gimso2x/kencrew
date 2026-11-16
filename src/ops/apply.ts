@@ -379,8 +379,11 @@ export interface CodeRollbackJournal {
 /** The journal in `gitDir`; undefined when there is none. Throws when it exists but is not a complete journal. */
 export function readCodeRollbackJournal(gitDir: string): CodeRollbackJournal | undefined {
 	let text: string;
+	const path = join(gitDir, CODE_ROLLBACK_JOURNAL);
 	try {
-		text = readFileSync(join(gitDir, CODE_ROLLBACK_JOURNAL), "utf8");
+		// A FIFO or device in the journal's place would block the read for good.
+		if (!statSync(path).isFile()) throw new Error("not a regular file");
+		text = readFileSync(path, "utf8");
 	} catch (error) {
 		if (errorCode(error) === "ENOENT") return undefined;
 		throw error;

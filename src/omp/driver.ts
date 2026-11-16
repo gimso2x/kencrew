@@ -140,6 +140,21 @@ export interface OmpFinal {
 	/** Final assistant text of the session at turn end; `""` when there is none. */
 	text: string;
 	error?: string;
+	/** What the turn spent, from a driver without a priced session file (agy); omp leaves it unset. */
+	usage?: OmpTurnUsage;
+}
+
+/** Token spend of one turn as the agent CLI reported it per model call; no price (agy reports none). */
+export interface OmpTurnUsage {
+	/** Model calls the turn made. */
+	calls: number;
+	input: number;
+	cacheRead: number;
+	output: number;
+	/** Context size of the turn's last call (its input + cacheRead); unset when no call reported usage. */
+	contextTokens?: number;
+	/** The conversation was full and was dropped after this turn: the next turn starts a new one. */
+	rotated: boolean;
 }
 
 export interface OmpState {

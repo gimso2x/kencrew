@@ -18,8 +18,6 @@ const HOST_CHECKS_TIMEOUT_MS = 5_000;
 const HOST_CHECKS_STDOUT_CAP = 1_000_000;
 const ERROR_CHARS = 200;
 
-export type HostCheckState = "ok" | "fail" | "stale" | "skipped";
-
 export interface HostCheckIssue {
 	id: string;
 	label: string;

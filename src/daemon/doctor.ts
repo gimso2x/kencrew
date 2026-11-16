@@ -19,6 +19,7 @@ import { checkOmpRuntime } from "../omp/runtime-check";
 import { CODE_ROLLBACK_JOURNAL, type CodeRollbackJournal, readCodeRollbackJournal } from "../ops/apply";
 import { BUNDLE_SOURCES, readStamp } from "../ops/backup";
 import { BACKUP_MAX_AGE_MS } from "../ops/gates";
+import { OWNER_NOTES_MAX_BYTES, PERSONA_MAX_BYTES, SOUL_MAX_BYTES } from "../safety/prompt";
 import { readVersion } from "./tools";
 
 /** Whether something accepts TCP connections at `host:port` (the webhook listener answers only when it bound). */
@@ -84,7 +85,10 @@ const TOKEN_FILE_ERRORS: Record<string, true> = { secret_missing: true, secret_p
 export function secretProblem(path: string, prefix: string): string | undefined {
 	let mode: number;
 	try {
-		mode = modeOf(path);
+		const stat = statSync(path);
+		// A FIFO or device in the file's place would block the read below for good.
+		if (!stat.isFile()) return `not a regular file (replace it: umask 077; cat > ${path})`;
+		mode = stat.mode & 0o777;
 	} catch {
 		return `missing (write it: umask 077; cat > ${path})`;
 	}
@@ -165,10 +169,48 @@ export function checkBackupBundle(homeDir: string, report: Report, warn: (name: 
 	} else if (stamp.bundle === undefined) {
 		report(true, "backup bundle", "sources=none (ledger-only home)");
 	} else if (!existsSync(join(homeDir, "backups", stamp.bundle))) {
-		report(false, "backup bundle", `bundle=${stamp.bundle} missing`);
+		report(false, "backup bundle", `bundle=${escapeControl(stamp.bundle)} missing`);
 	} else {
 		const hours = (Date.now() - stamp.ts.getTime()) / 3_600_000;
-		report(hours <= BACKUP_MAX_AGE_MS / 3_600_000, "backup bundle", `bundle=${stamp.bundle} hours=${hours.toFixed(1)}`);
+		report(
+			hours <= BACKUP_MAX_AGE_MS / 3_600_000,
+			"backup bundle",
+			`bundle=${escapeControl(stamp.bundle)} hours=${hours.toFixed(1)}`,
+		);
+	}
+}
+
+/** Share of an injected file's cap from which doctor warns that it is about to be cut. */
+const INJECTED_WARN_RATIO = 0.9;
+
+/**
+ * `warn` lines for the workspace files the floors prompt injects (`persona.md`, `soul.md`, `owner.md`) at or over 90%
+ * of their cap, or past it (then their tail is cut off). Sizes are of the symlink target; a missing file says nothing.
+ */
+export function checkInjectedFiles(homeDir: string, warn: (name: string, detail: string) => void): void {
+	const caps: ReadonlyArray<[string, number]> = [
+		["persona.md", PERSONA_MAX_BYTES],
+		["soul.md", SOUL_MAX_BYTES],
+		["owner.md", OWNER_NOTES_MAX_BYTES],
+	];
+	for (const [name, cap] of caps) {
+		let size: number;
+		try {
+			const stat = statSync(join(homeDir, "workspace", name));
+			if (!stat.isFile()) {
+				warn(`injected ${name}`, `${stat.isDirectory() ? "EISDIR: " : ""}not a regular file`);
+				continue;
+			}
+			size = stat.size;
+		} catch {
+			continue;
+		}
+		const percent = Math.floor((size / cap) * 100);
+		if (size > cap) {
+			warn(`injected ${name}`, `${size}/${cap} bytes (${percent}%): over the cap, injected with its tail cut off`);
+		} else if (size >= cap * INJECTED_WARN_RATIO) {
+			warn(`injected ${name}`, `${size}/${cap} bytes (${percent}%): near the cap, trim it before it is cut off`);
+		}
 	}
 }
 
@@ -382,6 +424,7 @@ export async function runDoctor(homeDir: string, write: (line: string) => void, 
 	);
 
 	checkBackupBundle(homeDir, report, warn);
+	checkInjectedFiles(homeDir, warn);
 	if (repoDir !== undefined) checkCodeRollbackJournal(repoDir, warn);
 
 	if (config && !tokensOk) {

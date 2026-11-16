@@ -67,6 +67,7 @@ export type LaneHarnessExtra = Partial<
 		| "ownerUserId"
 		| "laneBusy"
 		| "reviewer"
+		| "qaWorktreesDir"
 		| "changesGit"
 		| "rebaseGit"
 		| "completionNudges"
@@ -145,6 +146,8 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 		},
 		sessionDirFor: (origin) => sessionDirFor(sessionsRoot, origin, 1),
 		completionNudges: () => 0,
+		// Like the daemon: the follow-up ledger lives in the bot home.
+		followupsFile: join(homeDir, "followups.jsonl"),
 		session: router.sessionOps(),
 		// The core's rebase commits: a throwaway identity, like the fixtures' git (no global git config needed).
 		rebaseGit: (args) => defaultGit(["-c", "user.name=t", "-c", "user.email=t@example.com", ...args]),

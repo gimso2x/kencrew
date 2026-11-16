@@ -3,6 +3,7 @@
  * for the files the agent edits. Renderer and parser live together so the format has one definition.
  */
 
+import { LANE_MODEL_TIERS, type LaneModelTier } from "../config";
 import { redact } from "../redact";
 import { localIso } from "../time";
 import { assertCheckPlacement, checkSignalsOf, parseChecks, type Signal, SignalSyntaxError } from "./signals";
@@ -39,6 +40,9 @@ export interface NewTaskSpec {
 	background?: string;
 	/** The session's own reading of the owner's request (the hub brief's `[가정]`), shown on the accepted card. */
 	assumptions?: string;
+	/** The worker tier the session asked for; the default and the L3+ raise are applied after the risk floor. */
+	tier?: LaneModelTier;
+	tierReason?: string;
 }
 
 export type TaskSpecInput = { kind: "new"; spec: NewTaskSpec } | { kind: "resume"; id: string };
@@ -78,6 +82,8 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 	const record = asRecord(raw);
 	if (record === undefined) throw new TaskSpecError("taskSpec은 객체여야 합니다");
 	if (record.id !== undefined) {
+		if (record.tier !== undefined || record.tierReason !== undefined)
+			throw new TaskSpecError("재개에는 tier·tierReason을 줄 수 없습니다(처음 등록한 워커 모델로 다시 뜹니다)");
 		if (Object.keys(record).length !== 1) throw new TaskSpecError("재개는 taskSpec에 id만 줍니다");
 		if (typeof record.id !== "string" || !TASK_ID_PATTERN.test(record.id)) {
 			throw new TaskSpecError(`taskSpec.id 형식이 아닙니다(T-YYYYMMDD-NN): ${String(record.id)}`);
@@ -99,9 +105,18 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 	const assumptions = record.assumptions;
 	if (assumptions !== undefined && typeof assumptions !== "string")
 		throw new TaskSpecError("taskSpec.assumptions는 문자열이어야 합니다");
+	const tier = record.tier;
+	if (tier !== undefined && !(LANE_MODEL_TIERS as readonly unknown[]).includes(tier))
+		throw new TaskSpecError(`taskSpec.tier는 ${LANE_MODEL_TIERS.join("·")} 중 하나여야 합니다`);
+	const tierReason = record.tierReason;
+	if (tierReason !== undefined && typeof tierReason !== "string")
+		throw new TaskSpecError("taskSpec.tierReason은 문자열이어야 합니다");
 	// Masked here once: the ledger row, the four documents, the accepted card and the logs all take these values.
 	// Raw here: redactCriterion validates the check block as written, then collapses only the prose around it.
 	const acceptance = textList(record, "acceptance", 1, (text) => text).map(redactCriterion);
+	// A bare `AC-1:` would be snapshotted as "" and no claim could ever match it (qa-l #38).
+	if (acceptance.some((text) => stripAcPrefix(criterionLine(text)) === ""))
+		throw new TaskSpecError("taskSpec.acceptance는 비어 있지 않은 문자열 배열이어야 합니다");
 	return {
 		kind: "new",
 		spec: {
@@ -116,6 +131,8 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 			...(assumptions === undefined || oneLine(assumptions) === ""
 				? {}
 				: { assumptions: redact(oneLine(assumptions)) }),
+			...(tier === undefined ? {} : { tier: tier as LaneModelTier }),
+			...(tierReason === undefined || oneLine(tierReason) === "" ? {} : { tierReason: redact(oneLine(tierReason)) }),
 		},
 	};
 }
@@ -407,7 +424,7 @@ export function parseProgress(text: string): ParsedProgress {
 	return {
 		task: front.get("task"),
 		status: (front.get("status") ?? "").toLowerCase(),
-		updated: front.get("updated") ?? "",
+		updated: prose("updated"),
 		current: prose("current"),
 		next: prose("next"),
 		restated: prose("restated"),

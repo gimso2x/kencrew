@@ -1,4 +1,4 @@
-import { accessSync, chmodSync, constants, existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { defaultHomeDir, HOME_MODE, SECRET_MODE, workspaceOverlapsHome } from "../config";
@@ -105,6 +105,12 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 		let existing = dir;
 		while (!existsSync(existing) && dirname(existing) !== existing) existing = dirname(existing);
 		if (!statSync(existing).isDirectory()) return fail(`${label} ${dir}: ${existing} is not a directory`);
+	}
+
+	// chmod follows links: a secrets/ that is a symlink (or not a directory) would change a path outside the home.
+	const secretsStat = lstatSync(secretsDir, { throwIfNoEntry: false });
+	if (secretsStat !== undefined && (secretsStat.isSymbolicLink() || !secretsStat.isDirectory())) {
+		return fail(`home ${secretsDir} is a symlink or not a directory; nothing changed`);
 	}
 
 	mkdirSync(homeDir, { recursive: true, mode: HOME_MODE });

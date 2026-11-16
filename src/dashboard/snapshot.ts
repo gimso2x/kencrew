@@ -53,11 +53,13 @@ import { type TypicalDuration, typicalDuration } from "../store/turn-duration";
 import type { TaskRisk } from "../tasks/docs";
 import { evaluateTask } from "../tasks/evaluate";
 import type { TaskHostOps } from "../tasks/host";
-import { parseTaskJson, type TaskRow, type TaskStatus } from "../tasks/ledger";
+import { type ReadTask, readTaskSql, type TaskRow, type TaskSql, type TaskStatus } from "../tasks/ledger";
 import { formatLocal, localIso } from "../time";
 import { type BoardPromptRef, type BoardState, type BoardSummary, type BoardTaskRef, summarizeBoard } from "./board";
 import { type HostChecksInfo, readHostChecks } from "./host-checks";
-import { createSessionModelReader, type SessionModel, type SessionModelOrigin } from "./session-model";
+import type { PeerInstall } from "./peers";
+import { createSessionModelReader, type SessionModel } from "./session-model";
+import { readUsageLimits, type UsageLimitsInfo } from "./usage-limits";
 
 /** A snapshot is reused this long: IPC, herdr, ssh and git are not asked again inside it. */
 export const SNAPSHOT_TTL_MS = 10_000;
@@ -428,8 +430,10 @@ export interface MonitorInfo {
 	lastRun: MonitorRun | null;
 	/** Whether any scheduled (not manual) event exists, beyond {@link recent} too. */
 	scheduledRun: boolean;
-	/** Its conversation's origin key (`monitor/<id>`), as the turn board lists it. */
-	originKey: string;
+	/** Its conversation's origin key (`monitor/<id>`), as the turn board lists it; null for a peer install's monitor. */
+	originKey: string | null;
+	/** The peer install it belongs to (`id` is then `<install>:<id>`, `name` starts with `<install> · `); absent for this install's own. */
+	install?: string;
 	/** Whether the newest event is still on its way (not in {@link ENDED_STAGES}). */
 	running: boolean;
 	/** How many of the newest events in a row failed (`failed`, `failed_no_retry`), counted over {@link recent}. */
@@ -606,8 +610,13 @@ const JOB_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const JOB_LIMIT = 50;
 /** A running job whose `updatedAt` is older than this reads as `stale`. */
 export const JOB_STALE_MS = 10 * 60_000;
-/** A `done` or `stopped` job leaves the list once its `updatedAt` is older than this. */
+/**
+ * A `done` or `stopped` job, or a `running` one whose `pid` is gone (`dead`: its writer died without a final state),
+ * leaves the list once its `updatedAt` is older than this.
+ */
 export const JOB_DONE_KEEP_MS = 24 * 3_600_000;
+/** A `failed` job stays longer to be looked at, then leaves once its `updatedAt` is older than this. */
+export const JOB_FAILED_KEEP_MS = 7 * 24 * 3_600_000;
 const JOB_TITLE_CHARS = 120;
 const JOB_DETAIL_CHARS = 200;
 const JOB_FIELD_CHARS = 200;
@@ -665,7 +674,8 @@ export interface DashboardSnapshot {
 	herdr: Section<{ hosts: HerdrHostInfo[]; board?: BoardSummary; says?: HerdrSay[] }>;
 	/** `items`: the pending ones, oldest first; `recent`: the last settled ones, newest first. */
 	approvals: Section<{ items: ApprovalInfo[]; recent: ApprovalDecision[]; stats: ApprovalStats }>;
-	monitors: Section<{ items: MonitorInfo[] }>;
+	/** `peerErrors`: one line per peer install whose monitors could not be read in full; absent without any. */
+	monitors: Section<{ items: MonitorInfo[]; peerErrors?: Array<{ install: string; error: string }> }>;
 	alerts: Section<{ items: AlertInfo[] }>;
 	/** Every health gate, as `ompbot gates` lists them. */
 	gates: Section<{ items: Gate[] }>;
@@ -693,6 +703,8 @@ export interface DashboardSnapshot {
 	hostChecks?: Section<HostChecksInfo>;
 	/** Config `dashboard.opsStatus.url`: the card head links it. */
 	hostChecksUrl?: string;
+	/** The "모델 한도" card: only with `SnapshotDeps.usageLimits` and config `dashboard.usageLimits` (absent otherwise). */
+	usageLimits?: Section<UsageLimitsInfo>;
 }
 
 export type DashboardConfig = Partial<
@@ -743,6 +755,8 @@ export interface SnapshotDeps {
 	run: ProcessRunner;
 	/** omp version line for the database fallback (the daemon reports its own). */
 	ompVersion(): Promise<string>;
+	/** Peer installs whose monitors are listed read-only (config `dashboard.peerHomes`); absent = none. */
+	peers?: PeerInstall[];
 	/** File and git access of a task's host (`null` = local); throws for an unknown host. */
 	hostOps(host: string | null): TaskHostOps;
 	/** fetch used to resolve board card links. */
@@ -753,14 +767,93 @@ export interface SnapshotDeps {
 	collectGates?: (options: GatesOptions) => Gate[];
 	/** Whether a job's `pid` still runs; default {@link pidAlive}. */
 	isAlive?: (pid: number) => boolean;
-	/** A board thread's session model; default one {@link createSessionModelReader} shared by every snapshot. */
-	sessionModel?: (origin: SessionModelOrigin) => SessionModel | undefined;
+	/** Read the model limit commands (default false): the dashboard server only; the daemon's `!brief` never runs them. */
+	usageLimits?: boolean;
 }
 
 const sharedSessionModel = createSessionModelReader();
 
 const message = (error: unknown): string =>
 	redact(error instanceof Error ? error.message : String(error)).slice(0, ERROR_CHARS);
+
+/** An install's enabled monitors with the next fire time; `install` marks a peer's (id, name and origin set apart). */
+function monitorInfos(
+	handle: Database,
+	opts: {
+		/** The monitor's own install zone, for the schedule words. */
+		timezone: string;
+		config: DashboardConfig | undefined;
+		iso: (ms: number) => string;
+		now: number;
+		install?: string;
+	},
+): Array<{ next: number | null; info: MonitorInfo }> {
+	const { timezone, config, iso, install, now } = opts;
+	return rows<MonitorSql>(handle, "SELECT * FROM monitors WHERE enabled = 1").map((sql) => {
+		const monitor = toMonitor(sql);
+		const next = nextFireOf(monitor);
+		// Newest first; `recent` turns them around.
+		const events = rows<{ stage: string; slot_at: number; updated_at: number; attempts: number; manual: number }>(
+			handle,
+			"SELECT stage, slot_at, updated_at, attempts, manual FROM monitor_events WHERE monitor_id = ? ORDER BY event_id DESC LIMIT ?",
+			monitor.id,
+			MONITOR_RECENT,
+		);
+		const last = events[0];
+		const firstNotFailed = events.findIndex((event) => event.stage !== "failed" && event.stage !== "failed_no_retry");
+		const incidents = rows<{ n: number }>(
+			handle,
+			"SELECT COUNT(*) AS n FROM monitor_incidents WHERE monitor_id = ? AND status = 'alerted'",
+			monitor.id,
+		)[0];
+		const { trigger } = monitor;
+		const info: MonitorInfo = {
+			id: install === undefined ? monitor.id : `${install}:${monitor.id}`,
+			name: install === undefined ? redact(monitor.name) : `${install} · ${redact(monitor.name)}`,
+			kind: trigger.kind,
+			schedule: monitorSchedule(trigger, timezone),
+			cron: trigger.kind === "cron" ? `${trigger.schedule} (${trigger.timezone})` : null,
+			summary: monitorSummary(monitor.instruction),
+			destination: channelName(monitor.channel, config),
+			copyTo: monitor.copyChannel === null ? null : channelName(monitor.copyChannel, config),
+			model: monitor.model,
+			thinking: monitor.thinking,
+			deliver: monitor.deliver,
+			overlap: monitor.overlap,
+			files: monitorFiles(monitor),
+			nextFireAt: next === null ? null : iso(next),
+			lastStage: last?.stage ?? null,
+			lastAt: last === undefined ? null : iso(last.updated_at),
+			openIncidents: incidents?.n ?? 0,
+			recent: events
+				.map((event) => ({ stage: event.stage, manual: event.manual === 1, at: iso(event.updated_at) }))
+				.reverse(),
+			lastRun:
+				last === undefined
+					? null
+					: {
+							stage: last.stage,
+							at: iso(last.updated_at),
+							slotAt: iso(last.slot_at),
+							durationMs: monitorDurationMs(last.stage, last.slot_at, last.updated_at),
+							attempts: last.attempts,
+							manual: last.manual === 1,
+						},
+			scheduledRun:
+				rows<{ n: number }>(
+					handle,
+					"SELECT EXISTS(SELECT 1 FROM monitor_events WHERE monitor_id = ? AND manual = 0) AS n",
+					monitor.id,
+				)[0]?.n === 1,
+			originKey: install === undefined ? monitorOrigin(monitor.id) : null,
+			...(install === undefined ? {} : { install }),
+			running: last !== undefined && ENDED_STAGES[last.stage] !== true,
+			failStreak: firstNotFailed < 0 ? events.length : firstNotFailed,
+			stats: monitorStats(handle, monitor.id, now),
+		};
+		return { next, info };
+	});
+}
 
 async function section<T>(build: () => T | Promise<T>): Promise<Section<T>> {
 	try {
@@ -913,60 +1006,6 @@ function summarizeStatus(report: StatusReport): Omit<DaemonInfo, "heartbeat" | "
 		...(report.drain === undefined ? {} : { drain: report.drain }),
 	};
 }
-
-interface TaskSql {
-	task_id: string;
-	title: string;
-	risk: TaskRisk;
-	origin_key: string;
-	thread_ref: string;
-	host: string | null;
-	repo: string;
-	worktree: string;
-	branch: string;
-	agent: string;
-	status: TaskStatus;
-	acceptance_json: string;
-	created_at: number;
-	updated_at: number;
-	progress_at: number | null;
-	reminded_at: number | null;
-	notices_json: string;
-	closed_at: number | null;
-}
-
-/** A task row and the JSON columns that were damaged in the database (read as `[]`/`{}`). */
-interface ReadTask {
-	row: TaskRow;
-	broken: string[];
-}
-
-const toTaskRow = (r: TaskSql): ReadTask => {
-	const { acceptance, notices, broken } = parseTaskJson(r.acceptance_json, r.notices_json);
-	return {
-		row: {
-			taskId: r.task_id,
-			title: r.title,
-			risk: r.risk,
-			originKey: r.origin_key,
-			threadRef: r.thread_ref,
-			host: r.host,
-			repo: r.repo,
-			worktree: r.worktree,
-			branch: r.branch,
-			agent: r.agent,
-			status: r.status,
-			acceptance,
-			createdAt: r.created_at,
-			updatedAt: r.updated_at,
-			progressAt: r.progress_at,
-			remindedAt: r.reminded_at,
-			notices,
-			closedAt: r.closed_at,
-		},
-		broken,
-	};
-};
 
 interface HerdrTarget {
 	/** `local` or the `dispatchHosts` name. */
@@ -1271,7 +1310,7 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
 
 /**
  * `<home>/jobs/<name>.json` files whose name passes {@link JOB_NAME}: newest update first, at most {@link JOB_LIMIT},
- * `done` and `stopped` jobs only for {@link JOB_DONE_KEEP_MS}. No directory means no jobs. Reads only; never creates or removes.
+ * `done`, `stopped` and `dead` jobs only for {@link JOB_DONE_KEEP_MS}, `failed` ones for {@link JOB_FAILED_KEEP_MS}. No directory means no jobs. Reads only; never creates or removes.
  */
 function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolean, timezone: string): JobInfo[] {
 	const dir = join(homeDir, "jobs");
@@ -1285,9 +1324,83 @@ function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolea
 	return entries
 		.filter((entry) => entry.isFile() && entry.name.endsWith(".json") && JOB_NAME.test(entry.name.slice(0, -5)))
 		.map((entry) => readJob(dir, entry.name, now, isAlive, timezone))
-		.filter((job) => !((job.state === "done" || job.state === "stopped") && job.ageMs > JOB_DONE_KEEP_MS))
+		.filter((job) =>
+			job.state === "failed"
+				? job.ageMs <= JOB_FAILED_KEEP_MS
+				: !((job.state === "done" || job.state === "stopped" || job.health === "dead") && job.ageMs > JOB_DONE_KEEP_MS),
+		)
 		.sort((a, b) => a.ageMs - b.ageMs)
 		.slice(0, JOB_LIMIT);
+}
+
+/** Running `systemd-run --user --unit=ompbot-<name>` work is a job even without a progress file. */
+const UNIT_JOB_PREFIX = "ompbot-";
+/** `ompbot-job-*` units only write a job file for another unit: listing them too would show that work twice. */
+const UNIT_HELPER_PREFIX = "ompbot-job-";
+const UNIT_TIMEOUT_MS = 5_000;
+const UNIT_PROPERTIES = ["Id", "Description", "Transient", "ActiveState", "ActiveEnterTimestamp", "MainPID"];
+
+/**
+ * The user's running transient `ompbot-*.service` units (`systemd-run`), as `running` jobs named without the prefix. A unit
+ * that a job file already shows (same name or pid) or a helper unit is left out. A host without `systemctl` has none; any
+ * other failure comes back as one `invalid` row so the files still show.
+ */
+async function readUnitJobs(run: ProcessRunner, files: JobInfo[], now: number, timezone: string): Promise<JobInfo[]> {
+	const result = await run(
+		[
+			"systemctl",
+			"--user",
+			"show",
+			`--property=${UNIT_PROPERTIES.join(",")}`,
+			"--timestamp=unix",
+			`${UNIT_JOB_PREFIX}*.service`,
+		],
+		{ timeoutMs: UNIT_TIMEOUT_MS },
+	);
+	if (result.code === null && !result.timedOut && result.stdout.startsWith("spawn failed")) return [];
+	if (result.code !== 0 || result.timedOut) {
+		const why = result.timedOut ? "timed out" : result.stderr?.trim() || result.stdout.trim() || `exit ${result.code}`;
+		return [
+			{
+				name: "systemd",
+				title: "systemd 유닛 목록",
+				state: null,
+				updatedAt: localIso(now, timezone),
+				ageMs: 0,
+				detail: jobText(`systemctl --user show 실패: ${why}`, JOB_DETAIL_CHARS) ?? "",
+				health: "invalid",
+			},
+		];
+	}
+	const known = new Set(files.map((job) => job.name));
+	const knownPids = new Set(files.flatMap((job) => (job.pid === undefined ? [] : [job.pid])));
+	const jobs: JobInfo[] = [];
+	for (const block of result.stdout.split(/\n\s*\n/)) {
+		const unit = new Map<string, string>();
+		for (const line of block.split("\n")) {
+			const eq = line.indexOf("=");
+			if (eq > 0) unit.set(line.slice(0, eq), line.slice(eq + 1));
+		}
+		const id = unit.get("Id") ?? "";
+		if (unit.get("Transient") !== "yes" || unit.get("ActiveState") !== "active") continue;
+		if (!id.startsWith(UNIT_JOB_PREFIX) || id.startsWith(UNIT_HELPER_PREFIX) || !id.endsWith(".service")) continue;
+		const name = id.slice(UNIT_JOB_PREFIX.length, -".service".length);
+		const pid = Number(unit.get("MainPID"));
+		if (!JOB_NAME.test(name) || known.has(name) || knownPids.has(pid)) continue;
+		const started = /^@(\d+)$/.exec(unit.get("ActiveEnterTimestamp") ?? "");
+		jobs.push({
+			name,
+			title: jobText(unit.get("Description"), JOB_TITLE_CHARS) ?? name,
+			state: "running",
+			...(started === null ? {} : { startedAt: localIso(Number(started[1]) * 1000, timezone) }),
+			updatedAt: localIso(now, timezone),
+			ageMs: 0,
+			...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),
+			detail: `systemd 유닛 ${id}`,
+			health: "ok",
+		});
+	}
+	return jobs;
 }
 
 /** The inbound columns a turn row is read with. */
@@ -1325,6 +1438,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 
 		const opsStatus = config?.dashboard?.opsStatus;
 		const hostChecks = opsStatus === undefined ? undefined : readHostChecks(opsStatus.command, deps.run, deps.now);
+		const usageConfig = deps.usageLimits === true ? config?.dashboard?.usageLimits : undefined;
+		const usageLimits = usageConfig === undefined ? undefined : readUsageLimits(usageConfig, deps.run, deps.now);
 
 		const targets = herdrTargets(config);
 		// Run on first use only: with a live board and no open TASK on a host, that host's `herdr agent list` is not needed.
@@ -1466,7 +1581,6 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const since = now - THREAD_WINDOW_MS;
 			const ACTIVE = "COALESCE(last_event_at, dispatched_at, created_at)";
 			const OPEN = "state IN ('pending','dispatched')";
-			const sessionModel = deps.sessionModel ?? sharedSessionModel;
 			/** The chip of a board thread: its origin's session model; nothing when the origin or its session is unknown. */
 			const threadModel = (key: string): SessionModel | undefined => {
 				try {
@@ -1478,7 +1592,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					}>(handle, "SELECT session_dir, session_file, model, thinking FROM origins WHERE origin_key = ?", key);
 					return origin === undefined
 						? undefined
-						: sessionModel({
+						: sharedSessionModel({
 								sessionDir: origin.session_dir,
 								sessionFile: origin.session_file,
 								model: origin.model,
@@ -1606,7 +1720,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					TASK_EVAL_TIMEOUT_MS,
 					`${row.taskId} evaluation`,
 				).catch((error: unknown) => ({ ok: false as const, error: message(error) })),
-				herdrStateOf(row),
+				// One row's herdr failure shows as that row's herdr error, never as a missing tasks section.
+				herdrStateOf(row).catch((error: unknown): HerdrState => ({ ok: false, error: message(error) })),
 				linkOf(row),
 			]);
 			if (evaluation.ok) {
@@ -1636,13 +1751,13 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const open = rows<TaskSql>(
 				handle,
 				"SELECT * FROM tasks WHERE status IN ('working','blocked','review') ORDER BY task_id",
-			).map(toTaskRow);
+			).map(readTaskSql);
 			const closed = rows<TaskSql>(
 				handle,
 				"SELECT * FROM tasks WHERE status IN ('done','cancelled') AND closed_at >= ? ORDER BY closed_at DESC LIMIT ?",
 				now - CLOSED_TASK_DAYS * 86_400_000,
 				CLOSED_TASK_LIMIT,
-			).map(toTaskRow);
+			).map(readTaskSql);
 			return {
 				items: [...(await Promise.all(open.map(describeOpen))), ...closed.map((read) => baseTask(read, timezone))],
 			};
@@ -1654,7 +1769,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const scope =
 				"thread_ref IN (SELECT thread_ref FROM tasks WHERE created_at >= ? OR status IN ('working','blocked','review'))";
 			const read = rows<TaskSql>(handle, `SELECT * FROM tasks WHERE ${scope} ORDER BY created_at, task_id`, since).map(
-				(r) => toTaskRow(r).row,
+				(r) => readTaskSql(r).row,
 			);
 			const transitions = rows<FlowTransition>(
 				handle,
@@ -1870,79 +1985,36 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 		});
 
 		const monitors = section(() => {
-			const handle = needDb();
-			const listed = rows<MonitorSql>(handle, "SELECT * FROM monitors WHERE enabled = 1").map((sql) => {
-				const monitor = toMonitor(sql);
-				const next = nextFireOf(monitor);
-				// Newest first; `recent` turns them around.
-				const events = rows<{ stage: string; slot_at: number; updated_at: number; attempts: number; manual: number }>(
-					handle,
-					"SELECT stage, slot_at, updated_at, attempts, manual FROM monitor_events WHERE monitor_id = ? ORDER BY event_id DESC LIMIT ?",
-					monitor.id,
-					MONITOR_RECENT,
-				);
-				const last = events[0];
-				const firstNotFailed = events.findIndex(
-					(event) => event.stage !== "failed" && event.stage !== "failed_no_retry",
-				);
-				const incidents = rows<{ n: number }>(
-					handle,
-					"SELECT COUNT(*) AS n FROM monitor_incidents WHERE monitor_id = ? AND status = 'alerted'",
-					monitor.id,
-				)[0];
-				const { trigger } = monitor;
-				const info: MonitorInfo = {
-					id: monitor.id,
-					name: redact(monitor.name),
-					kind: trigger.kind,
-					schedule: monitorSchedule(trigger, timezone),
-					cron: trigger.kind === "cron" ? `${trigger.schedule} (${trigger.timezone})` : null,
-					summary: monitorSummary(monitor.instruction),
-					destination: channelName(monitor.channel, config),
-					copyTo: monitor.copyChannel === null ? null : channelName(monitor.copyChannel, config),
-					model: monitor.model,
-					thinking: monitor.thinking,
-					deliver: monitor.deliver,
-					overlap: monitor.overlap,
-					files: monitorFiles(monitor),
-					nextFireAt: next === null ? null : iso(next),
-					lastStage: last?.stage ?? null,
-					lastAt: last === undefined ? null : iso(last.updated_at),
-					openIncidents: incidents?.n ?? 0,
-					recent: events
-						.map((event) => ({ stage: event.stage, manual: event.manual === 1, at: iso(event.updated_at) }))
-						.reverse(),
-					lastRun:
-						last === undefined
-							? null
-							: {
-									stage: last.stage,
-									at: iso(last.updated_at),
-									slotAt: iso(last.slot_at),
-									durationMs: monitorDurationMs(last.stage, last.slot_at, last.updated_at),
-									attempts: last.attempts,
-									manual: last.manual === 1,
-								},
-					scheduledRun:
-						rows<{ n: number }>(
-							handle,
-							"SELECT EXISTS(SELECT 1 FROM monitor_events WHERE monitor_id = ? AND manual = 0) AS n",
-							monitor.id,
-						)[0]?.n === 1,
-					originKey: monitorOrigin(monitor.id),
-					running: last !== undefined && ENDED_STAGES[last.stage] !== true,
-					failStreak: firstNotFailed < 0 ? events.length : firstNotFailed,
-					stats: monitorStats(handle, monitor.id, now),
-				};
-				return { next, info };
-			});
+			const listed = monitorInfos(needDb(), { timezone, config, iso, now });
+			const peerErrors: Array<{ install: string; error: string }> = [];
+			for (const peer of deps.peers ?? []) {
+				const problems = peer.configError === undefined ? [] : [peer.configError];
+				const peerDbPath = join(peer.home, "ompbot.db");
+				if (existsSync(peerDbPath)) {
+					let peerDb: Database | undefined;
+					try {
+						peerDb = new Database(peerDbPath, { readonly: true, strict: true });
+						listed.push(
+							...monitorInfos(peerDb, { timezone: peer.timezone, config: undefined, iso, now, install: peer.name }),
+						);
+					} catch (error) {
+						problems.push(`db를 읽지 못함: ${message(error)}`);
+					} finally {
+						peerDb?.close();
+					}
+				} else {
+					problems.push("ompbot.db가 없음");
+				}
+				if (problems.length > 0)
+					peerErrors.push({ install: peer.name, error: redact(problems.join("; ")).slice(0, ERROR_CHARS) });
+			}
 			// Next to fire first, monitors with no next fire last, then by name.
 			listed.sort(
 				(a, b) =>
 					(a.next ?? Number.POSITIVE_INFINITY) - (b.next ?? Number.POSITIVE_INFINITY) ||
 					a.info.name.localeCompare(b.info.name, "ko"),
 			);
-			return { items: listed.map(({ info }) => info) };
+			return { items: listed.map(({ info }) => info), ...(peerErrors.length === 0 ? {} : { peerErrors }) };
 		});
 
 		const gates = await section(() => ({
@@ -1994,7 +2066,11 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			}),
 		}));
 
-		const jobs = section(() => ({ items: readJobs(deps.homeDir, now, deps.isAlive ?? pidAlive, timezone) }));
+		const jobs = section(async () => {
+			const files = readJobs(deps.homeDir, now, deps.isAlive ?? pidAlive, timezone);
+			const units = await readUnitJobs(run, files, now, timezone);
+			return { items: [...units, ...files].slice(0, JOB_LIMIT) };
+		});
 
 		const guildIds = deps.config?.channels?.discord?.guildIds;
 
@@ -2022,6 +2098,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			discordGuild: guildIds?.length === 1 ? (guildIds[0] ?? null) : null,
 			...(hostChecks === undefined ? {} : { hostChecks: await hostChecks }),
 			...(opsStatus?.url === undefined ? {} : { hostChecksUrl: opsStatus.url }),
+			...(usageLimits === undefined ? {} : { usageLimits: await usageLimits }),
 		};
 	} finally {
 		db?.close();

@@ -83,6 +83,8 @@ export interface OriginRouterDeps {
 	restartProvider?: MailboxDeps["restartProvider"];
 	/** Whether an origin's work is held (a paused lane); passed per mailbox (`MailboxDeps.isHeld`). */
 	isHeld?: (originKey: string) => boolean;
+	/** Whether the bot is frozen; passed to every mailbox (`MailboxDeps.isFrozen`). */
+	isFrozen?: MailboxDeps["isFrozen"];
 	/** A held origin's driver started working on its own; passed per mailbox (`MailboxDeps.onHeldWork`). */
 	onHeldWork?: MailboxDeps["onHeldWork"];
 	/** Task-list phases a fresh session of an origin starts with; passed per mailbox (`MailboxDeps.initialTodos`). */

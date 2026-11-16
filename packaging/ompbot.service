@@ -1,5 +1,5 @@
 [Unit]
-Description=ompbot (Slack bot driving omp --mode rpc)
+Description=ompbot (chat bot driving omp --mode rpc)
 After=network-online.target
 Wants=network-online.target
 

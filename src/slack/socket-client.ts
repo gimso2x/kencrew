@@ -18,11 +18,12 @@ export interface SocketClientOptions {
 	onHello?: () => void;
 	/** Fired when a connection is being replaced (disconnect envelope, close, dead socket). */
 	onReconnect?: (reason: string) => void;
-	apiUrl?: string;
 	fetchImpl?: typeof fetch;
 	/** No traffic (message, ping or pong) for this long marks the socket dead. */
 	deadAfterMs?: number;
 	checkIntervalMs?: number;
+	/** `apps.connections.open` gives up (and is retried) after this long. */
+	openTimeoutMs?: number;
 	backoffBaseMs?: number;
 	backoffMaxMs?: number;
 	now?: () => number;
@@ -72,10 +73,10 @@ export class SocketClient {
 
 	constructor(options: SocketClientOptions) {
 		this.opts = {
-			apiUrl: "https://slack.com/api/apps.connections.open",
 			fetchImpl: fetch,
 			deadAfterMs: 120_000,
 			checkIntervalMs: 15_000,
+			openTimeoutMs: 30_000,
 			backoffBaseMs: 1_000,
 			backoffMaxMs: 30_000,
 			now: Date.now,
@@ -127,12 +128,13 @@ export class SocketClient {
 	private async openUrl(): Promise<string> {
 		let res: Response;
 		try {
-			res = await this.opts.fetchImpl(this.opts.apiUrl, {
+			res = await this.opts.fetchImpl("https://slack.com/api/apps.connections.open", {
 				method: "POST",
 				headers: {
 					authorization: `Bearer ${this.opts.appToken}`,
 					"content-type": "application/x-www-form-urlencoded",
 				},
+				signal: AbortSignal.timeout(this.opts.openTimeoutMs),
 			});
 		} catch (err) {
 			throw new OpenError(`apps.connections.open request failed: ${(err as Error).message}`, false);

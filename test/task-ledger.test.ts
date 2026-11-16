@@ -147,7 +147,46 @@ describe("TaskLedger", () => {
 		ledger.transition("T-20261001-01", "working", "bot", "resume dispatch");
 		expect(ledger.history("T-20261001-01").map((h) => [h.fromStatus, h.toStatus])).toEqual([["review", "working"]]);
 	});
+
+	test("worker tier: register keeps model, tier and reason; a row without one reads three nulls", () => {
+		const ledger = ledgerAt({ ms: Date.parse("2026-11-15T00:00:00Z") });
+		const tiered = ledger.register({
+			...base,
+			worker: { tier: "middle", tierReason: "일반 구현", model: "anthropic/claude-sonnet-5-5" },
+		});
+		expect(ledger.require(tiered.taskId)).toMatchObject({
+			workerModel: "anthropic/claude-sonnet-5-5",
+			tier: "middle",
+			tierReason: "일반 구현",
+		});
+		const plain = ledger.register(base);
+		expect(ledger.require(plain.taskId)).toMatchObject({ workerModel: null, tier: null, tierReason: null });
+	});
+
+	test("migration adds the worker tier columns to a tasks table that predates them; old rows read null", () => {
+		const db = new Database(":memory:", { strict: true });
+		db.run(PRE_TIER_TASKS);
+		db.run(OLD_ROW);
+		const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => 7 } });
+		const columns = (db.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((c) => c.name);
+		expect(columns).toEqual(expect.arrayContaining(["worker_model", "tier", "tier_reason"]));
+		expect(ledger.require("T-20261001-01")).toMatchObject({ workerModel: null, tier: null, tierReason: null });
+		// Idempotent: a second migration over the migrated table adds nothing.
+		migrateTaskSchema(db);
+		expect((db.query("PRAGMA table_info(tasks)").all() as unknown[]).length).toBe(columns.length);
+	});
 });
+
+/** The `tasks` table as it was before the worker tier columns. */
+const PRE_TIER_TASKS = `CREATE TABLE tasks (
+	task_id TEXT PRIMARY KEY, title TEXT NOT NULL, risk TEXT NOT NULL, origin_key TEXT NOT NULL, thread_ref TEXT NOT NULL,
+	host TEXT, repo TEXT NOT NULL, worktree TEXT NOT NULL, branch TEXT NOT NULL, agent TEXT NOT NULL,
+	status TEXT NOT NULL CHECK (status IN ('working','blocked','review','done','cancelled')),
+	acceptance_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, progress_at INTEGER,
+	reminded_at INTEGER, notices_json TEXT NOT NULL DEFAULT '{}', closed_at INTEGER
+)`;
+const OLD_ROW = `INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
+	acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', 'C1:1.1', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`;
 
 describe("host ops (fake runner)", () => {
 	function recorder(respond: (cmd: string[]) => { code: number | null; stdout?: string; timedOut?: boolean }) {
@@ -521,5 +560,22 @@ describe("ompbot tasks (CLI)", () => {
 			["working", "cancelled", "human", "close --as cancelled"],
 		]);
 		expect(history[0]?.transitionId).toBeLessThan(history[1]?.transitionId ?? 0);
+	}, 30_000); // a dozen CLI child processes: slow on a 2-core machine
+
+	test("AC-11: read-only tasks list over a pre-tier ledger succeeds and shows the three tier values as null", async () => {
+		const db = new Database(join(home.dir, "ompbot.db"), { create: true, strict: true });
+		db.run(PRE_TIER_TASKS);
+		db.run(OLD_ROW);
+		db.close();
+		const list = await runMain(home.dir, ["tasks", "list", "--json"]);
+		expect(list.code).toBe(0);
+		expect((JSON.parse(list.stdout) as { tasks: unknown[] }).tasks).toEqual([
+			expect.objectContaining({ taskId: "T-20261001-01", workerModel: null, tier: null, tierReason: null }),
+		]);
+		// A read never migrates: the ledger file still has the old columns only.
+		const after = new Database(join(home.dir, "ompbot.db"), { readonly: true });
+		const columns = (after.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((c) => c.name);
+		after.close();
+		expect(columns).not.toContain("tier");
 	});
 });

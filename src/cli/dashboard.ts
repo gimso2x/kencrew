@@ -5,6 +5,7 @@ import { loadConfig } from "../config";
 import type { LiveView } from "../core/live-turn";
 import { callDaemon } from "../daemon/ipc";
 import { readMonitorDetail } from "../dashboard/monitor-detail";
+import { resolvePeers } from "../dashboard/peers";
 import { startDashboardServer } from "../dashboard/server";
 import { readBoardPrompts, readBoardTasks } from "../dashboard/snapshot";
 import { boardSourceFor, hasConfig, snapshotReader } from "../dashboard/snapshot-assembly";
@@ -22,7 +23,7 @@ export const DASHBOARD_USAGE = `  dashboard [--port <n>] [--bind 127.0.0.1|::1]
                                  masked omp session at /api/thread/conversation?origin=<key>, what its running turn
                                  is writing at /api/thread/live?origin=<key> (stream: /api/thread/live/events) (also
                                  under a prefix like /task/); --port/--bind override config
-                                 dashboard {port, bind?, herdrWebUrl?}; no port in either → exit 2. With config
+                                 dashboard {port, bind?, herdrWebUrl?, peerHomes?}; no port in either → exit 2. With config
                                  herdrBoard it also shows the herdr agent board (api/board, api/board/events,
                                  ?card=<key> detail with the pane's conversation and plan)
 `;
@@ -71,6 +72,7 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 		now,
 		callDaemon,
 		run: realProcessRunner,
+		usageLimits: true,
 		...(board === undefined ? {} : { board: () => board.current() }),
 	});
 
@@ -92,6 +94,7 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 						timezone: config?.timezone ?? hostTimezone(),
 					},
 					id,
+					resolvePeers(config?.dashboard, config?.timezone ?? hostTimezone()),
 				),
 			// 800 ms bound: a wedged daemon must not hold a read past the next tick (callDaemon defaults to 120 s).
 			live: async (origin) => {

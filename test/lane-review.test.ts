@@ -5,7 +5,15 @@ import { parseThreadRef } from "../src/core/normalize";
 import { Daemon } from "../src/daemon/daemon";
 import { GUEST_OVERLAY_YAML } from "../src/daemon/guest";
 import type { ProcessRunner, RunProcessOptions, RunProcessResult } from "../src/dispatch/omp";
-import { createLaneLander, type LandLane, type LandRequest, laneLandBlockers } from "../src/lanes/land";
+import {
+	createLaneLander,
+	type LandLane,
+	type LandRequest,
+	laneLandBlockers,
+	QA_FAIL,
+	QA_MISSING,
+} from "../src/lanes/land";
+import { parseQaVerdict, qaOverlayPath, qaWorktreePath } from "../src/lanes/qa";
 import {
 	buildReviewPrompt,
 	parseReviewVerdict,
@@ -23,6 +31,7 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
+import type { TaskRisk } from "../src/tasks/docs";
 import { createTaskHostOps } from "../src/tasks/host";
 import type { AutoLandPolicy } from "../src/tasks/notify";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
@@ -126,14 +135,19 @@ function requireLane(h: LaneHarness, name: string): LaneRow {
 }
 
 /** Starts a lane, commits `a.txt` and claims it; `settle` false leaves the background work (the review) running. */
-async function closeLane(h: LaneHarness, repo: string, settle = true): Promise<{ lane: LaneRow; sha: string }> {
+async function closeLane(
+	h: LaneHarness,
+	repo: string,
+	settle = true,
+	risk: TaskRisk = "L2",
+): Promise<{ lane: LaneRow; sha: string }> {
 	const started = await h.manager.start({
 		title: "review",
 		cwd: repo,
 		channel: "D1",
 		brief: "a.txt를 만든다",
 		acceptance: [CHECK_A],
-		risk: "L2",
+		risk,
 	});
 	await h.settle();
 	const sha = commitIn(started.cwd, "a.txt");
@@ -462,6 +476,303 @@ describe("review before auto-merge", () => {
 		expect(requireLane(h, lane.name).meta.land?.state).toBe("discarded");
 		expect(diffFiles(lane)).toEqual([]);
 		h.close();
+	});
+});
+
+describe("run QA after the review (doc/plans/bot-org-risk-gates.md 단계 3, 레인 C)", () => {
+	const QA_MODEL = "zai/test-qa:high";
+	const CLEAR = "스펙 충족\nCONFIDENCE: 0.90\nVERDICT: CLEAR";
+	const qaDir = (): string => join(home.dir, "qa-worktrees");
+	const isQa = (call: ReviewCall): boolean => argOf(call.cmd, "--model") === QA_MODEL;
+	const pass = (finding = "bun test 통과"): RunProcessResult => ({
+		code: 0,
+		stdout: `실행함\n${JSON.stringify({ verdict: "PASS", findings: [finding] })}`,
+		timedOut: false,
+	});
+
+	function qaOverlay(): string {
+		const path = join(home.dir, "qa.omp.yml");
+		writeFileSync(path, "modelRoles:\n  default: zai/test-qa:high\n");
+		return path;
+	}
+
+	/** Review (confident band up to L3) and QA from L3, as 송박 will set them after the merge. */
+	function qaPolicy(repo: string, withQa = true): AutoLandPolicy {
+		return {
+			repos: [repo],
+			maxRisk: "L2",
+			review: { ...REVIEW, confident: { maxRisk: "L3", minConfidence: 0.8 } },
+			...(withQa ? { qa: { minRisk: "L3" as const, overlay: qaOverlay(), model: QA_MODEL, timeoutMs: 60_000 } } : {}),
+		};
+	}
+
+	function qaHarness(run: ProcessRunner, policy: AutoLandPolicy, land?: LandLane): LaneHarness {
+		return laneHarness(home.dir, {
+			...(land === undefined ? {} : { land }),
+			autoLandPolicy: () => policy,
+			reviewer: { ompBin: "/bin/omp-fake", systemPromptAppendix: "FLOORS", reviewsDir: reviewsDir(), run },
+			qaWorktreesDir: qaDir(),
+		});
+	}
+
+	/** Linked worktrees of `repo` as `git worktree list` names them. */
+	const worktreeList = (repo: string): string => git(repo, "worktree", "list", "--porcelain");
+	const leftCopies = (): string[] => (existsSync(qaDir()) ? readdirSync(qaDir()) : []);
+
+	test("AC-1·AC-5·AC-6: an L3 lane is reviewed, then QA'd once in a detached copy of its sha; PASS frees it and it lands", async () => {
+		const repo = makeRepo(repos);
+		const order: string[] = [];
+		let atQa: { exists: boolean; head: string; laneHead: string; laneStatus: string } | undefined;
+		let h: LaneHarness | undefined;
+		const fake = fakeRunner((call) => {
+			if (!isQa(call)) {
+				order.push("review");
+				return { code: 0, stdout: CLEAR, timedOut: false };
+			}
+			order.push("qa");
+			const cwd = call.opts.cwd ?? "";
+			const laneWorktree = h?.store.listLanes()[0]?.meta.worktree ?? "";
+			atQa = {
+				exists: existsSync(cwd),
+				head: git(cwd, "rev-parse", "HEAD"),
+				laneHead: git(laneWorktree, "rev-parse", "HEAD"),
+				laneStatus: git(laneWorktree, "status", "--porcelain"),
+			};
+			return pass();
+		});
+		const counted = countingLand();
+		const policy = qaPolicy(repo);
+		h = qaHarness(fake.run, policy, counted.land);
+		const { lane, sha } = await closeLane(h, repo, true, "L3");
+		// AC-5: review → CLEAR → QA → PASS → merge, in one go.
+		expect(order).toEqual(["review", "qa"]);
+		const call = fake.calls.find(isQa) as ReviewCall;
+		const copy = qaWorktreePath(qaDir(), lane, sha);
+		expect(copy).toBe(join(home.dir, "qa-worktrees", `${lane.meta.laneId}-${sha}`));
+		expect(call.opts.cwd).toBe(copy);
+		expect(call.opts.timeoutMs).toBe(60_000);
+		// AC-6: --model <qa.model>, the reviewer's isolation overlay and then qa.overlay; the default tools (bash).
+		const at = call.cmd.indexOf("--no-session");
+		expect(call.cmd.slice(at + 1, at + 9)).toEqual([
+			"--config",
+			qaOverlayPath(reviewsDir(), lane, sha),
+			...ISOLATION_FLAGS,
+			"--config",
+			policy.qa?.overlay ?? "",
+		]);
+		expect(argOf(call.cmd, "--model")).toBe(QA_MODEL);
+		expect(call.cmd).not.toContain("--tools");
+		expect(call.cmd.at(-1)).toContain("a.txt가 있다");
+		// The copy held the claim commit; the lane worktree stayed at it, clean.
+		expect(atQa).toEqual({ exists: true, head: sha, laneHead: sha, laneStatus: "" });
+		const after = requireLane(h, lane.name);
+		expect(after.meta.qa).toMatchObject({ sha, verdict: "PASS", findings: ["bun test 통과"], model: QA_MODEL });
+		expect(after.history.some((entry) => entry.event === "qa" && entry.detail === `PASS · ${QA_MODEL}`)).toBe(true);
+		expect(laneLandBlockers(after, policy, true, false)).toEqual([]);
+		expect(counted.calls).toHaveLength(1);
+		expect(after.meta.land?.state).toBe("landed");
+		const cards = cardPosts(h.transport, lane);
+		expect(cards).toHaveLength(1);
+		expect(cards[0]?.text).toContain("🧪 실행 QA(뚱기 · test-qa): PASS");
+		// AC-6: the copy is gone, from disk and from git's worktree list.
+		expect(leftCopies()).toEqual([]);
+		expect(worktreeList(repo)).not.toContain(copy);
+		await h.manager.tick();
+		await h.settle();
+		expect(fake.calls).toHaveLength(2);
+		h.close();
+	});
+
+	test.each([
+		["FAIL", { code: 0, stdout: '{"verdict":"FAIL","findings":["bun test 3 fail"]}', timedOut: false }, QA_FAIL],
+		["a timeout", { code: null, stdout: "", timedOut: true }, "실행 QA 확인 불가(시간 초과)"],
+		[
+			"an unparsable last line",
+			{ code: 0, stdout: "다 돌려 봤다\nPASS", timedOut: false },
+			"실행 QA 확인 불가(마지막 줄이 JSON 아님)",
+		],
+	] as const)(
+		"AC-2·AC-6: %s holds the merge, the copy goes, the lane worktree is untouched",
+		async (_name, answer, reason) => {
+			const repo = makeRepo(repos);
+			const fake = fakeRunner((call) => (isQa(call) ? { ...answer } : { code: 0, stdout: CLEAR, timedOut: false }));
+			const counted = countingLand();
+			const policy = qaPolicy(repo);
+			const h = qaHarness(fake.run, policy, counted.land);
+			const { lane, sha } = await closeLane(h, repo, true, "L3");
+			expect(fake.calls.filter(isQa)).toHaveLength(1);
+			const after = requireLane(h, lane.name);
+			expect(after.meta.qa?.sha).toBe(sha);
+			expect(laneLandBlockers(after, policy, true, false)).toEqual([reason]);
+			expect(counted.calls).toHaveLength(0);
+			expect(after.meta.land?.state).toBe("pending");
+			const cards = cardPosts(h.transport, lane);
+			expect(cards).toHaveLength(1);
+			expect(cards[0]?.text).toContain(`자동 머지 안 함: ${reason}`);
+			expect(leftCopies()).toEqual([]);
+			expect(worktreeList(repo)).not.toContain(qaWorktreePath(qaDir(), lane, sha));
+			const worktree = after.meta.worktree ?? "";
+			expect(git(worktree, "rev-parse", "HEAD")).toBe(sha);
+			expect(git(worktree, "status", "--porcelain")).toBe("");
+			// One commit is run once: the tick after does not run it again.
+			await h.manager.tick();
+			await h.settle();
+			expect(fake.calls.filter(isQa)).toHaveLength(1);
+			h.close();
+		},
+	);
+
+	test.each([
+		["an L2 lane with qa set", "L2" as const, true],
+		["an L3 lane without qa", "L3" as const, false],
+	])("AC-4: %s is never QA'd and lands on its review alone", async (_name, risk, withQa) => {
+		const repo = makeRepo(repos);
+		const fake = fakeRunner(() => ({ code: 0, stdout: CLEAR, timedOut: false }));
+		const counted = countingLand();
+		const policy = qaPolicy(repo, withQa);
+		const h = qaHarness(fake.run, policy, counted.land);
+		const { lane } = await closeLane(h, repo, true, risk);
+		expect(fake.calls).toHaveLength(1);
+		expect(fake.calls.filter(isQa)).toHaveLength(0);
+		const after = requireLane(h, lane.name);
+		expect(after.meta.qa).toBeUndefined();
+		expect(counted.calls).toHaveLength(1);
+		expect(cardPosts(h.transport, lane)[0]?.text).not.toContain("실행 QA");
+		h.close();
+	});
+
+	test("AC-5: an L4 (unreviewable) lane is neither reviewed nor QA'd and asks for its risk only", async () => {
+		const repo = makeRepo(repos);
+		const fake = says(CLEAR);
+		const counted = countingLand();
+		const h = qaHarness(fake.run, qaPolicy(repo), counted.land);
+		const { lane } = await closeLane(h, repo, true, "L4");
+		expect(fake.calls).toHaveLength(0);
+		expect(counted.calls).toHaveLength(0);
+		const text = cardPosts(h.transport, lane)[0]?.text ?? "";
+		expect(text).toContain("자동 머지 안 함: 위험 L4 > L2");
+		expect(text).not.toContain("실행 QA");
+		h.close();
+	});
+
+	test.each([
+		["the owner's 머지", "land"],
+		["폐기", "discard"],
+	] as const)("AC-7: %s during the QA aborts it; no receipt is written and the copy goes", async (_name, action) => {
+		const repo = makeRepo(repos);
+		const started = Promise.withResolvers<string>();
+		const aborted: boolean[] = [];
+		const fake = fakeRunner((call) => {
+			if (!isQa(call)) return { code: 0, stdout: CLEAR, timedOut: false };
+			const signal = call.opts.signal;
+			// Ends only when the core aborts it (like a long QA run killed by its abort switch).
+			const ended = Promise.withResolvers<RunProcessResult>();
+			signal?.addEventListener("abort", () => {
+				aborted.push(true);
+				ended.resolve({ code: null, stdout: "", timedOut: false });
+			});
+			started.resolve(call.opts.cwd ?? "");
+			return ended.promise;
+		});
+		const counted = countingLand();
+		const h = qaHarness(fake.run, qaPolicy(repo), counted.land);
+		const { lane } = await closeLane(h, repo, false, "L3");
+		const copy = await started.promise;
+		expect(existsSync(copy)).toBe(true);
+		const outcome =
+			action === "land" ? await h.manager.requestLand(lane.name, "owner") : await h.manager.discard(lane.name);
+		await h.settle();
+		expect(outcome.handled).toBe(true);
+		expect(aborted).toEqual([true]);
+		const after = requireLane(h, lane.name);
+		expect(after.meta.qa).toBeUndefined();
+		expect(after.history.some((entry) => entry.event === "qa")).toBe(false);
+		expect(after.meta.land?.state).toBe(action === "land" ? "landed" : "discarded");
+		expect(existsSync(copy)).toBe(false);
+		expect(worktreeList(repo)).not.toContain(copy);
+		expect(h.logs.some((line) => line.includes("lane_qa_stopped"))).toBe(true);
+		h.close();
+	});
+
+	test("AC-7: a receipt whose lane moved to another sha meanwhile is dropped", async () => {
+		const repo = makeRepo(repos);
+		let h: LaneHarness | undefined;
+		const fake = fakeRunner((call) => {
+			if (!isQa(call)) return { code: 0, stdout: CLEAR, timedOut: false };
+			const name = h?.store.listLanes()[0]?.name ?? "";
+			h?.store.patchLane(name, undefined, { sha: "f".repeat(40) });
+			return pass();
+		});
+		const counted = countingLand();
+		h = qaHarness(fake.run, qaPolicy(repo), counted.land);
+		const { lane } = await closeLane(h, repo, true, "L3");
+		expect(fake.calls.filter(isQa)).toHaveLength(1);
+		const after = requireLane(h, lane.name);
+		expect(after.meta.qa).toBeUndefined();
+		expect(h.logs.some((line) => line.includes("lane_qa_stale"))).toBe(true);
+		expect(counted.calls).toHaveLength(0);
+		expect(leftCopies()).toEqual([]);
+		h.close();
+	});
+
+	test("AC-7: copies left in qa-worktrees are removed when the manager starts, from disk and git's list", async () => {
+		const repo = makeRepo(repos);
+		const sha = git(repo, "rev-parse", "HEAD");
+		const leftover = join(qaDir(), `L-20270115-01-${sha}`);
+		mkdirSync(qaDir(), { recursive: true });
+		git(repo, "worktree", "add", "--detach", leftover, sha);
+		writeFileSync(join(leftover, "untracked.txt"), "x");
+		const broken = join(qaDir(), "not-a-worktree");
+		mkdirSync(broken);
+		expect(worktreeList(repo)).toContain(leftover);
+		const h = qaHarness(says(CLEAR).run, qaPolicy(repo));
+		await h.settle();
+		expect(leftCopies()).toEqual([]);
+		expect(worktreeList(repo)).not.toContain(leftover);
+		h.close();
+	});
+
+	test("parseQaVerdict: the last line only; a closing fence is skipped; findings are capped and redacted", () => {
+		expect(parseQaVerdict('a\n{"verdict":"PASS","findings":["ok"]}\n```\n')).toEqual({
+			verdict: "PASS",
+			findings: ["ok"],
+		});
+		expect(parseQaVerdict('{"verdict":"FAIL"}')).toEqual({ verdict: "FAIL", findings: [] });
+		expect(parseQaVerdict('{"verdict":"PASS","findings":["x"]}\n끝')).toEqual({ reason: "마지막 줄이 JSON 아님" });
+		expect(parseQaVerdict('{"verdict":"OK"}')).toEqual({ reason: "verdict가 PASS·FAIL 아님" });
+		expect(parseQaVerdict('{"verdict":"PASS","findings":"x"}')).toEqual({ reason: "findings가 배열 아님" });
+		expect(parseQaVerdict("")).toEqual({ reason: "마지막 줄 없음" });
+		const many = parseQaVerdict(
+			JSON.stringify({ verdict: "FAIL", findings: Array.from({ length: 12 }, (_, i) => `${i}${"x".repeat(300)}`) }),
+		);
+		expect("findings" in many && many.findings).toHaveLength(10);
+		expect("findings" in many && many.findings[0]).toHaveLength(200);
+		const token = ["xoxb", "TEST", "0"].join("-");
+		expect(parseQaVerdict(JSON.stringify({ verdict: "FAIL", findings: [`leak ${token}`] }))).toEqual({
+			verdict: "FAIL",
+			findings: [redact(`leak ${token}`)],
+		});
+	});
+
+	test("AC-3: a receipt of the previous claim commit holds the lane as 실행 QA 없음", async () => {
+		const repo = makeRepo(repos);
+		const fake = fakeRunner((call) => (isQa(call) ? pass() : { code: 0, stdout: CLEAR, timedOut: false }));
+		const policy = qaPolicy(repo);
+		const h = qaHarness(fake.run, policy, countingLand().land);
+		const { lane, sha } = await closeLane(h, repo, false, "L3");
+		h.close();
+		const next = "e".repeat(40);
+		const reclaimed: LaneRow = {
+			...lane,
+			meta: {
+				...lane.meta,
+				sha: next,
+				checks: { head: next, results: lane.meta.checks?.results ?? [] },
+				review: { sha: next, verdict: "CLEAR", model: MODEL, at: 0, notes: "", confidence: 0.9 },
+				qa: { sha, verdict: "PASS", findings: [], model: QA_MODEL, at: 0 },
+			},
+		};
+		expect(laneLandBlockers(reclaimed, policy, true, false)).toEqual([QA_MISSING]);
 	});
 });
 

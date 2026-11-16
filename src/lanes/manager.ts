@@ -10,6 +10,7 @@ import type { ChatPlatform } from "../core/origin-key";
 import type { InboundRecord, MailboxClock } from "../core/types";
 import { pidAlive } from "../daemon/lock";
 import type { Logger } from "../log";
+import { THINKING_LEVELS } from "../monitors/spec";
 import type { TodoPhase } from "../omp/driver";
 import { endsWithQuestion } from "../omp/session-tail";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
@@ -19,10 +20,11 @@ import { type TaskCheck, type TaskChecksRun, taskChecksOf } from "../tasks/check
 import { worktreePathOf } from "../tasks/docs";
 import { runWorktreeChecks } from "../tasks/evaluate";
 import { createTaskHostOps, type TaskHostOps } from "../tasks/host";
-import { type AutoLandPolicy, cardMessage } from "../tasks/notify";
+import { type AutoLandPolicy, cardMessage, type LaneQaPolicy } from "../tasks/notify";
 import { repoMatchesCommonDir } from "../tasks/repo-match";
 import { applyRiskFloor } from "../tasks/risk-floor";
 import { CHECK_TIMEOUT_MS, type SignalCheck } from "../tasks/signals";
+import { resolveWorkerTier } from "../tasks/worker-tier";
 import { localDay } from "../time";
 import { changedFilesSince, fileSize, headOf, sessionDelta } from "./attach";
 import {
@@ -51,8 +53,11 @@ import {
 	type LandLane,
 	type LandResult,
 	laneLandBlockers,
+	laneQaRisk,
 } from "./land";
+import { cleanQaWorktrees, runLaneQa } from "./qa";
 import { formatConfidence, type LaneReviewDeps, reviewLane } from "./review";
+import { appendFollowups, checkLaneScope, parseLaneLeftovers, parseLaneScope } from "./scope";
 import {
 	INCONCLUSIVE_APPROVED,
 	INTEGRITY_APPROVED,
@@ -63,6 +68,7 @@ import {
 	type LaneClaim,
 	type LaneLand,
 	type LaneMeta,
+	type LaneQa,
 	type LaneReview,
 	type LaneRow,
 	type LaneStatus,
@@ -240,8 +246,20 @@ export interface LaneManagerDeps {
 	 * `<ompbot home>/reviews` for the diff files. Absent: a review policy finds no reviewer (`inconclusive`).
 	 */
 	reviewer?: Omit<LaneReviewDeps, "headOf" | "now">;
+	/**
+	 * `<ompbot home>/qa-worktrees`: the copies the run QA (`taskAutoLand.qa`) runs in, under the reviewer's omp setup.
+	 * Leftovers there are removed when the manager starts. Absent: a QA policy finds no runner (`inconclusive`).
+	 */
+	qaWorktreesDir?: string;
+	/** Git of the run QA's copies (test seam; default `defaultGit`). */
+	qaGit?: GitRunner;
 	/** Git for the Outcome card's change summary (test seam; default 10 seconds per call, `computeLaneChanges`). */
 	changesGit?: GitRunner;
+	/**
+	 * `$OMPBOT_HOME/followups.jsonl`: a merged lane's non-blocking leftovers are appended there (`appendFollowups`).
+	 * Absent: nothing is written.
+	 */
+	followupsFile?: string;
 	/** Git for the core's rebase of a lane whose landing was not fast-forward (test seam; default `defaultGit`). */
 	rebaseGit?: GitRunner;
 	/**
@@ -275,6 +293,19 @@ function detachSummary(turns: number, changed: number | undefined, costUsd: numb
 	const files = changed === undefined ? "바뀐 파일 수 확인 못 함" : `바뀐 파일 ${changed}개`;
 	const by = orphan ? " (attach 프로세스가 끝나 코어가 되찾음)" : "";
 	return `🖥 터미널 omp에서 레인을 돌려받았습니다${by} — TUI에서 ${turns}턴, ${files}, TUI 비용 $${costUsd.toFixed(2)}`;
+}
+
+/**
+ * A `lanes.models` value as origin settings: a trailing `:<thinking level>` is the thinking level, not part of the model id
+ * (the RPC model list holds bare `provider/id`s); any other colon stays in the id. Null: no model configured.
+ */
+function splitModelThinking(value: string | null): { model: string; thinking?: string } | undefined {
+	if (value === null) return undefined;
+	const cut = value.lastIndexOf(":");
+	const level = value.slice(cut + 1);
+	return cut > 0 && (THINKING_LEVELS as readonly string[]).includes(level)
+		? { model: value.slice(0, cut), thinking: level }
+		: { model: value };
 }
 
 function slugify(title: string): string {
@@ -324,7 +355,12 @@ export class LaneManager {
 	readonly #background = new Set<Promise<void>>();
 	/** Lanes whose independent review is running (in the background: a tick never waits for one). */
 	readonly #reviewing = new Set<string>();
-	/** One review at a time across all lanes: the tail of the queue for the review slot. */
+	/**
+	 * Lanes whose run QA is running: its abort switch and when its run (not the announce after it) has ended. A landing,
+	 * discard or `!reopen` aborts it first.
+	 */
+	readonly #qaRunning = new Map<string, { abort: AbortController; ended: Promise<void> }>();
+	/** One review or QA at a time across all lanes: the tail of the queue for the review slot. */
 	#reviewSlotTail: Promise<void> = Promise.resolve();
 	/** Lanes whose channel was found unregistered by a draw: the skip is logged once per lane per process. */
 	readonly #unroutableWarned = new Set<string>();
@@ -337,6 +373,18 @@ export class LaneManager {
 		this.#ops = deps.hostOps ?? createTaskHostOps();
 		const ops = this.#ops;
 		this.#land = deps.land ?? createLaneLander({ removeWorktree: (input) => ops.removeWorktree(input) });
+		// QA copies a stop or crash left behind go at start, in the review slot so no QA starts before they are gone.
+		const qaDir = deps.qaWorktreesDir;
+		if (qaDir !== undefined) {
+			this.#spawn("qa-worktrees", async () => {
+				const free = await this.#reviewSlot();
+				try {
+					await cleanQaWorktrees(qaDir, deps.qaGit, deps.log);
+				} finally {
+					free();
+				}
+			});
+		}
 	}
 
 	/** Resolves once the background work started so far (Outcome cards, auto-merges) has finished. */
@@ -437,6 +485,8 @@ export class LaneManager {
 		channel: string;
 		acceptance?: unknown;
 		risk?: unknown;
+		/** Repository-relative globs the claim's changes must stay inside (`parseLaneScope`); absent: no check. */
+		scope?: unknown;
 		/** A `lanes.models` tier; absent: the bot's default model. */
 		model?: unknown;
 	}): Promise<LaneRow & { startNote?: string }> {
@@ -452,7 +502,9 @@ export class LaneManager {
 		if (!risk.ok) throw new LaneInputError(risk.problem);
 		const acceptance = parseLaneAcceptance(input.acceptance);
 		if (!acceptance.ok) throw new LaneInputError(acceptance.problem);
-		const model = this.#laneModel(input.model);
+		const scope = parseLaneScope(input.scope);
+		if (!scope.ok) throw new LaneInputError(scope.problem);
+		const requestedTier = this.#laneTier(input.model);
 		// Kept for the independent review: the spec it reads first. A cut one says so inside, so the review knows the
 		// rest is missing; the lane itself gets the whole brief.
 		const fullBrief = redact(input.brief?.trim() ?? "");
@@ -462,6 +514,13 @@ export class LaneManager {
 			: fullBrief;
 		// Topic keywords put a floor under the class (raise only); `startNote` tells the starter.
 		const floored = applyRiskFloor(risk.value, [title, brief]);
+		// The tier follows the final risk (floor applied; a lane nobody rated counts as DEFAULT_LANE_RISK).
+		const worker = resolveWorkerTier(
+			floored.risk,
+			{ tier: requestedTier, tierReason: requestedTier === undefined ? `위험 ${floored.risk} 기본` : "요청" },
+			this.#deps.laneModels?.(),
+		);
+		const model = splitModelThinking(worker.model);
 		if (!isAbsolute(input.cwd)) throw new LaneInputError(`프로젝트 경로는 절대경로여야 합니다: ${input.cwd}`);
 		let cwd: string;
 		try {
@@ -544,7 +603,11 @@ export class LaneManager {
 					// A lane nobody rated (and no keyword raised) keeps no risk: it counts as DEFAULT_LANE_RISK, and the
 					// confident band (`taskAutoLand.review.confident`) is for explicit risks only.
 					...(input.risk === undefined && floored.risk === risk.value ? {} : { risk: floored.risk }),
+					tier: worker.tier,
+					tierReason: worker.tierReason,
+					...(worker.model === null ? {} : { workerModel: worker.model }),
 					acceptance: acceptance.value,
+					...(scope.value.length === 0 ? {} : { scope: scope.value }),
 					...(brief === "" ? {} : { brief }),
 				},
 			});
@@ -569,9 +632,16 @@ export class LaneManager {
 		if (model !== undefined) {
 			// The lane's first child applies origin settings when it opens (`#applySettings`), like a thread `!model`.
 			store.ensureOrigin(lane.originKey, lane.sessionDir);
-			store.setOriginSettings(lane.originKey, { model });
+			store.setOriginSettings(lane.originKey, model);
 		}
-		log.info("lane_started", { lane: lane.name, origin: lane.originKey, cwd: lane.cwd, branch, model });
+		log.info("lane_started", {
+			lane: lane.name,
+			origin: lane.originKey,
+			cwd: lane.cwd,
+			branch,
+			model: model?.model,
+			tier: worker.tier,
+		});
 		if (floored.note !== undefined) {
 			log.info("lane_risk_floor_raised", { lane: lane.name, from: risk.value, to: floored.risk });
 		}
@@ -595,6 +665,7 @@ export class LaneManager {
 		if (briefCut) log.warn("lane_brief_cut", { lane: lane.name, chars: fullBrief.length, kept: MAX_BRIEF_CHARS });
 		const notes = [
 			...(floored.note === undefined ? [] : [floored.note]),
+			...(worker.note === undefined ? [] : [worker.note]),
 			...(briefCut
 				? [
 						`브리프 ${fullBrief.length}자 중 앞 ${MAX_BRIEF_CHARS}자만 독립 리뷰에 남겼습니다. 긴 스펙은 파일로 두고 브리프에는 경로를 적으세요.`,
@@ -604,13 +675,14 @@ export class LaneManager {
 		return notes.length === 0 ? lane : { ...lane, startNote: notes.join("\n") };
 	}
 
-	/** The `provider/id` of a configured tier; undefined when none was asked for. */
-	#laneModel(tier: unknown): string | undefined {
+	/** The tier the starter asked for, checked against the configured ones; undefined when none was asked for. */
+	#laneTier(tier: unknown): LaneModelTier | undefined {
 		if (tier === undefined) return undefined;
 		const tiers = this.#deps.laneModels?.() ?? {};
 		const configured = LANE_MODEL_TIERS.filter((name) => tiers[name] !== undefined);
-		const model = typeof tier === "string" && Object.hasOwn(tiers, tier) ? tiers[tier as LaneModelTier] : undefined;
-		if (model !== undefined) return model;
+		if (typeof tier === "string" && Object.hasOwn(tiers, tier) && tiers[tier as LaneModelTier] !== undefined) {
+			return tier as LaneModelTier;
+		}
 		throw new LaneInputError(
 			configured.length === 0
 				? "레인 모델 등급이 설정돼 있지 않습니다(config lanes.models). model 없이 시작하세요."
@@ -676,11 +748,17 @@ export class LaneManager {
 					baseSha: lane.meta.sha ?? lane.meta.baseSha,
 					land: undefined,
 					review: undefined,
+					qa: undefined,
 					changes: undefined,
+					scopeViolations: undefined,
+					scopeError: undefined,
+					leftovers: undefined,
 					nudges: undefined,
 				},
 			);
 			this.#deps.log.info("lane_reopened", { lane: lane.name });
+			// A running QA stops; its receipt would not be written anyway (the lane has no claim commit now).
+			void this.#stopQa(lane.name);
 			this.#dropReviewFiles(reopened);
 			void this.#sync(reopened, "transition");
 			const cardTs = lane.meta.land?.cardTs;
@@ -1129,15 +1207,25 @@ export class LaneManager {
 	}
 
 	/** The lane says it is done. The core decides with git, not with the lane's word. */
-	async claimDone(originKey: string, evidence: ClaimEvidence): Promise<string> {
+	async claimDone(originKey: string, evidence: ClaimEvidence & { leftovers?: unknown }): Promise<string> {
 		const { store, clock } = this.#deps;
 		const lane = this.#requireLane(originKey);
 		if (lane.status === "closed") return `lane ${lane.name} ${CLOSED_LANE_REPLY}`;
 		if (lane.status === "paused") return `lane ${lane.name} ${PAUSED_LANE_REPLY}`;
-		const claim = { ...evidence, claimedAt: clock.now() };
+		const { leftovers: rawLeftovers, ...claimed } = evidence;
+		const leftovers = parseLaneLeftovers(rawLeftovers);
+		if (!leftovers.ok) return `claim not recorded: ${leftovers.problem}`;
+		const claim = { ...claimed, claimedAt: clock.now() };
 		const entry = { event: "claim", detail: `${evidence.repo}@${evidence.commit}: ${evidence.summary}` };
-		if (lane.status === "done-claimed") store.patchLane(lane.name, entry, { claim });
-		else store.transitionLane(lane.name, "done-claimed", entry, { claim });
+		// A new claim is judged afresh: the last close's scope result and the last claim's leftovers go with it.
+		const patch = {
+			claim,
+			leftovers: leftovers.value.length === 0 ? undefined : leftovers.value,
+			scopeViolations: undefined,
+			scopeError: undefined,
+		};
+		if (lane.status === "done-claimed") store.patchLane(lane.name, entry, patch);
+		else store.transitionLane(lane.name, "done-claimed", entry, patch);
 		return (await this.#settle(lane.name)).text;
 	}
 
@@ -1441,11 +1529,19 @@ export class LaneManager {
 			attempts: this.#deps.store.getLane(lane.name)?.meta.land?.attempts ?? 0,
 			...(held === undefined ? {} : { autoLandHeld: held }),
 		};
+		// Every file the claim changed against `scope` (not the card's top five); a git failure holds the merge.
+		const scope = lands ? await checkLaneScope(lane, sha, this.#deps.changesGit) : {};
+		if (scope.scopeError !== undefined) {
+			this.#deps.log.warn("lane_scope_check_failed", { lane: lane.name, error: scope.scopeError });
+		}
+		// The owner may have paused or answered, or the lane claimed again, while git ran.
+		const superseded = lands ? this.#claimSuperseded(lane) : undefined;
+		if (superseded !== undefined) return superseded;
 		const closed = this.#deps.store.transitionLane(
 			lane.name,
 			"closed",
 			{ event: "closed", sha },
-			{ sha, milestone: undefined, ...(lands ? { land } : {}) },
+			{ sha, milestone: undefined, ...(lands ? { land, ...scope } : {}) },
 		);
 		this.#deps.log.info("lane_closed", { lane: lane.name, sha });
 		const rendered = await this.#sync(closed, "transition");
@@ -1476,8 +1572,15 @@ export class LaneManager {
 	 */
 	async #announce(name: string): Promise<void> {
 		const { store, log } = this.#deps;
-		// A running review announces the lane itself when it ends.
-		if (this.#announcing.has(name) || this.#landing.has(name) || this.#reviewing.has(name)) return;
+		// A running review or QA announces the lane itself when it ends.
+		if (
+			this.#announcing.has(name) ||
+			this.#landing.has(name) ||
+			this.#reviewing.has(name) ||
+			this.#qaRunning.has(name)
+		) {
+			return;
+		}
 		this.#announcing.add(name);
 		try {
 			const lane = store.getLane(name);
@@ -1493,10 +1596,12 @@ export class LaneManager {
 				const matched = await this.#repoMatches(lane.meta.repo ?? lane.cwd, policy.repos);
 				const frozen = this.#deps.frozen?.() !== undefined;
 				const held = this.#autoLandHeld(name);
-				const { review, ...withoutReview } = policy;
+				// The review is judged without both receipts (a QA reason would hold it forever: the QA waits for the review),
+				// the QA without its own only — so the order is review → CLEAR → QA → merge.
+				const { review, qa, ...withoutReceipts } = policy;
 				// A lane in the confident band is held back by its risk only until its review: judge it at that band's top.
 				const band = confidentBand(lane, policy);
-				const gate = band === undefined ? withoutReview : { ...withoutReview, maxRisk: band.maxRisk };
+				const gate = band === undefined ? withoutReceipts : { ...withoutReceipts, maxRisk: band.maxRisk };
 				// Only a lane the review alone holds back is reviewed, and one commit only once (a restart keeps the receipt).
 				if (
 					review !== undefined &&
@@ -1507,6 +1612,18 @@ export class LaneManager {
 					// Up to 30 minutes: in the background, so the tick that announces never waits for it.
 					this.#reviewing.add(name);
 					this.#spawn(name, () => this.#review(name, review));
+					return;
+				}
+				// Only a lane the QA alone holds back is run (an unreviewable one never is), one commit only once.
+				const withoutQa = review === undefined ? withoutReceipts : { ...withoutReceipts, review };
+				if (
+					qa !== undefined &&
+					held.length === 0 &&
+					lane.meta.qa?.sha !== lane.meta.sha &&
+					laneQaRisk(lane, policy) &&
+					laneLandBlockers(lane, withoutQa, matched, frozen).length === 0
+				) {
+					this.#startQa(name, qa);
 					return;
 				}
 				skipped = [...held, ...laneLandBlockers(lane, policy, matched, frozen)];
@@ -1633,6 +1750,123 @@ export class LaneManager {
 		if (recorded) await this.#announce(name);
 	}
 
+	/** Starts the run QA in the background, registered before any await (a landing or discard finds it at once). */
+	#startQa(name: string, qa: LaneQaPolicy): void {
+		const abort = new AbortController();
+		const ended = Promise.withResolvers<void>();
+		this.#qaRunning.set(name, { abort, ended: ended.promise });
+		this.#spawn(name, () => this.#qa(name, qa, abort, ended.resolve));
+	}
+
+	/**
+	 * Runs the QA of the closed lane's claim commit (in the review slot: one review or QA at a time) and records its
+	 * receipt, then announces the lane again with it. An aborted QA (a landing, a discard, `!reopen`, `stop()`) records
+	 * nothing, and neither does one whose lane was landed or moved to another commit meanwhile: the lane is read again
+	 * right before the write.
+	 */
+	async #qa(name: string, qa: LaneQaPolicy, abort: AbortController, end: () => void): Promise<void> {
+		const { store, log, clock } = this.#deps;
+		let recorded = false;
+		try {
+			let receipt: LaneQa;
+			const free = await this.#reviewSlot();
+			try {
+				const lane = store.getLane(name);
+				if (this.#stopped || abort.signal.aborted || lane?.status !== "closed" || lane.meta.sha === undefined) return;
+				this.#checkAborts.add(abort);
+				const reviewer = this.#deps.reviewer;
+				const worktreesDir = this.#deps.qaWorktreesDir;
+				log.info("lane_qa_started", { lane: name, sha: lane.meta.sha, model: qa.model });
+				receipt =
+					reviewer === undefined || worktreesDir === undefined
+						? {
+								sha: lane.meta.sha,
+								verdict: "inconclusive",
+								findings: [],
+								model: qa.model,
+								at: clock.now(),
+								reason: "QA 실행기 없음",
+							}
+						: await runLaneQa(
+								{ lane, policy: qa, signal: abort.signal },
+								{
+									ompBin: reviewer.ompBin,
+									...(reviewer.ompProfile === undefined ? {} : { ompProfile: reviewer.ompProfile }),
+									systemPromptAppendix: reviewer.systemPromptAppendix,
+									worktreesDir,
+									overlaysDir: reviewer.reviewsDir,
+									now: () => clock.now(),
+									...(reviewer.run === undefined ? {} : { run: reviewer.run }),
+									...(this.#deps.qaGit === undefined ? {} : { git: this.#deps.qaGit }),
+									...(reviewer.inheritedEnv === undefined ? {} : { inheritedEnv: reviewer.inheritedEnv }),
+									log,
+								},
+							);
+			} finally {
+				this.#checkAborts.delete(abort);
+				free();
+			}
+			if (abort.signal.aborted) {
+				log.info("lane_qa_stopped", { lane: name });
+				return;
+			}
+			const current = store.getLane(name);
+			const land = current?.meta.land;
+			if (
+				current?.status !== "closed" ||
+				current.meta.sha !== receipt.sha ||
+				(land?.state !== "pending" && land?.state !== "blocked") ||
+				land.requestedBy !== undefined
+			) {
+				log.info("lane_qa_stale", { lane: name, sha: receipt.sha });
+				return;
+			}
+			const label = receipt.verdict === "inconclusive" ? `확인 불가(${receipt.reason ?? "?"})` : receipt.verdict;
+			store.patchLane(name, { event: "qa", detail: `${label} · ${receipt.model}`, sha: receipt.sha }, { qa: receipt });
+			log.info("lane_qa_recorded", {
+				lane: name,
+				sha: receipt.sha,
+				verdict: receipt.verdict,
+				reason: receipt.reason ?? "",
+			});
+			recorded = true;
+		} finally {
+			// Before the announce: a landing that announce starts must not wait for this QA.
+			this.#qaRunning.delete(name);
+			end();
+		}
+		if (recorded) await this.#announce(name);
+	}
+
+	/** Aborts the lane's running QA and waits until its run ended (its copy removed); at once when none runs. */
+	async #stopQa(name: string): Promise<void> {
+		const running = this.#qaRunning.get(name);
+		if (running === undefined) return;
+		running.abort.abort();
+		this.#deps.log.info("lane_qa_aborted", { lane: name });
+		await running.ended;
+	}
+
+	/**
+	 * A merged lane's non-blocking leftovers go to the follow-up ledger (`followupsFile`), each once per lane, commit and
+	 * text (a landing run again adds none), and the thread gets one line when any was written. A write that fails is
+	 * logged: the merge stands.
+	 */
+	async #recordFollowups(lane: LaneRow): Promise<void> {
+		const file = this.#deps.followupsFile;
+		if (file === undefined) return;
+		let written: number;
+		try {
+			written = appendFollowups(file, lane, this.#deps.clock.now());
+		} catch (error) {
+			this.#deps.log.warn("lane_followups_failed", { lane: lane.name, error: String(error).slice(0, 200) });
+			return;
+		}
+		if (written === 0) return;
+		this.#deps.log.info("lane_followups_recorded", { lane: lane.name, count: written });
+		await this.#postInThread(lane, `후속 ${written}건을 장부에 남김`);
+	}
+
 	/**
 	 * Removes the lane's review files (`<reviewsDir>/<laneId>-*.diff`, `-*.omp.yml` and the `-*.cwd` directories); a missing
 	 * one is no error, a failure is logged.
@@ -1704,6 +1938,8 @@ export class LaneManager {
 		if (this.#landing.has(name)) return { handled: false, text: "이미 머지가 진행 중입니다." };
 		this.#landing.add(name);
 		try {
+			// A running QA is aborted (its receipt is never written) and its copy removed before the landing.
+			await this.#stopQa(name);
 			// Recorded before any git runs: a restart finds the landing begun and the tick finishes it.
 			this.#patchLand(
 				name,
@@ -1831,6 +2067,7 @@ export class LaneManager {
 			log.warn("lane_merged_not_pushed", { lane: name, sha, reason: result.reason });
 			this.#dropReviewFiles(row);
 			await this.#showResult(await this.#sync(row, "transition"), unattended);
+			await this.#recordFollowups(row);
 			return `⚠️ ${baseBranch}에 머지했지만 push origin/${baseBranch}는 되지 않았습니다: ${result.reason}${
 				cleanup === undefined ? "" : ` · ${cleaned}`
 			}`;
@@ -1850,6 +2087,7 @@ export class LaneManager {
 		log.info("lane_landed", { lane: name, sha, pushed: result.pushed ?? "none", by });
 		this.#dropReviewFiles(row);
 		await this.#showResult(await this.#sync(row, "transition"), false);
+		await this.#recordFollowups(row);
 		return `✅ 머지했습니다: ${baseBranch} ← ${short} · ${result.pushed === undefined ? "push 없음(origin 원격 없음)" : `push ${result.pushed}`} · ${cleaned}`;
 	}
 
@@ -1990,6 +2228,7 @@ export class LaneManager {
 		}
 		this.#landing.add(name);
 		try {
+			await this.#stopQa(name);
 			// An idle child of this lane still has the worktree as its cwd.
 			await this.#deps.stopWhenIdle(lane.originKey);
 			await this.#ops.removeWorktree({ repo, worktree, branch });
@@ -2048,7 +2287,7 @@ export class LaneManager {
 		const route = this.#deps.channels.forThreadRef(lane.threadRef);
 		if (route === undefined) return undefined;
 		try {
-			const card = buildLaneOutcomeCard(lane, view);
+			const card = buildLaneOutcomeCard(lane, view, route.port.platform);
 			return (await route.port.post(route.target, cardMessage(card, route.port))).messageId;
 		} catch (error) {
 			this.#deps.log.warn("lane_card_post_failed", { lane: lane.name, error: String(error) });
@@ -2061,7 +2300,7 @@ export class LaneManager {
 		const route = this.#deps.channels.forThreadRef(lane.threadRef);
 		if (route === undefined) return;
 		try {
-			const card = buildLaneOutcomeCard(lane, view);
+			const card = buildLaneOutcomeCard(lane, view, route.port.platform);
 			await route.port.edit(
 				{
 					platform: route.port.platform,

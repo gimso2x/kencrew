@@ -14,6 +14,7 @@ const THINKING_CHARS = 4000;
 const OUTPUT_CHARS = 2000;
 const SUMMARY_CHARS = 120;
 const RETRY_ERROR_CHARS = 160;
+const DONE_KEEP = 6;
 
 /** `LiveTurn.view()`: every string is masked and trimmed to its tail. */
 export interface LiveView {
@@ -30,6 +31,8 @@ export interface LiveView {
 	toolCalls: Array<{ name: string; summary: string }>;
 	/** Tools running now, oldest first, with the tail of their partial output. */
 	running: Array<{ name: string; summary: string; ageMs: number; outputTail: string }>;
+	/** The last tools that finished, oldest first (at most 6): how long each took and whether it failed. */
+	done: Array<{ name: string; summary: string; ms: number; failed: boolean }>;
 	/** The provider call failed and omp is waiting to retry; the failed attempt's text is gone. */
 	retry?: { attempt: number; error: string };
 }
@@ -75,6 +78,7 @@ export class LiveTurn {
 	#updatedAt: number;
 	#message: unknown;
 	readonly #running = new Map<string, RunningTool>();
+	readonly #done: LiveView["done"] = [];
 	#retry: { attempt: number; error: string } | undefined;
 
 	constructor(clock: MailboxClock, inboundId: string) {
@@ -108,9 +112,20 @@ export class LiveTurn {
 				tool.output = outputOf(event.partialResult);
 				break;
 			}
-			case "tool_execution_end":
+			case "tool_execution_end": {
+				// An end without a start we saw (no such id, or an empty one) changes nothing.
+				const tool = callId === "" ? undefined : this.#running.get(callId);
+				if (tool === undefined) return;
 				this.#running.delete(callId);
+				this.#done.push({
+					name: redact(tool.name),
+					summary: redact(tool.intent).slice(0, SUMMARY_CHARS),
+					ms: Math.max(0, this.#clock.now() - tool.startedAt),
+					failed: event.isError === true,
+				});
+				if (this.#done.length > DONE_KEEP) this.#done.shift();
 				break;
+			}
 			case "auto_retry_start":
 				this.#message = undefined;
 				this.#retry = {
@@ -166,6 +181,7 @@ export class LiveTurn {
 				ageMs: Math.max(0, now - tool.startedAt),
 				outputTail: tail(tool.output, OUTPUT_CHARS),
 			})),
+			done: this.#done.map((tool) => ({ ...tool })),
 			...(this.#retry === undefined ? {} : { retry: { ...this.#retry } }),
 		};
 	}

@@ -1,7 +1,17 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readdirSync,
+	readFileSync,
+	rmSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { renderUnit } from "../src/cli/units";
 import { runCliCapture } from "./helpers/daemon-process";
 
 const REPO = resolve(import.meta.dir, "..");
@@ -126,7 +136,7 @@ describe("ompbot units render --instance", () => {
 		for (const name of INSTANCE_UNITS.filter((unit) => unit.endsWith(".service"))) {
 			expect(units.get(name)?.split("\n")).toContain(`Environment=OMPBOT_HOME=${ompbotHome}`);
 		}
-		expect(units.get("ompbot-tteok.service")).toContain("Description=ompbot-tteok (Slack bot");
+		expect(units.get("ompbot-tteok.service")).toContain("Description=ompbot-tteok (chat bot");
 		expect(units.get("ompbot-tteok-gc.service")).toContain("\nAfter=ompbot-tteok-backup.service\n");
 		expect(units.get("ompbot-tteok-backup.timer")).toContain("Description=ompbot-tteok daily backup timer");
 	});
@@ -273,5 +283,55 @@ describe("ompbot units render OMPBOT_HOME quoting", () => {
 		expect(run.code).toBe(2);
 		expect(run.out).toBe("");
 		expect(run.err).toContain("OMPBOT_HOME");
+	});
+});
+
+describe("qa-l low units (#7 #8 #9)", () => {
+	test("#7: a placeholder-looking path value is not substituted a second time", () => {
+		const template =
+			"[Service]\nEnvironment=PATH=@PATH@\nExecStart=@BUN@ @REPO_DIR@/src/main.ts daemon\nWorkingDirectory=@HOME@\n";
+		const text = renderUnit("ompbot.service", template, {
+			bun: "/opt/@REPO_DIR@/bun",
+			repoDir: "/srv/@BUN@/repo",
+			home: "/home/@PATH@",
+		});
+		expect(text).toContain("ExecStart=/opt/@REPO_DIR@/bun /srv/@BUN@/repo/src/main.ts daemon");
+		expect(text).toContain("WorkingDirectory=/home/@PATH@");
+		expect(text).toContain("Environment=PATH=/opt/@REPO_DIR@:/home/@PATH@/.local/bin:");
+	});
+
+	test("#8: a checkout path with a newline is refused like a HOME with one", async () => {
+		const root = tempDir("ompbot-units-nl-");
+		const dir = join(root, "a\nExecStartPre=/bin/false", "src", "cli");
+		mkdirSync(dir, { recursive: true });
+		const copy = join(dir, "units.ts");
+		writeFileSync(copy, readFileSync(join(REPO, "src", "cli", "units.ts"), "utf8"));
+		const mod = (await import(copy)) as typeof import("../src/cli/units");
+		let err = "";
+		const write = process.stderr.write.bind(process.stderr);
+		process.stderr.write = ((chunk: string) => {
+			err += chunk;
+			return true;
+		}) as typeof process.stderr.write;
+		let code: number;
+		try {
+			code = mod.unitsCommand(["render", "--dry-run"], { HOME: root });
+		} finally {
+			process.stderr.write = write;
+		}
+		expect(code).toBe(2);
+		expect(err).toContain("checkout path");
+	});
+
+	test("#9: an --out that cannot be written is a usage error naming the errno", async () => {
+		const home = tempDir("ompbot-units-home-");
+		const out = join(home, "ro");
+		mkdirSync(out);
+		chmodSync(out, 0o500);
+		const run = await render(["--out", join(out, "sub")], home);
+		chmodSync(out, 0o700);
+		expect(run.code).toBe(2);
+		expect(run.err).toContain("--out");
+		expect(run.err).toContain("EACCES");
 	});
 });

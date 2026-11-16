@@ -4,16 +4,19 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync }
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LogFields, Logger } from "../src/log";
+import { newestSessionFile } from "../src/omp/session-heal";
 import {
 	buildFloorsPrompt,
 	FLOORS_DYNAMIC_HEADING,
 	floorsSystemPrompt,
 	type PersonaFiles,
 	PINNED_OWNER_DOCS_FILE,
+	pinPrefix,
 	SOUL_MAX_BYTES,
 	type SpawnPromptOptions,
 	spawnSystemPrompt,
 } from "../src/safety/prompt";
+import { runBounded } from "./helpers/bounded-child";
 
 const NOW = Date.parse("2026-11-11T08:00:00.000Z");
 const MINUTE = 60_000;
@@ -324,7 +327,7 @@ describe("sidecar format versions (AC-3)", () => {
 		expect(text).toContain(OWNER_V1);
 		expect(text).not.toContain(OWNER_V2);
 		expect(records.some((r) => r.level === "warn")).toBe(false);
-		expect(sidecarHeader().startsWith("ompbot-pinned-owner-docs v2 ")).toBe(true);
+		expect(sidecarHeader().startsWith("ompbot-pinned-owner-docs v3 ")).toBe(true);
 	});
 
 	test("an unknown header is replaced without a warning", () => {
@@ -334,7 +337,81 @@ describe("sidecar format versions (AC-3)", () => {
 		expect(lastSpawnLog().pinned).toBe(false);
 		expect(text).not.toContain(OWNER_V2);
 		expect(records.some((r) => r.level === "warn")).toBe(false);
-		expect(sidecarHeader().startsWith("ompbot-pinned-owner-docs v2 ")).toBe(true);
+		expect(sidecarHeader().startsWith("ompbot-pinned-owner-docs v3 ")).toBe(true);
+	});
+});
+
+describe("sidecar forgery (qa-l #77)", () => {
+	const sidecar = (): string => join(sessionDir(), PINNED_OWNER_DOCS_FILE);
+	const forged = "# FORGED floors\n";
+
+	test("a tampered body with its own sha256 (v2 form) is not trusted", () => {
+		spawn({ herdr: false });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const body = forged + OWNER_V1;
+		writeFileSync(
+			sidecar(),
+			`ompbot-pinned-owner-docs v2 static=${forged.length} sha256=${createHash("sha256").update(body).digest("hex")}\n${body}`,
+		);
+		const text = spawn({ herdr: false });
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(text).not.toContain("FORGED");
+		expect(records.some((r) => r.level === "warn")).toBe(false);
+		expect(sidecarHeader().startsWith("ompbot-pinned-owner-docs v3 ")).toBe(true);
+	});
+
+	test("a tampered body with an arbitrary mac under the current key id is replaced and reported once", () => {
+		spawn({ herdr: false });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const keyId = /key=([0-9a-f]{16}) /.exec(sidecarHeader())?.[1] as string;
+		expect(keyId).toBeDefined();
+		writeFileSync(
+			sidecar(),
+			`ompbot-pinned-owner-docs v3 static=${forged.length} key=${keyId} mac=${"0".repeat(64)}\n${forged}${OWNER_V1}`,
+		);
+		const text = spawn({ herdr: false });
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(text).not.toContain("FORGED");
+		expect(records.filter((r) => r.level === "warn" && r.event === "pinned_owner_docs_unusable")).toHaveLength(1);
+	});
+
+	test("a v2 sidecar is replaced by v3 without a report", () => {
+		spawn({ herdr: false });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const raw = readFileSync(sidecar(), "utf8");
+		const body = raw.slice(raw.indexOf("\n") + 1);
+		const staticLength = /static=(\d+)/.exec(raw)?.[1];
+		writeFileSync(
+			sidecar(),
+			`ompbot-pinned-owner-docs v2 static=${staticLength} sha256=${createHash("sha256").update(body).digest("hex")}\n${body}`,
+		);
+		spawn({ herdr: false });
+		expect(lastSpawnLog().pinned).toBe(false);
+		expect(records.some((r) => r.level === "warn")).toBe(false);
+		expect(sidecarHeader().startsWith("ompbot-pinned-owner-docs v3 ")).toBe(true);
+	});
+
+	test("same key: pinned; another key (daemon restart): rewritten without a report; the key never reaches the file", () => {
+		const fresh = { floors: "FLOORS-A\n", owner: "OWNER-A\n" };
+		const reports: unknown[] = [];
+		const report = (error: unknown) => reports.push(error);
+		const keyA = Buffer.alloc(32, 7);
+		const keyB = Buffer.alloc(32, 9);
+		const dirPath = sessionDir();
+		expect(pinPrefix(dirPath, fresh, true, report, keyA).pinned).toBe(false);
+		const written = readFileSync(join(dirPath, PINNED_OWNER_DOCS_FILE), "utf8");
+		expect(written).not.toContain(keyA.toString("hex"));
+		expect(written).not.toContain(keyA.toString("base64"));
+		const other = { floors: "FLOORS-B\n", owner: "OWNER-B\n" };
+		const same = pinPrefix(dirPath, other, true, report, keyA);
+		expect(same).toEqual({ ...fresh, pinned: true });
+		const restarted = pinPrefix(dirPath, other, true, report, keyB);
+		expect(restarted).toEqual({ ...other, pinned: false });
+		expect(reports).toEqual([]);
+		const rewritten = readFileSync(join(dirPath, PINNED_OWNER_DOCS_FILE), "utf8");
+		expect(rewritten).toContain("FLOORS-B");
+		expect(rewritten).not.toContain(keyB.toString("hex"));
+		expect(rewritten).not.toContain(keyB.toString("base64"));
 	});
 });
 
@@ -465,5 +542,77 @@ describe("qa50b-low lane L", () => {
 		// The owner docs and the hard floors stay.
 		expect(without).toContain(SOUL);
 		expect(without).toContain("비밀 읽기 금지");
+	});
+});
+
+describe("a FIFO in the session dir (qa-l #78)", () => {
+	const SRC = join(import.meta.dir, "..", "src");
+	/** A FIFO open would block the child for good, so it runs bounded; the test's own timeout sits above that limit. */
+	const CHILD_TEST_MS = 30_000;
+	const mkfifo = (path: string): void => {
+		expect(Bun.spawnSync(["mkfifo", path]).exitCode).toBe(0);
+	};
+	/** Builds the spawn prompt in a bounded child; prints `done` and then one line per warning event. */
+	const spawnInChild = () =>
+		runBounded(
+			`const { spawnSystemPrompt } = await import(${JSON.stringify(join(SRC, "safety", "prompt.ts"))});
+			 const warns = [];
+			 const quiet = () => {};
+			 spawnSystemPrompt({ secretsDir: "/home/test/.ompbot/secrets", originKey: ${JSON.stringify(ORIGIN)},
+			   sessionDir: ${JSON.stringify(sessionDir())}, files: ${JSON.stringify(files)}, now: ${NOW},
+			   log: { debug: quiet, info: quiet, error: quiet, warn: (event, fields) => warns.push(event + " " + fields.error) } });
+			 console.log(["done", ...warns].join("\\n"));`,
+		);
+
+	test(
+		"a FIFO sidecar on a warm cache is reported and the prompt is still built",
+		async () => {
+			sessionWithCall(sessionDir(), 10 * MINUTE);
+			mkfifo(join(sessionDir(), PINNED_OWNER_DOCS_FILE));
+			const result = await spawnInChild();
+			expect(result.timedOut).toBe(false);
+			const [done, ...warns] = result.stdout.trim().split("\n");
+			expect(done).toBe("done");
+			expect(warns).toHaveLength(1);
+			expect(warns[0]).toStartWith("pinned_owner_docs_unusable ");
+			expect(warns[0]).toContain("not a regular file");
+		},
+		CHILD_TEST_MS,
+	);
+
+	test(
+		"the newest .jsonl being a FIFO is skipped for the next regular file, without a report",
+		async () => {
+			sessionWithCall(sessionDir(), 10 * MINUTE);
+			const fifo = join(sessionDir(), "2026-11-11T07-30-00-000Z_s2.jsonl");
+			mkfifo(fifo);
+			expect(newestSessionFile(sessionDir())).toBe(join(sessionDir(), "2026-11-11T07-00-00-000Z_s1.jsonl"));
+			const result = await spawnInChild();
+			expect(result.timedOut).toBe(false);
+			expect(result.stdout.trim()).toBe("done");
+		},
+		CHILD_TEST_MS,
+	);
+});
+
+describe("floors tool lines match the session (qa-l low B)", () => {
+	// qa-l #75: Teams owner 1:1 sessions register no monitor tools, so the prompt must not tell them to use them.
+	test("the monitor tools line is for Slack and Discord owner DMs only", () => {
+		const secrets = join(dir, "secrets");
+		expect(buildFloorsPrompt(secrets, "slack/dm/D1")).toContain("ompbot_monitor_add");
+		expect(buildFloorsPrompt(secrets, "discord/dm/1234567890")).toContain("ompbot_monitor_add"); // gitleaks:allow (fake channel id)
+		expect(buildFloorsPrompt(secrets, "teams/dm/t0123456789abcdef")).not.toContain("ompbot_monitor_add");
+	});
+
+	// qa-l #76: a lane session runs in the lane's worktree, not the ompbot workspace.
+	test("a lane session's cwd line names the lane directory", () => {
+		const secrets = join(dir, "secrets");
+		const lane = buildFloorsPrompt(secrets, "ompbot/work/lane1", false, false, false, {
+			lanePlatform: "slack",
+			laneCwd: "/wt/lane1",
+		});
+		expect(lane).toContain("/wt/lane1");
+		expect(lane).not.toContain("Your cwd is the ompbot workspace");
+		expect(buildFloorsPrompt(secrets, "slack/dm/D1")).toContain("Your cwd is the ompbot workspace");
 	});
 });

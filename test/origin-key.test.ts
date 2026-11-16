@@ -50,7 +50,7 @@ describe("platformOfConversationId / platformOfThreadRef", () => {
 	test("no file in src defines its own Slack conversation-id pattern", () => {
 		const root = join(import.meta.dir, "..", "src");
 		const files = (readdirSync(root, { recursive: true }) as string[]).filter((file) => file.endsWith(".ts"));
-		const owners = files.filter((file) => readFileSync(join(root, file), "utf8").includes("/^[A-Z][A-Z0-9]+$/"));
+		const owners = files.filter((file) => readFileSync(join(root, file), "utf8").includes("/^[A-Z][A-Z0-9]{1,30}$/"));
 		expect(owners).toEqual(["core/origin-key.ts"]);
 	});
 });
@@ -90,6 +90,14 @@ describe("parseChatOrigin / chatOriginKey", () => {
 		expect(parseChatOrigin("slack/ch/C1")?.conversationId).toBe("C1");
 		expect(parseChatOrigin("slack/dm/D1")?.conversationId).toBe("D1");
 		expect(parseChatOrigin("ompbot/work/lane")?.conversationId).toBeUndefined();
+	});
+
+	test("an id with no plausible length (4000 characters) is no conversation of either platform", () => {
+		expect(parseChatOrigin(`slack/dm/D${"A".repeat(4000)}`)).toBeUndefined();
+		expect(parseChatOrigin(`discord/dm/${"1".repeat(4001)}`)).toBeUndefined();
+		expect(parseChatOrigin(`discord/dm/${"1".repeat(21)}`)).toBeUndefined();
+		expect(parseChatOrigin("slack/dm/DABC12345")?.conversationId).toBe("DABC12345");
+		expect(parseChatOrigin("discord/dm/123456789012345678")?.conversationId).toBe("123456789012345678");
 	});
 
 	test("chatPlatformOf names the namespace even of keys outside the id grammar", () => {

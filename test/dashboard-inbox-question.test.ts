@@ -356,7 +356,8 @@ describe("inbox question: remote panes and the cap", () => {
 		expect(html).not.toContain(QUESTION);
 		const reads = fake.calls.filter((cmd) => cmd.some((word) => /\b(tail|cat|head|dd|less)\b/.test(word)));
 		expect(reads).toEqual([]);
-		for (const cmd of fake.calls) expect(cmd.join(" ")).toContain("agent");
+		// Besides herdr listings only the local systemd unit list (jobs section) runs; nothing reads the remote pane.
+		for (const cmd of fake.calls.filter((call) => call[0] !== "systemctl")) expect(cmd.join(" ")).toContain("agent");
 	});
 
 	test("AC-4: only the first 12 local panes are read", async () => {

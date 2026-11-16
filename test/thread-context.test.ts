@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type OriginMailbox, THREAD_CONTEXT_HEADER } from "../src/core/mailbox";
+import { type OriginMailbox, ROTATION_CONTEXT_HEADER, THREAD_CONTEXT_HEADER } from "../src/core/mailbox";
 import { threadRefOfOrigin } from "../src/core/normalize";
 import { OriginRouter, openBotStore } from "../src/core/origin";
 import type { InboundRecord } from "../src/core/types";
@@ -21,6 +21,7 @@ class FakeClock {
 const CHANNEL = "slack/ch/C1";
 const THREAD = `${CHANNEL}/t/111.222`;
 const REF = "C1:111.222";
+const ROTATE = "@rotate";
 
 function msg(originKey: string, threadRef: string, platformMessageId: string, text: string): InboundRecord {
 	return { platformMessageId, originKey, ownerVerified: true, text, threadRef };
@@ -46,7 +47,19 @@ beforeEach(() => {
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		statusProvider: () => "status: ok",
 		driverFactory: (_origin, sessionDir) => {
-			const driver = new FakeOmpDriver({ sessionDir, store: sessionStore, holdTurns: true });
+			const driver = new FakeOmpDriver({
+				sessionDir,
+				store: sessionStore,
+				holdTurns: true,
+				// Like the agy driver: a turn whose request ends with ROTATE reports its conversation rotated.
+				turnUsage: (prompt) => ({
+					calls: 1,
+					input: 1000,
+					cacheRead: 0,
+					output: 10,
+					rotated: prompt.endsWith(ROTATE),
+				}),
+			});
 			drivers.push(driver);
 			return driver;
 		},
@@ -154,5 +167,38 @@ describe("thread context injection", () => {
 		expect(threadRefOfOrigin(CHANNEL)).toBeUndefined();
 		expect(threadRefOfOrigin("slack/dm/D1")).toBeUndefined();
 		expect(threadRefOfOrigin("monitor/abc12345")).toBeUndefined();
+	});
+});
+
+describe("agy conversation rotation", () => {
+	test("the turn after a rotation carries the thread head and this origin's earlier exchanges; the next does not", async () => {
+		await turn(router.mailbox(CHANNEL), 0, () => router.route(msg(CHANNEL, REF, "C1:111.222", "스레드 시작 질문")));
+		confirmDelivery(store.listDeliveries({ originKey: CHANNEL }).find((d) => d.threadRef === REF));
+
+		const threadMailbox = router.mailbox(THREAD);
+		await turn(threadMailbox, 1, () => router.route(msg(THREAD, REF, "C1:111.333", "첫 질문")));
+		confirmDelivery(store.listDeliveries({ originKey: THREAD })[0]);
+		await turn(threadMailbox, 1, () => router.route(msg(THREAD, REF, "C1:111.444", `긴 작업 ${ROTATE}`)));
+		confirmDelivery(store.listDeliveries({ originKey: THREAD })[1]);
+		// No rotation before this turn: the session is not fresh and nothing was dropped.
+		expect(promptsOf(driverAt(1))[1]).toBe(`prompt:긴 작업 ${ROTATE}`);
+
+		await turn(threadMailbox, 1, () => router.route(msg(THREAD, REF, "C1:111.555", "회전 뒤 질문")));
+		const rotated = promptsOf(driverAt(1))[2] ?? "";
+		expect(rotated.startsWith(`prompt:${ROTATION_CONTEXT_HEADER}\n`)).toBe(true);
+		// One block only (the fake's echoed answers quote the first turn's thread block inline).
+		expect(rotated.split("\n").some((line) => line.startsWith(THREAD_CONTEXT_HEADER))).toBe(false);
+		expect(rotated).toContain("스레드 시작 메시지");
+		expect(rotated).toContain("- 받은 질문(");
+		expect(rotated).toContain(": 첫 질문");
+		expect(rotated).toContain(`: 긴 작업 ${ROTATE}`);
+		expect(rotated).toContain("- 이 세션이 올린 답(");
+		expect(rotated).toContain(`ECHO 긴 작업 ${ROTATE}`);
+		// The other origin's answer comes in as the thread-context rule gives it.
+		expect(rotated).toContain("- 이 스레드에 이미 올린 봇 답(");
+		expect(rotated.endsWith("\n\n[현재 요청]\n회전 뒤 질문")).toBe(true);
+
+		await turn(threadMailbox, 1, () => router.route(msg(THREAD, REF, "C1:111.666", "그다음 질문")));
+		expect(promptsOf(driverAt(1))[3]).toBe("prompt:그다음 질문");
 	});
 });

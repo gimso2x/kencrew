@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
 import { planReload, RESTART_FIELDS } from "../src/daemon/reload";
@@ -57,6 +58,24 @@ describe("planReload", () => {
 		expect(plan.changed).toEqual([]);
 		expect(plan.restartRequired).toEqual(["herdr"]);
 		expect(plan.next.herdr).toBeUndefined();
+	});
+
+	test("ompConfigOverlay is restart-bound: set, changed or removed, it is reported and never applied live", () => {
+		const glm = join(home.dir, "glm.omp.yml");
+		for (const [current, fresh] of [
+			[undefined, glm],
+			[glm, join(home.dir, "other.omp.yml")],
+			[glm, undefined],
+		] as const) {
+			const plan = planReload(
+				{ ...home.config, ...(current === undefined ? {} : { ompConfigOverlay: current }) },
+				{ ...home.config, ...(fresh === undefined ? {} : { ompConfigOverlay: fresh }) },
+			);
+			expect(plan.changed).toEqual([]);
+			expect(plan.restartRequired).toEqual(["ompConfigOverlay"]);
+			expect(plan.next.ompConfigOverlay).toBe(current);
+		}
+		expect(RESTART_FIELDS).toContain("ompConfigOverlay");
 	});
 
 	test("channels is restart-bound and the old ownerSlackUserId is no field of its own", () => {
@@ -316,4 +335,63 @@ test("real daemon process: SIGHUP reloads config.json instead of stopping", asyn
 	expect(JSON.parse((await runMain(home.dir, ["status", "--json"])).stdout)).toMatchObject({ daemonRunning: true });
 	spawned.signal("SIGTERM");
 	expect(await spawned.exited).toBe(0);
+});
+
+test("AC-9 (T-20261115-03): a reloaded lanes.models.middle reaches the next [TASK] through the running daemon's dispatch tool", async () => {
+	const transport = new WaitingTransport();
+	const clock = { now: () => Date.now() };
+	const sessions = new FakeSessionStore();
+	const live = { mentionFreeChannels: [CHANNEL], herdr: {} };
+	patchConfig({ ...live, lanes: { models: { middle: "a/one" } } });
+	daemon = new Daemon({
+		config: { ...home.config, ...live, lanes: { models: { middle: "a/one" } } },
+		channels: [new SlackBinding(new SlackChannel(transport))],
+		clock,
+		log: createLogger({ sink: () => undefined, clock, redact }),
+		ompVersion: "omp-test 0",
+		bootId: "boot-reload-tier",
+		sweepMs: 3_600_000,
+		gateSweepMs: 0,
+		taskSweepMs: 0,
+		driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+	});
+	await daemon.start();
+	const running = daemon;
+	const ts = `${Math.floor(Date.now() / 1000)}.000100`;
+	await transport.emitMessage({
+		type: "message",
+		channel: CHANNEL,
+		channel_type: "channel",
+		user: OWNER,
+		text: "[TASK] 등록해줘",
+		ts,
+	});
+	await transport.waitForPosts((text) => text.includes("ECHO [TASK] 등록해줘"));
+	// Fixture: the ledger records the worker model the real tool path hands it. The repo is a plain directory, so the
+	// start stops at `git worktree add` (before any herdr call) and the registration is undone.
+	const ledger = running.store.tasks;
+	const register = ledger.register.bind(ledger);
+	const models: Array<string | null | undefined> = [];
+	ledger.register = (input) => {
+		models.push(input.worker?.model);
+		return register(input);
+	};
+	// The tool is taken once, before the reload: only a per-call read of the config can see the new model.
+	const tool = running.hostToolsFor(`slack/ch/${CHANNEL}/t/${ts}`).find((t) => t.name === "ompbot_dispatch");
+	if (tool === undefined) throw new Error("dispatch tool missing");
+	const repo = mkdtempSync(join(tmpdir(), "ompbot-reload-tier-"));
+	try {
+		const register1 = () =>
+			tool.execute(
+				{ task: "구현", taskSpec: { title: "t", risk: "L2", goal: "g", acceptance: ["a"], repo } },
+				{ signal: new AbortController().signal },
+			);
+		expect(await register1()).toStartWith("시작 실패: git worktree add failed");
+		patchConfig({ ...live, lanes: { models: { middle: "b/two" } } });
+		expect(running.reloadConfig("ipc")).toMatchObject({ ok: true, changed: ["lanes"] });
+		expect(await register1()).toStartWith("시작 실패: git worktree add failed");
+	} finally {
+		rmSync(repo, { recursive: true, force: true });
+	}
+	expect(models).toEqual(["a/one", "b/two"]);
 });

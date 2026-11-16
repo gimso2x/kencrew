@@ -44,6 +44,8 @@ export const RESTART_FIELDS = [
 	"slack",
 	"ompExecutable",
 	"ompProfile",
+	// The file's path; its contents are read by each new omp child, so editing the file needs no restart.
+	"ompConfigOverlay",
 	"workspaceDir",
 	// Day keys, prompts and monitor tool descriptions take it when the daemon starts.
 	"timezone",
@@ -62,8 +64,9 @@ export const RESTART_FIELDS = [
 ] as const satisfies ReadonlyArray<keyof OmpbotConfig>;
 
 /**
- * Never read by the daemon: `ompbot gc` / `ompbot backup` load config.json themselves on every run, and
- * `ompbot apply` reads `apply` on every run.
+ * Read by the CLI levers on every run (`ompbot gc` / `ompbot backup` load config.json themselves, `ompbot apply`
+ * reads `apply`), so a change needs no daemon action. The daemon reads only `maxBundleBytes`, once, for its first-boot
+ * backup (`#bootBackup`); a changed value reaches that backup after a restart.
  */
 export const CLI_FIELDS = ["sessionRetentionDays", "maxBundleBytes", "apply"] as const satisfies ReadonlyArray<
 	keyof OmpbotConfig

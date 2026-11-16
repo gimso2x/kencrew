@@ -130,7 +130,15 @@ function rig(
 	over: Partial<
 		Pick<
 			TaskSweepDeps,
-			"boardLink" | "log" | "frozen" | "remind" | "autoLandPolicy" | "repoMatches" | "autoLand" | "autoLandHold"
+			| "boardLink"
+			| "log"
+			| "frozen"
+			| "remind"
+			| "agentStatus"
+			| "autoLandPolicy"
+			| "repoMatches"
+			| "autoLand"
+			| "autoLandHold"
 		>
 	> = {},
 	task: Partial<Pick<TaskRow, "host" | "risk">> = {},
@@ -518,6 +526,37 @@ describe("TaskSweeper", () => {
 		await r.sweeper.sweep();
 		await r.sweeper.sweep();
 		expect(held()).toHaveLength(2);
+	});
+
+	// qa-l low B #86: an owner pause or freeze that arrives while the sweep waits on herdr holds the prompt.
+	test("a pause or freeze that lands during the herdr status lookup sends no reminder and marks none", async () => {
+		const paused = { ledger: undefined as TaskLedger | undefined, id: "" };
+		const frozen: { value: { since: string; reason: string; by: string } | undefined } = { value: undefined };
+		const r = rig({
+			frozen: () => frozen.value,
+			agentStatus: async () => {
+				paused.ledger?.pauseTask(paused.id);
+				return { ok: true, status: "idle" };
+			},
+		});
+		paused.ledger = r.ledger;
+		paused.id = r.row.taskId;
+		r.clock.ms = T0 + STALE_REMIND_MS;
+		await r.sweeper.sweep();
+		expect(r.reminders).toEqual([]);
+		expect(r.ledger.require(r.row.taskId).remindedAt).toBeNull();
+
+		const f = rig({
+			frozen: () => frozen.value,
+			agentStatus: async () => {
+				frozen.value = { since: "2026-10-30T01:00:00.000Z", reason: "점검", by: "cli" };
+				return { ok: true, status: "idle" };
+			},
+		});
+		f.clock.ms = T0 + STALE_REMIND_MS;
+		await f.sweeper.sweep();
+		expect(f.reminders).toEqual([]);
+		expect(f.ledger.require(f.row.taskId).remindedAt).toBeNull();
 	});
 
 	test("stale PROGRESS: reminder to the agent every 30 minutes, one thread notice after 2 hours", async () => {

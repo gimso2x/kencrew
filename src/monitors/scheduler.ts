@@ -42,8 +42,6 @@ export interface MonitorSchedulerDeps {
 	workspaceDir: string;
 	/** The bot home, handed to scripts as `OMPBOT_HOME`. */
 	homeDir: string;
-	/** Test seam; default 60 s (a cron command's own `timeoutMs` wins). */
-	scriptTimeoutMs?: number;
 	/** `config.watcherRoots`: watcher monitors whose root is not inside one of them never start a watch. */
 	watcherRoots?: readonly string[] | undefined;
 	/** Test seam replacing the recursive `fs.watch`. */
@@ -435,7 +433,6 @@ export class MonitorScheduler {
 						cwd: this.#deps.workspaceDir,
 						monitorId: monitor.id,
 						homeDir: this.#deps.homeDir,
-						...(this.#deps.scriptTimeoutMs === undefined ? {} : { timeoutMs: this.#deps.scriptTimeoutMs }),
 					});
 					const outcome = result.fired
 						? "met"
@@ -594,7 +591,7 @@ export class MonitorScheduler {
 		const opRef = `monitor:${monitor.id}:${event.eventId}:${attempt}:verbatim`;
 		if (!store.monitors.markDispatched(event.eventId, opRef)) return false;
 		log.info("monitor_command", { monitor: monitor.id, event: event.eventId, attempt });
-		const timeoutMs = triggerTimeoutMs ?? this.#deps.scriptTimeoutMs ?? SCRIPT_TIMEOUT_MS;
+		const timeoutMs = triggerTimeoutMs ?? SCRIPT_TIMEOUT_MS;
 		const controller = new AbortController();
 		this.#commands.add(controller);
 		this.#track(

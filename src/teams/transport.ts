@@ -141,7 +141,7 @@ export class TeamsConnector {
 		return activityId === undefined ? base : `${base}/${encodeURIComponent(activityId)}`;
 	}
 
-	async #call(method: "POST" | "PUT" | "DELETE", url: string, body?: unknown): Promise<Response> {
+	async #call(method: "POST" | "PUT", url: string, body?: unknown): Promise<Response> {
 		const token = await this.#accessToken();
 		let response: Response;
 		try {
@@ -198,9 +198,5 @@ export class TeamsConnector {
 			from: { id: this.botId },
 			conversation: { id: conversationId },
 		});
-	}
-
-	async deleteActivity(serviceUrl: string, conversationId: string, activityId: string): Promise<void> {
-		await this.#call("DELETE", this.#url(serviceUrl, conversationId, activityId));
 	}
 }

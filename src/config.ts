@@ -1,6 +1,7 @@
-import { readFileSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { closeSync, openSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { TASK_RISKS, type TaskRisk } from "./tasks/docs";
 import type { LaneReviewConfident } from "./tasks/notify";
 import { hostTimezone, isTimezone } from "./time";
@@ -159,6 +160,7 @@ const ROOT_KEYS = new Set([
 	"slack",
 	"ompExecutable",
 	"ompProfile",
+	"ompConfigOverlay",
 	"workspaceDir",
 	"agent",
 	"claudeExecutable",
@@ -244,6 +246,12 @@ export interface OmpbotConfig {
 	 * `~/.omp/profiles/<name>/agent`, filled by `ompbot omp sync`. Unset → the inherited agent dir, as before.
 	 */
 	ompProfile?: string;
+	/**
+	 * Absolute path of an omp `--config` overlay every omp child of this install gets (RPC children of every origin and
+	 * the simple `ompbot_dispatch` run): the file's value resolved against the home, an existing file. Its contents are
+	 * read by each new child; unset → no `--config`, as before.
+	 */
+	ompConfigOverlay?: string;
 	workspaceDir: string;
 	/**
 	 * IANA time zone of every day boundary, displayed time and default monitor zone (`Europe/Berlin`). Always set on a
@@ -333,11 +341,16 @@ export interface OmpbotConfig {
 	 * `confident.maxRisk` (which must be above `maxRisk`) is reviewed too, and merges unasked when its `CLEAR` receipt
 	 * carries a confidence of at least `minConfidence` (0 < x ≤ 1). A lane without a risk is never in that band.
 	 * Turn `review` on alone first and watch the confidences for two weeks, then add `confident`.
+	 * `qa` (lanes only, `{ minRisk, overlay, model, timeoutMs }`): a reviewed lane at `minRisk` (default L3) or above is
+	 * also run once by `omp -p --model <model>` under the `overlay` omp yml (absolute, an existing file) in a detached
+	 * copy of its claim commit, and only that commit's `PASS` receipt lets it merge unasked (`timeoutMs` default
+	 * 600000, at most 1800000). Unset → no QA.
 	 */
 	taskAutoLand?: {
 		repos: string[];
 		maxRisk?: TaskRisk;
 		review?: { model: string; timeoutMs?: number; confident?: LaneReviewConfident };
+		qa?: { minRisk?: TaskRisk; overlay: string; model: string; timeoutMs?: number };
 	};
 	/**
 	 * Work lanes. `completionNudges`: after a lane turn ends with no done claim the core nudges the lane this many
@@ -373,13 +386,16 @@ export interface OmpbotConfig {
 	 * loopback address; the default is 127.0.0.1. Absent = the command needs `--port`. `herdrWebUrl` is herdr-web-ui's
 	 * address for the agent board's "herdr에서 답하기" links (absent = no link). `opsStatus` is a command printing the
 	 * ops-status JSON for the system view's "호스트 점검" card and a `!brief` line (absent = no card, no command run);
-	 * `url` links the card head.
+	 * `url` links the card head. `usageLimits` lists the commands of the "모델 한도" card (`omp`: argv per provider, `agy`: one argv, `agyAccount`: argv printing the agy account label; absent = no card, no command run). `peerHomes`: other installs on this host (`name` one word, no `:`; `home` absolute)
+	 * whose enabled monitors the monitors view lists read-only beside this install's own.
 	 */
 	dashboard?: {
 		port: number;
 		bind?: "127.0.0.1" | "::1";
 		herdrWebUrl?: string;
 		opsStatus?: { command: string[]; url?: string };
+		usageLimits?: { omp?: string[][]; agy?: string[]; agyAccount?: string[] };
+		peerHomes?: Array<{ name: string; home: string }>;
 	};
 	/**
 	 * `ompbot apply` (read on every run, never by the daemon). `codeRollback`: what a failed apply whose config rollback
@@ -414,6 +430,8 @@ export interface SlackTokens {
 
 /** A `dispatchHosts.<h>.ssh` target: not an ssh option (no leading `-`), no whitespace or control character (NUL throws in spawn). */
 export const DISPATCH_SSH = /^[^\s-][^\s\p{Cc}]*$/u;
+/** A `dispatchHosts.<h>.workDir` / `herdrBin`: non-empty (an empty word would reach the remote command) and no control character (NUL throws in spawn). */
+const isHostPath = (value: unknown): boolean => typeof value === "string" && /^[^\p{Cc}]+$/u.test(value);
 /** An ssh alias or `user@host`: never starts with `-` (no option injection), no spaces or shell characters. */
 export const OFFSITE_SSH = /^([A-Za-z0-9_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9._-]*$/;
 /** Absolute or `~/` path of plain characters, so it can sit unquoted in the remote shell command. */
@@ -747,15 +765,62 @@ function optionalChannelId(configPath: string, obj: Record<string, unknown>, key
 }
 
 /**
- * Whether `workspaceDir` is the home, `config.json` or `secrets/` (or inside one): the workspace root would then hold
- * the config or the token files (a procedure file under it could be a secret), or `mkdir` would collide with config.json.
+ * The realpath of `path`, or of its deepest existing ancestor with the missing rest appended (it may not exist yet).
+ * `undefined` when a symlink loop (ELOOP) makes it unresolvable: such a path can never be created or used.
+ */
+function realOrPending(path: string): string | undefined {
+	const absolute = resolve(path);
+	try {
+		return realpathSync(absolute);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ELOOP") return undefined;
+		const parent = dirname(absolute);
+		if (parent === absolute) return absolute;
+		const resolved = realOrPending(parent);
+		return resolved === undefined ? undefined : join(resolved, basename(absolute));
+	}
+}
+
+/** Whether `child` is `parent` or lies below it (both already resolved). */
+function within(parent: string, child: string): boolean {
+	const rel = relative(parent, child);
+	return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+/**
+ * Whether `workspaceDir` is the home, `config.json` or `secrets/` (or inside one), or holds the home or `secrets/`
+ * below it, compared by realpath (qa-j #6/#1: a symlinked workspace or an ancestor of the home): the workspace root
+ * would then hold the config or the token files (a procedure file under it could be a secret), or `mkdir` would
+ * collide with config.json.
  */
 export function workspaceOverlapsHome(homeDir: string, workspaceDir: string): boolean {
-	const inside = (parent: string): boolean => {
-		const rel = relative(parent, workspaceDir);
-		return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-	};
-	return workspaceDir === resolve(homeDir) || inside(join(homeDir, "config.json")) || inside(join(homeDir, "secrets"));
+	const workspace = realOrPending(workspaceDir);
+	const home = realOrPending(homeDir);
+	const secrets = realOrPending(join(homeDir, "secrets"));
+	const configFile = realOrPending(join(homeDir, "config.json"));
+	// A symlink loop leaves nothing to compare (qa-l #3): the workspace cannot be created, so refuse it like an overlap.
+	if (workspace === undefined || home === undefined || secrets === undefined || configFile === undefined) return true;
+	return (
+		within(workspace, home) || within(workspace, secrets) || within(configFile, workspace) || within(secrets, workspace)
+	);
+}
+
+/** Why `overlay` cannot be handed to omp as `--config`: not a regular file or not readable (qa-l #1/#2), else undefined. */
+function overlayProblem(overlay: string): string | undefined {
+	try {
+		if (!statSync(overlay).isFile()) return "not a file";
+		// A procfs "regular file" like /proc/self/mem stats as a file but fails to read.
+		const fd = openSync(overlay, "r");
+		try {
+			readSync(fd, Buffer.alloc(1), 0, 1, 0);
+		} finally {
+			closeSync(fd);
+		}
+		return undefined;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "ENOENT" ? "not a file" : `unreadable (${code ?? "error"})`;
+	}
 }
 
 function checkHome(homeDir: string): void {
@@ -783,8 +848,12 @@ function readSecret(path: string, prefix: string): string {
 function readSecretFile(path: string): string {
 	let mode: number;
 	try {
-		mode = statSync(path).mode;
-	} catch {
+		const stat = statSync(path);
+		// A FIFO or device in the file's place would block the read below for good.
+		if (!stat.isFile()) throw new ConfigError("secret_missing", path, "not a regular file");
+		mode = stat.mode;
+	} catch (error) {
+		if (error instanceof ConfigError) throw error;
 		throw new ConfigError("secret_missing", path);
 	}
 	if ((mode & 0o777) !== SECRET_MODE) {
@@ -894,6 +963,13 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (workspaceOverlapsHome(home, workspaceDir)) invalid(configPath, "workspaceDir");
 	const ompProfile = optionalString(configPath, root, "ompProfile");
 	if (ompProfile !== undefined && !OMP_PROFILE_PATTERN.test(ompProfile)) invalid(configPath, "ompProfile");
+	const overlayValue = optionalString(configPath, root, "ompConfigOverlay");
+	const ompConfigOverlay = overlayValue === undefined ? undefined : resolve(home, overlayValue);
+	if (ompConfigOverlay !== undefined) {
+		const problem = overlayProblem(ompConfigOverlay);
+		if (problem !== undefined)
+			throw new ConfigError("config_invalid", ompConfigOverlay, `field=ompConfigOverlay ${problem}`);
+	}
 
 	const agent = root.agent;
 	if (agent !== undefined && agent !== "omp" && agent !== "claude" && agent !== "agy") invalid(configPath, "agent");
@@ -1018,10 +1094,10 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			if (record === undefined || typeof record.ssh !== "string" || !DISPATCH_SSH.test(record.ssh)) {
 				invalid(configPath, `dispatchHosts.${name}.ssh`);
 			}
-			if (record.workDir !== undefined && typeof record.workDir !== "string") {
+			if (record.workDir !== undefined && !isHostPath(record.workDir)) {
 				invalid(configPath, `dispatchHosts.${name}.workDir`);
 			}
-			if (record.herdrBin !== undefined && typeof record.herdrBin !== "string") {
+			if (record.herdrBin !== undefined && !isHostPath(record.herdrBin)) {
 				invalid(configPath, `dispatchHosts.${name}.herdrBin`);
 			}
 			optionalArgList(configPath, record, "ompArgs", `dispatchHosts.${name}.ompArgs`);
@@ -1086,7 +1162,50 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			invalid(configPath, "taskAutoLand.maxRisk");
 		}
 		for (const key of Object.keys(record)) {
-			if (key !== "repos" && key !== "maxRisk" && key !== "review") invalid(configPath, `taskAutoLand.${key}`);
+			if (key !== "repos" && key !== "maxRisk" && key !== "review" && key !== "qa") {
+				invalid(configPath, `taskAutoLand.${key}`);
+			}
+		}
+		let qa: NonNullable<OmpbotConfig["taskAutoLand"]>["qa"];
+		if (record.qa !== undefined) {
+			const qaRecord = asRecord(record.qa);
+			if (qaRecord === undefined) invalid(configPath, "taskAutoLand.qa");
+			for (const key of Object.keys(qaRecord)) {
+				if (key !== "minRisk" && key !== "overlay" && key !== "model" && key !== "timeoutMs") {
+					invalid(configPath, `taskAutoLand.qa.${key}`);
+				}
+			}
+			const minRisk = qaRecord.minRisk;
+			if (minRisk !== undefined && !(TASK_RISKS as readonly unknown[]).includes(minRisk)) {
+				invalid(configPath, "taskAutoLand.qa.minRisk");
+			}
+			const overlay = qaRecord.overlay;
+			if (typeof overlay !== "string" || !isAbsolute(overlay)) invalid(configPath, "taskAutoLand.qa.overlay");
+			const overlayIssue = overlayProblem(overlay);
+			if (overlayIssue !== undefined) {
+				throw new ConfigError("config_invalid", overlay, `field=taskAutoLand.qa.overlay ${overlayIssue}`);
+			}
+			const model = qaRecord.model;
+			// Like the reviewer: `cursor` is a discovery provider the isolation overlay disables.
+			if (typeof model !== "string" || model.trim() === "" || model.trim().startsWith("cursor/")) {
+				invalid(configPath, "taskAutoLand.qa.model");
+			}
+			const timeoutMs = qaRecord.timeoutMs;
+			if (
+				timeoutMs !== undefined &&
+				(typeof timeoutMs !== "number" ||
+					!Number.isInteger(timeoutMs) ||
+					timeoutMs <= 0 ||
+					timeoutMs > LANE_REVIEW_TIMEOUT_MAX_MS)
+			) {
+				invalid(configPath, "taskAutoLand.qa.timeoutMs");
+			}
+			qa = {
+				overlay,
+				model,
+				...(minRisk === undefined ? {} : { minRisk: minRisk as TaskRisk }),
+				...(timeoutMs === undefined ? {} : { timeoutMs: timeoutMs as number }),
+			};
 		}
 		let review: NonNullable<OmpbotConfig["taskAutoLand"]>["review"];
 		if (record.review !== undefined) {
@@ -1148,6 +1267,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			repos: (repos as string[]).map((repo) => repo.replace(/(?<=.)\/+$/, "")),
 			...(maxRisk === undefined ? {} : { maxRisk: maxRisk as TaskRisk }),
 			...(review === undefined ? {} : { review }),
+			...(qa === undefined ? {} : { qa }),
 		};
 	}
 
@@ -1204,6 +1324,10 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 				workTree = false;
 			}
 			if (!workTree) invalid(configPath, "turnSnapshot.repos");
+			// A repo without a commit never yields a snapshot (qa-l #19): require HEAD to resolve.
+			if (spawnSync("git", ["-C", repo, "rev-parse", "--verify", "-q", "HEAD"], { stdio: "ignore" }).status !== 0) {
+				invalid(configPath, "turnSnapshot.repos");
+			}
 		}
 		turnSnapshot = { repos: (repos as string[] | undefined) ?? [] };
 	}
@@ -1277,8 +1401,48 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 				if (key !== "command" && key !== "url") invalid(configPath, `dashboard.opsStatus.${key}`);
 			}
 		}
+		if (record.usageLimits !== undefined) {
+			const limits = asRecord(record.usageLimits);
+			if (limits === undefined) invalid(configPath, "dashboard.usageLimits");
+			const argvOk = (value: unknown): boolean =>
+				Array.isArray(value) && value.length > 0 && value.every((part) => typeof part === "string" && part !== "");
+			if (limits.omp !== undefined && !(Array.isArray(limits.omp) && limits.omp.every(argvOk))) {
+				invalid(configPath, "dashboard.usageLimits.omp");
+			}
+			if (limits.agy !== undefined && !argvOk(limits.agy)) invalid(configPath, "dashboard.usageLimits.agy");
+			if (limits.agyAccount !== undefined && !argvOk(limits.agyAccount)) {
+				invalid(configPath, "dashboard.usageLimits.agyAccount");
+			}
+			for (const key of Object.keys(limits)) {
+				if (key !== "omp" && key !== "agy" && key !== "agyAccount") invalid(configPath, `dashboard.usageLimits.${key}`);
+			}
+		}
+		if (record.peerHomes !== undefined) {
+			if (!Array.isArray(record.peerHomes)) invalid(configPath, "dashboard.peerHomes");
+			const names = new Set<string>();
+			record.peerHomes.forEach((entry: unknown, i: number) => {
+				const peer = asRecord(entry);
+				if (peer === undefined) invalid(configPath, `dashboard.peerHomes.${i}`);
+				for (const key of Object.keys(peer)) {
+					if (key !== "name" && key !== "home") invalid(configPath, `dashboard.peerHomes.${i}.${key}`);
+				}
+				const { name, home } = peer;
+				if (typeof name !== "string" || name === "" || name.length > 20 || /[:\s]/.test(name) || names.has(name)) {
+					invalid(configPath, `dashboard.peerHomes.${i}.name`);
+				}
+				names.add(name);
+				if (typeof home !== "string" || !isAbsolute(home)) invalid(configPath, `dashboard.peerHomes.${i}.home`);
+			});
+		}
 		for (const key of Object.keys(record)) {
-			if (key !== "port" && key !== "bind" && key !== "herdrWebUrl" && key !== "opsStatus") {
+			if (
+				key !== "port" &&
+				key !== "bind" &&
+				key !== "herdrWebUrl" &&
+				key !== "opsStatus" &&
+				key !== "usageLimits" &&
+				key !== "peerHomes"
+			) {
 				invalid(configPath, `dashboard.${key}`);
 			}
 		}
@@ -1340,6 +1504,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (claudeExecutable !== undefined) config.claudeExecutable = claudeExecutable;
 	if (agyExecutable !== undefined) config.agyExecutable = agyExecutable;
 	if (ompProfile !== undefined) config.ompProfile = ompProfile;
+	if (ompConfigOverlay !== undefined) config.ompConfigOverlay = ompConfigOverlay;
 	if (sessionRetentionDays !== undefined) config.sessionRetentionDays = sessionRetentionDays;
 	if (maxBundleBytes !== undefined) config.maxBundleBytes = maxBundleBytes;
 	if (offsite !== undefined) config.offsite = offsite;

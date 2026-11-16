@@ -300,12 +300,14 @@ describe("floors prompt answer format", () => {
 		expect(claude).not.toContain(ALLOWED);
 	});
 
-	test("the send-file guidance names the conversation thread and the mermaid/SVG/HTML push for every origin", () => {
-		for (const originKey of [undefined, "slack/dm/D1", "monitor/3"] as const) {
+	test("the send-file guidance names the conversation thread and the mermaid/SVG/HTML push for every origin with a conversation", () => {
+		for (const originKey of [undefined, "slack/dm/D1"] as const) {
 			const prompt = buildFloorsPrompt("/s", originKey);
 			expect(prompt).toContain("지금 대화 스레드로 업로드");
 			expect(prompt).toContain("mermaid·SVG·HTML");
 		}
+		// A monitor session has no conversation and no upload tool (qa-j #47).
+		expect(buildFloorsPrompt("/s", "monitor/3")).not.toContain("지금 대화 스레드로 업로드");
 	});
 });
 
@@ -614,6 +616,19 @@ describe("host tools", () => {
 	});
 	afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
+	test("qa-j #47: a monitor session has no conversation, so neither its tools nor its prompt offer upload or approval", () => {
+		const names = build("monitor/m1").map((t) => t.name);
+		expect(names).not.toContain("slack_send_file");
+		expect(names).not.toContain("ompbot_request_approval");
+		const prompt = buildFloorsPrompt(join(homeDir, "secrets"), "monitor/m1");
+		expect(prompt).not.toContain("slack_send_file");
+		expect(prompt).not.toContain("`ompbot_request_approval(");
+		expect(prompt).not.toContain("승인 카드(`ompbot_request_approval`)");
+		// A chat origin keeps both.
+		expect(build().map((t) => t.name)).toEqual(expect.arrayContaining(["slack_send_file", "ompbot_request_approval"]));
+		expect(buildFloorsPrompt(join(homeDir, "secrets"), ORIGIN)).toContain("`ompbot_request_approval(");
+	});
+
 	test("a Slack origin's upload and approval tools are the base commit's definitions byte for byte", () => {
 		const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "slack-prompt-base.json"), "utf8")) as {
 			tools: Array<{ name: string; label: string; description: string; parameters: unknown }>;
@@ -863,11 +878,11 @@ describe("host tools", () => {
 		expect(checkUploadable(plain, deps)).toBe(plain);
 	});
 
-	test("upload tools need an owner DM origin", async () => {
-		tools = build("slack/channel/C1");
-		writeFileSync(join(workspaceDir, "a.txt"), "x");
-		await expect(tool("slack_send_file").execute({ path: "a.txt" }, ctx)).rejects.toThrow();
-		await expect(tool("ompbot_request_approval").execute({ summary: "s" }, ctx)).rejects.toThrow();
+	test("upload tools need an owner DM origin", () => {
+		// No conversation to post into: the tools are not offered at all (qa-j #47).
+		const names = build("slack/channel/C1").map((t) => t.name);
+		expect(names).not.toContain("slack_send_file");
+		expect(names).not.toContain("ompbot_request_approval");
 	});
 
 	test("ompbot_request_approval returns approved / denied / denied (timeout) from the buttons", async () => {

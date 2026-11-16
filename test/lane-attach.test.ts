@@ -66,9 +66,9 @@ class FileSessionDriver extends FakeOmpDriver {
 const entry = (role: string, text: string): string =>
 	`${JSON.stringify({ type: "message", timestamp: "2027-01-01T00:00:00.000Z", message: { role, content: [{ type: "text", text }], ...(role === "assistant" ? { usage: { cost: { total: 0.25 } } } : {}) } })}\n`;
 
-/** Resolves once `cond` holds; microtask polling only (a settle bound, never a fixed wait). */
-async function until(cond: () => boolean, tries = 500): Promise<void> {
-	for (let i = 0; !cond() && i < tries; i++) {
+/** Resolves once `cond` holds; yields to the event loop, bounded by a deadline rather than a tick count (never a fixed wait). */
+async function until(cond: () => boolean, timeoutMs = 20_000): Promise<void> {
+	for (const deadline = Date.now() + timeoutMs; !cond() && Date.now() < deadline; ) {
 		const { promise, resolve } = Promise.withResolvers<void>();
 		setImmediate(resolve);
 		await promise;

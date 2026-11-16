@@ -148,6 +148,35 @@ describe("classifyLaneCompletion", () => {
 		expect(categories("done", DIFF("test/a.test.ts", '+test("x", { timeout: 5 }, () => {});'))).toEqual([]);
 	});
 
+	test("a guard line edited only in its message or trailing comment is no deletion; any code change still is (qa-l #83)", () => {
+		const GUARD = "guard_deletion_without_adversarial_regression";
+		const edit = (...lines: string[]) => categories("done", DIFF("src/a.ts", ...lines));
+		expect(edit('-\tthrow new Error("bad input");', '+\tthrow new Error("bad input: empty");')).toEqual([]);
+		expect(edit("-if (!ok) throw new Error('x'); // old", "+if (!ok) throw new Error('y'); // new")).toEqual([]);
+		// A guard deleted with nothing in its place.
+		expect(edit('-\tthrow new Error("bad input");', "+\treturn;")).toEqual([GUARD]);
+		// The condition changed.
+		expect(edit('-if (!auth) throw new Error("no");', '+if (!auth && false) throw new Error("no");')).toEqual([GUARD]);
+		// Two guards deleted, one similar line added: one stays deleted.
+		expect(edit('-throw new Error("a");', '-throw new Error("b");', '+throw new Error("c");')).toEqual([GUARD]);
+		// Code inside an interpolating template is code.
+		const interpolate = (name: string): string => ["$", `{${name}}`].join("");
+		expect(
+			edit(`-throw new Error(\`bad ${interpolate("input")}\`);`, `+throw new Error(\`bad ${interpolate("other")}\`);`),
+		).toEqual([GUARD]);
+		// Another hunk is no counterpart.
+		const twoHunks = [
+			"diff --git a/src/a.ts b/src/a.ts",
+			"--- a/src/a.ts",
+			"+++ b/src/a.ts",
+			"@@ -1,1 +1,0 @@",
+			'-throw new Error("bad input");',
+			"@@ -9,0 +9,1 @@",
+			'+throw new Error("bad input: empty");',
+		].join("\n");
+		expect(categories("done", twoHunks)).toEqual([GUARD]);
+	});
+
 	test("verification words without a command are refused", () => {
 		expect(categories("테스트 통과, 수정 완료", "")).toEqual(["unproven_claim_word"]);
 		expect(categories("bun test 통과, 수정 완료", "")).toEqual([]);
@@ -315,5 +344,25 @@ describe("lane and task diffs never run diff.external (qa-d M-3)", () => {
 		} finally {
 			reader.kill("SIGKILL");
 		}
+	});
+});
+
+// doc/plans/qa-l-low-fixes.md 묶음 A: 무결성 판정.
+describe("qa-l low A: adversarial test lines", () => {
+	const GUARD = "guard_deletion_without_adversarial_regression";
+	const guardDeleted = DIFF("src/auth.ts", "-if (!allowlist.has(host)) throw new Error('denied');");
+	const withTest = (...lines: string[]): string => `${guardDeleted}\n${DIFF("test/auth.test.ts", ...lines)}`;
+
+	test("#84 a comment naming invalid and assert is no adversarial test", () => {
+		for (const lines of [
+			["+// invalid hosts are no longer guarded; asserts were dropped"],
+			["+# invalid hosts: assert dropped"],
+			["+/* invalid hosts: expect( removed */"],
+			["+/*", "+ * invalid hosts: assert dropped", "+ */"],
+			["+/*", "+invalid hosts: assert dropped", "+*/"],
+		])
+			expect({ lines, refused: categories("done", withTest(...lines)) }).toEqual({ lines, refused: [GUARD] });
+		expect(categories("done", withTest('+test("rejects invalid hosts", () => {});'))).toEqual([]);
+		expect(categories("done", withTest('+\texpect(check("bad")).toBe("invalid"); // was dropped'))).toEqual([]);
 	});
 });

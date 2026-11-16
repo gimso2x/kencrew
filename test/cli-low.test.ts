@@ -1,14 +1,18 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { doctorCommand } from "../src/cli/index";
 import { openBotStore } from "../src/core/origin";
+import { startIpcServer } from "../src/daemon/ipc";
 import type { ProcessRunner } from "../src/dispatch/omp";
+import { acceptanceItems } from "../src/tasks/docs";
+import { openTaskLedger } from "../src/tasks/ledger";
 
 const MAIN = join(import.meta.dir, "..", "src", "main.ts");
 
 import { makeHome, type TestHome } from "./helpers/bot-home";
-import { runMain } from "./helpers/daemon-process";
+import { runCliCapture, runMain } from "./helpers/daemon-process";
 
 let home: TestHome;
 beforeEach(() => {
@@ -85,6 +89,39 @@ describe("CLI commands without a daemon", () => {
 		expect(run.stderr).not.toContain("Error:");
 	});
 
+	test("reload refuses a daemon answer of the wrong shape instead of a TypeError (qa-l #4)", async () => {
+		const answers: unknown[] = [
+			{ ok: true },
+			{ ok: true, changed: ["a"], restartRequired: "model", cli: [] },
+			{ ok: true, changed: [1], restartRequired: [], cli: [] },
+			null,
+		];
+		for (const answer of answers) {
+			const server = startIpcServer(join(home.dir, "ompbot.sock"), async () => answer);
+			try {
+				const run = await runCliCapture(home.dir, ["reload"]);
+				expect(run.code).toBe(1);
+				expect(run.stdout).toBe("");
+				expect(run.stderr).toBe("reload: unexpected daemon answer\n");
+			} finally {
+				server.stop();
+			}
+		}
+		const good = startIpcServer(join(home.dir, "ompbot.sock"), async () => ({
+			ok: true,
+			changed: ["mentionFreeChannels"],
+			restartRequired: [],
+			cli: ["x", "y"],
+		}));
+		try {
+			const run = await runCliCapture(home.dir, ["reload"]);
+			expect(run.code, run.stderr).toBe(0);
+			expect(run.stdout).toBe("config_reloaded changed=mentionFreeChannels restart_required=- cli=x,y\n");
+		} finally {
+			good.stop();
+		}
+	});
+
 	test("status falls back to the database without reading the Slack tokens, and works on a db-only home", async () => {
 		openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul").close();
 		chmodSync(join(home.dir, "secrets", "slack-app-token"), 0o644);
@@ -136,5 +173,73 @@ describe("ompbot doctor dispatch host names", () => {
 		]);
 		for (const line of lines) expect(line).not.toContain("\n");
 		expect(existsSync(path)).toBe(true);
+	});
+});
+
+describe("tasks CLI reads (qa-l low B)", () => {
+	const dbPath = () => join(home.dir, "ompbot.db");
+	function registerTask(title: string): string {
+		const ledger = openTaskLedger(dbPath(), "Asia/Seoul");
+		const row = ledger.register({
+			title,
+			risk: "L2",
+			originKey: "slack/dm/D1/t/1.1",
+			threadRef: "D1:1.1",
+			host: null,
+			repo: "/r/repo",
+			acceptance: acceptanceItems(["a"]),
+		});
+		ledger.close();
+		return row.taskId;
+	}
+
+	// qa-l #45: a title with a terminal escape must not forge a row or move the cursor.
+	test("tasks list escapes control characters of ledger text", async () => {
+		registerTask("real\u001b[2K\nforged  working  L0");
+		const list = await runCliCapture(home.dir, ["tasks", "list"]);
+		expect(list.code, list.stderr).toBe(0);
+		expect(list.stdout).not.toContain("\u001b");
+		expect(list.stdout).toContain("\\u001b[2K\\u000aforged");
+		expect(list.stdout.trimEnd().split("\n")).toHaveLength(1);
+	});
+
+	// qa-l #40: an owner-paused task reads as paused in the text list and the json.
+	test("tasks list marks a paused task in text and json", async () => {
+		const id = registerTask("pausable");
+		const ledger = openTaskLedger(dbPath(), "Asia/Seoul");
+		ledger.pauseTask(id);
+		ledger.close();
+		expect((await runCliCapture(home.dir, ["tasks", "list"])).stdout).toContain("(멈춤)");
+		const json = JSON.parse((await runCliCapture(home.dir, ["tasks", "list", "--json"])).stdout) as {
+			tasks: Array<{ paused: boolean }>;
+		};
+		expect(json.tasks.map((task) => task.paused)).toEqual([true]);
+	});
+
+	// qa-l #44: a ledger from before task_transitions existed shows its task with an empty history.
+	test("tasks show on a ledger without task_transitions is not a raw SQLiteError", async () => {
+		const id = registerTask("old ledger");
+		const db = new Database(dbPath(), { strict: true });
+		db.run("DROP TABLE task_transitions");
+		db.close();
+		const show = await runCliCapture(home.dir, ["tasks", "show", id]);
+		expect(show.stderr).not.toContain("SQLiteError");
+		expect(JSON.parse(show.stdout.trim().split("\n")[0] ?? "{}").history).toEqual([]);
+	});
+
+	// qa-l #43: a WAL ledger on a read-only directory cannot create -shm/-wal; it is still read (immutable).
+	test("tasks list and show read a WAL ledger in a read-only directory", async () => {
+		const id = registerTask("on a read-only medium");
+		expect(existsSync(`${dbPath()}-wal`)).toBe(false);
+		chmodSync(home.dir, 0o555);
+		try {
+			const list = await runCliCapture(home.dir, ["tasks", "list", "--json"]);
+			expect(list.code, list.stderr).toBe(0);
+			expect(JSON.parse(list.stdout).tasks).toHaveLength(1);
+			const show = await runCliCapture(home.dir, ["tasks", "show", id]);
+			expect(show.stderr).not.toContain("SQLiteError");
+		} finally {
+			chmodSync(home.dir, 0o755);
+		}
 	});
 });

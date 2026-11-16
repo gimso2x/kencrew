@@ -6,6 +6,7 @@ import { ChannelRegistry } from "../src/channel/registry";
 import type { LaneModelTiers } from "../src/config";
 import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
+import { buildLaneOutcomeCard } from "../src/lanes/card";
 import {
 	CLAIM_GRACE_MS,
 	DEFAULT_COMPLETION_NUDGES,
@@ -415,6 +416,42 @@ describe("lane start and registry", () => {
 		const set = calls.indexOf("setModel:fake/beta");
 		expect(set).toBeGreaterThanOrEqual(0);
 		expect(set).toBeLessThan(calls.findIndex((call) => call.startsWith("prompt:")));
+		h.close();
+	});
+
+	test("no model: the risk picks the tier (L1 low, none high); meta keeps tier and reason; the card has a worker line", async () => {
+		const h = harness({ laneModels: { high: "fake/beta", middle: "fake/alpha", low: "fake/alpha" } });
+		const low = await h.manager.start({ title: "Low one", cwd: cwdOf(), channel: "D1", risk: "L1" });
+		expect(low.meta).toMatchObject({ tier: "low", tierReason: "위험 L1 기본", workerModel: "fake/alpha" });
+		const unrated = await h.manager.start({ title: "Unrated one", cwd: cwdOf(), channel: "D1" });
+		expect(unrated.meta).toMatchObject({ tier: "high", tierReason: "위험 L3 기본", workerModel: "fake/beta" });
+		await h.settle();
+		expect(h.store.getOrigin(unrated.originKey)?.model).toBe("fake/beta");
+		const card = buildLaneOutcomeCard(unrated, { kind: "ask" }).text;
+		expect(card).toContain("워커: beta (high — 위험 L3 기본)");
+		const { tier: _t, tierReason: _r, workerModel: _w, ...legacy } = unrated.meta;
+		expect(buildLaneOutcomeCard({ ...unrated, meta: legacy }, { kind: "ask" }).text).not.toContain("워커:");
+		h.close();
+	});
+
+	test("an explicit low tier on an unrated (L3) lane is raised to high and the reply says so", async () => {
+		const h = harness({ laneModels: { high: "fake/beta", low: "fake/alpha" } });
+		const lane = await h.manager.start({ title: "Raised", cwd: cwdOf(), channel: "D1", model: "low" });
+		expect(lane.meta.tier).toBe("high");
+		expect(lane.startNote).toContain("high로 올렸습니다");
+		h.close();
+	});
+
+	test("a `:thinking` suffix of the tier model is stored as thinking and sent to the driver on its own", async () => {
+		const h = harness({ laneModels: { low: "fake/alpha:high", high: "fake/beta" } });
+		const lane = await h.manager.start({ title: "Thinking", cwd: cwdOf(), channel: "D1", risk: "L1" });
+		await h.settle();
+		expect(h.store.getOrigin(lane.originKey)).toMatchObject({ model: "fake/alpha", thinking: "high" });
+		const calls = h.drivers.get(lane.originKey)?.calls ?? [];
+		expect(calls).toContain("setModel:fake/alpha");
+		expect(calls).toContain("setThinking:high");
+		const plain = await h.manager.start({ title: "Plain", cwd: cwdOf(), channel: "D1" });
+		expect(h.store.getOrigin(plain.originKey)).toMatchObject({ model: "fake/beta", thinking: null });
 		h.close();
 	});
 

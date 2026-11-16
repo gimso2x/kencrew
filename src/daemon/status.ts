@@ -6,7 +6,7 @@ import { type MonitorRow, type MonitorSql, nextFireOf, toMonitor } from "../moni
 import type { OmpState } from "../omp/driver";
 import { type FreezeState, readFreeze } from "../ops/freeze";
 import { assertRegularLedger, type ConfigGateOptions, collectGates } from "../ops/gates";
-import type { HostLoadReader } from "../ops/host-resources";
+import type { HostLoadReader, StatfsReader } from "../ops/host-resources";
 import type { DeliveryState, InboundState, Store } from "../store/db";
 import { formatLocal } from "../time";
 
@@ -99,12 +99,15 @@ export function openGateSummary(
 	gateOptions: ConfigGateOptions = {},
 	/** Test seam for `host_pressure` (default this machine's readings). */
 	hostLoad?: Partial<HostLoadReader>,
+	/** Test seam for `disk_low` (default `statfsSync`). */
+	statfs?: StatfsReader,
 ): OpenGateSummary[] {
 	return collectGates({
 		homeDir: dirname(dbPath),
 		now,
 		...gateOptions,
 		...(hostLoad === undefined ? {} : { hostLoad }),
+		...(statfs === undefined ? {} : { statfs }),
 	})
 		.filter((gate) => gate.state === "open")
 		.map((gate) => ({ name: gate.name, detail: gate.detail }));
@@ -187,7 +190,8 @@ export function readStatusFromDb(
 
 /** Inbound and delivery counts, origins and monitors of a read-only handle; throws on an unreadable ledger. */
 function readCoreCounts(db: Database): Pick<StatusReport, "inbound" | "ledger" | "origins" | "monitors"> {
-	const inbound = emptyInbound();
+	// No prototype: a stored state named `__proto__` is counted like any other, not swallowed by the setter (qa-l #11).
+	const inbound = Object.assign(Object.create(null) as Record<InboundState, number>, emptyInbound());
 	for (const row of db.query("SELECT state, COUNT(*) AS n FROM inbound GROUP BY state").all() as Array<{
 		state: InboundState;
 		n: number;
@@ -214,7 +218,19 @@ function readCoreCounts(db: Database): Pick<StatusReport, "inbound" | "ledger" |
 function readMonitorsStatus(db: Database): MonitorsStatus {
 	try {
 		const rows = db.query("SELECT * FROM monitors ORDER BY created_at, id").all() as MonitorSql[];
-		return summarizeMonitors(rows.map(toMonitor));
+		// A row that does not parse still counts as a monitor but has no next fire: `gates` skips such a row the same
+		// way, so one bad row must not blank every count of the report nor open a gate `gates` does not.
+		const readable: MonitorRow[] = [];
+		for (const raw of rows) {
+			try {
+				const row = toMonitor(raw);
+				nextFireOf(row);
+				readable.push(row);
+			} catch {
+				// counted below, not scheduled
+			}
+		}
+		return { ...summarizeMonitors(readable), count: rows.length };
 	} catch (error) {
 		if (error instanceof Error && /no such table/.test(error.message)) return { count: 0, next: null };
 		throw error;

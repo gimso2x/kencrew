@@ -99,11 +99,13 @@ export const RULES: readonly Rule[] = [
 			/ignore\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|prompts?|rules?)|disregard\s+(?:your\s+|the\s+)?(?:instructions?|rules?)|이전\s*지시(?:를|사항을|는)?\s*(?:무시|잊)|앞(?:의|서)\s*(?:지시|명령|규칙)(?:를|을)?\s*(?:무시|잊)|지시를?\s*(?:잊어|무시해)|(?:忽略|无视|忘掉|忘记)(?:之前|以上|先前|前面)(?:的)?(?:所有)?(?:指令|指示|提示|规则)/iu,
 		),
 	},
-	// A message pretending to be the system or the agent's own scaffolding.
+	// A message pretending to be the system or the agent's own scaffolding. A line ends at any of the breaks
+	// handoff-risk splits on (CR, VT, FF, NEL, LS, PS too), and markdown emphasis, quote, list and heading marks
+	// around the role (`**System**:`, `> System:`, `- System:`) still make it a role line.
 	{
 		kind: "system prompt impersonation",
 		matches: re(
-			/(?:^|\n)[^\S\n]*(?:system|assistant|developer)\s*[:：]|<\s*system\s*>|\[INST\]|###\s*(?:instruction|system)/iu,
+			/(?:^|[\n\r\v\f\u0085\u2028\u2029])(?:[^\S\n\r\v\f\u0085\u2028\u2029]|[*_>#-])*(?:system|assistant|developer)[*_]*\s*[:：]|<\s*system\s*>|\[INST\]|###\s*(?:instruction|system)/iu,
 		),
 	},
 	// "you are now …", "지금부터 너는 …", "从现在起你是 …" — a role change names a role.
@@ -129,8 +131,12 @@ export const RULES: readonly Rule[] = [
 	{ kind: "instruction hidden in data", matches: hiddenInstruction },
 ];
 
-/** Characters that render as nothing (zero-width space/joiners, word joiner, BOM, soft hyphen): they split no word. */
-const INVISIBLE = /[\u200B-\u200D\u2060\uFEFF\u00AD]/g;
+/**
+ * Characters that render as nothing or as a filler (every default-ignorable code point — zero-width space and
+ * joiners, word joiner, BOM, soft hyphen, variation selectors, Hangul fillers, tags… — and the braille blank): they
+ * split no word.
+ */
+export const INVISIBLE = /[\p{Default_Ignorable_Code_Point}\u2800]/gu;
 
 /** Every rule that matches `text` with its invisible characters dropped, at most one finding per rule. */
 export function scanForInjection(text: string, where: string): InjectionFinding[] {

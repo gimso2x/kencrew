@@ -271,6 +271,43 @@ describe("inbound attachments", () => {
 		expect(saved).toBeNull();
 	});
 
+	test("a server root !status with an image runs as the command on the plain !status origin, downloading nothing (qa-l #28)", async () => {
+		await adapter();
+		const root = (attachments: DiscordAttachment[]) =>
+			dmWith(attachments, { channel_id: CH, guild_id: GUILD, content: `<@${BOT}> !status` });
+		const plain = root([]);
+		const withImage = root([file("shot.png", "image/png", PNG)]);
+		await transport.emitMessage(plain);
+		await transport.emitMessage(withImage);
+		expect(inbound.map((m) => [m.originKey, m.threadRef, m.text])).toEqual([
+			[`discord/ch/${CH}`, `${CH}:${plain.id}`, "!status"],
+			[`discord/ch/${CH}`, `${CH}:${withImage.id}`, "!status"],
+		]);
+		expect(downloads()).toHaveLength(0);
+		expect(transport.calls.filter((c) => c.method === "startThread")).toHaveLength(0);
+	});
+
+	test("a server root command that takes an argument keeps the notes in its argument; a plain root with a file opens a thread", async () => {
+		await adapter();
+		const followup = dmWith([file("a.png", "image/png", PNG)], {
+			channel_id: CH,
+			guild_id: GUILD,
+			content: `<@${BOT}> !followup 이것도`,
+		});
+		await transport.emitMessage(followup);
+		const plain = dmWith([file("b.png", "image/png", PNG)], {
+			channel_id: CH,
+			guild_id: GUILD,
+			content: `<@${BOT}> 이거 봐줘`,
+		});
+		await transport.emitMessage(plain);
+		expect(inbound.map((m) => m.originKey)).toEqual([`discord/ch/${CH}`, `discord/ch/${CH}/t/${plain.id}`]);
+		expect(inbound[0]?.text).toMatch(/^!followup 이것도\n\[첨부: .+\.png \(image\/png\)\]$/);
+		expect(inbound[1]?.text).toMatch(/^이거 봐줘\n\[첨부: .+\.png \(image\/png\)\]$/);
+		expect(downloads()).toHaveLength(2);
+		expect(transport.calls.filter((c) => c.method === "startThread")).toHaveLength(1);
+	});
+
 	test("an attachment-only message still reaches the core with just the notes", async () => {
 		await adapter();
 		await transport.emitMessage(dmWith([file("only.png", "image/png", PNG)], { content: "" }));

@@ -1275,3 +1275,129 @@ describe("herdr prompts kept for the dashboard (herdr_prompts)", () => {
 		expect(warned).toEqual(["herdr_prompt_record_failed"]);
 	});
 });
+
+describe("herdr start guards and agent list shape (qa-l low B)", () => {
+	const signal = new AbortController().signal;
+	const ok = (stdout: string): RunProcessResult => ({ code: 0, stdout, timedOut: false });
+	const created = JSON.stringify({
+		result: { workspace: { workspace_id: "W1" }, tab: { tab_id: "T1" }, root_pane: { pane_id: "P1" } },
+	});
+	/** Answers the remote start chain; `promptFails` fails the first prompt. Every argv is recorded unquoted. */
+	function remoteChain(promptFails = false) {
+		const words: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			const herdr = cmd.slice(cmd.indexOf("--") + 2).map((word) => word.replace(/^'|'$/g, ""));
+			words.push(herdr);
+			if (herdr[1] === "agent" && herdr[2] === "prompt" && promptFails) {
+				return { code: 1, stdout: "", stderr: "boom", timedOut: false };
+			}
+			if (herdr[2] === "create") return ok(created);
+			return ok(JSON.stringify({ result: { agents: [], workspaces: [] } }));
+		};
+		return { words, run };
+	}
+	const closes = (words: string[][]) => words.filter((w) => w[2] === "close");
+
+	// qa-l #36: the quoted prompt is one ssh argument; quote expansion must not push it past the argv limit.
+	test("a remote start refuses a task whose quoted size is over the limit before anything is created", async () => {
+		const { words, run } = remoteChain();
+		const result = await herdrRemoteStart({
+			sshTarget: "wsl",
+			name: "w-1",
+			task: "'".repeat(30_000),
+			cwd: "/r",
+			options: { run },
+		});
+		expect(result.ok).toBe(false);
+		expect(words).toEqual([]);
+	});
+
+	test("the ad hoc remote dispatch closes what it created when the prompt fails", async () => {
+		const { words, run } = remoteChain(true);
+		const built = buildDispatchTool({
+			originKey: "slack/dm/D0123456789",
+			ompExecutable: "omp",
+			homeDir: "/h",
+			workspaceDir: "/h/workspace",
+			herdr: {},
+			dispatchHosts: { wsl: { ssh: "wsl" } },
+			log: { info() {}, warn() {} },
+			run,
+		});
+		const text = String(await built.execute({ host: "wsl", name: "w-1", task: "작업" }, { signal }));
+		expect(text).toContain("시작 실패");
+		expect(closes(words)).toEqual([["herdr", "workspace", "close", "W1"]]);
+	});
+
+	// qa-l #37: a cancelled turn must not create a workspace or start an agent.
+	test("an aborted signal stops local and remote starts before any herdr call", async () => {
+		const controller = new AbortController();
+		controller.abort();
+		const seen: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			seen.push(cmd);
+			return ok("{}");
+		};
+		const local = await herdrStartAgent({
+			name: "w-1",
+			task: "t",
+			cwd: "/ws",
+			options: { run, signal: controller.signal },
+		});
+		const remote = await herdrRemoteStart({
+			sshTarget: "wsl",
+			name: "w-1",
+			task: "t",
+			cwd: "/r",
+			options: { run, signal: controller.signal },
+		});
+		expect([local.ok, remote.ok]).toEqual([false, false]);
+		expect(seen).toEqual([]);
+	});
+
+	test("the dispatch tool hands its turn signal to the herdr start", async () => {
+		const controller = new AbortController();
+		const seen: string[][] = [];
+		const built = buildDispatchTool({
+			originKey: "slack/dm/D0123456789",
+			ompExecutable: "omp",
+			homeDir: "/h",
+			workspaceDir: "/h/workspace",
+			herdr: {},
+			log: { info() {}, warn() {} },
+			run: async (cmd) => {
+				seen.push(cmd);
+				if (cmd.includes("list")) {
+					controller.abort();
+					return ok(JSON.stringify({ result: { agents: [] } }));
+				}
+				return ok(created);
+			},
+		});
+		const text = String(
+			await built.execute({ mode: "herdr", name: "w-1", task: "작업" }, { signal: controller.signal }),
+		);
+		expect(text).toContain("시작 실패");
+		expect(seen.some((cmd) => cmd.includes("create"))).toBe(false);
+	});
+
+	// qa-l #80: herdr output is outside-controlled; `result.agents` that is no array reads as no agents, never a TypeError.
+	test("a non-array result.agents and null entries are read as no agents", async () => {
+		for (const agents of [{}, "x", 7, null, [null, 3]]) {
+			const run: ProcessRunner = async () => ok(JSON.stringify({ result: { agents } }));
+			expect(await herdrAgentStatus("t-1", { run })).toEqual({ ok: true, status: "gone" });
+			expect(await herdrAgentExists("t-1", { run })).toEqual({ ok: true, exists: false });
+		}
+		const run: ProcessRunner = async () =>
+			ok(JSON.stringify({ result: { agents: [null, { name: "t-1", agent_status: "idle" }] } }));
+		expect(await herdrAgentStatus("t-1", { run })).toEqual({ ok: true, status: "idle" });
+		const start = await herdrRemoteStart({
+			sshTarget: "wsl",
+			name: "w-1",
+			task: "t",
+			cwd: "/r",
+			options: { run: async () => ok(JSON.stringify({ result: { agents: { oops: 1 } } })) },
+		});
+		expect(start.ok).toBe(false);
+	});
+});

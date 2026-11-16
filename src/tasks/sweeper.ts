@@ -582,7 +582,6 @@ export class TaskSweeper {
 		const frozen = this.#deps.frozen?.() !== undefined;
 		// An owner pause of this task holds the same prompts plus the stale notice, until the unpause.
 		const pausedAt = taskPausedAt(fresh);
-		const held = frozen || pausedAt !== undefined;
 		// One herdr question per working task per sweep, shared by the LOST check and the reminder below.
 		const agent = await this.#agentStatus(row);
 		this.#sweepAgents.set(row.taskId, agent);
@@ -639,7 +638,6 @@ export class TaskSweeper {
 			}
 		}
 		const stale = age >= STALE_REMIND_MS && (fresh.remindedAt === null || now - fresh.remindedAt >= STALE_REMIND_MS);
-		const due = !held && stale;
 		if (!frozen) this.#remindHeld.delete(row.taskId);
 		else if (stale && status !== "gone" && !this.#remindHeld.has(row.taskId)) {
 			this.#remindHeld.add(row.taskId);
@@ -665,6 +663,10 @@ export class TaskSweeper {
 			);
 			actions.push("nudge limit notice");
 		}
+		// Read again after the awaits above (herdr, board link, posts): an owner pause or freeze that came in meanwhile
+		// holds the prompt below, and nothing is marked reminded.
+		const held = this.#deps.frozen?.() !== undefined || taskPausedAt(ledger.require(row.taskId)) !== undefined;
+		const due = !held && stale;
 		const nudge = !held && wantsNudge && !capped;
 		if (nudge) {
 			if (await this.#remind(row, [NUDGE_HEAD, ...unmetLines(judgement.problems)].join("\n"))) {

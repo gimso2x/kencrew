@@ -8,6 +8,7 @@ import { realProcessRunner } from "../dispatch/omp";
 import { resolveTaskHost } from "../tasks/host";
 import { hostTimezone } from "../time";
 import { BoardSource, type BoardState } from "./board";
+import { resolvePeers } from "./peers";
 import { buildSnapshot, createSnapshotCache, type DashboardSnapshot, type SnapshotDeps } from "./snapshot";
 
 /** The checkout this file belongs to (src/dashboard → repo root): its short HEAD is shown on the page and the picture. */
@@ -47,6 +48,8 @@ export interface SnapshotAssemblyOptions {
 	repoDir?: string;
 	/** The live herdr board (the CLI starts one, the daemon has none); absent = no board links or counts. */
 	board?: () => BoardState | undefined;
+	/** Run the model limit commands for the "모델 한도" card: the dashboard CLI only. */
+	usageLimits?: boolean;
 }
 
 /**
@@ -58,18 +61,21 @@ export function assembleSnapshotDeps(options: SnapshotAssemblyOptions): Snapshot
 	const { homeDir, config } = options;
 	const run = options.run ?? realProcessRunner;
 	const now = options.now ?? Date.now;
+	// A home without config.json takes the zone a config without `timezone` gets.
+	const timezone = config?.timezone ?? hostTimezone();
 	return {
 		homeDir,
 		repoDir: options.repoDir ?? REPO_DIR,
 		config,
-		// A home without config.json takes the zone a config without `timezone` gets.
-		timezone: config?.timezone ?? hostTimezone(),
+		timezone,
+		...(config?.dashboard?.peerHomes === undefined ? {} : { peers: resolvePeers(config.dashboard, timezone) }),
 		now,
 		callDaemon: options.callDaemon ?? callDaemon,
 		run,
 		ompVersion: async () => (config === undefined ? "unknown" : await readVersion([config.ompExecutable, "--version"])),
 		hostOps: (host) => resolveTaskHost(host, config?.dispatchHosts, { run }),
 		...(options.board === undefined ? {} : { board: options.board }),
+		...(options.usageLimits === true ? { usageLimits: true } : {}),
 	};
 }
 

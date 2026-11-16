@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { realpathSync, statSync } from "node:fs";
-import { isAbsolute, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { assertTimezone, CronError, parseCron, zonedToUtc } from "./cron";
 
 export const MAX_INSTRUCTION_CHARS = 4000;
@@ -120,7 +120,7 @@ const SPEC_KEYS = [
 	"deliver",
 	"procedureFiles",
 ];
-const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 export type MonitorThinking = (typeof THINKING_LEVELS)[number];
 const MODEL_ID = /^\S+\/\S+$/;
 const CHANNEL_ID = /^[CG][A-Z0-9]{8,}$/;
@@ -144,16 +144,36 @@ function rejectUnknown(obj: Record<string, unknown>, allowed: readonly string[],
 
 const ISO_LOCAL = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,3}))?)?$/;
 const ISO_WITH_OFFSET = /(?:Z|[+-]\d{2}:?\d{2})$/i;
+const ISO_DATE = /^(\d{4})-(\d{2})-(\d{2})/;
+
+/** True when year-month-day names a day that exists (`Date` alone rolls 02-30 over to 03-02). */
+function calendarDayExists(year: number, month: number, day: number): boolean {
+	const probe = new Date(Date.UTC(2000, month - 1, day));
+	probe.setUTCFullYear(year);
+	return probe.getUTCMonth() === month - 1 && probe.getUTCDate() === day;
+}
 
 /** ISO instant to epoch ms. A value without an offset is wall-clock time in `timezone`. */
 export function parseAt(text: string, timezone: string): number {
 	const trimmed = text.trim();
 	let ms: number;
+	const notIso = () => new MonitorSpecError(`trigger.at is not an ISO time: "${text}"`);
 	if (ISO_WITH_OFFSET.test(trimmed)) {
+		const date = ISO_DATE.exec(trimmed);
+		if (date && !calendarDayExists(Number(date[1]), Number(date[2]), Number(date[3]))) throw notIso();
 		ms = Date.parse(trimmed);
 	} else {
 		const m = ISO_LOCAL.exec(trimmed);
-		if (!m) throw new MonitorSpecError(`trigger.at is not an ISO time: "${text}"`);
+		if (!m) throw notIso();
+		const [year, month, day, hour, minute, second] = [m[1], m[2], m[3], m[4], m[5], m[6] ?? "0"].map(Number) as [
+			number,
+			number,
+			number,
+			number,
+			number,
+			number,
+		];
+		if (!calendarDayExists(year, month, day) || hour > 23 || minute > 59 || second > 59) throw notIso();
 		try {
 			assertTimezone(timezone);
 		} catch (error) {
@@ -161,18 +181,18 @@ export function parseAt(text: string, timezone: string): number {
 		}
 		ms = zonedToUtc(
 			{
-				year: Number(m[1]),
-				month: Number(m[2]),
-				day: Number(m[3]),
-				hour: Number(m[4]),
-				minute: Number(m[5]),
-				second: Number(m[6] ?? 0),
+				year,
+				month,
+				day,
+				hour,
+				minute,
+				second,
 				ms: Number((m[7] ?? "0").padEnd(3, "0")),
 			},
 			timezone,
 		);
 	}
-	if (!Number.isFinite(ms)) throw new MonitorSpecError(`trigger.at is not an ISO time: "${text}"`);
+	if (!Number.isFinite(ms)) throw notIso();
 	return ms;
 }
 
@@ -263,6 +283,17 @@ export function resolveProcedureFile(path: string, workspaceDir: string | undefi
 	}
 	if (!procedureRoots(workspaceDir, scriptsRoot).some((root) => under(root, real))) {
 		throw new MonitorSpecError(`procedure file must live under the workspace or ${scriptsRoot}: ${path}`);
+	}
+	// The scripts root is always `<home>/scripts`; whatever the workspace holds, the token files never go into a prompt
+	// (qa-j #6).
+	let secrets: string | undefined;
+	try {
+		secrets = realpathSync(join(dirname(scriptsRoot), "secrets"));
+	} catch {
+		secrets = undefined;
+	}
+	if (secrets !== undefined && under(secrets, real)) {
+		throw new MonitorSpecError(`procedure file must not live under secrets/: ${path}`);
 	}
 	if (!statSync(real).isFile()) throw new MonitorSpecError(`procedure file is not a regular file: ${path}`);
 	return real;
@@ -419,8 +450,16 @@ export function mergeMonitorSpec(current: MonitorSpec | undefined, patch: unknow
 	const obj = record(patch, "monitor spec");
 	rejectUnknown(obj, SPEC_KEYS, "monitor spec");
 	const name = obj.name ?? current?.name;
-	if (typeof name !== "string" || name.trim() === "" || name.length > MAX_NAME_CHARS) {
-		throw new MonitorSpecError(`name must be 1-${MAX_NAME_CHARS} characters`);
+	if (
+		typeof name !== "string" ||
+		name.trim() === "" ||
+		name.length > MAX_NAME_CHARS ||
+		/\p{Cc}/u.test(name) ||
+		!name.isWellFormed()
+	) {
+		throw new MonitorSpecError(
+			`name must be 1-${MAX_NAME_CHARS} characters without control characters or unpaired surrogates`,
+		);
 	}
 	const instruction = obj.instruction ?? current?.instruction;
 	if (typeof instruction !== "string" || instruction.trim() === "") {

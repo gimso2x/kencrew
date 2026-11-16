@@ -233,6 +233,11 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 				});
 				return 1;
 			}
+			// The scheduler drops a check whose last stdout line is the wake gate; a manual fire follows the same rule.
+			if (result.wakeOff) {
+				out({ fired: false, suppressed: "wake_gate" });
+				return 0;
+			}
 			payload = result.stdout;
 		}
 		const event = ledger.admitManual(row.id, payload);

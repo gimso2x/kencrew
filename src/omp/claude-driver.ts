@@ -648,7 +648,12 @@ export class ClaudeOmpDriver implements OmpSessionDriver {
 		// Synthetic omp-style activity events keep the mailbox status/stall logic working.
 		for (const block of blocks) {
 			if (block.type === "tool_use") {
-				this.#emit({ type: "tool_execution_start", toolName: block.name, args: block.input });
+				this.#emit({
+					type: "tool_execution_start",
+					toolName: block.name,
+					args: block.input,
+					...(str(block.id) === undefined ? {} : { toolCallId: block.id }),
+				});
 			}
 		}
 	}
@@ -658,6 +663,11 @@ export class ClaudeOmpDriver implements OmpSessionDriver {
 		if (message === undefined) return;
 		const id = str(frame.uuid) ?? `cl-${++this.#entrySeq}`;
 		this.#entries.push({ id, type: "message", message: { role: "user", content: message.content } });
+		// A tool_result closes the tool_use it answers, so the live view stops showing it as running.
+		for (const block of blockArray(message.content)) {
+			const toolCallId = block.type === "tool_result" ? str(block.tool_use_id) : undefined;
+			if (toolCallId !== undefined) this.#emit({ type: "tool_execution_end", toolCallId });
+		}
 	}
 
 	#onResult(frame: Record<string, unknown>): void {

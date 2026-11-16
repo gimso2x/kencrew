@@ -3,15 +3,14 @@ import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { ConfigError, defaultHomeDir, loadConfig, type OmpbotConfig, timezoneOfHome } from "../config";
 import { escapeControl, runDoctor } from "../daemon/doctor";
-import { callDaemon } from "../daemon/ipc";
-import type { ReloadResult } from "../daemon/reload";
+import { callDaemon, IpcNoResponse } from "../daemon/ipc";
 import { runDaemon } from "../daemon/run";
 import { readStatusFromDb, renderStatusText, type StatusReport } from "../daemon/status";
 import { readVersion } from "../daemon/tools";
-import { herdrSshArgv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
+import { dispatchEnv, herdrSshArgv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
 import { readConfigText } from "../ops/apply";
 import { BackupError, type BackupResult, DEFAULT_KEEP, runBackup } from "../ops/backup";
-import { clearFreeze, readFreeze, writeFreeze } from "../ops/freeze";
+import { clearFreeze, freezePath, readFreeze, writeFreeze } from "../ops/freeze";
 import { collectGates, type GatesOptions, gateOptionsFromConfig } from "../ops/gates";
 import { DEFAULT_SESSION_RETENTION_DAYS, gcSessions } from "../ops/gc";
 import { type HostLoadReader, testHostLoad } from "../ops/host-resources";
@@ -62,8 +61,32 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
 ${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${LANES_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${TEAMS_USAGE}`;
 
+/** The fields `renderStatusText` and `--json` readers rely on; a reply without them is not a status report. */
+function isStatusReport(value: unknown): value is StatusReport {
+	if (typeof value !== "object" || value === null) return false;
+	const report = value as Partial<Record<keyof StatusReport, unknown>>;
+	const isObject = (field: unknown): boolean => typeof field === "object" && field !== null;
+	return (
+		typeof report.ompVersion === "string" &&
+		typeof report.timezone === "string" &&
+		typeof report.daemonRunning === "boolean" &&
+		Array.isArray(report.origins) &&
+		isObject(report.ledger) &&
+		isObject(report.inbound) &&
+		isObject(report.monitors) &&
+		Array.isArray(report.openGates)
+	);
+}
+
 function isStatusResponse(value: unknown): value is { ok: true; status: StatusReport } {
-	return typeof value === "object" && value !== null && "ok" in value && value.ok === true && "status" in value;
+	return (
+		typeof value === "object" &&
+		value !== null &&
+		"ok" in value &&
+		value.ok === true &&
+		"status" in value &&
+		isStatusReport(value.status)
+	);
 }
 
 function gcCommand(args: string[], homeDir: string): number {
@@ -113,6 +136,7 @@ async function checkDispatchHosts(config: OmpbotConfig, run: ProcessRunner): Pro
 			const [result, integration] = await Promise.all([
 				run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "--", host.ssh, "true"], {
 					timeoutMs: DISPATCH_HOST_CHECK_MS,
+					env: dispatchEnv(process.env),
 				}),
 				checkHerdrIntegration(herdrSshArgv(host.ssh, host.herdrBin ?? "herdr", ["integration", "status"]), run),
 			]);
@@ -133,7 +157,7 @@ async function checkDispatchHosts(config: OmpbotConfig, run: ProcessRunner): Pro
  * the install command and `(warning only)`.
  */
 async function checkHerdrIntegration(cmd: string[], run: ProcessRunner): Promise<{ ok: boolean; detail: string }> {
-	const result = await run(cmd, { timeoutMs: DISPATCH_HOST_CHECK_MS });
+	const result = await run(cmd, { timeoutMs: DISPATCH_HOST_CHECK_MS, env: dispatchEnv(process.env) });
 	const fix = "— herdr integration install omp (warning only)";
 	if (result.code !== 0 || result.timedOut) {
 		const reason = result.timedOut
@@ -154,7 +178,7 @@ async function checkHerdrIntegration(cmd: string[], run: ProcessRunner): Promise
 /** Local herdr (config `herdr` on): `<bin> --version` must answer; the line carries its first output line or why not. */
 async function checkLocalHerdr(herdr: { bin?: string }, run: ProcessRunner): Promise<{ ok: boolean; line: string }> {
 	const bin = herdr.bin ?? "herdr";
-	const result = await run([bin, "--version"], { timeoutMs: DISPATCH_HOST_CHECK_MS });
+	const result = await run([bin, "--version"], { timeoutMs: DISPATCH_HOST_CHECK_MS, env: dispatchEnv(process.env) });
 	if (result.code === 0 && !result.timedOut)
 		return { ok: true, line: `ok herdr: ${bin} ${firstLine(result.stdout)}`.trim() };
 	const reason = result.timedOut
@@ -370,7 +394,14 @@ function freezeCommand(args: string[], homeDir: string): number {
 
 function unfreezeCommand(homeDir: string): number {
 	const was = readFreeze(homeDir) !== undefined;
-	clearFreeze(homeDir);
+	try {
+		clearFreeze(homeDir);
+	} catch (error) {
+		// Whatever blocks the removal or the unfrozen-at stamp: FROZEN stays, the owner learns the path and errno.
+		const { code, path } = error as NodeJS.ErrnoException;
+		process.stderr.write(`unfreeze: ${path ?? freezePath(homeDir)}: ${code ?? String(error)}\n`);
+		return 1;
+	}
 	process.stdout.write(was ? "unfrozen\n" : "not frozen\n");
 	return 0;
 }
@@ -406,7 +437,13 @@ async function injectCommand(args: string[], homeDir: string): Promise<number> {
 			thread: values.thread,
 		});
 	} catch (error) {
-		process.stderr.write(`inject: daemon not reachable (${error instanceof Error ? error.message : String(error)})\n`);
+		const message = error instanceof Error ? error.message : String(error);
+		if (error instanceof IpcNoResponse) {
+			// The request went out: the daemon may already have posted the marker and queued the message.
+			process.stderr.write(
+				`inject: no daemon answer (${message}) — the request may have been delivered; check the conversation before retrying\n`,
+			);
+		} else process.stderr.write(`inject: daemon not reachable (${message})\n`);
 		return 1;
 	}
 	if (
@@ -428,15 +465,31 @@ async function injectCommand(args: string[], homeDir: string): Promise<number> {
 
 /** `ompbot reload`: the running daemon re-reads config.json (same as SIGHUP); exit 1 when it kept the old config. */
 async function reloadCommand(homeDir: string): Promise<number> {
-	let response: ReloadResult;
+	let answer: unknown;
 	try {
-		response = (await callDaemon(join(homeDir, "ompbot.sock"), { op: "reload" }, 10_000)) as ReloadResult;
+		answer = await callDaemon(join(homeDir, "ompbot.sock"), { op: "reload" }, 10_000);
 	} catch (error) {
 		process.stderr.write(`reload: daemon not reachable (${error instanceof Error ? error.message : String(error)})\n`);
 		return 1;
 	}
-	if (response.ok !== true) {
-		process.stderr.write(`reload failed, config unchanged: ${response.error}\n`);
+	if (typeof answer === "object" && answer !== null && "ok" in answer && answer.ok === false) {
+		process.stderr.write(`reload failed, config unchanged: ${"error" in answer ? String(answer.error) : "unknown"}\n`);
+		return 1;
+	}
+	const isNames = (value: unknown): value is string[] =>
+		Array.isArray(value) && value.every((item) => typeof item === "string");
+	if (typeof answer !== "object" || answer === null) {
+		process.stderr.write("reload: unexpected daemon answer\n");
+		return 1;
+	}
+	const response: { ok?: unknown; changed?: unknown; restartRequired?: unknown; cli?: unknown } = answer;
+	if (
+		response.ok !== true ||
+		!isNames(response.changed) ||
+		!isNames(response.restartRequired) ||
+		!isNames(response.cli)
+	) {
+		process.stderr.write("reload: unexpected daemon answer\n");
 		return 1;
 	}
 	const list = (fields: string[]) => (fields.length === 0 ? "-" : fields.join(","));

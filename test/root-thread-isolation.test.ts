@@ -22,6 +22,7 @@ import { SlackChannel } from "../src/slack/channel";
 import { SlackCallError, type SlackTransport } from "../src/slack/transport";
 import type { Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { ROOMY_STATFS } from "./helpers/disk";
 import { makeRepo } from "./helpers/git-fixtures";
 import { removeRepoAndWorktrees } from "./helpers/lane-harness";
 
@@ -121,6 +122,7 @@ describe("daemon: channel roots are isolated sessions", () => {
 			ompVersion: "omp-test 0",
 			bootId: "boot",
 			stopDrainMs: 0,
+			statfs: ROOMY_STATFS, // the [TASK] start's disk check never depends on this machine's free space
 			driverFactory: (origin, sessionDir) => {
 				const driver = new FakeOmpDriver({ sessionDir, store: sessions, holdTurns: hold(origin) });
 				drivers.set(origin, driver);
@@ -286,7 +288,7 @@ describe("daemon: channel roots are isolated sessions", () => {
 		expect(transport.historyReads.filter((channel) => channel === CH)).toHaveLength(1);
 
 		expect(daemon.store.listInbound().filter((row) => row.platformMessageId === ref(x))).toHaveLength(1);
-		expect(daemon.store.listSlackOrigins().filter((origin) => origin.endsWith(x))).toEqual([rootOrigin(x)]);
+		expect(daemon.store.listOrigins("slack").filter((origin) => origin.endsWith(x))).toEqual([rootOrigin(x)]);
 		expect(driverOf(rootOrigin(x)).calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:중복 테스트"]);
 		expect(daemon.store.listDeliveries({ originKey: rootOrigin(x) }).map((d) => [d.threadRef, d.body])).toEqual([
 			[ref(x), "ECHO 중복 테스트"],
@@ -544,7 +546,7 @@ describe("daemon: channel roots are isolated sessions", () => {
 		const passes = backfillLines().length;
 		await boot(() => false);
 		await logs.waitFor(() => backfillLines().length > passes, "startup backfill pass");
-		expect(daemon.store.listSlackOrigins().filter((origin) => origin.startsWith(CHANNEL_ORIGIN))).toEqual([]);
+		expect(daemon.store.listOrigins("slack").filter((origin) => origin.startsWith(CHANNEL_ORIGIN))).toEqual([]);
 
 		// While the bot was down, root B arrived in the now origin-less channel.
 		const missed = tsAt(200);

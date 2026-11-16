@@ -2,6 +2,7 @@ import { afterAll, expect, spyOn, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, watch, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createLogger, type Logger } from "../src/log";
 import { AgyOmpDriver, parseAgyModels } from "../src/omp/agy-driver";
 import { turnAnswerParts } from "../src/omp/answers";
 import { OmpDriverError, type OmpEvent, type OmpExitInfo, type OmpFinal } from "../src/omp/driver";
@@ -36,6 +37,7 @@ interface Harness {
 		thinking?: string;
 		systemPrompt?: string;
 		env?: Record<string, string>;
+		log?: Logger;
 	}): AgyOmpDriver;
 	readLog(): LogEntry[];
 }
@@ -63,6 +65,7 @@ function makeHarness(): Harness {
 				...(options.model === undefined ? {} : { model: options.model }),
 				...(options.thinking === undefined ? {} : { thinking: options.thinking }),
 				...(options.systemPrompt === undefined ? {} : { systemPrompt: options.systemPrompt }),
+				...(options.log === undefined ? {} : { log: options.log, originKey: "discord/ch/C1/t/T1" }),
 				env: { FAKE_AGY_LOG: logFile, ...(options.env ?? {}) },
 				baseEnv: { HOME: root, PATH: process.env.PATH ?? "/usr/bin:/bin" },
 				startupTimeoutMs: 10_000,
@@ -165,7 +168,12 @@ test("one turn completes; entries, usage and the system prompt on the first mess
 
 	const done = nextFinal(driver);
 	const opRef = await driver.prompt("hello");
-	expect(await done).toEqual({ opRef, status: "completed", text: "REPLY1:hello" });
+	expect(await done).toEqual({
+		opRef,
+		status: "completed",
+		text: "REPLY1:hello",
+		usage: { calls: 1, input: 100, cacheRead: 40, output: 7, contextTokens: 140, rotated: false },
+	});
 
 	const all = await driver.entriesSince();
 	expect(all.entries.map((entry) => entry.message?.role)).toEqual(["user", "assistant"]);
@@ -345,7 +353,13 @@ test("steer while a turn runs is queued and answered within the same turn", asyn
 	const pid = driver.pid;
 	if (pid === undefined) throw new Error("no child");
 	process.kill(pid, "SIGUSR1");
-	expect(await done).toEqual({ opRef, status: "completed", text: "REPLY2:also this" });
+	// Both answers are one turn: its usage sums the steered follow-up's call too.
+	expect(await done).toEqual({
+		opRef,
+		status: "completed",
+		text: "REPLY2:also this",
+		usage: { calls: 2, input: 200, cacheRead: 80, output: 14, contextTokens: 140, rotated: false },
+	});
 	expect(sentContents(harness)).toEqual(["@hold", "also this"]);
 	expect(turnAnswerParts((await driver.entriesSince()).entries)).toEqual(["HELD-DONE", "REPLY2:also this"]);
 	expect(await driver.state()).toMatchObject({ idle: true, queuedMessageCount: 0 });
@@ -437,8 +451,32 @@ test("a respawn during a turn ends that turn aborted before the new child takes 
 
 	const done = nextFinal(driver);
 	const third = await driver.prompt("after");
-	expect(await done).toEqual({ opRef: third, status: "completed", text: "REPLY1:after" });
+	expect(await done).toEqual({
+		opRef: third,
+		status: "completed",
+		text: "REPLY1:after",
+		usage: { calls: 1, input: 100, cacheRead: 40, output: 7, contextTokens: 140, rotated: false },
+	});
 	expect(finals).toHaveLength(3);
+	await driver.stop();
+});
+
+test("steered texts a respawn throws away are named in the aborted final (qa-l #34)", async () => {
+	const harness = makeHarness();
+	const driver = harness.make({ model: "gemini-3.8-flash-high" });
+	const finals: OmpFinal[] = [];
+	driver.onFinal((final) => finals.push(final));
+	await driver.start();
+
+	const started = nextEvent(driver, (event) => event.type === "step_update");
+	const first = await driver.prompt("@hold");
+	await started;
+	await driver.steer("one");
+	await driver.steer("two");
+	await driver.newSession();
+	expect(finals).toEqual([
+		{ opRef: first, status: "aborted", text: "", error: "agy restarted (new session) (steer 2건 미전달)" },
+	]);
 	await driver.stop();
 });
 
@@ -480,6 +518,7 @@ test("a steered message that cannot be sent ends the turn as error", async () =>
 			status: "error",
 			text: "HELD-DONE",
 			error: "steer 전송 실패: agy stdin is closed",
+			usage: { calls: 1, input: 100, cacheRead: 40, output: 7, contextTokens: 140, rotated: false },
 		});
 		expect(await driver.state()).toMatchObject({ idle: true, queuedMessageCount: 0 });
 		await driver.stop();
@@ -529,5 +568,100 @@ test("compact is refused with rpc_error", async () => {
 	expect(error).toBeInstanceOf(OmpDriverError);
 	expect(error).toMatchObject({ code: "rpc_error", message: "agy 세션은 compact를 지원하지 않습니다" });
 	expect(existsSync(join(harness.sessionDir, "agy-conversation.json"))).toBe(true);
+	await driver.stop();
+});
+
+function capturedLog(): { log: Logger; lines: string[] } {
+	const lines: string[] = [];
+	return { log: createLogger({ sink: (line) => lines.push(line), clock: Date, redact: (text) => text }), lines };
+}
+
+test("a turn whose last call fills 70% of the window rotates the conversation before the next turn", async () => {
+	const harness = makeHarness();
+	const { log, lines } = capturedLog();
+	const driver = harness.make({ log });
+	await driver.start();
+	const opened = await driver.openSession();
+	const pointer = join(harness.sessionDir, "agy-conversation.json");
+
+	const done = nextFinal(driver);
+	await driver.prompt("big @ctx=180000");
+	const final = await done;
+	expect(final.usage).toEqual({
+		calls: 1,
+		input: 1000,
+		cacheRead: 179_000,
+		output: 10,
+		contextTokens: 180_000,
+		rotated: true,
+	});
+	expect(existsSync(pointer)).toBe(false);
+	expect((await driver.state()).sessionId).toBe("");
+	const rotated = lines.filter((line) => line.includes("event=agy_conversation_rotated"));
+	expect(rotated).toHaveLength(1);
+	expect(rotated[0]).toContain("origin=discord/ch/C1/t/T1");
+	expect(rotated[0]).toContain(`conversationId=${opened.sessionId}`);
+	expect(rotated[0]).toContain("contextTokens=180000");
+
+	const next = nextFinal(driver);
+	await driver.prompt("after");
+	expect(await next).toMatchObject({ status: "completed", text: "REPLY1:after", usage: { rotated: false } });
+	expect(spawns(harness)).toEqual([
+		[...BASE_ARGS, "--dangerously-skip-permissions"],
+		[...BASE_ARGS, "--dangerously-skip-permissions"],
+	]);
+	const fresh = (await driver.state()).sessionId;
+	expect(fresh).not.toBe(opened.sessionId);
+	expect(JSON.parse(readFileSync(pointer, "utf8"))).toEqual({ conversationId: fresh });
+	await driver.stop();
+});
+
+test("a turn under 70% keeps the conversation; the next spawn resumes it", async () => {
+	const harness = makeHarness();
+	const { log, lines } = capturedLog();
+	const driver = harness.make({ log });
+	await driver.start();
+	const opened = await driver.openSession();
+
+	const done = nextFinal(driver);
+	await driver.prompt("big @ctx=170000");
+	expect((await done).usage).toMatchObject({ calls: 1, contextTokens: 170_000, rotated: false });
+	expect(JSON.parse(readFileSync(join(harness.sessionDir, "agy-conversation.json"), "utf8"))).toEqual({
+		conversationId: opened.sessionId,
+	});
+	expect((await driver.state()).sessionId).toBe(opened.sessionId);
+	expect(lines.some((line) => line.includes("agy_conversation_rotated"))).toBe(false);
+	await driver.stop();
+
+	const restarted = harness.make({ log });
+	await restarted.start();
+	expect(spawns(harness).at(-1)).toEqual([
+		...BASE_ARGS,
+		"--conversation",
+		opened.sessionId,
+		"--dangerously-skip-permissions",
+	]);
+	await restarted.stop();
+});
+
+test("rotation reads the last call, not the turn's sum: three 70k calls stay in the conversation", async () => {
+	const harness = makeHarness();
+	const { log, lines } = capturedLog();
+	const driver = harness.make({ log });
+	await driver.start();
+	const opened = await driver.openSession();
+
+	const done = nextFinal(driver);
+	await driver.prompt("tools @ctx=70000,70000,70000");
+	expect((await done).usage).toEqual({
+		calls: 3,
+		input: 3000,
+		cacheRead: 207_000,
+		output: 30,
+		contextTokens: 70_000,
+		rotated: false,
+	});
+	expect((await driver.state()).sessionId).toBe(opened.sessionId);
+	expect(lines.some((line) => line.includes("agy_conversation_rotated"))).toBe(false);
 	await driver.stop();
 });

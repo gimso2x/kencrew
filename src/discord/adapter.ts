@@ -47,6 +47,7 @@ import {
 	threadRefOf,
 } from "../core/normalize";
 import { parseChatOrigin } from "../core/origin-key";
+import { parseCommand, TAKES_ARG } from "../core/types";
 import type { Logger } from "../log";
 import { DEFAULT_PEER_HOP_LIMIT, PEER_HOP_NOTICE, type PeerBotList } from "../slack/adapter";
 import { type BackfillCursors, type BackfillTarget, DiscordBackfill, snowflakeTime } from "./backfill";
@@ -180,6 +181,8 @@ export class DiscordAdapter implements ChannelAdapter {
 	readonly #recoveredThreads = new Set<string>();
 	#ready: Promise<string | undefined> = Promise.resolve(undefined);
 	#botUserId: string | undefined;
+	/** Managed bot roles seen on the gateway (`tags.bot_id`): role id → the bot's user id. */
+	readonly #botRoles = new Map<string, string>();
 
 	constructor(options: DiscordAdapterOptions) {
 		this.#port = options.channel;
@@ -275,6 +278,13 @@ export class DiscordAdapter implements ChannelAdapter {
 		return this.#botUserId;
 	}
 
+	/** `<@&role>` tokens of the managed roles of the bot with this user id. */
+	#roleTokensOf(userId: string): string[] {
+		const tokens: string[] = [];
+		for (const [roleId, botId] of this.#botRoles) if (botId === userId) tokens.push(`<@&${roleId}>`);
+		return tokens;
+	}
+
 	/**
 	 * Connects in the background: the daemon (and Slack) never waits for the gateway. A failed start — a fatal close
 	 * such as 4004/4014 — leaves Discord off and is logged; every other part of the daemon keeps running.
@@ -287,6 +297,14 @@ export class DiscordAdapter implements ChannelAdapter {
 			// has the bot id: that one is the daemon's own startup recover().
 			ready: ({ resumed }) => {
 				if (!resumed && this.#botUserId !== undefined) this.recover();
+			},
+			roles: (roles) => {
+				for (const role of roles) {
+					// Gateway payloads are not validated upstream: a role that is not an object is skipped.
+					if (typeof role !== "object" || role === null || typeof role.id !== "string") continue;
+					const botId = role.tags?.bot_id;
+					if (typeof botId === "string") this.#botRoles.set(role.id, botId);
+				}
 			},
 		};
 		this.#ready = this.#transport.start(handlers).then(
@@ -336,14 +354,13 @@ export class DiscordAdapter implements ChannelAdapter {
 		// `kind` is the daemon's guess from Slack id shapes; a Discord DM is told by its channel having no server.
 		const conversation = input.kind === "ch" ? await this.#port.channelInfo(input.conversationId) : undefined;
 		const inChannel = conversation?.guildId !== undefined;
+		const isDm = input.kind === "dm" || (conversation !== undefined && !inChannel);
 		return this.#processMessage(
 			{
 				id: input.messageId,
 				// A DM has no threads: its `threadId` is the message the marker replied to, not a channel.
-				channel_id: input.kind === "dm" ? input.conversationId : (input.threadId ?? input.conversationId),
-				...(input.kind === "dm" && input.threadId !== undefined
-					? { message_reference: { message_id: input.threadId } }
-					: {}),
+				channel_id: isDm ? input.conversationId : (input.threadId ?? input.conversationId),
+				...(isDm && input.threadId !== undefined ? { message_reference: { message_id: input.threadId } } : {}),
 				guild_id: inChannel ? conversation?.guildId : undefined,
 				author: { id: this.#owner },
 				content: `${inChannel && botUserId !== undefined ? `<@${botUserId}> ` : ""}${input.text}`,
@@ -533,7 +550,8 @@ export class DiscordAdapter implements ChannelAdapter {
 		const spot: MessageSpot = { channelId: event.channel_id, messageId: event.id };
 		let text = event.content;
 		if (!dm) {
-			const tokens = [`<@${botUserId}>`, `<@!${botUserId}>`];
+			// The bot's managed role (`<@&role>`, what the @ autocomplete often picks) counts as a mention of the bot.
+			const tokens = [`<@${botUserId}>`, `<@!${botUserId}>`, ...this.#roleTokensOf(botUserId)];
 			const repliesToBot = event.referenced_message?.author?.id === botUserId;
 			// A pinging reply lists its target under `mentions`: for a reply to this bot only a mention in the text counts.
 			const mentioned =
@@ -550,6 +568,7 @@ export class DiscordAdapter implements ChannelAdapter {
 					(p) =>
 						text.includes(`<@${p.userId}>`) ||
 						text.includes(`<@!${p.userId}>`) ||
+						this.#roleTokensOf(p.userId).some((token) => text.includes(token)) ||
 						(event.mentions?.some((user) => user.id === p.userId) ?? false),
 				);
 			const addressed = isChannelMessageAddressed(this.#core, {
@@ -603,12 +622,18 @@ export class DiscordAdapter implements ChannelAdapter {
 			await this.#startThread(conversationId, event, text.trim() === "" ? (forwarded[0] ?? "") : text);
 			onThread?.();
 		}
-		if (opensThread || files.length > 0) {
+		// A server root's gate decides once whether it is a command: one without an argument would stop parsing as a
+		// command once notes were appended, so its files are neither fetched nor noted (qa-l #28). DMs and threads keep
+		// their own handling.
+		const command = !dm && threadId === undefined ? parseCommand(inbound.text) : undefined;
+		const argless = command !== undefined && !TAKES_ARG.has(command.kind);
+		if (!argless && (opensThread || files.length > 0)) {
 			const notes = files.length === 0 ? [] : await this.#collectAttachments(event, files);
 			const body = [text.trim(), ...forwardNote, ...notes].filter((line) => line !== "").join("\n");
 			const final = normalizeInbound({ ...args, text: body, ...(opensThread ? { threadTs: event.id } : {}) });
 			if (!final.accept) return this.#drop(event, final.reason);
-			inbound = final.inbound;
+			// The origin stays the gate's: the thread was opened (or not) on its reading.
+			inbound = { ...final.inbound, originKey: inbound.originKey };
 		}
 		const recorded = inbound;
 		return recordInbound(this.#core, this.#log, recorded, (thread, showStatus) =>
@@ -669,16 +694,19 @@ export class DiscordAdapter implements ChannelAdapter {
 		const refused = await recordPeerInbound(this.#core, this.#log, inbound, this.#peerHopLimit, drop, () =>
 			this.postNotice(conversationId, PEER_HOP_NOTICE, root),
 		);
-		if (refused !== undefined) return refused;
+		if (refused !== undefined && refused !== "held") return refused;
 		if (opensThread) await this.#startThread(conversationId, event, text, false);
-		await this.#beginStatus(
-			threadRef,
-			conversationId,
-			root,
-			{ channelId: event.channel_id, messageId: event.id },
-			inbound.originKey,
-			{ showStatus: true },
-		);
+		// A frozen bot only records the peer's message: no ⏳ status for a turn that will not run now.
+		if (refused === undefined) {
+			await this.#beginStatus(
+				threadRef,
+				conversationId,
+				root,
+				{ channelId: event.channel_id, messageId: event.id },
+				inbound.originKey,
+				{ showStatus: true },
+			);
+		}
 		return "recorded";
 	}
 

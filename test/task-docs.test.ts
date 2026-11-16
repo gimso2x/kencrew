@@ -17,7 +17,7 @@ import {
 	TaskSpecError,
 	worktreePathOf,
 } from "../src/tasks/docs";
-import { parseChecks } from "../src/tasks/signals";
+import { assertCheckPlacement, parseChecks } from "../src/tasks/signals";
 import { localDay, localIso } from "../src/time";
 
 const spec: NewTaskSpec = {
@@ -78,6 +78,18 @@ describe("taskSpec input", () => {
 		["slash-only repo (qa-i #58)", { ...spec, repo: "//" }],
 	])("rejects %s", (_name, raw) => {
 		expect(() => parseTaskSpecInput(raw)).toThrow(TaskSpecError);
+	});
+
+	test("a criterion that is only its AC-n: prefix is refused; one with text keeps the text (qa-l #38)", () => {
+		for (const bare of ["AC-1:", "  AC-2)  "]) {
+			expect(() => parseTaskSpecInput({ ...spec, acceptance: ["확인", bare] })).toThrow(
+				new TaskSpecError("taskSpec.acceptance는 비어 있지 않은 문자열 배열이어야 합니다"),
+			);
+		}
+		const parsed = parseTaskSpecInput({ ...spec, acceptance: ["AC-1: 확인"] });
+		expect(parsed.kind === "new" ? acceptanceItems(parsed.spec.acceptance) : []).toEqual([
+			{ id: "AC-1", text: "확인" },
+		]);
 	});
 });
 
@@ -379,5 +391,24 @@ describe("checkTask table", () => {
 		expect(result.status).toBe("done");
 		// ... and a self-declared status does not block a genuinely complete one either.
 		expect((await checkTask({ ...base, progress: progress("review") })).reached).toBe(true);
+	});
+});
+
+describe("task documents (qa-l low B)", () => {
+	// qa-l #79: `updated` goes to the model, the CLI and the dashboard like the other prose fields: masked as read.
+	test("PROGRESS updated is masked like the other fields", () => {
+		const token = ["xoxb", "TEST", "0", "docs"].join("-");
+		const progress = parseProgress(
+			["---", "task: T-20261026-01", "status: working", `updated: ${token}`, "---", "# 단계"].join("\n"),
+		);
+		expect(progress.updated).not.toContain(token);
+		expect(progress.updated).toContain("[REDACTED]");
+	});
+
+	// qa-l #85: a JSON string ending in an escaped backslash (`"a\\"`) closes its quote, so the quotes pair up.
+	test("a criterion whose JSON argument ends in a backslash passes the quote parity guard", () => {
+		const text = String.raw`인자에 백슬래시가 있다 [check: command ["grep","[check:","a\\"]]`;
+		expect(() => assertCheckPlacement(text)).not.toThrow();
+		expect(() => assertCheckPlacement('[check: command ["a"]] "x [check: y]')).toThrow(/짝이 맞지 않아/);
 	});
 });

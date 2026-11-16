@@ -116,12 +116,16 @@ export interface HostToolDeps {
 	ompExecutable?: string;
 	/** Config `ompProfile` of the dispatch tool's simple `omp -p` run. */
 	ompProfile?: string;
+	/** Config `ompConfigOverlay`: the `--config` of the dispatch tool's simple `omp -p` run. */
+	ompConfigOverlay?: string;
 	/** Home of the user running the bot (tests override); default `os.homedir()`. */
 	userHome?: string;
 	/** Remote dispatch targets (config `dispatchHosts`) for the dispatch tool. */
 	dispatchHosts?: DispatchToolDeps["dispatchHosts"];
 	/** Local herdr worker omp extra arguments (config `workerOmpArgs`) for the dispatch tool. */
 	workerOmpArgs?: DispatchToolDeps["workerOmpArgs"];
+	/** Live config `lanes.models` for the dispatch tool's [TASK] worker tiers. */
+	laneModels?: DispatchToolDeps["laneModels"];
 	/** herdr task board (config `herdrBoard`) for the dispatch tool's card links. */
 	herdrBoard?: DispatchToolDeps["herdrBoard"];
 	/** [TASK] state docs for the dispatch tool's `taskSpec`. */
@@ -249,8 +253,10 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 	return [
 		...(dispatch === undefined ? [] : [dispatch]),
 		...teamsGraph,
-		// Only where the platform's port can upload: Teams cannot, so its sessions get no upload tool (qa-i #110).
-		...(fileTool === undefined
+		// Only where the platform's port can upload: Teams cannot, so its sessions get no upload tool (qa-i #110). Upload
+		// and approval post into the session's conversation: a session without one (a monitor) gets neither, and its
+		// prompt does not name them (`floorsLines`, qa-j #47).
+		...(fileTool === undefined || channel === undefined
 			? []
 			: [
 					{
@@ -295,49 +301,53 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 						},
 					} satisfies HostToolDef,
 				]),
-		{
-			name: "ompbot_request_approval",
-			label: "Ask owner for approval",
-			description:
-				"Ask the owner to approve an irreversible or risky action with approve/deny buttons in Slack. Waits for the click. Result is `approved`, `denied`, `denied (timeout)` or `replied: <owner text>` (the owner answered in the card's thread instead of clicking); proceed on `approved`, or on a reply only when it plainly approves this exact action — otherwise treat it as not approved.",
-			parameters: {
-				type: "object",
-				properties: {
-					summary: { type: "string", description: "What you are about to do and why, in one or two lines" },
-					external: {
-						type: "string",
+		...(channel === undefined
+			? []
+			: [
+					{
+						name: "ompbot_request_approval",
+						label: "Ask owner for approval",
 						description:
-							"Where it is published outside the owner's own systems and who can see it (public GitHub issue/PR/comment, email, another workspace, a web post), one line; omit when nothing leaves",
-					},
-					action: { type: "string", description: "The exact action (command or file paths), one line" },
-					why: { type: "string", description: "Why this action is needed now, one line" },
-					impact: { type: "string", description: "What changes or breaks when it runs, one line" },
-					rollback: { type: "string", description: "Why this cannot be undone (omit when it can), one line" },
-				},
-				required: ["summary"],
-				additionalProperties: false,
-			},
-			async execute(params, context) {
-				const target = needChannel();
-				const summary = stringParam(params, "summary");
-				if (summary === undefined) throw new Error("summary is required");
-				// Empty sections are omitted by the card renderer, so a summary-only call renders exactly as before.
-				const detail: ApprovalDetail = {
-					external: stringParam(params, "external"),
-					action: stringParam(params, "action"),
-					why: stringParam(params, "why"),
-					impact: stringParam(params, "impact"),
-					rollback: stringParam(params, "rollback"),
-				};
-				const threadTs = deps.threadTs?.();
-				const outcome = await deps.broker.ask(target, summary, {
-					signal: context.signal,
-					detail,
-					origin: { originKey: deps.originKey, channel: target, threadTs },
-				});
-				if (typeof outcome === "object") return `replied: ${outcome.replied}`;
-				return outcome === "timeout" ? "denied (timeout)" : outcome;
-			},
-		},
+							"Ask the owner to approve an irreversible or risky action with approve/deny buttons in Slack. Waits for the click. Result is `approved`, `denied`, `denied (timeout)` or `replied: <owner text>` (the owner answered in the card's thread instead of clicking); proceed on `approved`, or on a reply only when it plainly approves this exact action — otherwise treat it as not approved.",
+						parameters: {
+							type: "object",
+							properties: {
+								summary: { type: "string", description: "What you are about to do and why, in one or two lines" },
+								external: {
+									type: "string",
+									description:
+										"Where it is published outside the owner's own systems and who can see it (public GitHub issue/PR/comment, email, another workspace, a web post), one line; omit when nothing leaves",
+								},
+								action: { type: "string", description: "The exact action (command or file paths), one line" },
+								why: { type: "string", description: "Why this action is needed now, one line" },
+								impact: { type: "string", description: "What changes or breaks when it runs, one line" },
+								rollback: { type: "string", description: "Why this cannot be undone (omit when it can), one line" },
+							},
+							required: ["summary"],
+							additionalProperties: false,
+						},
+						async execute(params, context) {
+							const target = needChannel();
+							const summary = stringParam(params, "summary");
+							if (summary === undefined) throw new Error("summary is required");
+							// Empty sections are omitted by the card renderer, so a summary-only call renders exactly as before.
+							const detail: ApprovalDetail = {
+								external: stringParam(params, "external"),
+								action: stringParam(params, "action"),
+								why: stringParam(params, "why"),
+								impact: stringParam(params, "impact"),
+								rollback: stringParam(params, "rollback"),
+							};
+							const threadTs = deps.threadTs?.();
+							const outcome = await deps.broker.ask(target, summary, {
+								signal: context.signal,
+								detail,
+								origin: { originKey: deps.originKey, channel: target, threadTs },
+							});
+							if (typeof outcome === "object") return `replied: ${outcome.replied}`;
+							return outcome === "timeout" ? "denied (timeout)" : outcome;
+						},
+					} satisfies HostToolDef,
+				]),
 	];
 }
