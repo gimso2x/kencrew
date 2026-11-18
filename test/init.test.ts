@@ -50,6 +50,31 @@ function freshHome(): string {
 	return join(tempDir("ompbot-init-"), ".ompbot");
 }
 
+describe("ompbot init: the printed next-step commands", () => {
+	test("a home with a space and a quote still parses in bash and unquotes to the same paths", () => {
+		const home = join(tempDir("ompbot-init-"), "a b", "it's");
+		const run = init(["--owner", OWNER, "--omp", process.execPath], home);
+		expect(run.code, run.err).toBe(0);
+		const commands = run.out.split("\n").filter((line) => line.startsWith("  cat >") || line.includes("OMPBOT_HOME="));
+		expect(commands.length).toBe(3);
+		const script = commands
+			.map((line) =>
+				line.replace("cat >", "printf '%s\\n'").replace("bun src/main.ts doctor", "/usr/bin/printenv OMPBOT_HOME"),
+			)
+			.join("\n");
+		const syntax = Bun.spawnSync(["bash", "-n", "-c", script], { stderr: "pipe" });
+		expect(syntax.stderr.toString()).toBe("");
+		expect(syntax.exitCode).toBe(0);
+		const unquoted = Bun.spawnSync(["bash", "-c", script], { stdout: "pipe", stderr: "pipe" });
+		expect(unquoted.stdout.toString().split("\n")).toEqual([
+			join(home, "secrets", "slack-bot-token"),
+			join(home, "secrets", "slack-app-token"),
+			home,
+			"",
+		]);
+	});
+});
+
 describe("ompbot init", () => {
 	test("AC-1: creates home, secrets, workspace, config.json; loadConfig accepts it once tokens exist", () => {
 		const home = freshHome();

@@ -75,6 +75,7 @@ async function boot(options: { maxPages?: number } = {}): Promise<DiscordAdapter
 		log: createLogger({ sink: (line) => logs.push(line), clock: { now: () => 0 }, redact }),
 		config,
 		store,
+		detach: () => {},
 	}) as DiscordAdapter;
 	await adapter.start();
 	return adapter;

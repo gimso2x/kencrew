@@ -9,6 +9,7 @@ import { herdrSshArgv } from "../src/dispatch/omp";
 import { CODE_ROLLBACK_JOURNAL } from "../src/ops/apply";
 import { sshCommand } from "../src/tasks/host";
 import { makeHome, type TestHome } from "./helpers/bot-home";
+import { OFFLINE_DOCTOR } from "./helpers/doctor-network";
 
 let home: TestHome;
 beforeEach(() => {
@@ -76,7 +77,7 @@ describe("home and workspace layout", () => {
 		chmodSync(file, 0o700);
 		expect(configError(() => loadConfig(file)).message).toContain("not a directory");
 		const lines: string[] = [];
-		await runDoctor(file, (line) => lines.push(line));
+		await runDoctor(file, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		expect(lines[0]).toBe(`fail home: ${file} is not a directory`);
 	});
 

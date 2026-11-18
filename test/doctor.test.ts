@@ -127,8 +127,9 @@ describe("doctor: omp --version probe env", () => {
 		envDumpingOmp(home.config.ompExecutable, dump);
 		const line = await inBunWithSecrets(
 			`import { runDoctor } from ${JSON.stringify(join(SRC, "daemon", "doctor"))};
+			import { OFFLINE_DOCTOR } from ${JSON.stringify(join(import.meta.dir, "helpers", "doctor-network"))};
 			const out = [];
-			await runDoctor(${JSON.stringify(home.dir)}, (line) => out.push(line));
+			await runDoctor(${JSON.stringify(home.dir)}, (line) => out.push(line), undefined, OFFLINE_DOCTOR);
 			console.log(out.find((line) => line.includes(" omp: ")));`,
 		);
 		expect(line).toContain("omp 9.9.9");
@@ -148,8 +149,9 @@ describe("qa50b I-18: the doctor's bun line", () => {
 				process.execPath,
 				"-e",
 				`import { runDoctor } from ${JSON.stringify(join(import.meta.dir, "..", "src", "daemon", "doctor"))};
+				import { OFFLINE_DOCTOR } from ${JSON.stringify(join(import.meta.dir, "helpers", "doctor-network"))};
 				const out = [];
-				await runDoctor(${JSON.stringify(home.dir)}, (line) => out.push(line));
+				await runDoctor(${JSON.stringify(home.dir)}, (line) => out.push(line), undefined, OFFLINE_DOCTOR);
 				console.log(out.find((line) => / bun: /.test(line)));`,
 			],
 			{ env: { ...process.env, PATH: `${bin}:${process.env.PATH ?? ""}` }, stdout: "pipe", stderr: "pipe" },

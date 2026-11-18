@@ -37,6 +37,7 @@ import {
 import {
 	backgroundResumeLine,
 	buildFloorsPrompt,
+	buildWorkerFloorsPrompt,
 	floorsSystemPrompt,
 	OMPBOT_BUN,
 	OMPBOT_MAIN,
@@ -182,6 +183,22 @@ describe("prompt and child environment", () => {
 		expect(prompt).toContain("/bot/home/secrets");
 		expect(prompt).toContain("ompbot_request_approval");
 		expect(prompt).toContain("slack_send_file");
+	});
+
+	test("buildWorkerFloorsPrompt includes Korean prose and command-with-claim rules without changing buildFloorsPrompt", () => {
+		const worker = buildWorkerFloorsPrompt("/bot/home/secrets", {
+			branch: "task/T-20261116-16",
+			worktree: "/ws-t-20261116-16",
+		});
+		const koreanRule =
+			"- 사람에게 보이는 글(PROGRESS·outcome·커밋 메시지·답)은 한국어로 쓴다(코드·식별자·명령·로그 원문은 그대로).";
+		const claimRule =
+			"- outcome 요약이나 답에서 '통과·검증됨·확인함'을 주장할 때는 같은 문장에 실제로 돌린 명령과 결과 숫자를 함께 쓴다(예: `bun test x.test.ts` → 12 pass 0 fail).";
+		expect(worker).toContain(koreanRule);
+		expect(worker).toContain(claimRule);
+		const chat = buildFloorsPrompt("/bot/home/secrets", "slack/dm/D1");
+		expect(chat).not.toContain(koreanRule);
+		expect(chat).not.toContain(claimRule);
 	});
 
 	test("the child env loses SLACK_*/OMPBOT_* keys and refuses them as extras", () => {

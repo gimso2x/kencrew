@@ -2,7 +2,7 @@ import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { WebClient } from "@slack/web-api";
+import { type AuthTestResponse, WebClient } from "@slack/web-api";
 import {
 	ConfigError,
 	HOME_MODE,
@@ -242,12 +242,23 @@ export function checkCodeRollbackJournal(repoDir: string, warn: (name: string, d
 	);
 }
 
+/** The network calls `runDoctor` makes; tests pass fakes so the report never reaches Slack or Discord. */
+export interface DoctorNetwork {
+	slackAuthTest?: (botToken: string) => Promise<AuthTestResponse>;
+	fetchImpl?: typeof fetch;
+}
+
 /**
  * Prints one `ok`/`fail` line per check (`warn` lines never count as failures). Only paths, modes, token *prefixes* and public ids are printed; token values
  * never leave `readSlackTokens`. Returns 0 when every check passed. With `repoDir` (the checkout the daemon runs),
  * a code rollback journal there is a warning.
  */
-export async function runDoctor(homeDir: string, write: (line: string) => void, repoDir?: string): Promise<number> {
+export async function runDoctor(
+	homeDir: string,
+	write: (line: string) => void,
+	repoDir?: string,
+	{ slackAuthTest = (botToken) => new WebClient(botToken).auth.test(), fetchImpl = fetch }: DoctorNetwork = {},
+): Promise<number> {
 	let failures = 0;
 	const report = (ok: boolean, name: string, detail: string): void => {
 		if (!ok) failures += 1;
@@ -433,7 +444,7 @@ export async function runDoctor(homeDir: string, write: (line: string) => void, 
 		const slack = config.slack;
 		try {
 			const { botToken } = readSlackTokens(config);
-			const auth = await new WebClient(botToken).auth.test();
+			const auth = await slackAuthTest(botToken);
 			const idMatches = slack.botUserId === undefined || slack.botUserId === auth.user_id;
 			report(
 				auth.ok === true && idMatches,
@@ -458,6 +469,6 @@ export async function runDoctor(homeDir: string, write: (line: string) => void, 
 			);
 		}
 	}
-	if (config) await checkDiscord(config, report);
+	if (config) await checkDiscord(config, report, fetchImpl);
 	return failures === 0 ? 0 : 1;
 }

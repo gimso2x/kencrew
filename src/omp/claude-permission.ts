@@ -1238,8 +1238,26 @@ export function isDangerousBash(command: string): boolean {
 	return shellSegments(command).some(({ words }) => {
 		const { name, args } = simpleCommand(words);
 		if (name === undefined) return false;
-		return dangerous(name) || (COMMAND_WRAPPERS[basename(name)] === true && args.some(dangerous));
+		return (
+			dangerous(name) ||
+			(COMMAND_WRAPPERS[basename(name)] === true && args.some(dangerous)) ||
+			commandsIn(name, args).some(findDeletes)
+		);
 	});
+}
+
+/**
+ * A `find` that deletes what it matches: `-delete`, or `rm` run by `-exec` / `-execdir` / `-ok` / `-okdir`. Not
+ * `findActs`, which also holds for actions that only read or write a listing (`-exec wc`, `-fprint`, `-fls`).
+ */
+function findDeletes({ name, args }: { name: string; args: string[] }): boolean {
+	return (
+		name === "find" &&
+		args.some(
+			(arg, index) =>
+				arg === "-delete" || (/^-(?:exec|execdir|ok|okdir)$/.test(arg) && basename(args[index + 1] ?? "") === "rm"),
+		)
+	);
 }
 
 function allow(input: Record<string, unknown>): PermissionDecision {

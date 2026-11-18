@@ -1,5 +1,5 @@
 import { isAbsolute, join } from "node:path";
-import { type DispatchHostConfig, LANE_MODEL_TIERS, type LaneModelTiers } from "../config";
+import { type DispatchHostConfig, LANE_MODEL_TIERS, type LaneModelTiers, type WorkerAgyConfig } from "../config";
 import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
 import type { ApprovalDetail, ApprovalResult } from "../safety/approval";
@@ -7,10 +7,17 @@ import { scanHandoffBrief } from "../safety/handoff-risk";
 import type { HostToolDef } from "../safety/host-tools";
 import { buildFloorsPrompt } from "../safety/prompt";
 import type { HerdrPromptInput } from "../store/db";
-import { notePrompt, resumeTask, startTask, type TaskDispatchDeps, taskSummaryLine } from "../tasks/dispatch";
+import {
+	agyOccupant,
+	notePrompt,
+	resumeTask,
+	startTask,
+	type TaskDispatchDeps,
+	taskSummaryLine,
+} from "../tasks/dispatch";
 import { parseTaskSpecInput, TASK_ID_PATTERN } from "../tasks/docs";
 import { applyRiskFloor } from "../tasks/risk-floor";
-import { resolveWorkerTier } from "../tasks/worker-tier";
+import { resolveAgyWorker, resolveWorkerTier } from "../tasks/worker-tier";
 import { auditContext } from "./audit";
 import { type BoardLinkResolver, boardCardLink, type HerdrBoardConfig } from "./board";
 import {
@@ -39,6 +46,8 @@ export interface DispatchToolDeps {
 	workerOmpArgs?: string[];
 	/** Config `lanes.models`, read at every new [TASK] (a reload applies to the next one); absent → no `--model`. */
 	laneModels?: () => LaneModelTiers | undefined;
+	/** Config `workerAgy`, read at every new [TASK] and agy start; absent → `taskSpec.worker: "agy"` runs on omp. */
+	workerAgy?: () => WorkerAgyConfig | undefined;
 	/** Test seam: process runner override. */
 	run?: import("./omp").ProcessRunner;
 	/** herdr-web-ui task board (`config.herdrBoard`): started agents get a card link; absent → no links. */
@@ -46,7 +55,16 @@ export interface DispatchToolDeps {
 	/** [TASK] state docs (`taskSpec`); absent → `taskSpec` is refused and dispatch is exactly the plain flow. */
 	tasks?: Omit<
 		TaskDispatchDeps,
-		"originKey" | "workspaceDir" | "dispatchHosts" | "workerOmpArgs" | "run" | "log" | "boardLink" | "recordPrompt"
+		| "originKey"
+		| "workspaceDir"
+		| "dispatchHosts"
+		| "workerOmpArgs"
+		| "workerAgy"
+		| "secretsDir"
+		| "run"
+		| "log"
+		| "boardLink"
+		| "recordPrompt"
 	>;
 	/** Freeze switch (`<home>/FROZEN`): while it returns a state every call is refused before any command runs. */
 	frozen?: () => FreezeState | undefined;
@@ -88,6 +106,15 @@ function taskTextProblem(task: string): string | undefined {
 	return bytes > MAX_TASK_BYTES
 		? `task가 너무 깁니다(${bytes}바이트, 상한 ${MAX_TASK_BYTES}). 파일로 저장하고 경로를 넘기세요`
 		: undefined;
+}
+
+/** `taskSpec.worker` taken off the raw spec (the four documents never carry it): `"agy"` or absent. */
+function takeWorkerKind(raw: unknown): { worker: "agy" | undefined; rest: unknown } {
+	if (typeof raw !== "object" || raw === null || Array.isArray(raw) || !Object.hasOwn(raw, "worker"))
+		return { worker: undefined, rest: raw };
+	const { worker, ...rest } = raw as Record<string, unknown>;
+	if (worker !== "agy") throw new Error(`taskSpec.worker는 agy만 받습니다: ${String(worker)}`);
+	return { worker, rest };
 }
 
 /** The `ompbot_dispatch` host tool for chat origins; `undefined` when the omp binary is not provided. */
@@ -132,7 +159,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				taskSpec: {
 					type: "object",
 					description:
-						"여러 단계·하루 넘는 작업의 [TASK] 상태 문서 등록. 신규: title·risk·goal·acceptance·repo 필수(+scope·exclusions·background·tier·tierReason). 재개: {id}만(tier 불가, 처음 모델로 뜬다). host가 있으면 그 호스트에, 없으면 로컬에 워크트리를 만든다",
+						"여러 단계·하루 넘는 작업의 [TASK] 상태 문서 등록. 신규: title·risk·goal·acceptance·repo 필수(+scope·exclusions·background·tier·tierReason·worker). 재개: {id}만(tier·worker 불가, 처음 모델로 뜬다). host가 있으면 그 호스트에, 없으면 로컬에 워크트리를 만든다",
 					properties: {
 						id: { type: "string", description: "재개할 TASKID(T-YYYYMMDD-NN). 이것만 준다" },
 						title: { type: "string" },
@@ -155,9 +182,15 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 							type: "string",
 							enum: [...LANE_MODEL_TIERS],
 							description:
-								"워커 모델 등급(config lanes.models). high: 설계·디버깅·넓은 변경·L3 이상, middle(기본): 일반 구현, low: 기계적 수선 묶음. L3 이상은 항상 high. 신규 등록에서만",
+								"워커 모델 등급(config lanes.models). 생략하면 위험 등급으로 정한다(L0·L1 low, L2 middle, L3 이상 high) — 이유가 있을 때만 준다. high: 설계·디버깅·넓은 변경, middle: 일반 구현, low: 기계적 수선 묶음. L3 이상은 항상 high. 신규 등록에서만",
 						},
 						tierReason: { type: "string", description: "그 등급을 고른 이유 한 줄(카드에 보임). 신규 등록에서만" },
+						worker: {
+							type: "string",
+							enum: ["agy"],
+							description:
+								"agy(gemini, 무료 시범): L0·L1 로컬, 동시 1개. 품질 미검증. 조건 밖이면 omp 등급 워커로 뜬다. 신규 등록에서만",
+						},
 					},
 					additionalProperties: false,
 				},
@@ -265,6 +298,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 						workspaceDir: deps.workspaceDir,
 						...(deps.dispatchHosts === undefined ? {} : { dispatchHosts: deps.dispatchHosts }),
 						...(deps.workerOmpArgs === undefined ? {} : { workerOmpArgs: deps.workerOmpArgs }),
+						secretsDir: join(deps.homeDir, "secrets"),
 						...(deps.run === undefined ? {} : { run: deps.run }),
 						...(boardLink === undefined ? {} : { boardLink }),
 						...(deps.recordPrompt === undefined ? {} : { recordPrompt: deps.recordPrompt }),
@@ -274,9 +308,12 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			if (taskDeps === undefined) throw new Error("이 세션에서는 taskSpec을 쓸 수 없습니다");
 			if (name !== undefined)
 				throw new Error("taskSpec에는 name을 줄 수 없습니다(에이전트 이름은 TASKID에서 만듭니다)");
-			const input = parseTaskSpecInput(params.taskSpec);
+			const { worker: workerKind, rest } = takeWorkerKind(params.taskSpec);
+			const input = parseTaskSpecInput(rest);
 			const briefed = task !== undefined && task !== "";
 			if (input.kind === "resume") {
+				if (workerKind !== undefined)
+					throw new Error("재개에는 worker를 줄 수 없습니다(처음 등록한 워커 종류로 다시 뜹니다)");
 				const gate = await gateWork(briefed ? task : undefined, signal);
 				return redact(await resumeTask(taskDeps, { id: input.id, task, host })) + gate.suffix;
 			}
@@ -296,7 +333,16 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				deps.log.info("dispatch_risk_floor_raised", { origin: deps.originKey, from: approvedRisk, to: floored.risk });
 			}
 			// The tier follows the final risk (approval and floor applied) and the live `lanes.models` of this call.
-			const worker = resolveWorkerTier(floored.risk, spec, deps.laneModels?.());
+			const tier = resolveWorkerTier(floored.risk, spec, deps.laneModels?.());
+			const worker =
+				workerKind === "agy"
+					? resolveAgyWorker(tier, {
+							risk: floored.risk,
+							host: host ?? null,
+							agy: deps.workerAgy?.(),
+							busy: agyOccupant(taskDeps.ledger),
+						})
+					: tier;
 			const started = await startTask(taskDeps, {
 				spec: { ...spec, risk: floored.risk },
 				task,

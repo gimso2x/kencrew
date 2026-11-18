@@ -126,6 +126,8 @@ export interface HostToolDeps {
 	workerOmpArgs?: DispatchToolDeps["workerOmpArgs"];
 	/** Live config `lanes.models` for the dispatch tool's [TASK] worker tiers. */
 	laneModels?: DispatchToolDeps["laneModels"];
+	/** Live config `workerAgy` for the dispatch tool's agy [TASK] worker trial. */
+	workerAgy?: DispatchToolDeps["workerAgy"];
 	/** herdr task board (config `herdrBoard`) for the dispatch tool's card links. */
 	herdrBoard?: DispatchToolDeps["herdrBoard"];
 	/** [TASK] state docs for the dispatch tool's `taskSpec`. */

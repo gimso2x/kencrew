@@ -96,7 +96,7 @@ export const RULES: readonly Rule[] = [
 	{
 		kind: "instruction override",
 		matches: re(
-			/ignore\s+(?:all\s+|any\s+|the\s+)?(?:previous|prior|above|earlier)\s+(?:instructions?|prompts?|rules?)|disregard\s+(?:your\s+|the\s+)?(?:instructions?|rules?)|이전\s*지시(?:를|사항을|는)?\s*(?:무시|잊)|앞(?:의|서)\s*(?:지시|명령|규칙)(?:를|을)?\s*(?:무시|잊)|지시를?\s*(?:잊어|무시해)|(?:忽略|无视|忘掉|忘记)(?:之前|以上|先前|前面)(?:的)?(?:所有)?(?:指令|指示|提示|规则)/iu,
+			/ignore\s+(?:(?:all|any|the|of|your|my)\s+){0,3}(?:previous|prior|above|earlier)\s+(?:instructions?|prompts?|rules?)|disregard\s+(?:(?:all|any|the|of|your|my)\s+){0,3}(?:(?:previous|prior|above|earlier)\s+)?(?:instructions?|rules?)|이전\s*지시(?:를|사항을|는)?\s*(?:무시|잊)|앞(?:의|서)\s*(?:지시|명령|규칙)(?:를|을)?\s*(?:무시|잊)|지시를?\s*(?:잊어|무시해)|(?:忽略|无视|忘掉|忘记)(?:之前|以上|先前|前面)(?:的)?(?:所有)?(?:指令|指示|提示|规则)/iu,
 		),
 	},
 	// A message pretending to be the system or the agent's own scaffolding. A line ends at any of the breaks
@@ -105,7 +105,7 @@ export const RULES: readonly Rule[] = [
 	{
 		kind: "system prompt impersonation",
 		matches: re(
-			/(?:^|[\n\r\v\f\u0085\u2028\u2029])(?:[^\S\n\r\v\f\u0085\u2028\u2029]|[*_>#-])*(?:system|assistant|developer)[*_]*\s*[:：]|<\s*system\s*>|\[INST\]|###\s*(?:instruction|system)/iu,
+			/(?:^|[\n\r\v\f\u0085\u2028\u2029])[\t \u00a0\u1680\u2000-\u200a\u202f\u205f\u3000\ufeff*_>#-]*(?:system|assistant|developer)[*_]*\s*[:：]|<\s*system\s*>|\[INST\]|###\s*(?:instruction|system)/iu,
 		),
 	},
 	// "you are now …", "지금부터 너는 …", "从现在起你是 …" — a role change names a role.
@@ -124,7 +124,7 @@ export const RULES: readonly Rule[] = [
 	{
 		kind: "credential or file exfiltration",
 		matches: re(
-			/(?:cat|type|print|show|reveal|read)\s+(?:the\s+)?(?:contents?\s+of\s+)?[\w./~`'"-]{0,200}?(?:\.env|id_rsa|credentials?|secret|token)|(?:토큰|비밀번호|자격\s*증명|\.env)[^\n]{0,24}(?:알려|출력|보여|읽어)|(?:令牌|密码|凭证|密钥|\.env)[^\n]{0,24}(?:告诉|输出|显示|读出|发给)/iu,
+			/(?:cat|type|print|show|reveal|read)\s+(?:[a-z]+\s+){0,2}(?:contents?\s+of\s+)?[\w./~`'"-]{0,200}?(?:\.env|id_rsa|credentials?|secret|token)|(?:토큰|비밀번호|자격\s*증명|\.env)[^\n]{0,24}(?:알려|출력|보여|읽어)|(?:令牌|密码|凭证|密钥|\.env)[^\n]{0,24}(?:告诉|输出|显示|读出|发给)/iu,
 		),
 	},
 	// Image alt text or an HTML comment carrying an instruction.

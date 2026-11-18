@@ -44,7 +44,8 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
                                  with config offsite {ssh, remoteDir, keep?}, a good backup is then copied off-site
                                  (exit 4 when only the off-site copy failed; the local backup and its stamp stay)
   freeze [--reason <t>]          write <home>/FROZEN: remote dispatch, monitor fires, new work lanes, running lanes' automatic
-                                 re-prompts, task reminders and skill reviews stop within seconds (owner chat turns keep
+                                 re-prompts, pending autonomous rows (peer mentions, monitor and lane-directive rows), Teams
+                                 guest questions, task reminders and skill reviews stop within seconds (owner chat turns keep
                                  working); a due 'at' monitor waits and fires once after unfreeze; the 'frozen' gate stays
                                  open until unfreeze
   unfreeze                       remove <home>/FROZEN

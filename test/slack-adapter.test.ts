@@ -1410,7 +1410,7 @@ describe("format", () => {
 	});
 
 	test("an escaped pipe stays inside its cell", () => {
-		expect(toMrkdwn("| a \\| b | c |\n| --- | --- |")).toBe("```\n| a | b | c   |\n| ----- | --- |\n```");
+		expect(toMrkdwn("| a \\| b | c |\n| --- | --- |")).toBe("```\n| a \\| b | c   |\n| ------ | --- |\n```");
 	});
 
 	test("pipes in prose without a delimiter row, and tables inside fences, are left alone", () => {

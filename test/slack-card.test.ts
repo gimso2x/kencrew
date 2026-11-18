@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { CARD_TONE_COLORS, MAX_CARDS, splitCards, tableToAscii, validateCard } from "../src/channel/card";
 import { REDELIVERED_PREFIX } from "../src/channel/text";
 import { CARD_SKELETONS } from "../src/safety/prompt";
-import { CARD_MAX_BLOCKS, parseCard } from "../src/slack/card";
+import { CARD_MAX_BLOCKS, cardToBlocks, parseCard } from "../src/slack/card";
 import { renderMarkdownParts, toMrkdwn } from "../src/slack/format";
 
 const el = (type: string, props: Record<string, unknown> = {}, children: string[] = []) => ({ type, props, children });
@@ -413,5 +413,82 @@ describe("qa50b lane K: mrkdwn links and sentinels, card fences and limits", () 
 		expect(fields).toHaveLength(13);
 		for (const block of parsed.ok ? parsed.blocks : [])
 			expect(((block as { fields?: unknown[] }).fields ?? []).length).toBeLessThanOrEqual(10);
+	});
+});
+
+describe("fencedFallbackText surrogate cut (qa-q #21)", () => {
+	test("an emoji table past 3000 characters falls back to ASCII without a lone surrogate, whatever the cut parity", () => {
+		const lone = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+		for (const header of ["a", "ab"]) {
+			const row = ["😀".repeat(1700)];
+			const parsed = parseCard(
+				spec({ c: el("Card", {}, ["t"]), t: el("Table", { headers: [header], rows: [row, row, row] }) }),
+			);
+			expect(parsed.ok).toBe(true);
+			if (!parsed.ok) continue;
+			const fallback = parsed.blocks.find((block) => (block as { type: string }).type === "section") as
+				| { text: { text: string } }
+				| undefined;
+			expect(fallback?.text.text).toContain("\u2026");
+			expect(lone.test(fallback?.text.text ?? "")).toBe(false);
+		}
+	});
+});
+
+describe("qa-r: Slack card fences and links", () => {
+	const sections = (json: string): string[] => {
+		const parsed = parseCard(json);
+		if (!parsed.ok) throw new Error(parsed.issues.join("; "));
+		return parsed.blocks.flatMap((block) => {
+			const text = (block as { text?: { text?: string } }).text?.text;
+			return text === undefined ? [] : [text];
+		});
+	};
+
+	test("#4: a table cell holding a fence line cannot close the ASCII fallback fence early", () => {
+		const headers = Array.from({ length: 21 }, (_, i) => `h${i}`);
+		const row = headers.map((_, i) => (i === 0 ? "x\n```\n<!here>" : "v"));
+		const json = spec({
+			c: el("Card", { title: "t" }, ["t"]),
+			t: el("Table", { headers, rows: [row] }),
+		});
+		const [text = ""] = sections(json).filter((section) => section.includes("<!here>"));
+		const lines = text.split("\n");
+		expect(lines[0]).toBe("```");
+		expect(lines.at(-1)).toBe("```");
+		expect(lines.slice(1, -1).some((line) => line.includes("```"))).toBe(false);
+		expect(text.length).toBeLessThanOrEqual(3000);
+	});
+
+	test("#4: a cut fallback keeps the fence closed and inside the section limit", () => {
+		const headers = Array.from({ length: 21 }, (_, i) => `h${i}`);
+		const row = headers.map((_, i) => (i === 0 ? `${"```\n".repeat(900)}<!here>` : "v"));
+		const json = spec({
+			c: el("Card", { title: "t" }, ["t"]),
+			t: el("Table", { headers, rows: [row] }),
+		});
+		const [text = ""] = sections(json).filter((section) => section.startsWith("```"));
+		const lines = text.split("\n");
+		expect(text.length).toBeLessThanOrEqual(3000);
+		expect(lines.at(-1)).toBe("```");
+		expect(lines.slice(1, -1).some((line) => line.includes("```"))).toBe(false);
+	});
+
+	const linkSections = (label: string, url: string): string[] =>
+		cardToBlocks({ type: "card", children: [{ type: "link", label, url }] } as unknown as Parameters<
+			typeof cardToBlocks
+		>[0]).flatMap((block) =>
+			(block as { text?: { text?: string } }).text?.text === undefined
+				? []
+				: [(block as { text: { text: string } }).text.text],
+		);
+
+	test("#21: a Link label cannot break the link token or raise a mention", () => {
+		const [text = ""] = linkSections("a|b> <!here>", "https://x.test/a)b");
+		expect(text).toBe("<https://x.test/a)b|a\uFF5Cb&gt; &lt;!here&gt;>");
+	});
+
+	test("#21: a Link url holding | < > and a blank keeps the <url|label> structure", () => {
+		expect(linkSections("go", "https://x.test/a|b c<d")).toEqual(["<https://x.test/a%7Cb%20c%3Cd|go>"]);
 	});
 });

@@ -23,7 +23,7 @@ export const DASHBOARD_USAGE = `  dashboard [--port <n>] [--bind 127.0.0.1|::1]
                                  masked omp session at /api/thread/conversation?origin=<key>, what its running turn
                                  is writing at /api/thread/live?origin=<key> (stream: /api/thread/live/events) (also
                                  under a prefix like /task/); --port/--bind override config
-                                 dashboard {port, bind?, herdrWebUrl?, peerHomes?}; no port in either → exit 2. With config
+                                 dashboard {port, bind?, herdrWebUrl?, opsStatus?, usageLimits?, peerHomes?}; no port in either → exit 2. With config
                                  herdrBoard it also shows the herdr agent board (api/board, api/board/events,
                                  ?card=<key> detail with the pane's conversation and plan)
 `;

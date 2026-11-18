@@ -1,14 +1,16 @@
 import { constants, Database } from "bun:sqlite";
 import { pathToFileURL } from "node:url";
 import type { LaneModelTier } from "../config";
+import type { LaneQa, LaneReview } from "../lanes/status";
 import { localDay } from "../time";
 import { type AcceptanceItem, agentNameOf, branchOf, formatTaskId, type TaskRisk, worktreePathOf } from "./docs";
 
 export const TASK_STATUSES = ["working", "blocked", "review", "done", "cancelled"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
-export type TaskActor = "bot" | "human";
+/** `core-land`: the core's own landing of a reached local task (`landTask`), which may only close a task in review. */
+export type TaskActor = "bot" | "human" | "core-land";
 
-/** Statuses only a human `close` can reach; a closed task never moves again. */
+/** Statuses only a human `close` (or, `review → done` alone, the core landing) can reach; a closed task never moves again. */
 const HUMAN_ONLY: readonly TaskStatus[] = ["done", "cancelled"];
 /** What the bot paths (tool, sweep) may do: working ⇄ blocked, working → review, review → working (resume). */
 const BOT_TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
@@ -58,6 +60,14 @@ export interface TaskRow {
 	/** The worker's model tier; null only for tasks registered before tiers existed. */
 	tier: LaneModelTier | null;
 	tierReason: string | null;
+	/** The independent review and run QA receipts of the task's tips (`recordGate`); null before the first. */
+	gate: TaskGate | null;
+}
+
+/** The [TASK] gate's receipts, shaped like a lane's meta: each one is bound to the tip it judged (`sha`). */
+export interface TaskGate {
+	review?: LaneReview;
+	qa?: LaneQa;
 }
 
 export interface NewTask {
@@ -94,7 +104,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 	closed_at INTEGER,
 	worker_model TEXT,
 	tier TEXT,
-	tier_reason TEXT
+	tier_reason TEXT,
+	gate_json TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_thread ON tasks(thread_ref);
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);
@@ -103,7 +114,7 @@ CREATE TABLE IF NOT EXISTS task_transitions (
 	task_id TEXT NOT NULL REFERENCES tasks(task_id),
 	from_status TEXT,
 	to_status TEXT NOT NULL,
-	actor TEXT NOT NULL CHECK (actor IN ('bot','human')),
+	actor TEXT NOT NULL CHECK (actor IN ('bot','human','core-land')),
 	reason TEXT,
 	at INTEGER NOT NULL
 );
@@ -122,7 +133,7 @@ export interface TaskTransitionRow {
 }
 
 /** Columns added after the first `tasks` schema; rows that predate them read null. */
-const LATER_TASK_COLUMNS = ["worker_model", "tier", "tier_reason"] as const;
+const LATER_TASK_COLUMNS = ["worker_model", "tier", "tier_reason", "gate_json"] as const;
 
 /** Creates the tables in a database that may predate them and adds later columns (idempotent, never touches rows). */
 export function migrateTaskSchema(db: Database): void {
@@ -131,6 +142,30 @@ export function migrateTaskSchema(db: Database): void {
 	for (const column of LATER_TASK_COLUMNS) {
 		if (!columns.some((existing) => existing.name === column)) db.run(`ALTER TABLE tasks ADD COLUMN ${column} TEXT`);
 	}
+	migrateTransitionActors(db);
+}
+
+/**
+ * The `core-land` actor widens a CHECK constraint, which SQLite cannot ALTER: a task_transitions table without it is
+ * rebuilt (rename, create, copy, drop) in one transaction. Existing rows keep their ids and data.
+ */
+function migrateTransitionActors(db: Database): void {
+	const current = db
+		.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'task_transitions'")
+		.get() as {
+		sql: string;
+	} | null;
+	if (current === null || current.sql.includes("'core-land'")) return;
+	const ddl = TASK_SCHEMA.slice(TASK_SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS task_transitions"));
+	db.transaction(() => {
+		db.run("DROP INDEX IF EXISTS task_transitions_task");
+		db.run("ALTER TABLE task_transitions RENAME TO task_transitions_old");
+		db.run(ddl);
+		db.run(
+			"INSERT INTO task_transitions (transition_id, task_id, from_status, to_status, actor, reason, at) SELECT transition_id, task_id, from_status, to_status, actor, reason, at FROM task_transitions_old",
+		);
+		db.run("DROP TABLE task_transitions_old");
+	})();
 }
 
 export interface TaskSql {
@@ -156,6 +191,7 @@ export interface TaskSql {
 	worker_model?: string | null;
 	tier?: LaneModelTier | null;
 	tier_reason?: string | null;
+	gate_json?: string | null;
 }
 
 interface TransitionSql {
@@ -228,8 +264,20 @@ export function readTaskSql(r: TaskSql): ReadTask {
 		workerModel: r.worker_model ?? null,
 		tier: r.tier ?? null,
 		tierReason: r.tier_reason ?? null,
+		gate: parseGate(r.gate_json),
 	};
 	return { row, broken };
+}
+
+/** A `gate_json` value; null when absent or not a plain object (a damaged value counts as no receipt). */
+function parseGate(json: string | null | undefined): TaskGate | null {
+	if (json === null || json === undefined) return null;
+	try {
+		const value: unknown = JSON.parse(json);
+		return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as TaskGate) : null;
+	} catch {
+		return null;
+	}
 }
 
 const toTask = (r: TaskSql): TaskRow => readTaskSql(r).row;
@@ -399,7 +447,7 @@ export class TaskLedger {
 
 	/**
 	 * Moves a task. The bot (`actor: "bot"`) can never reach `done`/`cancelled`; only a human close does, from any
-	 * open state. Closed tasks never move. Same-state moves are no-ops. Each real move appends one history line in the
+	 * open state, and the core landing (`actor: "core-land"`) from `review` to `done` alone. Closed tasks never move. Same-state moves are no-ops. Each real move appends one history line in the
 	 * same transaction.
 	 */
 	transition(taskId: string, to: TaskStatus, actor: TaskActor, reason?: string): TaskRow {
@@ -412,6 +460,9 @@ export class TaskLedger {
 			if (row.status === "done" || row.status === "cancelled") {
 				throw new TaskTransitionError(`${taskId}: 이미 ${row.status}로 닫힌 작업입니다`);
 			}
+			if (actor === "core-land" && !(row.status === "review" && to === "done")) {
+				throw new TaskTransitionError(`${taskId}: 코어 착지는 review → done만 옮깁니다(${row.status} → ${to})`);
+			}
 			if (actor === "human" && !HUMAN_ONLY.includes(to)) {
 				throw new TaskTransitionError(`${taskId}: 사람은 done·cancelled로만 옮깁니다`);
 			}
@@ -423,6 +474,15 @@ export class TaskLedger {
 				.query("UPDATE tasks SET status = ?, updated_at = ?, closed_at = ? WHERE task_id = ?")
 				.run(to, now, HUMAN_ONLY.includes(to) ? now : null, taskId);
 			this.#recordTransition(taskId, row.status, to, actor, reason ?? null, now);
+			return this.require(taskId);
+		})();
+	}
+
+	/** Merges gate receipts into the task's `gate_json`; a receipt of a kind replaces the one before it. */
+	recordGate(taskId: string, patch: TaskGate): TaskRow {
+		return this.#db.transaction(() => {
+			const gate = { ...(this.require(taskId).gate ?? {}), ...patch };
+			this.#db.query("UPDATE tasks SET gate_json = ? WHERE task_id = ?").run(JSON.stringify(gate), taskId);
 			return this.require(taskId);
 		})();
 	}

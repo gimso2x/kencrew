@@ -31,7 +31,7 @@ kencrew를 Discord에서도 쓰려면 Discord 봇이 하나 필요합니다. Sla
 4. 왼쪽 **Bot** 탭으로 갑니다.
    - **Public Bot**을 끕니다. 오너만 이 봇을 서버에 넣을 수 있게 됩니다.
    - **Requires OAuth2 Code Grant**는 끈 채로 둡니다.
-   - **Privileged Gateway Intents**에서 **Message Content Intent**를 켜고 **Save Changes**를 누릅니다. 이걸 끄면 서버 채널에서 멘션 없는 글(스레드 안 답장 등)의 본문을 받지 못하고, ompbot이 이 인텐트를 요청하므로 Gateway가 닫힘 코드 4014로 연결을 끊습니다. 서버 100개 미만의 봇은 심사 없이 켤 수 있습니다.
+   - **Privileged Gateway Intents**에서 **Message Content Intent**를 켜고 **Save Changes**를 누릅니다. 이걸 끄면 서버 채널에서 멘션 없는 글(스레드 안 답장 등)의 본문을 받지 못하고, kencrew가 이 인텐트를 요청하므로 Gateway가 닫힘 코드 4014로 연결을 끊습니다. 서버 100개 미만의 봇은 심사 없이 켤 수 있습니다.
    - **Presence Intent**, **Server Members Intent**는 켜지 않습니다(쓰지 않습니다).
    - Username과 아이콘은 여기서 바꿉니다. Username은 소문자·숫자·`_`·`.`뿐이라 한글은 못 넣습니다. 메시지 위에 한글 봇 이름을 띄우려면 5절 설정의 `displayName`을 씁니다(기동 때 봇의 글로벌 표시 이름으로 반영되어 DM·별명 없는 서버에서 보입니다. 서버에서 지은 별명이 있으면 그 별명이 우선).
 

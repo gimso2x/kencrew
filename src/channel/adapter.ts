@@ -38,6 +38,7 @@ export interface OwnerIngest {
 export interface ChannelAdapter {
 	readonly platform: ChatPlatform;
 	readonly botUserId: string | undefined;
+	/** Resolves once the platform is up; rejects when it cannot come up (the daemon stops it and runs without it). */
 	start(): Promise<void>;
 	stop(): Promise<void>;
 	/** Claims and posts this platform's due deliveries; returns how many were confirmed. */
@@ -68,6 +69,11 @@ export interface AdapterDeps {
 	config: OmpbotConfig;
 	/** Lookups and cursors (recovery targets and watermarks, task roots). */
 	store: Store;
+	/**
+	 * The adapter cannot run any more after a successful `start()` (a fatal gateway close): the daemon drops and stops
+	 * it. Its pending deliveries stay for the next boot; the other platforms and the daemon itself keep running.
+	 */
+	detach(error: Error): void;
 }
 
 export interface ChannelBinding {

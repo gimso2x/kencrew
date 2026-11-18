@@ -269,8 +269,7 @@ describe("review before auto-merge", () => {
 		expect(cards[0]?.text).toContain("*리뷰 지적*");
 		expect(cards[0]?.text).toContain("테스트를 지웠다");
 		expect(JSON.stringify(cards[0]?.blocks ?? [])).toContain(`ompbot:lane:merge:${lane.name}`);
-		const files = diffFiles(lane);
-		expect(files).toEqual([`${lane.meta.laneId}-${sha.slice(0, 12)}.diff`]);
+		expect(diffFiles(lane)).toEqual([]);
 
 		const outcome = await h.manager.requestLand(lane.name, "owner");
 		await h.settle();
@@ -430,6 +429,10 @@ describe("review before auto-merge", () => {
 			{ git: recording, land: counted.land },
 		);
 		const { lane, sha: first } = await closeLane(h, repo);
+		// The review took its diff file away itself; a leftover of a killed daemon is what the reopen drops.
+		expect(diffFiles(lane)).toEqual([]);
+		mkdirSync(reviewsDir(), { recursive: true });
+		writeFileSync(join(reviewsDir(), `${lane.meta.laneId}-${first.slice(0, 12)}.diff`), "x");
 		expect(diffFiles(lane)).toHaveLength(1);
 
 		h.manager.onOwnerMessage(requireLane(h, lane.name), "!reopen b.txt도 추가");
@@ -465,9 +468,10 @@ describe("review before auto-merge", () => {
 		const fake = says("VERDICT: BLOCK");
 		const h = harness(fake.run, { repos: [repo], maxRisk: "L2", review: REVIEW });
 		const { lane, sha } = await closeLane(h, repo);
-		expect(diffFiles(lane)).toHaveLength(1);
-		// lane-review-isolation AC-6: a leftover overlay and cwd (a killed daemon's) go with it, the cwd recursively.
+		expect(diffFiles(lane)).toEqual([]);
+		// lane-review-isolation AC-6: a leftover diff, overlay and cwd (a killed daemon's) go with it, the cwd recursively.
 		const leftover = reviewIsolationPaths(reviewsDir(), lane, sha);
+		writeFileSync(join(reviewsDir(), `${lane.meta.laneId}-${sha.slice(0, 12)}.diff`), "x");
 		writeFileSync(leftover.configPath, "x");
 		mkdirSync(join(leftover.cwd, "sub"), { recursive: true });
 		writeFileSync(join(leftover.cwd, "sub", "f"), "x");
@@ -870,17 +874,24 @@ describe("reviewLane: the prompt and the diff file (AC-8)", () => {
 	});
 
 	test("a diff over 60000 characters is cut, the prompt names the diff file, and the file is 0600 in a 0700 directory", async () => {
-		const fake = says("VERDICT: CLEAR");
+		const path = join(reviewsDir(), `L-20270115-01-${SHA.slice(0, 12)}.diff`);
+		let modes: { file: number; dir: number; text: string } | undefined;
+		const fake = fakeRunner(() => {
+			modes = {
+				file: statSync(path).mode & 0o777,
+				dir: statSync(reviewsDir()).mode & 0o777,
+				text: readFileSync(path, "utf8"),
+			};
+			return { code: 0, stdout: "VERDICT: CLEAR", timedOut: false };
+		});
 		const big = `${"+x\n".repeat(30_000)}+tail-marker\n`;
 		await reviewLane({ lane: lane(), model: MODEL, timeoutMs: 1000 }, deps(fakeGit(big).git, fake.run));
 		const prompt = fake.calls[0]?.cmd.at(-1) ?? "";
-		const path = join(reviewsDir(), `L-20270115-01-${SHA.slice(0, 12)}.diff`);
 		expect(prompt).toContain(path);
 		expect(prompt).not.toContain("tail-marker");
 		expect(prompt.length).toBeLessThan(big.length);
-		expect(statSync(path).mode & 0o777).toBe(0o600);
-		expect(statSync(reviewsDir()).mode & 0o777).toBe(0o700);
-		expect(await Bun.file(path).text()).toContain("tail-marker");
+		expect(modes).toEqual({ file: 0o600, dir: 0o700, text: expect.stringContaining("tail-marker") });
+		expect(existsSync(path)).toBe(false);
 		// The prompt's diff block holds at most REVIEW_DIFF_PROMPT_MAX characters.
 		const block = buildReviewPrompt({ lane: lane(), diff: big, diffPath: path });
 		const diffPart = block.slice(block.indexOf("```diff\n") + 8, block.indexOf("\n```", block.indexOf("```diff\n")));
@@ -952,7 +963,7 @@ describe("reviewLane: the prompt and the diff file (AC-8)", () => {
 		expect(receipt.verdict).toBe(verdict);
 		expect(existsSync(isolation.configPath)).toBe(false);
 		expect(existsSync(isolation.cwd)).toBe(false);
-		expect(readdirSync(reviewsDir())).toEqual([`L-20270115-01-${SHA.slice(0, 12)}.diff`]);
+		expect(readdirSync(reviewsDir())).toEqual([]);
 	});
 
 	test("no merge-base and a worktree off the claim are inconclusive without running the reviewer", async () => {

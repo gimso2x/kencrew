@@ -73,11 +73,15 @@ export type LaneHarnessExtra = Partial<
 		| "completionNudges"
 		| "pidAlive"
 	>
-> & { driver?: LaneDriverFactory };
+> & {
+	driver?: LaneDriverFactory;
+	/** True for a core message whose route must fail (the mailbox refusing it). */
+	routeFails?: (record: InboundRecord) => boolean;
+};
 
 /** A `LaneManager` over a real store and router with held fake omp turns, a fake clock and a fake Slack. */
 export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): LaneHarness {
-	const { driver: laneDriver, ...managerExtra } = extra;
+	const { driver: laneDriver, routeFails, ...managerExtra } = extra;
 	let now = LANE_START;
 	const clock = { now: () => now };
 	const store = openBotStore(join(homeDir, "ompbot.db"), clock, "Asia/Seoul");
@@ -125,6 +129,7 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 		log,
 		sessionsRoot,
 		route: (record) => {
+			if (routeFails?.(record) === true) return Promise.reject(new Error("route refused"));
 			const run = router.route(record);
 			pending.push(run);
 			return run;

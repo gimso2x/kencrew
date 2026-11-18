@@ -277,7 +277,15 @@ export const OWNER_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
 /** Shapes of herdr's JSON outputs (outside-controlled data, read at one boundary). */
 type HerdrAgentList = {
-	result?: { agents?: Array<{ name?: string; pane_id?: string; agent_status?: string; agent_session?: unknown }> };
+	result?: {
+		agents?: Array<{
+			name?: string;
+			pane_id?: string;
+			workspace_id?: string;
+			agent_status?: string;
+			agent_session?: unknown;
+		}>;
+	};
 };
 type HerdrWorkspaceList = { result?: { workspaces?: Array<{ workspace_id?: string; label?: string }> } };
 type HerdrWorkspaceCreated = {
@@ -342,9 +350,17 @@ export async function herdrCreateWorkspace(
 		: { error: "workspace create returned no root pane" };
 }
 
-/** `herdr agent start … --kind omp`; non-empty `agentArgs` go to omp after `--` (herdr's `[-- [AGENT_ARG]...]`). */
-function agentStartArgs(name: string, paneId: string, agentArgs: string[] | undefined): string[] {
-	const args = ["agent", "start", name, "--kind", "omp", "--pane", paneId, "--timeout", "60000"];
+/** The agent herdr starts: omp, or agy for the agy [TASK] worker trial. */
+export type HerdrAgentKind = "omp" | "agy";
+
+/** `herdr agent start … --kind <kind>`; non-empty `agentArgs` go to the agent after `--` (herdr's `[-- [AGENT_ARG]...]`). */
+function agentStartArgs(
+	name: string,
+	paneId: string,
+	agentArgs: string[] | undefined,
+	kind: HerdrAgentKind = "omp",
+): string[] {
+	const args = ["agent", "start", name, "--kind", kind, "--pane", paneId, "--timeout", "60000"];
 	return agentArgs === undefined || agentArgs.length === 0 ? args : [...args, "--", ...agentArgs];
 }
 
@@ -356,8 +372,10 @@ export async function herdrStartAgent(input: {
 	name: string;
 	task: string;
 	cwd: string;
-	/** Extra omp arguments (config `workerOmpArgs`), passed after `--`; empty/absent → none. */
+	/** Extra agent arguments (config `workerOmpArgs`, or an agy worker's), passed after `--`; empty/absent → none. */
 	agentArgs?: string[];
+	/** Default omp. */
+	kind?: HerdrAgentKind;
 	/**
 	 * Close the workspace this call created when the first prompt fails (a [TASK] start, whose caller then removes the
 	 * worktree). Default false: a plain herdr dispatch keeps the agent up so the same name can be prompted again.
@@ -372,7 +390,7 @@ export async function herdrStartAgent(input: {
 	const label = `ompbot · ${name}`;
 	const ws = await herdrCreateWorkspace(cwd, label, options);
 	if ("error" in ws) return { ok: false, error: ws.error };
-	const started = await herdrRun(agentStartArgs(name, ws.paneId, input.agentArgs), options);
+	const started = await herdrRun(agentStartArgs(name, ws.paneId, input.agentArgs, input.kind), options);
 	if (started.code !== 0) {
 		// Like the remote start: close only the workspace this call created.
 		if (ws.workspaceId !== undefined) await herdrRun(["workspace", "close", ws.workspaceId], cleanup);
@@ -492,24 +510,63 @@ export async function herdrRemoteStart(
 	return { ok: true, agentName: name, paneId, tabId, workspaceId, createdWorkspace };
 }
 
+type HerdrAgentEntry = NonNullable<NonNullable<HerdrAgentList["result"]>["agents"]>[number];
+
+/** The `herdr agent list` entry named `name` (`undefined`: none); a herdr that cannot be asked is an error. */
+async function herdrAgentEntry(
+	name: string,
+	options: HerdrRunnerOptions,
+): Promise<{ ok: true; agent: HerdrAgentEntry | undefined } | { ok: false; error: string }> {
+	const list = await herdrRun(["agent", "list"], options);
+	if (list.code !== 0) return { ok: false, error: `agent list failed: ${herdrFailure(list, 120)}` };
+	const agents = parseHerdrAgents(list.stdout);
+	if (agents === undefined) return { ok: false, error: "agent list output is not JSON" };
+	return { ok: true, agent: agents.find((entry) => entry.name === name) };
+}
+
 /** Whether herdr has an agent of that name; a herdr that cannot be asked is an error, not "no". */
 export async function herdrAgentExists(
 	name: string,
 	options: HerdrRunnerOptions = {},
 ): Promise<{ ok: true; exists: boolean } | { ok: false; error: string }> {
-	const list = await herdrRun(["agent", "list"], options);
-	if (list.code !== 0) return { ok: false, error: `agent list failed: ${herdrFailure(list, 120)}` };
-	const agents = parseHerdrAgents(list.stdout);
-	if (agents === undefined) return { ok: false, error: "agent list output is not JSON" };
-	return { ok: true, exists: agents.some((agent) => agent.name === name) };
+	const found = await herdrAgentEntry(name, options);
+	return found.ok ? { ok: true, exists: found.agent !== undefined } : found;
 }
 
 /** The pane an agent runs in (its board card key); `undefined` when herdr cannot be asked or has no such agent. */
 export async function herdrAgentPane(name: string, options: HerdrRunnerOptions = {}): Promise<string | undefined> {
-	const list = await herdrRun(["agent", "list"], options);
-	if (list.code !== 0) return undefined;
-	const pane = parseHerdrAgents(list.stdout)?.find((agent) => agent.name === name)?.pane_id;
+	const found = await herdrAgentEntry(name, options);
+	const pane = found.ok ? found.agent?.pane_id : undefined;
 	return typeof pane === "string" && pane !== "" ? pane : undefined;
+}
+
+/**
+ * The workspace an agent runs in (`herdr agent list` `workspace_id`): `undefined` when herdr has no such agent (nothing
+ * to close); an error when herdr cannot be asked or names no workspace for it.
+ */
+export async function herdrAgentWorkspace(
+	name: string,
+	options: HerdrRunnerOptions = {},
+): Promise<{ ok: true; workspaceId: string | undefined } | { ok: false; error: string }> {
+	const found = await herdrAgentEntry(name, options);
+	if (!found.ok) return found;
+	const { agent } = found;
+	if (agent === undefined) return { ok: true, workspaceId: undefined };
+	const workspaceId = agent.workspace_id;
+	return typeof workspaceId === "string" && workspaceId !== ""
+		? { ok: true, workspaceId }
+		: { ok: false, error: `agent ${name} has no workspace_id` };
+}
+
+/** `herdr workspace close <id>`: ends the agents running in it. */
+export async function herdrCloseWorkspace(
+	workspaceId: string,
+	options: HerdrRunnerOptions = {},
+): Promise<{ ok: true } | { ok: false; error: string }> {
+	const closed = await herdrRun(["workspace", "close", workspaceId], options);
+	return closed.code === 0
+		? { ok: true }
+		: { ok: false, error: `workspace close failed: ${herdrFailure(closed, 120)}` };
 }
 
 /** herdr's `agent_status` values (`herdr agent wait --until`), plus `gone` for a name the list does not have. */
@@ -536,11 +593,9 @@ export async function herdrAgentStatus(
 	name: string,
 	options: HerdrRunnerOptions = {},
 ): Promise<HerdrAgentStatusResult> {
-	const list = await herdrRun(["agent", "list"], options);
-	if (list.code !== 0) return { ok: false, error: `agent list failed: ${herdrFailure(list, 120)}` };
-	const agents = parseHerdrAgents(list.stdout);
-	if (agents === undefined) return { ok: false, error: "agent list output is not JSON" };
-	const agent = agents.find((entry) => entry.name === name);
+	const found = await herdrAgentEntry(name, options);
+	if (!found.ok) return found;
+	const { agent } = found;
 	if (agent === undefined) return { ok: true, status: "gone" };
 	const status = isReportedStatus(agent.agent_status) ? agent.agent_status : "unknown";
 	const sessionPath = sessionPathOf(agent.agent_session);

@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { chmodSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
@@ -11,6 +11,7 @@ import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { runBounded } from "./helpers/bounded-child";
 import { killSpawned, runCliCapture, runMain } from "./helpers/daemon-process";
 
 const clock = { now: () => Date.now() };
@@ -520,6 +521,47 @@ describe("ompbot monitors (CLI)", () => {
 		expect((parse(renamed.stdout).monitor as unknown as { procedureFiles: string[] }).procedureFiles).toEqual([file]);
 		const cleared = await monitors("update", "proc", "--json", JSON.stringify({ procedureFiles: null }));
 		expect((parse(cleared.stdout).monitor as unknown as { procedureFiles: string[] }).procedureFiles).toEqual([]);
+	});
+});
+
+describe("ompbot monitors export: odd targets", () => {
+	const MAIN = join(import.meta.dir, "..", "src", "main.ts");
+
+	/** The real CLI in a child of a bounded child: a hang kills the inner run after 10 s and the outer after 20 s. */
+	async function exportBounded(dir: string): Promise<{ code: number | null; stderr: string; timedOut: boolean }> {
+		const code = `const r = Bun.spawnSync(["bun", ${JSON.stringify(MAIN)}, "monitors", "export", "--dir", ${JSON.stringify(dir)}], { env: { ...process.env, OMPBOT_HOME: ${JSON.stringify(home.dir)} }, stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10000 });
+console.log(JSON.stringify({ code: r.exitCode, stderr: r.stderr.toString() }));`;
+		const result = await runBounded(code);
+		if (result.timedOut) return { code: null, stderr: result.stderr, timedOut: true };
+		return { ...(JSON.parse(result.stdout) as { code: number | null; stderr: string }), timedOut: false };
+	}
+
+	const addMorning = () =>
+		monitors(
+			"add",
+			"--json",
+			JSON.stringify({ name: "morning", trigger: { kind: "cron", schedule: "30 9 * * *" }, instruction: "hi" }),
+		);
+
+	test("a FIFO where a monitor file goes is refused with exit 2 and stays", async () => {
+		expect((await addMorning()).code).toBe(0);
+		const dir = join(home.dir, "export");
+		mkdirSync(dir);
+		const fifo = join(dir, "morning.json");
+		expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+		const run = await exportBounded(dir);
+		expect(run.timedOut).toBe(false);
+		expect(run.code).toBe(2);
+		expect(run.stderr).toContain("monitors export:");
+		expect(statSync(fifo).isFIFO()).toBe(true);
+	});
+
+	test("--dir naming a regular file exits 2 with `monitors export: … not a directory`", async () => {
+		const file = join(home.dir, "plain.txt");
+		writeFileSync(file, "x");
+		const run = await monitors("export", "--dir", file);
+		expect(run.code).toBe(2);
+		expect(run.stderr).toMatch(/^monitors export: .*not a directory/m);
 	});
 });
 

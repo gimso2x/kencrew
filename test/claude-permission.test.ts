@@ -63,6 +63,32 @@ describe("isDangerousBash", () => {
 		}
 	});
 
+	test("find that deletes asks for a card; find that only reads or writes a listing does not", () => {
+		for (const command of [
+			"find . -name '*.log' -delete",
+			"find /srv -type f -mtime +7 -delete -print",
+			"find . -name x -exec rm {} +",
+			"find . -name x -exec rm -f {} \\;",
+			"find build -execdir /bin/rm {} +",
+			"cd /tmp && find . -delete",
+			"sudo find / -name core -delete",
+			"xargs find -delete < dirs.txt",
+		]) {
+			expect([command, isDangerousBash(command)]).toEqual([command, true]);
+		}
+		for (const command of [
+			"find . -name x -exec wc -l {} +",
+			"find . -type f -execdir grep -l TODO {} +",
+			"find . -name '*.ts' -fprint list.txt",
+			"find . -fls listing.txt",
+			"find . -name '*-delete*'",
+			"find . -name rm -print",
+			"find src -exec cat {} \\;",
+		]) {
+			expect([command, isDangerousBash(command)]).toEqual([command, false]);
+		}
+	});
+
 	// The brief scan ends a command at a backtick or a redirection's `&`; a command about to run does not.
 	test("keeps a destructive flag after a backtick substitution or a redirection", () => {
 		for (const command of [

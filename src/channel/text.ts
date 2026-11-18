@@ -43,6 +43,8 @@ function splitAt(text: string, limit: number, keepWhole: (cut: number) => number
 		// never split a surrogate pair
 		const code = text.charCodeAt(cut - 1);
 		if (code >= 0xd800 && code <= 0xdbff) cut -= 1;
+		// A limit of 1 on an emoji: the code point goes out whole rather than not at all.
+		if (cut === 0) cut = 2;
 	}
 	cut = keepWhole(cut);
 	// The fence fix only moves the cut back; it is dropped when nothing would be left before it (the loop of
@@ -81,6 +83,10 @@ function fenceSafeCut(text: string, cut: number): number {
  * Splits into messages of at most `limit` characters, preferring paragraph/line boundaries and keeping code fences
  * balanced; a fence mark and a line opening a fence are never cut in two. A cut inside one of the `keepWhole` spans
  * (each at most the limit) moves to the line break before it, or past it when the span opens the message.
+ *
+ * The contract holds for every `limit >= 1`: the call returns, and with `limit >= 2` every chunk, the fence it closes
+ * and the fence it reopens included, is at most `limit` long. A chunk the fences leave no room in is cut as plain text
+ * (no fence reopened). The smallest unit is one code point, so at `limit` 1 a surrogate pair is a chunk of length 2.
  */
 export function chunkText(
 	text: string,
@@ -93,48 +99,67 @@ export function chunkText(
 		if (run !== undefined && run > longest) longest = run;
 	}
 	const budget = limit - FENCE_RESERVE - 2 * (longest - 3);
-	const raw: string[] = [];
-	let rest = text;
-	while (rest.length > 0) {
-		const base = text.length - rest.length;
-		const [head, tail] = splitAt(rest, budget, (cut) => {
-			const span = keepWhole.find(([start, end]) => start < base + cut && base + cut < end);
-			if (span === undefined) return cut;
-			const before = span[0] - base - 1;
-			return before > 0 ? before : span[1] - base;
-		});
-		raw.push(head);
-		rest = tail;
-	}
-	if (raw.length === 0) return [""];
+	const chunks: string[] = [];
 	// The backtick count of the fence open at a chunk's end: 0 when none. A fence opened at a line's head closes only on
 	// a line of at least as many backticks alone; any other ``` (mid-line, or a run too long to track) toggles a
 	// three-backtick fence as before.
 	let open = 0;
 	let lineHead = false;
-	return raw.map((chunk) => {
-		const mark = "`".repeat(open);
-		let out = open > 0 ? `${mark}\n${chunk}` : chunk;
+	const scan = (chunk: string, from: { open: number; lineHead: boolean }): { open: number; lineHead: boolean } => {
+		let state = { ...from };
 		for (const line of chunk.split("\n")) {
-			if (lineHead) {
+			if (state.lineHead) {
 				const close = /^ {0,3}(`+)[ \t]*\r?$/.exec(line);
-				if (close !== null && (close[1]?.length ?? 0) >= open) {
-					open = 0;
-					lineHead = false;
-				}
+				if (close !== null && (close[1]?.length ?? 0) >= state.open) state = { open: 0, lineHead: false };
 				continue;
 			}
-			const run = open === 0 ? fenceRun(line, limit) : undefined;
+			const run = state.open === 0 ? fenceRun(line, limit) : undefined;
 			if (run !== undefined) {
-				open = run;
-				lineHead = true;
+				state = { open: run, lineHead: true };
 				continue;
 			}
-			if ((line.match(/```/g) ?? []).length % 2 === 1) open = open > 0 ? 0 : 3;
+			if ((line.match(/```/g) ?? []).length % 2 === 1) state.open = state.open > 0 ? 0 : 3;
 		}
-		if (open > 0) out = `${out}\n${"`".repeat(open)}`;
-		return out;
-	});
+		return state;
+	};
+	let rest = text;
+	while (rest.length > 0) {
+		const base = text.length - rest.length;
+		// A chunk too long once its fences are added is cut again, shorter by the overflow.
+		let room = budget;
+		let head: string;
+		let tail: string;
+		let out: string;
+		for (;;) {
+			if (room < 1) {
+				head = cutCodePointSafe(rest, limit);
+				if (head === "") head = String.fromCodePoint(rest.codePointAt(0) ?? 0);
+				tail = rest.slice(head.length);
+				out = head;
+				open = 0;
+				lineHead = false;
+				break;
+			}
+			[head, tail] = splitAt(rest, room, (cut) => {
+				const span = keepWhole.find(([start, end]) => start < base + cut && base + cut < end);
+				if (span === undefined) return cut;
+				const before = span[0] - base - 1;
+				return before > 0 ? before : span[1] - base;
+			});
+			const next = scan(head, { open, lineHead });
+			out = open > 0 ? `${"`".repeat(open)}\n${head}` : head;
+			if (next.open > 0) out = `${out}\n${"`".repeat(next.open)}`;
+			if (out.length <= limit) {
+				open = next.open;
+				lineHead = next.lineHead;
+				break;
+			}
+			room -= out.length - limit;
+		}
+		chunks.push(out);
+		rest = tail;
+	}
+	return chunks.length === 0 ? [""] : chunks;
 }
 
 /**
@@ -274,9 +299,12 @@ export function splitRowCells(line: string): string[] {
 	return cells;
 }
 
+const BLOCK_START = /^ {0,3}(?:>|#{1,6}(?:[ \t]|$)|(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$))/;
+
 /**
  * When a GFM table starts at line `i`, the index of the first line after it: a row of 2+ cells, a delimiter row of the
  * same count (hyphens, at least `minDashes` per cell, optional colons) and the rows after it holding an unescaped pipe.
+ * A quote, heading or list line ends the table even when it holds a pipe, as in GFM.
  */
 export function tableEndAt(lines: readonly string[], i: number, minDashes = 1): number | undefined {
 	const header = splitRowCells(lines[i] ?? "");
@@ -285,7 +313,7 @@ export function tableEndAt(lines: readonly string[], i: number, minDashes = 1): 
 	const rule = new RegExp(`^\\s*:?-{${minDashes},}:?\\s*$`);
 	if (!delimiter.every((cell) => rule.test(cell))) return undefined;
 	let j = i + 2;
-	while (j < lines.length && /(?<!\\)\|/.test(lines[j] ?? "")) j++;
+	while (j < lines.length && /(?<!\\)\|/.test(lines[j] ?? "") && !BLOCK_START.test(lines[j] ?? "")) j++;
 	return j;
 }
 

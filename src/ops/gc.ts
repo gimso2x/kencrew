@@ -204,21 +204,22 @@ function gcLedger(db: Database, options: GcOptions): LedgerRemoved {
 		.filter((term) => term !== undefined)
 		.join(" AND ");
 	const deliveriesWhere = "d.created_at < ? AND d.state IN ('confirmed','failed_ambiguous','expired')";
-	const posts = hasTable(db, "delivery_posts");
+	const hasDeliveries = hasTable(db, "deliveries");
+	const posts = hasDeliveries && hasTable(db, "delivery_posts");
 	const events = hasTable(db, "monitor_events");
 	const postsWhere = `delivery_id IN (SELECT d.delivery_id FROM deliveries d WHERE ${deliveriesWhere})`;
 	const eventsWhere = "stage IN ('delivered','failed_no_retry','skipped','no_report') AND updated_at < ?";
 	const count = (sql: string) => (db.query(`SELECT COUNT(*) AS n FROM ${sql}`).get(cutoff) as { n: number }).n;
 	const removed: LedgerRemoved = {
 		inbound: count(`inbound i WHERE ${inboundWhere}`),
-		deliveries: count(`deliveries d WHERE ${deliveriesWhere}`),
+		deliveries: hasDeliveries ? count(`deliveries d WHERE ${deliveriesWhere}`) : 0,
 		deliveryPosts: posts ? count(`delivery_posts WHERE ${postsWhere}`) : 0,
 		monitorEvents: events ? count(`monitor_events WHERE ${eventsWhere}`) : 0,
 	};
 	if (options.dryRun === true) return removed;
 	db.transaction(() => {
 		if (posts) db.query(`DELETE FROM delivery_posts WHERE ${postsWhere}`).run(cutoff);
-		db.query(`DELETE FROM deliveries AS d WHERE ${deliveriesWhere}`).run(cutoff);
+		if (hasDeliveries) db.query(`DELETE FROM deliveries AS d WHERE ${deliveriesWhere}`).run(cutoff);
 		db.query(`DELETE FROM inbound AS i WHERE ${inboundWhere}`).run(cutoff);
 		if (events) db.query(`DELETE FROM monitor_events WHERE ${eventsWhere}`).run(cutoff);
 	})();
@@ -240,6 +241,7 @@ function gcTeamsQa(db: Database, options: GcOptions): number {
  * opened; a dry run reads the count and writes nothing.
  */
 function gcTurnSnapshots(db: Database, options: GcOptions): number {
+	if (!hasTable(db, "turn_snapshots")) return 0;
 	const cutoff = options.now - TURN_SNAPSHOT_RETENTION_DAYS * DAY_MS;
 	const rows = db.query("SELECT id, repo FROM turn_snapshots WHERE ended_at < ?").all(cutoff) as Array<{
 		id: number;

@@ -55,7 +55,7 @@ import {
 	laneLandBlockers,
 	laneQaRisk,
 } from "./land";
-import { cleanQaWorktrees, runLaneQa } from "./qa";
+import { cleanQaWorktrees, createGateSlot, type GateSlot, qaDepsOf, runLaneQa, untilAborted } from "./qa";
 import { formatConfidence, type LaneReviewDeps, reviewLane } from "./review";
 import { appendFollowups, checkLaneScope, parseLaneLeftovers, parseLaneScope } from "./scope";
 import {
@@ -93,6 +93,7 @@ import {
 	verifyClaim,
 } from "./verify";
 import {
+	DEFAULT_LANE_RISK,
 	laneBranchOf,
 	laneIdsOnBranches,
 	nextLaneId,
@@ -251,8 +252,8 @@ export interface LaneManagerDeps {
 	 * Leftovers there are removed when the manager starts. Absent: a QA policy finds no runner (`inconclusive`).
 	 */
 	qaWorktreesDir?: string;
-	/** Git of the run QA's copies (test seam; default `defaultGit`). */
-	qaGit?: GitRunner;
+	/** The one review-or-QA slot, shared with the [TASK] gate (default: a slot of the manager's own). */
+	gateSlot?: GateSlot;
 	/** Git for the Outcome card's change summary (test seam; default 10 seconds per call, `computeLaneChanges`). */
 	changesGit?: GitRunner;
 	/**
@@ -353,6 +354,8 @@ export class LaneManager {
 	readonly #announcing = new Set<string>();
 	/** Work started without awaiting it (the card and auto-merge after a close); `idle()` waits for it. */
 	readonly #background = new Set<Promise<void>>();
+	/** Lanes with a completion nudge being prepared or sent: a second turn end meanwhile sends none. */
+	readonly #nudging = new Set<string>();
 	/** Lanes whose independent review is running (in the background: a tick never waits for one). */
 	readonly #reviewing = new Set<string>();
 	/**
@@ -360,8 +363,8 @@ export class LaneManager {
 	 * discard or `!reopen` aborts it first.
 	 */
 	readonly #qaRunning = new Map<string, { abort: AbortController; ended: Promise<void> }>();
-	/** One review or QA at a time across all lanes: the tail of the queue for the review slot. */
-	#reviewSlotTail: Promise<void> = Promise.resolve();
+	/** One review or QA at a time across all lanes (and the [TASK] gate when the daemon shares its slot). */
+	readonly #reviewSlot: GateSlot;
 	/** Lanes whose channel was found unregistered by a draw: the skip is logged once per lane per process. */
 	readonly #unroutableWarned = new Set<string>();
 	/** Origins whose lane worktree the core is rebasing: their mailbox holds its rows (`isCoreRebasing`). */
@@ -370,6 +373,7 @@ export class LaneManager {
 	constructor(deps: LaneManagerDeps) {
 		this.#deps = deps;
 		this.#max = deps.maxLanes ?? DEFAULT_MAX_LANES;
+		this.#reviewSlot = deps.gateSlot ?? createGateSlot();
 		this.#ops = deps.hostOps ?? createTaskHostOps();
 		const ops = this.#ops;
 		this.#land = deps.land ?? createLaneLander({ removeWorktree: (input) => ops.removeWorktree(input) });
@@ -379,7 +383,7 @@ export class LaneManager {
 			this.#spawn("qa-worktrees", async () => {
 				const free = await this.#reviewSlot();
 				try {
-					await cleanQaWorktrees(qaDir, deps.qaGit, deps.log);
+					await cleanQaWorktrees(qaDir, deps.reviewer?.git, deps.log);
 				} finally {
 					free();
 				}
@@ -439,15 +443,6 @@ export class LaneManager {
 		const previous = this.#checkSlotTail;
 		const freed = Promise.withResolvers<void>();
 		this.#checkSlotTail = previous.then(() => freed.promise);
-		await previous;
-		return freed.resolve;
-	}
-
-	/** Waits for the review slot (one independent review at a time across lanes); the returned function frees it. */
-	async #reviewSlot(): Promise<() => void> {
-		const previous = this.#reviewSlotTail;
-		const freed = Promise.withResolvers<void>();
-		this.#reviewSlotTail = previous.then(() => freed.promise);
 		await previous;
 		return freed.resolve;
 	}
@@ -696,18 +691,21 @@ export class LaneManager {
 		return name;
 	}
 
-	/** Feeds a core-authored message (first prompt, not-done reasons) into the lane's mailbox without awaiting it. */
-	#send(name: string, kind: string, text: string): void {
+	/**
+	 * Feeds a core-authored message (first prompt, not-done reasons) into the lane's mailbox; most callers do not await
+	 * it. Resolves true once the mailbox took the message, false when it was held or the route failed (logged).
+	 */
+	#send(name: string, kind: string, text: string): Promise<boolean> {
 		const lane = this.#deps.store.getLane(name);
-		if (!lane) return;
+		if (!lane) return Promise.resolve(false);
 		// Held: nothing is steered into a paused lane (the resume word goes after the transition back).
 		if (lane.status === "paused") {
 			this.#deps.log.warn("lane_send_held_paused", { lane: name, kind });
-			return;
+			return Promise.resolve(false);
 		}
 		const seq = lane.meta.steerSeq + 1;
 		this.#deps.store.patchLane(name, undefined, { steerSeq: seq });
-		this.#deps
+		return this.#deps
 			.route({
 				platformMessageId: `lane:${name}:${kind}:${seq}`,
 				originKey: lane.originKey,
@@ -715,7 +713,13 @@ export class LaneManager {
 				text,
 				threadRef: lane.threadRef,
 			})
-			.catch((error: unknown) => this.#deps.log.error("lane_send_failed", { lane: name, kind, error: String(error) }));
+			.then(
+				() => true,
+				(error: unknown) => {
+					this.#deps.log.error("lane_send_failed", { lane: name, kind, error: String(error) });
+					return false;
+				},
+			);
 	}
 
 	/**
@@ -909,12 +913,13 @@ export class LaneManager {
 		if (lane.meta.attach !== undefined || this.#attaching.has(name)) {
 			return { ok: false, error: `lane ${name} is already attached (pid ${lane.meta.attach?.pid ?? "?"})` };
 		}
-		const origin = store.getOrigin(lane.originKey);
-		const sessionFile =
-			(await session.openFile(lane.originKey)) ?? (origin === undefined ? undefined : sessionToResume(origin));
-		if (sessionFile === undefined) return { ok: false, error: `lane ${name} has no session file yet` };
+		// Marked before the first await: a second attach arriving meanwhile is refused by the check above.
 		this.#attaching.add(name);
 		try {
+			const origin = store.getOrigin(lane.originKey);
+			const sessionFile =
+				(await session.openFile(lane.originKey)) ?? (origin === undefined ? undefined : sessionToResume(origin));
+			if (sessionFile === undefined) return { ok: false, error: `lane ${name} has no session file yet` };
 			const head = await headOf(this.#deps.changesGit ?? defaultGit, lane.cwd);
 			const now = clock.now();
 			const attach: LaneAttach = {
@@ -1106,25 +1111,42 @@ export class LaneManager {
 				);
 				return;
 			}
-			const n = nudges.sent + 1;
-			// Counted before the git reads: a second turn end meanwhile sees this nudge.
-			store.patchLane(lane.name, { event: "nudge", detail: `${n}/${max}` }, { nudges: { sent: n } });
-			log.info("lane_nudge", { lane: lane.name, n, max });
+			// One nudge at a time per lane: a second turn end during the git reads would otherwise send a second one.
+			if (this.#nudging.has(lane.name)) {
+				log.info("lane_nudge_skipped", { lane: lane.name, reason: "in_flight" });
+				return;
+			}
+			this.#nudging.add(lane.name);
 			this.#spawn(lane.name, async () => {
-				const worktree = await this.#worktreeState(lane);
-				const current = store.getLane(lane.name);
-				if (current?.status !== "working" && current?.status !== "not-done") {
-					log.info("lane_nudge_skipped", { lane: lane.name, reason: "status" });
-					return;
+				try {
+					const worktree = await this.#worktreeState(lane);
+					const current = store.getLane(lane.name);
+					if (current?.status !== "working" && current?.status !== "not-done") {
+						log.info("lane_nudge_skipped", { lane: lane.name, reason: "status" });
+						return;
+					}
+					// A freeze that began during the git reads holds the nudge like any other autonomous steer.
+					if (this.#deps.frozen?.() !== undefined) {
+						log.info("lane_nudge_skipped", { lane: lane.name, reason: "frozen" });
+						return;
+					}
+					// A message queued meanwhile (the owner's, or the core's own) is the next turn already.
+					if (store.listInbound({ originKey: current.originKey, state: "pending" }).length > 0) {
+						log.info("lane_nudge_skipped", { lane: lane.name, reason: "pending" });
+						return;
+					}
+					// The counter is read again: an owner message during the git reads may have started it over.
+					const n = (store.getLane(lane.name)?.meta.nudges?.sent ?? 0) + 1;
+					const notDone =
+						current.status === "not-done" ? current.history.findLast((e) => e.event === "not_done")?.detail : undefined;
+					if (!(await this.#send(lane.name, "nudge", buildNudgePrompt({ n, max, worktree, notDone })))) return;
+					// Counted only once the mailbox took it, against the value as it is now.
+					const sent = (store.getLane(lane.name)?.meta.nudges?.sent ?? 0) + 1;
+					store.patchLane(lane.name, { event: "nudge", detail: `${sent}/${max}` }, { nudges: { sent } });
+					log.info("lane_nudge", { lane: lane.name, n: sent, max });
+				} finally {
+					this.#nudging.delete(lane.name);
 				}
-				// A freeze that began during the git reads holds the nudge like any other autonomous steer.
-				if (this.#deps.frozen?.() !== undefined) {
-					log.info("lane_nudge_skipped", { lane: lane.name, reason: "frozen" });
-					return;
-				}
-				const notDone =
-					current.status === "not-done" ? current.history.findLast((e) => e.event === "not_done")?.detail : undefined;
-				this.#send(lane.name, "nudge", buildNudgePrompt({ n, max, worktree, notDone }));
 			});
 		} catch (error) {
 			log.error("lane_nudge_failed", { lane: lane.name, error: String(error) });
@@ -1600,7 +1622,7 @@ export class LaneManager {
 				// the QA without its own only — so the order is review → CLEAR → QA → merge.
 				const { review, qa, ...withoutReceipts } = policy;
 				// A lane in the confident band is held back by its risk only until its review: judge it at that band's top.
-				const band = confidentBand(lane, policy);
+				const band = confidentBand(lane.meta.risk, policy);
 				const gate = band === undefined ? withoutReceipts : { ...withoutReceipts, maxRisk: band.maxRisk };
 				// Only a lane the review alone holds back is reviewed, and one commit only once (a restart keeps the receipt).
 				if (
@@ -1620,7 +1642,7 @@ export class LaneManager {
 					qa !== undefined &&
 					held.length === 0 &&
 					lane.meta.qa?.sha !== lane.meta.sha &&
-					laneQaRisk(lane, policy) &&
+					laneQaRisk(lane.meta.risk ?? DEFAULT_LANE_RISK, policy) &&
 					laneLandBlockers(lane, withoutQa, matched, frozen).length === 0
 				) {
 					this.#startQa(name, qa);
@@ -1769,7 +1791,14 @@ export class LaneManager {
 		let recorded = false;
 		try {
 			let receipt: LaneQa;
-			const free = await this.#reviewSlot();
+			const slot = this.#reviewSlot();
+			const free = await untilAborted(slot, abort.signal);
+			if (free === undefined) {
+				// Aborted while waiting: the place in the queue is taken already, so it is given back when it comes.
+				void slot.then((late) => late());
+				log.info("lane_qa_stopped", { lane: name });
+				return;
+			}
 			try {
 				const lane = store.getLane(name);
 				if (this.#stopped || abort.signal.aborted || lane?.status !== "closed" || lane.meta.sha === undefined) return;
@@ -1789,18 +1818,7 @@ export class LaneManager {
 							}
 						: await runLaneQa(
 								{ lane, policy: qa, signal: abort.signal },
-								{
-									ompBin: reviewer.ompBin,
-									...(reviewer.ompProfile === undefined ? {} : { ompProfile: reviewer.ompProfile }),
-									systemPromptAppendix: reviewer.systemPromptAppendix,
-									worktreesDir,
-									overlaysDir: reviewer.reviewsDir,
-									now: () => clock.now(),
-									...(reviewer.run === undefined ? {} : { run: reviewer.run }),
-									...(this.#deps.qaGit === undefined ? {} : { git: this.#deps.qaGit }),
-									...(reviewer.inheritedEnv === undefined ? {} : { inheritedEnv: reviewer.inheritedEnv }),
-									log,
-								},
+								qaDepsOf(reviewer, worktreesDir, () => clock.now(), log),
 							);
 			} finally {
 				this.#checkAborts.delete(abort);

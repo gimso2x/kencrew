@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -320,21 +320,33 @@ test("dangerous bash escalates to the approval hook", async () => {
 });
 
 test("a throwing approval hook still answers the CLI with a deny", async () => {
+	const errors: string[] = [];
+	const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+		errors.push(args.map(String).join(" "));
+	});
 	const harness = makeHarness({
 		approval: async () => {
 			throw new Error("slack 429");
 		},
 	});
 	const driver = harness.driver;
-	await driver.start();
-	await driver.openSession();
-	const done = nextFinal(driver);
-	await driver.prompt("@tool git push --force origin main");
-	const final = await done;
-	expect(final.text).toBe("TOOL-DENIED");
-	expect(permissionResponses(harness.readLog())).toHaveLength(1);
-	expect(permissionDecision(harness.readLog())).toMatchObject({ behavior: "deny" });
-	await driver.stop();
+	try {
+		await driver.start();
+		await driver.openSession();
+		const done = nextFinal(driver);
+		await driver.prompt("@tool git push --force origin main");
+		const final = await done;
+		expect(final.text).toBe("TOOL-DENIED");
+		expect(permissionResponses(harness.readLog())).toHaveLength(1);
+		expect(permissionDecision(harness.readLog())).toMatchObject({ behavior: "deny" });
+		expect(errors).toEqual(["[ompbot] claude_permission_failed: tool=Bash Error: slack 429"]);
+	} finally {
+		try {
+			await driver.stop();
+		} finally {
+			errorSpy.mockRestore();
+		}
+	}
 });
 
 test("safe bash runs without asking the owner", async () => {

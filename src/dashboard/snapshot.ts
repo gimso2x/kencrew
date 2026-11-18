@@ -34,7 +34,7 @@ import {
 import type { MonitorDeliver, MonitorOverlap, MonitorTrigger } from "../monitors/spec";
 import { type AssistantTail, pendingToolCall, readLastAssistant, sessionPathOf } from "../omp/session-tail";
 import { isRecord } from "../omp/type-guards";
-import { readLockStartedAt } from "../ops/apply";
+import { parseSystemctlShow, parseUnixTimestamp, readLockStartedAt } from "../ops/apply";
 import { readStamp } from "../ops/backup";
 import type { FreezeState } from "../ops/freeze";
 import {
@@ -1375,24 +1375,19 @@ async function readUnitJobs(run: ProcessRunner, files: JobInfo[], now: number, t
 	const known = new Set(files.map((job) => job.name));
 	const knownPids = new Set(files.flatMap((job) => (job.pid === undefined ? [] : [job.pid])));
 	const jobs: JobInfo[] = [];
-	for (const block of result.stdout.split(/\n\s*\n/)) {
-		const unit = new Map<string, string>();
-		for (const line of block.split("\n")) {
-			const eq = line.indexOf("=");
-			if (eq > 0) unit.set(line.slice(0, eq), line.slice(eq + 1));
-		}
+	for (const unit of parseSystemctlShow(result.stdout)) {
 		const id = unit.get("Id") ?? "";
 		if (unit.get("Transient") !== "yes" || unit.get("ActiveState") !== "active") continue;
 		if (!id.startsWith(UNIT_JOB_PREFIX) || id.startsWith(UNIT_HELPER_PREFIX) || !id.endsWith(".service")) continue;
 		const name = id.slice(UNIT_JOB_PREFIX.length, -".service".length);
 		const pid = Number(unit.get("MainPID"));
 		if (!JOB_NAME.test(name) || known.has(name) || knownPids.has(pid)) continue;
-		const started = /^@(\d+)$/.exec(unit.get("ActiveEnterTimestamp") ?? "");
+		const started = parseUnixTimestamp(unit.get("ActiveEnterTimestamp") ?? "");
 		jobs.push({
 			name,
 			title: jobText(unit.get("Description"), JOB_TITLE_CHARS) ?? name,
 			state: "running",
-			...(started === null ? {} : { startedAt: localIso(Number(started[1]) * 1000, timezone) }),
+			...(started === undefined ? {} : { startedAt: localIso(started, timezone) }),
 			updatedAt: localIso(now, timezone),
 			ageMs: 0,
 			...(Number.isSafeInteger(pid) && pid > 0 ? { pid } : {}),

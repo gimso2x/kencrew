@@ -1339,6 +1339,10 @@ async function endTurn(h: LaneHarness, driver: FakeOmpDriver | undefined) {
 	return info;
 }
 
+/** Nudge inbound rows the core queued for a lane (a held first turn never prompts them, but the rows show what went out). */
+const nudgeRows = (h: LaneHarness, name: string) =>
+	h.store.listInbound().filter((row) => row.platformMessageId.startsWith(`lane:${name}:nudge:`));
+
 const nudgePrompts = (h: LaneHarness, originKey: string) =>
 	h.prompts(originKey).filter((call) => call.includes("[자동 재촉"));
 
@@ -1508,18 +1512,75 @@ describe("lane completion nudges", () => {
 	});
 
 	test("a freeze that starts while the nudge reads git holds the nudge (qa-i #56 #125)", async () => {
-		let logs: string[] = [];
-		// Frozen only once the nudge was counted: the pre-await check saw an unfrozen bot, the post-await one must not.
+		// The first check (the turn end itself) sees an unfrozen bot; the one after the git reads must see the freeze.
+		let armed = false;
+		let checks = 0;
 		const frozen = () =>
-			logs.some((line) => /event=lane_nudge(\s|$)/.test(line))
-				? { since: "2026-11-14T01:00:00.000Z", reason: "점검", by: "cli" }
-				: undefined;
+			armed && ++checks > 1 ? { since: "2026-11-14T01:00:00.000Z", reason: "점검", by: "cli" } : undefined;
 		const h = laneHarness(home.dir, { completionNudges: () => 2, frozen });
-		logs = h.logs;
 		const lane = await startLane(h, "freeze-nudge");
+		armed = true;
 		await endTurn(h, h.drivers.get(lane.originKey));
 		expect(nudgePrompts(h, lane.originKey)).toHaveLength(0);
 		expect(h.logs.some((line) => line.includes("lane_nudge_skipped") && line.includes("reason=frozen"))).toBe(true);
+		// A skipped nudge is not a sent one: no count, no `nudge` event, no `lane_nudge` line.
+		const stored = h.store.getLane(lane.name);
+		expect(stored?.meta.nudges?.sent ?? 0).toBe(0);
+		expect(stored?.history.some((entry) => entry.event === "nudge")).toBe(false);
+		expect(h.logs.some((line) => /event=lane_nudge(\s|$)/.test(line))).toBe(false);
+		h.close();
+	});
+
+	test("two turn ends in a row send one nudge", async () => {
+		const h = laneHarness(home.dir, { completionNudges: () => 2 });
+		const lane = await startLane(h, "double-end");
+		h.manager.onTurnSettled({ originKey: lane.originKey, text: "끝", openDialogs: 0 });
+		h.manager.onTurnSettled({ originKey: lane.originKey, text: "끝", openDialogs: 0 });
+		await h.settle();
+		expect(nudgeRows(h, lane.name)).toHaveLength(1);
+		expect(h.store.getLane(lane.name)?.meta.nudges?.sent).toBe(1);
+		h.close();
+	});
+
+	test("an owner message that starts the count over during the git reads leaves the count at 1", async () => {
+		let armed = false;
+		let checks = 0;
+		let reset = (): void => {};
+		const frozen = () => {
+			if (armed && ++checks === 2) reset();
+			return undefined;
+		};
+		const h = laneHarness(home.dir, { completionNudges: () => 2, frozen });
+		const lane = await startLane(h, "reset-during-git");
+		h.store.patchLane(lane.name, undefined, { nudges: { sent: 1 } });
+		reset = () => h.store.patchLane(lane.name, undefined, { nudges: undefined });
+		armed = true;
+		h.manager.onTurnSettled({ originKey: lane.originKey, text: "끝", openDialogs: 0 });
+		await h.settle();
+		expect(nudgeRows(h, lane.name)).toHaveLength(1);
+		expect(h.store.getLane(lane.name)?.meta.nudges?.sent).toBe(1);
+		h.close();
+	});
+
+	test("a nudge whose route fails is not counted, and the next turn end can nudge again", async () => {
+		let refuse = true;
+		const h = laneHarness(home.dir, {
+			completionNudges: () => 2,
+			routeFails: (record) => refuse && record.platformMessageId.includes(":nudge:"),
+		});
+		const lane = await startLane(h, "route-fails");
+		h.manager.onTurnSettled({ originKey: lane.originKey, text: "끝", openDialogs: 0 });
+		await h.settle();
+		expect(nudgeRows(h, lane.name)).toHaveLength(0);
+		const failed = h.store.getLane(lane.name);
+		expect(failed?.meta.nudges?.sent ?? 0).toBe(0);
+		expect(failed?.history.some((entry) => entry.event === "nudge")).toBe(false);
+		expect(h.logs.some((line) => line.includes("lane_send_failed") && line.includes("kind=nudge"))).toBe(true);
+		refuse = false;
+		h.manager.onTurnSettled({ originKey: lane.originKey, text: "끝", openDialogs: 0 });
+		await h.settle();
+		expect(nudgeRows(h, lane.name)).toHaveLength(1);
+		expect(h.store.getLane(lane.name)?.meta.nudges?.sent).toBe(1);
 		h.close();
 	});
 

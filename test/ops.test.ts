@@ -57,6 +57,7 @@ import type { SlackTransport } from "../src/slack/transport";
 import { ALERT_INCIDENT_REPEAT_MS, type Store } from "../src/store/db";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain, spawnDaemon } from "./helpers/daemon-process";
+import { OFFLINE_DOCTOR, slackAuthOk } from "./helpers/doctor-network";
 import { isRoot } from "./helpers/privileges";
 
 const ORIGIN = "slack/dm/D1";
@@ -1341,7 +1342,7 @@ describe("ompbot doctor claude agent checks", () => {
 
 	async function claudeLines(): Promise<string[]> {
 		const lines: string[] = [];
-		await runDoctor(dir, (line) => lines.push(line));
+		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		return lines.filter((line) => /^(ok|fail) claude/.test(line));
 	}
 
@@ -1362,8 +1363,9 @@ describe("ompbot doctor claude agent checks", () => {
 
 	test("agent claude never spawns omp: no omp runtime line (its ompExecutable here is a standalone binary)", async () => {
 		const lines: string[] = [];
-		await runDoctor(dir, (line) => lines.push(line));
+		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		expect(lines.filter((line) => line.includes("omp runtime"))).toEqual([]);
+		expect(lines.find((line) => line.includes("slack auth.test"))).toStartWith("fail slack auth.test: invalid_auth ");
 	}, 30_000);
 });
 
@@ -1391,7 +1393,7 @@ describe("ompbot doctor omp runtime check", () => {
 			{ mode: 0o600 },
 		);
 		const lines: string[] = [];
-		await runDoctor(dir, (line) => lines.push(line));
+		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		return lines.find((line) => line.includes("omp runtime"));
 	}
 
@@ -1424,12 +1426,13 @@ describe("ompbot doctor omp runtime check", () => {
 			{ mode: 0o600 },
 		);
 		const lines: string[] = [];
-		await runDoctor(dir, (line) => lines.push(line));
+		await runDoctor(dir, (line) => lines.push(line), undefined, slackAuthOk("UBOT0"));
 		// checkOmpRuntime reports the directory as a problem (the same code the gate and the RPC driver give).
 		expect(lines.find((line) => line.includes("omp runtime"))).toStartWith(
 			`fail omp runtime: omp_launcher_unreadable ${folder} cannot be read`,
 		);
 		expect(lines.some((line) => line.includes("backup bundle"))).toBe(true);
+		expect(lines).toContain("ok slack auth.test: bot_user_id=UBOT0 team_id=T0TEST0");
 	}, 30_000);
 
 	test("token file problems get one line each with the fix, and every later check still runs", async () => {
@@ -1437,7 +1440,7 @@ describe("ompbot doctor omp runtime check", () => {
 		chmodSync(join(dir, "secrets", "slack-app-token"), 0o644);
 		await runtimeLine(process.execPath);
 		const lines: string[] = [];
-		await runDoctor(dir, (line) => lines.push(line));
+		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		const bot = join(dir, "secrets", "slack-bot-token");
 		const app = join(dir, "secrets", "slack-app-token");
 		expect(lines).toContain(`ok config: ${join(dir, "config.json")}`);
@@ -1450,7 +1453,7 @@ describe("ompbot doctor omp runtime check", () => {
 		writeFileSync(bot, "xapp-WRONG-0\n", { mode: 0o600 });
 		chmodSync(app, 0o600);
 		const swapped: string[] = [];
-		await runDoctor(dir, (line) => swapped.push(line));
+		await runDoctor(dir, (line) => swapped.push(line), undefined, OFFLINE_DOCTOR);
 		expect(swapped.find((line) => line.startsWith("fail secret slack-bot-token"))).toContain(
 			"does not start with xoxb-",
 		);
@@ -1478,7 +1481,7 @@ describe("ompbot doctor backup bundle check", () => {
 	/** Only the `backup bundle` line matters here, so the rest of doctor (config, secrets, Slack) is out of scope. */
 	async function bundleLine(): Promise<string | undefined> {
 		const lines: string[] = [];
-		await runDoctor(dir, (line) => lines.push(line));
+		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		return lines.find((line) => line.includes("backup bundle"));
 	}
 
@@ -1924,6 +1927,27 @@ describe("ompbot gc", () => {
 		expect(real.stdout).toContain(`gc removed path=${sessionOf(ORIGIN, 1)}`);
 		expect(real.stdout).toContain("gc_done removed=1 retained=1");
 		expect(existsSync(sessionOf(ORIGIN, 1))).toBe(false);
+	});
+});
+
+describe("ompbot gc: a ledger from before later tables existed", () => {
+	test("a db with only origins and inbound finishes, dry run and real", () => {
+		const home = makeHome("ompbot-ops-gc-old-");
+		try {
+			const db = new Database(join(home.dir, "ompbot.db"), { create: true, strict: true });
+			db.run(
+				"CREATE TABLE origins (origin_key TEXT PRIMARY KEY, epoch INTEGER NOT NULL, session_dir TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+			);
+			db.run(
+				"CREATE TABLE inbound (inbound_id INTEGER PRIMARY KEY, origin_key TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL)",
+			);
+			db.close();
+			const options = { homeDir: home.dir, retentionDays: 30, now: Date.now() };
+			expect(() => gcSessions({ ...options, dryRun: true })).not.toThrow();
+			expect(() => gcSessions(options)).not.toThrow();
+		} finally {
+			home.remove();
+		}
 	});
 });
 

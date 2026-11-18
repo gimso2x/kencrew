@@ -28,6 +28,8 @@ const DEFAULT_PROTECTED_BRANCHES = ["main", "master"] as const;
 
 /** The rest of a shell command after its verb: up to the next `;`, `&`, `|`, or the end of an inline code span. */
 const SEGMENT = "[^;&|`\\n]*";
+/** A SQL name: bare, `"quoted"`, backtick-quoted or `[bracketed]`; a schema-qualified one is two of them joined by `.`. */
+const SQL_NAME = '(?:\\w+|"[^"]+"|`[^`]+`|\\[[^\\]]+\\])';
 
 /**
  * One argument of a git global option: a quoted string holding a blank, or a word without whitespace or a command
@@ -109,12 +111,12 @@ const HIGH_RISK_PATTERNS: readonly PatternRule[] = [
 		verb: /\b[gG][iI][tT]\s+([bB][rR][aA][nN][cC][hH])\b/,
 	},
 	{ rule: "git_stash_discard", pattern: /\bgit\s+stash\s+(?:drop|clear)\b/i },
-	// A forced checkout or switch, or a checkout / restore of the whole tree (`.`, `./`, `:/`); a restore that names
+	// A forced checkout or switch, or a checkout / restore of the whole tree (`.`, `./`, `:/`, `*`, `./*`, `:/*`); a restore that names
 	// only `--staged` leaves the work tree alone unless `--worktree` / `-W` comes with it.
 	{
 		rule: "git_discard_worktree",
 		pattern: new RegExp(
-			`\\bgit\\s+(?:(?:checkout|switch)\\b${SEGMENT}\\s(?:-[a-z]*f[a-z]*|--force|--discard-changes)(?![\\w-])|(?:checkout\\b|restore\\b(?:(?=${SEGMENT}\\s(?:--worktree|-[a-z]*w[a-z]*)(?![\\w-]))|(?!${RESTORE_STAGED})))${SEGMENT}\\s(?:\\.\\/?|:\\/\\.?)(?=\\s|$|[;&|\`]))`,
+			`\\bgit\\s+(?:(?:checkout|switch)\\b${SEGMENT}\\s(?:-[a-z]*f[a-z]*|--force|--discard-changes)(?![\\w-])|(?:checkout\\b|restore\\b(?:(?=${SEGMENT}\\s(?:--worktree|-[a-z]*w[a-z]*)(?![\\w-]))|(?!${RESTORE_STAGED})))${SEGMENT}\\s(?:\\.\\/?|:\\/\\.?|\\.\\/\\*|:\\/\\*|\\*|'\\*'|"\\*")(?=\\s|$|[;&|\`]))`,
 			"i",
 		),
 		verb: /\bgit\s+(checkout|switch|restore)\b/i,
@@ -132,12 +134,19 @@ const HIGH_RISK_PATTERNS: readonly PatternRule[] = [
 	},
 	{
 		rule: "sql_destructive",
-		pattern: /\b(?:drop\s+(?:table|database)|truncate\s+table|delete\s+from\s+\w+\s*(?:;|$|['"`]))/i,
+		pattern: new RegExp(
+			"\\b(?:drop\\s+(?:table|database)|truncate\\s+table|delete\\s+from\\s+(?:" +
+				SQL_NAME +
+				"\\.)*" +
+				SQL_NAME +
+				"\\s*(?:;|$|['\"`]))",
+			"i",
+		),
 	},
 	{
 		rule: "service_control",
 		pattern:
-			/\bsystemctl(?:\s+-{1,2}[\w=-]+)*\s+(?:restart|stop|start|disable|kill)\b|\b(?:docker|podman)\s+(?:(?:container|compose)\s+)?(?:rm|stop|kill|restart)\b|\bpm2\s+(?:restart|stop|delete)\b/i,
+			/\bsystemctl(?:\s+-{1,2}[\w=-]+)*\s+(?:restart|stop|start|disable|kill|reboot|poweroff|halt|suspend)\b|\b(?:docker|podman)\s+(?:(?:container|compose)\s+)?(?:rm|stop|kill|restart)\b|\bpm2\s+(?:restart|stop|delete)\b/i,
 	},
 	{
 		rule: "disk_destructive",
@@ -168,11 +177,11 @@ const ADVISORY_PATTERNS: ReadonlyArray<readonly [string, RegExp]> = [
 const FORBIDDING =
 	/하지\s*마|하지\s*않|지\s*말고|지\s*않고|않는다|금지|말\s*것|말고|\bnever\b|\bdo\s+not\b|\bdon['’]t\b|\bmust\s+not\b|\bforbidden\b|^\s*[-*]\s+no\s/i;
 /**
- * Phrases that contain a forbidding marker but order or urge the command: "don't hesitate to", "do not forget / skip /
+ * Phrases that contain a forbidding marker but order or urge the command: "don't hesitate to", "don't be afraid to", "do not forget / skip /
  * fail to", "never forget", a double negative "…않으면 안" / "하지 않을 수 없다", "잊지 말고", "…말고는 (방법이) 없다".
  */
 const NOT_FORBIDDING =
-	/\b(?:do\s+not|don['’]t|never|must\s+not|mustn['’]t)\s+(?:hesitate|forget|skip|omit|miss|fail|neglect|leave\s+out)\b|\bforbidden\s+to\s+(?:skip|omit)\b|(?:하지\s*)?않으면\s*안|하지\s*않을\s*수\s*(?:가\s*)?없|(?:잊|빠뜨리|빼먹)지\s*말고|말고는[^.。!?\n]{0,20}?없/gi;
+	/\b(?:do\s+not|don['’]t|never|must\s+not|mustn['’]t)\s+(?:hesitate|forget|skip|omit|miss|fail|neglect|leave\s+out|be\s+afraid|worry|fear)\b|\bforbidden\s+to\s+(?:skip|omit)\b|(?:하지\s*)?않으면\s*안|하지\s*않을\s*수\s*(?:가\s*)?없|(?:잊|빠뜨리|빼먹)지\s*말고|말고는[^.。!?\n]{0,20}?없/gi;
 
 const HIGH_RISK_RULES = new Set([
 	...HIGH_RISK_PATTERNS.map(({ rule }) => rule),
@@ -238,7 +247,8 @@ function ruleMatches(text: string, { global, sticky, verb }: CompiledRule): Arra
 	return matches;
 }
 
-const KOREAN_CONNECTORS = "하고|하되|하며|한\\s+뒤|한\\s+다음|한\\s*후|해서|하여|그리고|다음에|후에|뒤에";
+const KOREAN_CONNECTORS =
+	"하고|하되|하며|한\\s+뒤|한\\s+다음|한\\s*후|해서|하여|그리고|다음에|후에|뒤에|지만|으나|는데|으면서";
 /**
  * Where one clause of a line ends and the next begins: `; , ， 、`, `. 。 ! ?` before whitespace, an English connector
  * or a lone `후` between spaces, a Korean connector with whitespace on one side. A forbidding `말고` (`<용언>지 말고`,
@@ -340,11 +350,24 @@ function removesAbsoluteTree(line: string): Hit[] {
 }
 
 /**
- * `cd` / `pushd` (past options and `--`) or `env -C` / `--chdir` into the bot home itself (`~/.ompbot`,
- * `$OMPBOT_HOME`, quoted or with a trailing `/`).
+ * `cd` / `pushd` (past options and `--`) or `env -C` / `--chdir` and its target word, quotes and all (`botHomeWord`
+ * judges it).
  */
-const CD_BOT_HOME =
-	/(?:\b(?:cd|pushd)\s+(?:(?:-[A-Za-z@]+|--)\s+)*|\benv\s+(?:[^\s;&|`]+\s+)*?(?:-[A-Za-z]*C\s*|--chdir(?:=|\s+)))["']?[^\s;&|`'"]*(?:\.ompbot|\$\{?OMPBOT_HOME\}?)\/?["']?(?=[\s;&|`]|$)/gi;
+const CD_TARGET =
+	/(?:\b(?:cd|pushd)\s+(?:(?:-[A-Za-z@]+|--)\s+)*|\benv\s+(?:[^\s;&|`]+\s+)*?(?:-[A-Za-z]*C\s*|--chdir(?:=|\s+)))(["']?[^\s;&|`'"]*["']?)(?=[\s;&|`]|$)/gi;
+/** The bot home in a path word, with what follows it (`rest` is empty or starts with `/`). */
+const BOT_HOME_WORD = /^(.*?)(?:\.ompbot|\$\{?OMPBOT_HOME\}?)((?:\/.*)?)$/is;
+
+/**
+ * Where a cd target word that names the bot home leads, as a path from it (`home`, `home/secrets`), once its `.`, `..`
+ * and `//` are folded: `~/.ompbot/logs/..` and `~/.ompbot/../.ompbot` are `home`, `~/.ompbot/secrets` is
+ * `home/secrets`. A word that does not name the bot home, or climbs out of it (`~/.ompbot/..`), is undefined.
+ */
+function botHomePath(word: string): string | undefined {
+	const parts = BOT_HOME_WORD.exec(posix.normalize(word.replace(/^["']|["']$/g, "")));
+	if (parts === null) return undefined;
+	return posix.normalize(`home${parts[2]}`).replace(/\/$/, "");
+}
 /** A path under the bot home with a `..` in it (`~/.ompbot/logs/../secrets`): the rest after the bot home. */
 const BOT_HOME_CLIMB = /(?:\.ompbot|\$\{?OMPBOT_HOME\}?)((?:\/[^\s/;&|`'"]*)*\/\.\.(?:\/[^\s/;&|`'"]*)*)/gi;
 
@@ -369,13 +392,246 @@ function entersBotHome(line: string): Hit[] {
 	if (secrets.length === 0) return [];
 	const hits: Hit[] = [];
 	let next = 0;
-	for (const cd of line.matchAll(CD_BOT_HOME)) {
+	for (const cd of line.matchAll(CD_TARGET)) {
+		if (botHomePath(cd[1] ?? "") !== "home") continue;
 		while (next < secrets.length && (secrets[next] as readonly [number, number])[0] < cd.index + cd[0].length) next++;
 		const after = secrets[next];
 		if (after === undefined) break;
 		if (hits.at(-1)?.end === after[1]) hits.pop();
 		hits.push({ rule: "secret_path", start: cd.index, end: after[1] });
 	}
+	return hits;
+}
+
+/** Shell brace alternatives of a word, expanded (`{a,b}c` → `ac`, `bc`), without nesting and at most 64 of them. */
+function braceAlternatives(word: string): string[] {
+	let words = [word];
+	for (let round = 0; round < 3; round++) {
+		const next: string[] = [];
+		for (const w of words) {
+			const brace = /\{([^{}]*)\}/.exec(w);
+			if (brace === null) next.push(w);
+			else
+				for (const alt of brace[1]?.split(",") ?? [])
+					next.push(`${w.slice(0, brace.index)}${alt}${w.slice(brace.index + brace[0].length)}`);
+		}
+		words = next.slice(0, 64);
+	}
+	return words;
+}
+
+/** A shell glob word as a regex matching the whole word: `*`, `?` and `[…]` are the globs, the rest is literal. */
+function globRegExp(glob: string): RegExp {
+	let source = "";
+	for (let i = 0; i < glob.length; i++) {
+		const ch = glob.charAt(i);
+		const close = ch === "[" ? glob.indexOf("]", i + 2) : -1;
+		if (ch === "*") source += ".*";
+		else if (ch === "?") source += ".";
+		else if (close > 0) {
+			source += `[${glob
+				.slice(i + 1, close)
+				.replace(/^!/, "^")
+				.replace(/[\\\]]/g, "\\$&")}]`;
+			i = close;
+		} else source += escapeRegExp(ch);
+	}
+	return new RegExp(`^${source}$`, "i");
+}
+
+/** Whether a glob word can expand to `secrets`; one that is no valid pattern (`[z-a]`) is assumed to. */
+function globMaySpellSecrets(glob: string): boolean {
+	try {
+		return globRegExp(glob).test("secrets");
+	} catch {
+		return true;
+	}
+}
+
+const BOT_HOME_CHILD = /(?:\.ompbot|\$\{?OMPBOT_HOME\}?)\/(?:\.?\/)*([^\s/;&|`'"]+)/gi;
+
+/**
+ * `secret_path` spelled with a glob or brace right under the bot home (`~/.ompbot/sec*`, `~/.ompbot/{secrets,logs}`):
+ * a hit when that path word can expand to `secrets`; `~/.ompbot/logs/*` cannot.
+ */
+function globsIntoSecrets(line: string): Hit[] {
+	const hits: Hit[] = [];
+	for (const match of line.matchAll(BOT_HOME_CHILD)) {
+		const piece = match[1] ?? "";
+		if (!/[*?[{]/.test(piece)) continue;
+		if (braceAlternatives(piece).some(globMaySpellSecrets))
+			hits.push({ rule: "secret_path", start: match.index, end: match.index + match[0].length });
+	}
+	return hits;
+}
+
+/** Where a command starts: the line head (past a list or prompt mark) or after `;`, `&`, `|`, `(`, `$(`, backtick, `then`, `do`. */
+const COMMAND_START = "(?:^\\s*(?:[-*]\\s+|\\$\\s+)?|[;&|(`]\\s*|\\$\\(\\s*|\\b(?:then|do)\\s+)";
+/** Wrappers a command may hide behind: `sudo`, `doas`, `nohup`, `exec`, `env VAR=x`, `timeout N`. */
+const COMMAND_WRAPPERS =
+	"(?:(?:(?:sudo|doas)(?:\\s+-\\S+)*|nohup|exec|env(?:\\s+[A-Za-z_]\\w*=\\S*)*|timeout(?:\\s+-\\S+)*\\s+\\d\\S*)\\s+)*";
+/** After a power word: the line or command ends, or an option, `now`, `+N` or `HH:MM` follows — not more prose. */
+const POWER_ARGS = "(?=\\s*$|\\s*[;&|)`]|\\s+(?:-{1,2}\\w|now\\b|\\+\\d|\\d{1,2}:\\d{2}))";
+const POWER_COMMAND = new RegExp(
+	`${COMMAND_START}${COMMAND_WRAPPERS}(reboot|poweroff|halt|shutdown)${POWER_ARGS}`,
+	"gi",
+);
+
+/** `service_control` through a power command (`sudo reboot`, `shutdown -h now`) in command position, not in prose. */
+function powerCommands(line: string): Hit[] {
+	return Array.from(line.matchAll(POWER_COMMAND), (m) => {
+		const end = m.index + m[0].length;
+		return { rule: "service_control", start: end - (m[1] ?? "").length, end };
+	});
+}
+
+/** A cd that changes where the following lines run, with its target word (empty for `cd` alone). */
+interface CdEvent {
+	at: number;
+	end: number;
+	popd: boolean;
+	target: string;
+}
+
+const CD_COMMAND = new RegExp(
+	`${COMMAND_START}(cd|pushd|popd)(?=\\s|[;&|]|$)((?:\\s+(?:-[A-Za-z@]+|--))*)[ \\t]*(["']?[^\\s;&|\`'"]*["']?)`,
+	"gi",
+);
+
+/** Not the bot home: a shell outside it, or not known to be inside. */
+type Cwd = string | null;
+
+/** The label of a line stating a rule (`` `rule`: … ``): what follows it may quote commands, in backticks, or run one. */
+const RULE_DEFINITION = /^\s*[-*]?\s*`[a-z_]+`\s*:/;
+
+/**
+ * The top-level `cd` / `pushd` / `popd` of a line in order: not those in parentheses, `$( )` or backticks (a subshell
+ * or a quotation), and not `env -C` (it moves one command). A rule line's label is blanked, so a `cd` right after it
+ * is a command in command position and one inside backticks is only quoted.
+ */
+function cdEvents(source: string): CdEvent[] {
+	const label = RULE_DEFINITION.exec(source)?.[0] ?? "";
+	const line = " ".repeat(label.length) + source.slice(label.length);
+	const { groups } = parenGroups(line);
+	const events: CdEvent[] = [];
+	for (const m of line.matchAll(CD_COMMAND)) {
+		const at = m.index + m[0].search(/(?:cd|pushd|popd)/i);
+		if (groups.some((g) => g.open < at && at <= g.close)) continue;
+		if ((line.slice(0, at).match(/`/g)?.length ?? 0) % 2 === 1) continue;
+		const target = (m[3] ?? "").replace(/^["']|["']$/g, "");
+		events.push({ at, end: m.index + m[0].length, popd: (m[1] ?? "").toLowerCase() === "popd", target });
+	}
+	return events;
+}
+
+/**
+ * Where the shell is after a cd: a path from the bot home (`home`, `home/secrets`), or null once it is outside or not
+ * known. `cd` with no target, `cd -` and `popd` leave it; a bot home path word is the path it names; a relative word
+ * is followed from where the shell is (`cd secrets` inside the home stays inside, `cd ..` from it leaves).
+ */
+function afterCd(cwd: Cwd, event: CdEvent): Cwd {
+	const { target } = event;
+	if (event.popd || target === "" || target === "-") return null;
+	const named = botHomePath(target);
+	if (named !== undefined) return named;
+	if (cwd === null || /^[/~$]/.test(target)) return null;
+	const next = posix.normalize(`${cwd}/${target}`).replace(/\/$/, "");
+	return /^home(?:\/|$)/.test(next) ? next : null;
+}
+
+/** An opening or closing code fence line: its marker and info string. */
+const FENCE = /^\s*(```+|~~~+)\s*([^\s`]*)/;
+/** Fence info strings of a shell block: its commands run in the shell the earlier lines left. */
+const SHELL_FENCE = /^(?:|sh|bash|shell|zsh|console)$/i;
+
+/**
+ * For each line of a brief where the shell is when that line starts (`afterCd`'s state). A shell block's fences keep
+ * the state; a block of another language (`diff`, `json`, …) clears it and its lines change nothing.
+ */
+function botHomeStates(lines: readonly string[]): Cwd[] {
+	const states: Cwd[] = [];
+	let cwd: Cwd = null;
+	let fence: { marker: string; shell: boolean } | undefined;
+	for (const line of lines) {
+		states.push(cwd);
+		const fenced = FENCE.exec(line);
+		if (fence === undefined && fenced !== null) {
+			fence = { marker: (fenced[1] ?? "").charAt(0), shell: SHELL_FENCE.test(fenced[2] ?? "") };
+			if (!fence.shell) cwd = null;
+		} else if (fence !== undefined && fenced !== null && fenced[1]?.charAt(0) === fence.marker && fenced[2] === "") {
+			fence = undefined;
+		} else if (fence?.shell !== false) {
+			for (const event of cdEvents(line)) cwd = afterCd(cwd, event);
+		}
+	}
+	return states;
+}
+
+const COMMAND_WITH_FILE_ARGS =
+	"cat|ls|rm|cp|mv|less|more|head|tail|tar|zip|rsync|scp|grep|rg|find|chmod|chown|source|bat|xxd|od|strings|sed|awk|vi|vim|nano|stat|du|wc|file|ln|install|shred|base64|jq";
+/** A `secrets` path word as a command's argument, `secrets/…`, or `./secrets`: what makes a bare `secrets` an order. */
+const HOME_RELATIVE_SECRETS = new RegExp(
+	`(?<![\\w.$/-])secrets\\/|(?<![\\w.$/-])\\.\\/secrets(?![\\w.-])|${COMMAND_START}${COMMAND_WRAPPERS}(?:${COMMAND_WITH_FILE_ARGS})\\b[^;&|\`\\n]*?(?<![\\w.$/-])secrets(?=[\\s;&|\`'"]|$)`,
+	"gi",
+);
+/** Whether a hit lies within a top-level `cd`'s own words: going into `secrets` reads nothing, what runs there does. */
+function inCdTarget(events: readonly CdEvent[], hit: Hit): boolean {
+	return events.some((event) => event.at <= hit.start && hit.end <= event.end);
+}
+/** A file command and its arguments up to the end of the command. */
+const FILE_COMMAND = new RegExp(
+	`${COMMAND_START}${COMMAND_WRAPPERS}(?:${COMMAND_WITH_FILE_ARGS})\\b([^;&|\`\\n]*)`,
+	"gi",
+);
+
+/** `secret_path` in a stretch of a line that runs in the bot home itself: only a path-shaped `secrets` counts. */
+function secretsFromHome(text: string): Hit[] {
+	return Array.from(text.matchAll(HOME_RELATIVE_SECRETS), (m) => {
+		const secrets = m[0].toLowerCase().lastIndexOf("secrets");
+		return { rule: "secret_path", start: m.index, end: m.index + secrets + "secrets".length };
+	});
+}
+
+/**
+ * `secret_path` in a stretch that runs in a directory below the bot home: a file command with a relative, non-option
+ * argument that lands in `secrets` (`cat slack.json` inside `secrets`, `cat ../secrets/x` inside `logs`).
+ */
+function secretsFromSubdir(text: string, cwd: string): Hit[] {
+	const hits: Hit[] = [];
+	for (const m of text.matchAll(FILE_COMMAND)) {
+		const reaches = (m[1] ?? "")
+			.split(/\s+/)
+			.map((word) => word.replace(/^["']|["']$/g, ""))
+			.some(
+				(word) =>
+					word !== "" &&
+					!/^[-/~$]/.test(word) &&
+					/^home\/secrets(?:\/|$)/i.test(posix.normalize(`${cwd}/${word}`).replace(/\/$/, "")),
+			);
+		if (reaches) hits.push({ rule: "secret_path", start: m.index, end: m.index + m[0].length });
+	}
+	return hits;
+}
+
+/**
+ * `secret_path` for a line that runs below the bot home because an earlier line `cd`-ed there: it is read in the
+ * stretches between the line's own cds, each in the directory the shell is in then.
+ */
+function homeRelativeSecrets(line: string, start: Cwd): Hit[] {
+	const hits: Hit[] = [];
+	let cwd = start;
+	let from = 0;
+	const scan = (to: number) => {
+		if (cwd === null) return;
+		const found = cwd === "home" ? secretsFromHome(line.slice(from, to)) : secretsFromSubdir(line.slice(from, to), cwd);
+		for (const hit of found) hits.push({ ...hit, start: hit.start + from, end: hit.end + from });
+	};
+	for (const event of cdEvents(line)) {
+		scan(event.at);
+		cwd = afterCd(cwd, event);
+		from = event.end;
+	}
+	scan(line.length);
 	return hits;
 }
 
@@ -797,7 +1053,7 @@ export function expandGitAliases(text: string): string {
  * markdown rendered before the shell reading. A rule keeps the more severe finding, its excerpt cut from the line as
  * written.
  */
-function scanLine(text: string, line: number, branches: readonly string[]): HandoffFinding[] {
+function scanLine(text: string, line: number, branches: readonly string[], cwd: Cwd): HandoffFinding[] {
 	const written: Spelling = { text };
 	// Each spelling only when the line has what it changes; most lines are scanned once.
 	const aliased = /alias\./i.test(text) ? edited(written, gitAliasEdits(text)) : written;
@@ -811,7 +1067,7 @@ function scanLine(text: string, line: number, branches: readonly string[]): Hand
 	for (const spelling of [written, shellRead(written), shellRead(rendered)]) {
 		if (scanned.has(spelling.text)) continue;
 		scanned.add(spelling.text);
-		for (const finding of scanSpelling(spelling, line, branches, text)) {
+		for (const finding of scanSpelling(spelling, line, branches, text, cwd)) {
 			const index = findings.findIndex((found) => found.rule === finding.rule);
 			const found = findings[index];
 			if (found === undefined) findings.push(finding);
@@ -845,6 +1101,7 @@ function scanSpelling(
 	line: number,
 	branches: readonly string[],
 	written: string,
+	cwd: Cwd,
 ): HandoffFinding[] {
 	const { text } = spelling;
 	// The rules run on the text with git global options blanked (same indices) and, for a command inside an option's
@@ -858,12 +1115,15 @@ function scanSpelling(
 			}
 		}
 	}
+	const cds = cdEvents(text);
 	const hits: Hit[] = [
-		...found.values(),
+		...[...found.values()].filter((hit) => !(hit.rule === "secret_path" && inCdTarget(cds, hit))),
 		...pushesProtected(blanked, branches),
 		...removesAbsoluteTree(text),
 		...entersBotHome(text),
-		...climbsIntoSecrets(text),
+		...[...climbsIntoSecrets(text), ...globsIntoSecrets(text)].filter((hit) => !inCdTarget(cds, hit)),
+		...powerCommands(text),
+		...homeRelativeSecrets(text, cwd),
 	];
 	/** Where each advisory-only rule found matches first. */
 	const advisoryAt = new Map<string, number>();
@@ -937,11 +1197,13 @@ export function scanHandoffBrief(brief: string, options: { protectedBranches?: r
 	const findings: HandoffFinding[] = [];
 	// Every character Slack, editors and browsers break a line at, numbered in order (CRLF is one break).
 	const lines = head.split(/\r\n|[\n\r\v\f\u0085\u2028\u2029]/);
+	const inBotHome = botHomeStates(lines);
 	for (let first = 0; first < lines.length; ) {
 		let last = first;
 		while (last + 1 < lines.length && CONTINUED.test(lines[last] ?? "")) last++;
 		const own: HandoffFinding[] = [];
-		for (let index = first; index <= last; index++) own.push(...scanLine(lines[index] ?? "", index + 1, branches));
+		for (let index = first; index <= last; index++)
+			own.push(...scanLine(lines[index] ?? "", index + 1, branches, inBotHome[index] ?? null));
 		findings.push(...own);
 		if (last > first) {
 			const parts = lines
@@ -949,7 +1211,7 @@ export function scanHandoffBrief(brief: string, options: { protectedBranches?: r
 				.map((text, offset) => (first + offset < last ? text.replace(CONTINUED, "") : text));
 			// Joined with a blank (a break between words) and without one (the shell's reading of a break inside a word).
 			for (const joined of [parts.join(" "), parts.join("")]) {
-				for (const finding of scanLine(joined, first + 1, branches)) {
+				for (const finding of scanLine(joined, first + 1, branches, inBotHome[first] ?? null)) {
 					const seen = own.some(
 						(found) => found.rule === finding.rule && SEVERITY_RANK[found.severity] >= SEVERITY_RANK[finding.severity],
 					);

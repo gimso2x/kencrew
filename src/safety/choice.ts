@@ -1,3 +1,4 @@
+import { cutCodePointSafe } from "../channel/text";
 import type { OmpAskQuestion, OmpDialogRequest, OmpDialogResponse } from "../omp/driver";
 import type { ApprovalBroker, ApprovalOrigin, ChoiceCardHandle, ChoiceEvent } from "./approval";
 
@@ -11,6 +12,9 @@ export const MAX_CARD_BUTTONS = 25;
  */
 const DEADLINE_LEAD_MS = 1_000;
 const REPLY_HINT = "버튼을 누르거나 이 스레드에 답장해 주세요";
+const OPTION_ONLY_HINT = "↪ 번호나 선택지 이름으로 답해 주세요";
+/** omp's free-text row of a select (`askChoice`: "Other (type your own)"); picking it makes omp open an `input` next. */
+const OTHER_ROW_SUFFIX = " (type your own)";
 const YES = /^(예|네|응|ㅇㅇ|ㅇ|좋아|yes|y|ok|확인)$/i;
 
 const TIMEOUT_LINE = (fallback: string) => `⌛ 시간 초과: ${fallback}로 처리됨`;
@@ -62,17 +66,36 @@ async function answerSelect(
 	const text = asButtons
 		? `❓ ${request.title}\n${REPLY_HINT}`
 		: `❓ ${request.title}\n${numbered(options)}\n번호로 이 스레드에 답장해 주세요`;
+	// omp's own "other" row is its last row. Without one (a tool approval) or in a multi-select (omp marks its rows
+	// "checkbox"; a required one has no "Done" row to tell it by) a text naming no option is not an answer: the card
+	// refuses it and stays open. A blank text never picks "Other": omp would reopen its input loop on it.
+	const multi = request.selectionMarker === "checkbox";
+	const other = !multi && options.at(-1)?.endsWith(OTHER_ROW_SUFFIX) === true ? options.at(-1) : undefined;
 	const card = await broker.choose(
 		origin,
-		{ text, buttons: asButtons ? options : [], fallback: "취소", timeoutMs: deadlineOf(request) },
+		{
+			text,
+			buttons: asButtons ? options : [],
+			fallback: "취소",
+			timeoutMs: deadlineOf(request),
+			acceptsText: (reply: string) =>
+				other === undefined ? optionOf(options, reply) !== undefined : reply.trim() !== "",
+			rejectHint: OPTION_ONLY_HINT,
+		},
 		{ signal },
 	);
 	const result = await card.next();
 	if (result.kind === "timeout" || result.kind === "cancelled") return endUnanswered(card, result.kind, "취소");
-	// A reply naming an option picks it; any other reply text is the value itself.
 	const reply = result.kind === "text" ? result.text.trim() : "";
 	const index = result.kind === "choice" ? result.index : optionOf(options, reply);
-	const value = (index === undefined ? undefined : options[index]) ?? reply;
+	const picked = index === undefined ? undefined : options[index];
+	if (picked === undefined && other !== undefined) {
+		// Text outside the options: pick the "other" row, and answer the `input` omp opens next with the text itself.
+		broker.holdInput(origin.originKey, origin.opRef, reply);
+		await card.close(`✅ 선택: 기타 — ${cutCodePointSafe(reply.replace(/\s+/g, " "), 40)}`, other);
+		return { value: other };
+	}
+	const value = picked ?? reply;
 	await card.close(`✅ 선택: ${value}`, value);
 	return { value };
 }
@@ -314,6 +337,13 @@ export function answerDialogOnSlack(
 	request: OmpDialogRequest,
 	signal: AbortSignal,
 ): Promise<OmpDialogResponse> {
+	// A text held behind an "Other" row answers the very next plain `input`, and nothing else.
+	const held =
+		request.method === "input" && request.secret !== true
+			? broker.takeInput(origin.originKey, origin.opRef)
+			: undefined;
+	if (held !== undefined) return Promise.resolve({ value: held });
+	broker.dropInput(origin.originKey, `next_dialog_${request.method}`);
 	switch (request.method) {
 		case "select":
 			return answerSelect(broker, origin, request, signal);

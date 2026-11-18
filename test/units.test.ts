@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { renderUnit } from "../src/cli/units";
 import { runCliCapture } from "./helpers/daemon-process";
+import { isRoot } from "./helpers/privileges";
 
 const REPO = resolve(import.meta.dir, "..");
 const MAIN = join(REPO, "src", "main.ts");
@@ -323,7 +324,8 @@ describe("qa-l low units (#7 #8 #9)", () => {
 		expect(err).toContain("checkout path");
 	});
 
-	test("#9: an --out that cannot be written is a usage error naming the errno", async () => {
+	test.skipIf(isRoot)("#9: an --out that cannot be written is a usage error naming the errno", async () => {
+		// root writes into a 0o500 dir, so EACCES cannot be provoked
 		const home = tempDir("ompbot-units-home-");
 		const out = join(home, "ro");
 		mkdirSync(out);

@@ -131,7 +131,7 @@ loginctl enable-linger "$USER"   # (선택) 로그아웃·재부팅 뒤에도 �
 
 ```mermaid
 flowchart LR
-  subgraph Chat["Slack · Discord(하나 이상)"]
+  subgraph Chat["Slack · Discord · Teams(하나 이상)"]
     O["👤 오너<br/>DM · 채널 · 스레드"]
   end
   subgraph Host["내 서버 · systemd user"]
@@ -163,9 +163,12 @@ flowchart LR
 
 아래는 설정 한 줄로 켜는 선택 기능입니다. 자세한 조건과 예시는 사용 설명서에 있습니다.
 
-- **[`[TASK]`·작업 레인 자동 머지](docs/guide.md#task-자동-머지)** — `taskAutoLand`: 개인 저장소의 `[TASK]`·작업 레인이 재실행 검사(`[check: …]`)까지 통과하면 봇이 직접 ff 머지·push·정리. 서비스 반영은 여전히 승인
+- **[`[TASK]`·작업 레인 자동 머지](docs/guide.md#task-자동-머지)** — `taskAutoLand`: 개인 저장소의 `[TASK]`·작업 레인이 재실행 검사(`[check: …]`)까지 통과하면 봇이 직접 ff 머지·push·정리. `review.confident` 밴드(예: L3)의 로컬 `[TASK]`는 레인과 같은 독립 리뷰 CLEAR(확신도 기준 이상) → 실행 QA(뚱기) PASS 뒤에만 머지. 서비스 반영은 여전히 승인
+  - 로컬 `[TASK]`(자동 머지와 Outcome 카드 `머지` 버튼)는 코어가 모델 없이 착지합니다: 기준 브랜치가 앞서 있으면 task worktree에서 rebase하고 outcome.md·PROGRESS.md의 옛 증거 해시를 patch-id로 짝지어 바꾼 커밋을 더한 뒤, 그 끝을 SHA로 고정해 다시 판정(재실행 검사·무결성)하고 레인과 같은 lander로 ff 머지·push·worktree/브랜치·herdr 워크스페이스 정리·`done`(기록 actor `core-land`)까지 합니다. push가 거부되면 머지·`done`은 그대로 두고 "손으로 push" 경고 카드만 올립니다.
+  - 판단이 필요한 경우만 지금처럼 스레드에 "머지해"를 넣어 모델 턴으로 넘깁니다(handoff): rebase 충돌, 짝 없는 증거 해시, rebase 뒤 변경 유실, worktree에 커밋 안 된 변경(추적 안 된 파일 포함), 비베어 원격일 수 있는 `origin`(로컬 경로·`host:path`인데 `.git`으로 끝나지 않음), 재판정 문제·무결성 경고·판정 오류, 검증 뒤 브랜치 이동. 원격 호스트 `[TASK]`는 언제나 모델 턴입니다. 착지 직전에 동결·멈춤·`autoland.hold`·상태 변화가 보이면 아무것도 넣지 않고 멈춥니다. 같은 `[TASK]`의 자동 머지·버튼은 한 번에 하나만 돌고(넘긴 "머지해" 턴이 끝날 때까지 포함), 그 사이 호출은 "이미 착지 중"으로 끝납니다.
 - **[턴 되돌리기(`!undo`)](docs/guide.md#턴-되돌리기undo)** — `turnSnapshot.repos`: 대화 턴마다 작업 트리를 스냅샷해 그 턴이 바꾼 파일만 승인 카드 뒤에 되돌림
 - **[워커 omp 인자](docs/guide.md#5-설정-파일-ompbotconfigjson)** — `workerOmpArgs`·`dispatchHosts.<h>.ompArgs`: herdr 워커 omp에만 `--prewalk` 같은 인자를 붙임
+- **agy 워커 시범** — `workerAgy: { model, args? }`: `taskSpec.worker: "agy"`인 로컬 L0·L1 `[TASK]`를 herdr `--kind agy`(Antigravity CLI)로 띄움(동시 1개, 품질 미검증). 세션 한정 `--settings`로 그 워크트리만 신뢰하고 `git push`·`git reset --hard`·`git clean`·`systemctl`·`ompbot`·`bun src/main.ts`·`rm -rf /` 명령과 secrets 디렉터리 `read_file`을 거부, 첫 프롬프트 앞에 워커용 안전 안내를 붙임. 조건 밖이면 omp 등급 워커로 뜨고 답에 이유 한 줄. 화면에 `RESOURCE_EXHAUSTED`·`quota`·`rate limit`이 보이면 그 TASK를 blocked로 두고 `agy 한도` 카드를 한 번 올린 뒤 독촉을 멈춤(재개하면 풀림)
 - **[비용 상한](docs/guide.md#5-설정-파일-ompbotconfigjson)** — `costCap`: 턴·하루 상한, `!budget`으로 확인
 - **[Teams 채널](docs/guide.md#teams선택)** — `channels.teams`: Microsoft Teams 1:1·그룹 채팅(멘션)에서 대화, 동료(손님)에게는 웹 검색만 쓰는 읽기 전용 답변(`guestAadObjectIds`)
 - **[Teams 채팅 읽기](docs/guide.md#teams-채팅-읽기선택-graph)** — `channels.teams.graph` + `ompbot teams login`: 오너 Teams 1:1에서 오너의 채팅 목록·메시지를 Graph 위임 `Chat.Read`로 읽음

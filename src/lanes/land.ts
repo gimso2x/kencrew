@@ -1,8 +1,8 @@
 import { existsSync } from "node:fs";
-import { TASK_RISKS } from "../tasks/docs";
+import { TASK_RISKS, type TaskRisk } from "../tasks/docs";
 import { type AutoLandPolicy, checkBlockers, type LaneReviewConfident } from "../tasks/notify";
 import { formatConfidence } from "./review";
-import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneRow } from "./status";
+import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneQa, type LaneReview, type LaneRow } from "./status";
 import { defaultGit, type GitResult, type GitRunner, gitRunner, hiddenChanges } from "./verify";
 import { DEFAULT_LANE_RISK } from "./worktree";
 
@@ -18,14 +18,15 @@ const PUSH_TIMEOUT_MS = 120_000;
 const REASON_MAX = 300;
 const DIRTY_SHOWN = 5;
 
+/** One landing: a closed work lane's, or a reached local [TASK]'s (`landTask`). */
 export interface LandRequest {
-	/** Top level of the repository the lane started from. */
+	/** The repository the lane or task started from (any of its worktrees). */
 	repo: string;
 	baseBranch: string;
-	/** `lane/<laneId>`. */
+	/** `lane/<laneId>` or `task/<taskId>`. */
 	branch: string;
 	worktree: string;
-	/** The verified claim commit: the base branch ends exactly there. */
+	/** The verified commit (a lane's claim, a task's re-judged tip): the base branch ends exactly there. */
 	sha: string;
 	/** Whether this landing may push `origin/<baseBranch>` (an owner request always; an auto-merge inside `repos`). */
 	push: boolean;
@@ -253,7 +254,7 @@ export async function landLane(request: LandRequest, deps: LanderDeps, hooks: La
 
 export interface CoreRebaseRequest {
 	worktree: string;
-	/** `lane/<laneId>`: the branch the worktree must have checked out. */
+	/** `lane/<laneId>` or `task/<taskId>`: the branch the worktree must have checked out. */
 	branch: string;
 	baseBranch: string;
 }
@@ -416,7 +417,10 @@ export async function externallyLanded(
 	return { sha, pushed: tracked && (await landedIn(origin)) };
 }
 
-/** `landLane` with the landings of one repository run one after the other (two lanes never race for a base branch). */
+/**
+ * `landLane` with the landings of one repository run one after the other: two lanes, or a lane and a [TASK] sharing
+ * the daemon's one lander, never race for a base branch.
+ */
 export function createLaneLander(deps: LanderDeps): LandLane {
 	const tails = new Map<string, Promise<void>>();
 	return (request, hooks) => {
@@ -446,11 +450,14 @@ export const QA_MISSING = "실행 QA 없음";
 export const QA_FAIL = "실행 QA FAIL";
 export const QA_INCONCLUSIVE = "실행 QA 확인 불가";
 
-/** Whether `taskAutoLand.qa` is set and the lane's risk (`DEFAULT_LANE_RISK` without one) is at its `minRisk` or above. */
-export function laneQaRisk(lane: LaneRow, policy: AutoLandPolicy): boolean {
+/**
+ * Whether `taskAutoLand.qa` is set and `risk` (a lane's `DEFAULT_LANE_RISK` without one, a task's own) is at its
+ * `minRisk` or above.
+ */
+export function laneQaRisk(risk: TaskRisk, policy: AutoLandPolicy): boolean {
 	const qa = policy.qa;
 	if (qa === undefined) return false;
-	return TASK_RISKS.indexOf(lane.meta.risk ?? DEFAULT_LANE_RISK) >= TASK_RISKS.indexOf(qa.minRisk);
+	return TASK_RISKS.indexOf(risk) >= TASK_RISKS.indexOf(qa.minRisk);
 }
 
 /**
@@ -458,14 +465,44 @@ export function laneQaRisk(lane: LaneRow, policy: AutoLandPolicy): boolean {
  * without one) above `policy.maxRisk` and at most `confident.maxRisk`. Such a lane is reviewed, and merges unasked on
  * a `CLEAR` receipt of at least `minConfidence`.
  */
-export function confidentBand(lane: LaneRow, policy: AutoLandPolicy): LaneReviewConfident | undefined {
+export function confidentBand(risk: TaskRisk | undefined, policy: AutoLandPolicy): LaneReviewConfident | undefined {
 	const confident = policy.review?.confident;
-	const risk = lane.meta.risk;
 	if (confident === undefined || risk === undefined) return undefined;
 	const rank = TASK_RISKS.indexOf(risk);
 	return rank > TASK_RISKS.indexOf(policy.maxRisk) && rank <= TASK_RISKS.indexOf(confident.maxRisk)
 		? confident
 		: undefined;
+}
+
+/**
+ * The review and QA reasons of a reviewable change at `sha` (a lane's claim, a task's tip): with `policy.review` only
+ * a `CLEAR` receipt for `sha` lets it through, and in the `confidentBand` of `risk` only one of at least
+ * `minConfidence`; with `policy.qa` and `risk` at its `minRisk` or above it needs a `PASS` receipt for `sha` too.
+ */
+export function receiptBlockers(
+	receipts: { review?: LaneReview | undefined; qa?: LaneQa | undefined },
+	sha: string | undefined,
+	risk: TaskRisk,
+	policy: AutoLandPolicy,
+): string[] {
+	const blockers: string[] = [];
+	const band = confidentBand(risk, policy);
+	if (policy.review !== undefined) {
+		const { review } = receipts;
+		if (review === undefined || review.sha !== sha) blockers.push(REVIEW_MISSING);
+		else if (review.verdict === "BLOCK") blockers.push(REVIEW_BLOCK);
+		else if (review.verdict === "inconclusive") blockers.push(`${REVIEW_INCONCLUSIVE}(${review.reason ?? "?"})`);
+		else if (band !== undefined && !(review.confidence !== undefined && review.confidence >= band.minConfidence)) {
+			blockers.push(reviewUnsure(review.confidence, band.minConfidence, risk));
+		}
+	}
+	if (laneQaRisk(risk, policy)) {
+		const { qa } = receipts;
+		if (qa === undefined || qa.sha !== sha) blockers.push(QA_MISSING);
+		else if (qa.verdict === "FAIL") blockers.push(QA_FAIL);
+		else if (qa.verdict === "inconclusive") blockers.push(`${QA_INCONCLUSIVE}(${qa.reason ?? "?"})`);
+	}
+	return blockers;
 }
 
 /**
@@ -489,7 +526,7 @@ export function laneLandBlockers(
 	const blockers: string[] = [];
 	if (!repoMatched) blockers.push("저장소가 taskAutoLand.repos 밖");
 	const risk = lane.meta.risk ?? DEFAULT_LANE_RISK;
-	const band = confidentBand(lane, policy);
+	const band = confidentBand(lane.meta.risk, policy);
 	// Above `maxRisk` and outside the confident band: the risk alone holds it, and no review is expected.
 	const unreviewable = band === undefined && TASK_RISKS.indexOf(risk) > TASK_RISKS.indexOf(policy.maxRisk);
 	if (unreviewable) blockers.push(`위험 ${risk} > ${policy.maxRisk}`);
@@ -508,20 +545,9 @@ export function laneLandBlockers(
 	}
 	const blocking = (leftovers ?? []).filter((item) => item.blocking).length;
 	if (blocking > 0) blockers.push(`막는 남은 일 ${blocking}개`);
-	if (policy.review !== undefined && !unreviewable) {
-		const review = lane.meta.review;
-		if (review === undefined || review.sha !== lane.meta.sha) blockers.push(REVIEW_MISSING);
-		else if (review.verdict === "BLOCK") blockers.push(REVIEW_BLOCK);
-		else if (review.verdict === "inconclusive") blockers.push(`${REVIEW_INCONCLUSIVE}(${review.reason ?? "?"})`);
-		else if (band !== undefined && !(review.confidence !== undefined && review.confidence >= band.minConfidence)) {
-			blockers.push(reviewUnsure(review.confidence, band.minConfidence, risk));
-		}
-	}
-	if (!unreviewable && laneQaRisk(lane, policy)) {
-		const qa = lane.meta.qa;
-		if (qa === undefined || qa.sha !== lane.meta.sha) blockers.push(QA_MISSING);
-		else if (qa.verdict === "FAIL") blockers.push(QA_FAIL);
-		else if (qa.verdict === "inconclusive") blockers.push(`${QA_INCONCLUSIVE}(${qa.reason ?? "?"})`);
+	if (!unreviewable) {
+		const receipts = { review: lane.meta.review, qa: lane.meta.qa };
+		blockers.push(...receiptBlockers(receipts, lane.meta.sha, risk, policy));
 	}
 	if (frozen) blockers.push("동결 중");
 	return blockers;

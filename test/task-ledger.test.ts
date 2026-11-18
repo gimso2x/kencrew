@@ -148,6 +148,61 @@ describe("TaskLedger", () => {
 		expect(ledger.history("T-20261001-01").map((h) => [h.fromStatus, h.toStatus])).toEqual([["review", "working"]]);
 	});
 
+	test("AC-5: core-land closes review → done only; other moves and other non-human done are refused", () => {
+		const ledger = ledgerAt({ ms: Date.parse("2026-11-16T00:00:00Z") });
+		const working = ledger.register(base);
+		expect(() => ledger.transition(working.taskId, "done", "core-land")).toThrow(TaskTransitionError);
+		expect(() => ledger.transition(working.taskId, "review", "core-land")).toThrow(TaskTransitionError);
+		ledger.transition(working.taskId, "review", "bot");
+		expect(() => ledger.transition(working.taskId, "cancelled", "core-land")).toThrow(TaskTransitionError);
+		expect(() => ledger.transition(working.taskId, "working", "core-land")).toThrow(TaskTransitionError);
+		expect(() => ledger.transition(working.taskId, "done", "bot")).toThrow(TaskTransitionError);
+		expect(ledger.require(working.taskId).status).toBe("review");
+		const done = ledger.transition(working.taskId, "done", "core-land", "core land");
+		expect(done.status).toBe("done");
+		expect(done.closedAt).not.toBeNull();
+		expect(ledger.history(working.taskId).at(-1)).toMatchObject({
+			fromStatus: "review",
+			toStatus: "done",
+			actor: "core-land",
+		});
+		expect(() => ledger.transition(working.taskId, "cancelled", "human")).toThrow(TaskTransitionError);
+	});
+
+	test("AC-5: a ledger with the old actor CHECK keeps its history rows and takes core-land after migration", () => {
+		const db = new Database(":memory:", { strict: true });
+		db.run("PRAGMA foreign_keys = ON");
+		db.run(TASK_SCHEMA.replace("'bot','human','core-land'", "'bot','human'"));
+		db.run(
+			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
+				acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', 'C1:1.1', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`,
+		);
+		db.run(
+			`INSERT INTO task_transitions (task_id, from_status, to_status, actor, reason, at) VALUES
+				('T-20261001-01', NULL, 'working', 'bot', 'registered', 5), ('T-20261001-01', 'working', 'review', 'bot', 'reached', 6)`,
+		);
+		expect(() =>
+			db.run(
+				"INSERT INTO task_transitions (task_id, from_status, to_status, actor, reason, at) VALUES ('T-20261001-01', 'review', 'done', 'core-land', 'x', 7)",
+			),
+		).toThrow();
+		const before = db.query("SELECT * FROM task_transitions ORDER BY transition_id").all();
+		const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => 8 } });
+		expect(db.query("SELECT * FROM task_transitions ORDER BY transition_id").all()).toEqual(before);
+		ledger.transition("T-20261001-01", "done", "core-land", "core land");
+		expect(ledger.history("T-20261001-01").map((h) => [h.transitionId, h.toStatus, h.actor])).toEqual([
+			[1, "working", "bot"],
+			[2, "review", "bot"],
+			[3, "done", "core-land"],
+		]);
+		// Idempotent: the migrated table is left as it is.
+		migrateTaskSchema(db);
+		expect(ledger.history("T-20261001-01")).toHaveLength(3);
+		expect(db.query("SELECT name FROM sqlite_master WHERE name = 'task_transitions_task'").get()).toEqual({
+			name: "task_transitions_task",
+		});
+	});
+
 	test("worker tier: register keeps model, tier and reason; a row without one reads three nulls", () => {
 		const ledger = ledgerAt({ ms: Date.parse("2026-11-15T00:00:00Z") });
 		const tiered = ledger.register({

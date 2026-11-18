@@ -1519,6 +1519,17 @@ describe("monitors: script runner", () => {
 		expect(result.stderr.endsWith("REASON-END")).toBe(true);
 	});
 
+	test("a head that ends exactly at a line end at the collect bound keeps the whole last line: the wake gate still reads", async () => {
+		// 4 MiB of output = 4_194_303 chars and the newline; the gate line is the next one, the first of the tail.
+		const script = writeScript(
+			"exact.sh",
+			"#!/bin/sh\nhead -c 4194303 /dev/zero | tr '\\0' A\necho\necho '{\"wakeAgent\": false}'\nexit 0\n",
+		);
+		const result = await runScript([script], { scriptsRoot: scriptsRoot(), cwd: dir });
+		expect(result).toMatchObject({ fired: true, wakeOff: true });
+		expect(result.stdout.endsWith('{"wakeAgent": false}')).toBe(true);
+	});
+
 	test("a background child holding the stderr pipe does not push the run to the timeout", async () => {
 		const script = writeScript("holder.sh", "#!/bin/sh\n( sleep 30 >&2 ) &\nsleep 0.2\nexit 0\n");
 		const started = Date.now();

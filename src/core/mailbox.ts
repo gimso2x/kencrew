@@ -1134,8 +1134,16 @@ export class OriginMailbox {
 		if (turn.costRecorded) return;
 		turn.costRecorded = true;
 		const { store, originKey, log, clock } = this.#deps;
+		// A ledger write that fails is logged: it never holds up the turn's answer or the next queued row.
+		const charge = (cost: number, calls: number): void => {
+			try {
+				store.addDailyUsage({ day: ledgerDay(clock.now(), this.#deps.timezone), originKey, cost, calls });
+			} catch (error) {
+				log.warn("usage_daily_failed", { origin: originKey, opRef: turn.opRef, cost, calls, error: String(error) });
+			}
+		};
 		if (usage !== undefined) {
-			store.addDailyUsage({ day: ledgerDay(clock.now(), this.#deps.timezone), originKey, cost: 0, calls: usage.calls });
+			charge(0, usage.calls);
 			log.info("agy_usage", {
 				origin: originKey,
 				opRef: turn.opRef,
@@ -1148,17 +1156,9 @@ export class OriginMailbox {
 			});
 			return;
 		}
-		const chargeLive = (): void => {
-			store.addDailyUsage({
-				day: ledgerDay(clock.now(), this.#deps.timezone),
-				originKey,
-				cost: turn.costUsd,
-				calls: 1,
-			});
-		};
 		if (wedged) {
 			log.info("usage_daily_live", { origin: originKey, opRef: turn.opRef, reason: "child_stopped" });
-			chargeLive();
+			charge(turn.costUsd, 1);
 			return;
 		}
 		let file: string | undefined;
@@ -1166,7 +1166,7 @@ export class OriginMailbox {
 			file = (await driver.state()).sessionFile;
 		} catch (error) {
 			log.warn("usage_daily_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
-			chargeLive();
+			charge(turn.costUsd, 1);
 			return;
 		}
 		if (file === undefined || file === "") return;
@@ -1186,7 +1186,7 @@ export class OriginMailbox {
 			cost = turn.costUsd;
 			calls = 1;
 		}
-		store.addDailyUsage({ day: ledgerDay(clock.now(), this.#deps.timezone), originKey, cost, calls });
+		charge(cost, calls);
 	}
 
 	/**
@@ -1287,6 +1287,11 @@ export class OriginMailbox {
 		log.warn("provider_limit_hit", { origin: originKey, attempt, error: redact(errorMessage).slice(0, 200) });
 		this.#deps.onProviderLimit?.({ originKey, threadRef: turn.threadRef, attempt, maxAttempts, errorMessage });
 		return true;
+	}
+
+	/** The running turn's opRef; undefined between turns. */
+	get turnOpRef(): string | undefined {
+		return this.#turn?.opRef;
 	}
 
 	/** What the running turn is writing now (dashboard `live` op); null without a turn or with nothing in flight. */
@@ -1794,10 +1799,12 @@ export class OriginMailbox {
 		if (turnUndo === undefined || parseChatOrigin(originKey) === undefined) return undefined;
 		const repos = turnUndo.repos();
 		if (repos.length === 0) return undefined;
+		// Stamped before the capture starts (doc/plans/turn-undo.md): a turn that ends while the capture runs still overlaps.
+		const startedAt = this.#deps.clock.now();
 		const captured = await captureTrees(repos, { run: turnUndo.run, log: this.#deps.log });
 		// Every repository failing still matters: `!undo` must say so instead of walking back to an older turn.
 		if (captured.trees.size === 0 && captured.failed.size === 0) return undefined;
-		return { startedAt: this.#deps.clock.now(), before: captured.trees, failed: captured.failed };
+		return { startedAt, before: captured.trees, failed: captured.failed };
 	}
 
 	/**

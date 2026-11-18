@@ -111,7 +111,15 @@ export interface OmpAskQuestion {
 
 /** A dialog omp asks the host to answer (`extension_ui_request` with an owner-answerable method). */
 export type OmpDialogRequest =
-	| { method: "select"; id: string; title: string; options: string[]; timeout?: number }
+	| {
+			method: "select";
+			id: string;
+			title: string;
+			options: string[];
+			timeout?: number;
+			/** omp's `selectionMarker`: "checkbox" is a multi-select (rows toggle), "radio" a single choice. */
+			selectionMarker?: string;
+	  }
 	| { method: "confirm"; id: string; title: string; message: string; timeout?: number }
 	| { method: "input"; id: string; title: string; placeholder?: string; timeout?: number; secret?: boolean }
 	| { method: "editor"; id: string; title: string; prefill?: string }

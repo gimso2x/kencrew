@@ -180,6 +180,7 @@ const ROOT_KEYS = new Set([
 	"costCap",
 	"herdr",
 	"workerOmpArgs",
+	"workerAgy",
 	"dispatchHosts",
 	"herdrBoard",
 	"taskAutoLand",
@@ -223,6 +224,10 @@ export interface DispatchHostConfig {
 	workDir?: string;
 	herdrBin?: string;
 	ompArgs?: string[];
+}
+
+export interface WorkerAgyConfig {
+	model: string;
 }
 
 export interface OmpbotConfig {
@@ -318,6 +323,11 @@ export interface OmpbotConfig {
 	 */
 	workerOmpArgs?: string[];
 	/**
+	 * The agy (Antigravity CLI) [TASK] worker trial (`taskSpec.worker: "agy"`, doc/plans/agy-task-worker.md): `model` is
+	 * the agy model id, `args` extra agy arguments after the bot's own. Absent → `worker: "agy"` runs on omp instead.
+	 */
+	workerAgy?: WorkerAgyConfig;
+	/**
 	 * Remote dispatch targets for `ompbot_dispatch host=…`: herdr runs on that host over ssh. Needs `herdr`.
 	 * `ompArgs`: extra arguments for that host's herdr worker omp, resolved by that host's omp settings.
 	 */
@@ -334,14 +344,16 @@ export interface OmpbotConfig {
 	 * at most `maxRisk` (default L2), and whose outcome stands on at least one passing re-run check without warnings
 	 * is merged without a question — a task gets "머지해" from the bot, a lane is landed by the core
 	 * (`src/lanes/land.ts`). Unset → every reached task and closed lane waits for the owner. Works without `herdr`
-	 * (lanes); the [TASK] sweep itself only runs with it. `review` (lanes only): before an auto-merge a fresh read-only
+	 * (lanes); the [TASK] sweep itself only runs with it. `review` (lanes, and [TASK]s in the `confident` band): before an auto-merge a fresh read-only
 	 * `omp -p --model <model>` reviews the claim commit's diff against the lane's spec, and only its `CLEAR` receipt
 	 * for that commit lets the lane merge unasked (`timeoutMs` default 600000, at most 1800000). Unset → no review.
 	 * `review.confident` (`{ maxRisk, minConfidence }`): a lane whose explicit risk is above `maxRisk` and at most
 	 * `confident.maxRisk` (which must be above `maxRisk`) is reviewed too, and merges unasked when its `CLEAR` receipt
-	 * carries a confidence of at least `minConfidence` (0 < x ≤ 1). A lane without a risk is never in that band.
+	 * carries a confidence of at least `minConfidence` (0 < x ≤ 1). A lane without a risk is never in that band. A local
+	 * [TASK] in that band gets the same review of its branch tip, then `qa`, then the core's landing
+	 * (src/tasks/gate.ts); a task at or below `maxRisk` is never reviewed.
 	 * Turn `review` on alone first and watch the confidences for two weeks, then add `confident`.
-	 * `qa` (lanes only, `{ minRisk, overlay, model, timeoutMs }`): a reviewed lane at `minRisk` (default L3) or above is
+	 * `qa` (`{ minRisk, overlay, model, timeoutMs }`): a reviewed lane or banded [TASK] at `minRisk` (default L3) or above is
 	 * also run once by `omp -p --model <model>` under the `overlay` omp yml (absolute, an existing file) in a detached
 	 * copy of its claim commit, and only that commit's `PASS` receipt lets it merge unasked (`timeoutMs` default
 	 * 600000, at most 1800000). Unset → no QA.
@@ -1108,6 +1120,16 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		}
 	}
 	const workerOmpArgs = optionalArgList(configPath, root, "workerOmpArgs");
+	let workerAgy: WorkerAgyConfig | undefined;
+	if (root.workerAgy !== undefined) {
+		const record = asRecord(root.workerAgy);
+		if (record === undefined) invalid(configPath, "workerAgy");
+		const model = record.model;
+		// The model goes to agy as one argument: no blank, no leading `-` that would read as an option.
+		if (typeof model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(model))
+			invalid(configPath, "workerAgy.model");
+		workerAgy = { model };
+	}
 
 	const offsiteRaw = root.offsite;
 	let offsite: OmpbotConfig["offsite"];
@@ -1541,6 +1563,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (herdr !== undefined) config.herdr = herdr;
 	if (dispatchHosts !== undefined) config.dispatchHosts = dispatchHosts as Record<string, DispatchHostConfig>;
 	if (workerOmpArgs !== undefined) config.workerOmpArgs = workerOmpArgs;
+	if (workerAgy !== undefined) config.workerAgy = workerAgy;
 
 	if (herdrBoard !== undefined) config.herdrBoard = herdrBoard as { url: string; api?: string };
 	if (taskAutoLand !== undefined) config.taskAutoLand = taskAutoLand;

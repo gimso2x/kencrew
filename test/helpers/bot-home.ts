@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OmpbotConfig } from "../../src/config";
-import type { CreateMessageArgs, EditMessageArgs } from "../../src/discord/transport";
+import type { CreateMessageArgs, DiscordHandlers, EditMessageArgs } from "../../src/discord/transport";
 import { type FakeDiscordCall, FakeDiscordTransport } from "./discord-fake-transport";
 import { type FakeCall, FakeSlackTransport } from "./slack-fake-transport";
 
@@ -153,6 +153,21 @@ export class WaitingDiscordTransport extends FakeDiscordTransport {
 		this.#waiters.add(check);
 		check();
 		return promise;
+	}
+}
+
+/** A transport whose first Ready never comes until `release()`: a gateway stuck on 5xx or a Hello that does not arrive. */
+export class PendingDiscordTransport extends WaitingDiscordTransport {
+	readonly #gate = Promise.withResolvers<void>();
+
+	override async start(handlers: DiscordHandlers): Promise<{ botUserId: string; applicationId: string }> {
+		await this.#gate.promise;
+		return super.start(handlers);
+	}
+
+	/** The first Ready arrives. */
+	release(): void {
+		this.#gate.resolve();
 	}
 }
 

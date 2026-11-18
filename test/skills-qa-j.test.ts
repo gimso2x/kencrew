@@ -3,6 +3,7 @@ import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, syml
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { backupSkillRevision, listSkillRevisions, rollbackSkill } from "../src/review/skills";
+import { isRoot } from "./helpers/privileges";
 
 let dir: string;
 let skill: string;
@@ -70,7 +71,8 @@ describe("skills rollback (qa-j)", () => {
 	});
 
 	// qa-l low B #41: a revision slot that cannot be written must leave SKILL.md as it was.
-	test("a failed slot write keeps the current SKILL.md", () => {
+	test.skipIf(isRoot)("#41: a failed slot write keeps the current SKILL.md", () => {
+		// root writes into a 0o555 dir, so the slot write cannot fail
 		writeFileSync(join(skill, "SKILL.md"), "now");
 		mkdirSync(join(skill, "revisions"));
 		const slot = join(skill, "revisions", "2026-11-14T00-00-00-000Z.md");

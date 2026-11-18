@@ -52,7 +52,15 @@ class FileSessionDriver extends FakeOmpDriver {
 		return result;
 	}
 
+	/** When set, `state()` counts the caller and waits for `opened`: a test holds an attach inside its first await. */
+	stateGate: { opened: Promise<void>; waiting: number } | undefined;
+
 	async state(): Promise<OmpState> {
+		const gate = this.stateGate;
+		if (gate !== undefined) {
+			gate.waiting += 1;
+			await gate.opened;
+		}
 		const base = await super.state();
 		return this.file === undefined ? base : { ...base, sessionFile: this.file };
 	}
@@ -170,6 +178,35 @@ describe("lane attach / detach through the daemon", () => {
 		await d.sweep();
 		expect(drivers.filter((driver) => driver.alive)).toHaveLength(0);
 		expect(transport.posts((text) => text.includes("터미널 omp에서 이 레인을 넘겨받았습니다"))).toHaveLength(1);
+	});
+
+	test("two attaches at once: one hands the lane over, the other is refused before it holds anything", async () => {
+		const d = await startDaemon();
+		const { lane, child } = await runningLane(d, "race-me");
+		alivePids.add(4343);
+		const gate = Promise.withResolvers<void>();
+		child.stateGate = { opened: gate.promise, waiting: 0 };
+		const first = attach(d, lane.name);
+		await until(() => child.stateGate?.waiting === 1);
+		// The first attach is inside its file lookup. The second must be refused right away; reaching the same lookup
+		// is the race (the gate then opens so the assertions below report it instead of hanging).
+		let secondAnswer: Record<string, unknown> | undefined;
+		const second = attach(d, lane.name, { pid: 4343 }).then((answer) => {
+			secondAnswer = answer;
+			return answer;
+		});
+		await until(() => secondAnswer !== undefined || child.stateGate?.waiting === 2);
+		child.stateGate = undefined;
+		gate.resolve();
+		const answers = [await first, await second];
+		expect(answers.filter((answer) => answer.ok === true)).toHaveLength(1);
+		expect(answers.filter((answer) => answer.ok === false)).toEqual([
+			{ ok: false, error: expect.stringContaining("already attached") },
+		]);
+		expect(child.calls.filter((call) => call === "abort")).toHaveLength(1);
+		const held = d.store.getLane(lane.name);
+		expect(held?.status).toBe("paused");
+		expect(held?.history.filter((event) => event.event === "attached")).toHaveLength(1);
 	});
 
 	test("AC-1: attach with wait lets the running turn finish instead of aborting it", async () => {

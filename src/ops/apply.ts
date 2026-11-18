@@ -206,12 +206,7 @@ async function findCheckoutUnits(
 	if (shown.code !== 0) throw new Error(`systemctl show rc=${shown.code}: ${shown.stderr.trim()}`);
 	const argv = `${join(repoDir, "src", "main.ts")} ${command} `;
 	const found: Array<DaemonUnit & { activeSince: number | undefined }> = [];
-	for (const block of shown.stdout.split(/\n\s*\n/)) {
-		const props = new Map<string, string>();
-		for (const line of block.split("\n")) {
-			const eq = line.indexOf("=");
-			if (eq > 0) props.set(line.slice(0, eq), line.slice(eq + 1));
-		}
+	for (const props of parseSystemctlShow(shown.stdout)) {
 		const id = props.get("Id");
 		if (id === undefined || !(props.get("ExecStart") ?? "").includes(argv)) continue;
 		const home = /(?:^|\s)OMPBOT_HOME=(\S+)/.exec(props.get("Environment") ?? "")?.[1];
@@ -437,6 +432,18 @@ export function readAutoLandHold(homeDir: string): string | undefined {
 		// a hand-written or broken hold still holds
 	}
 	return text.trim() || AUTOLAND_HOLD_FILE;
+}
+
+/** `systemctl show` of several units: one `Key=Value` map per blank-line separated block. */
+export function parseSystemctlShow(stdout: string): Array<Map<string, string>> {
+	return stdout.split(/\n\s*\n/).map((block) => {
+		const props = new Map<string, string>();
+		for (const line of block.split("\n")) {
+			const eq = line.indexOf("=");
+			if (eq > 0) props.set(line.slice(0, eq), line.slice(eq + 1));
+		}
+		return props;
+	});
 }
 
 /** Parses `systemctl show --timestamp=unix` output (`@<seconds>`) into ms; undefined for empty/unknown. */

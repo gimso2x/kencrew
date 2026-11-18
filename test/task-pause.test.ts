@@ -216,7 +216,7 @@ describe("the sweep holds a paused task (AC-1)", () => {
 			repoMatches: async () => true,
 			autoLand: async () => {
 				r.autoLands.count += 1;
-				return true;
+				return { state: "handoff", reason: "재판정 문제" };
 			},
 		});
 		const autoLands = { count: 0 };

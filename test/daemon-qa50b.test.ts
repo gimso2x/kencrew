@@ -1,9 +1,15 @@
 // qa50b lane I (doc/plans/qa50b-low-fixes.md): daemon items driven through the real daemon with fake transports.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { openBotStore } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
-import { RESTART_NOTICE_FILE, takeRestartMarker } from "../src/daemon/restart-notice";
+import {
+	RESTART_NOTICE_FILE,
+	RESTART_NOTICE_TEXT,
+	takeRestartMarker,
+	writeRestartMarker,
+} from "../src/daemon/restart-notice";
 import { fatalHandler } from "../src/daemon/run";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
@@ -50,6 +56,40 @@ async function startDaemon(): Promise<Daemon> {
 	await daemon.start();
 	return daemon;
 }
+
+describe("qa-r #16: the restart notice waits for the IPC server", () => {
+	const backPosts = () => transport.posts((text) => text === RESTART_NOTICE_TEXT.back);
+
+	test("a start that fails before the IPC server is up sends no 'back' notice and keeps the marker", async () => {
+		writeRestartMarker(home.dir, { at: Date.now(), threads: ["D1:5.5"] });
+		mkdirSync(join(home.dir, "ompbot.sock")); // the socket path is a directory: the IPC server cannot start
+		await expect(startDaemon()).rejects.toThrow();
+		expect(backPosts()).toHaveLength(0);
+		expect(existsSync(join(home.dir, RESTART_NOTICE_FILE))).toBe(true);
+	});
+
+	test("a normal start sends one notice, consumes the marker, and says it before a recovered turn's answer", async () => {
+		const seed = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		seed.ensureOrigin("slack/dm/D1", "sess/e1");
+		seed.recordInbound({
+			originKey: "slack/dm/D1",
+			platformMessageId: "D1:5.5",
+			textRef: "left-pending",
+			threadRef: "D1:5.5",
+		});
+		seed.close();
+		writeRestartMarker(home.dir, { at: Date.now(), threads: ["D1:5.5"] });
+		await startDaemon();
+		await transport.waitForPosts((text) => text.includes("ECHO left-pending"));
+		await transport.waitForPosts((text) => text === RESTART_NOTICE_TEXT.back);
+		expect(backPosts()).toHaveLength(1);
+		expect(existsSync(join(home.dir, RESTART_NOTICE_FILE))).toBe(false);
+		const texts = transport.posts().map((call) => call.text);
+		expect(texts.indexOf(RESTART_NOTICE_TEXT.back)).toBeLessThan(
+			texts.findIndex((text) => text.includes("ECHO left-pending")),
+		);
+	});
+});
 
 describe("I-8: a lane trigger during a restart drain", () => {
 	test("starts no lane (no worktree, no lane row) and says to ask again after the restart", async () => {

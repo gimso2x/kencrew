@@ -2,6 +2,7 @@ import { accessSync, chmodSync, constants, existsSync, lstatSync, mkdirSync, sta
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { defaultHomeDir, HOME_MODE, SECRET_MODE, workspaceOverlapsHome } from "../config";
+import { remoteShellQuote } from "../dispatch/omp";
 
 export const INIT_USAGE = `  init --owner <Slack member id> [--omp <abs path>] [--workspace <dir>] | --help
   init --platform discord --owner <Discord user id> --app-id <application id> [--omp …] [--workspace …]
@@ -154,7 +155,8 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 	writeFileSync(configPath, `${JSON.stringify(config, null, 2)}\n`, { mode: SECRET_MODE, flag: "wx" });
 	chmodSync(configPath, SECRET_MODE);
 
-	const homePrefix = env.OMPBOT_HOME === undefined || env.OMPBOT_HOME === "" ? "" : `OMPBOT_HOME=${homeDir} `;
+	const homePrefix =
+		env.OMPBOT_HOME === undefined || env.OMPBOT_HOME === "" ? "" : `OMPBOT_HOME=${remoteShellQuote(homeDir)} `;
 	process.stdout.write(
 		[
 			`init_done home=${homeDir} config=${configPath} workspace=${workspaceDir}`,
@@ -162,19 +164,19 @@ export function initCommand(args: string[], env: Record<string, string | undefin
 				? [
 						"next: put the Teams client secret into a file (never into chat or shell history), then run doctor:",
 						"  umask 077",
-						`  cat > ${join(secretsDir, "teams-client-secret")}   # paste the secret then Ctrl-D`,
+						`  cat > ${remoteShellQuote(join(secretsDir, "teams-client-secret"))}   # paste the secret then Ctrl-D`,
 					]
 				: platform === "discord"
 					? [
 							"next: put the Discord bot token into a file (never into chat or shell history), then run doctor:",
 							"  umask 077",
-							`  cat > ${join(secretsDir, "discord-bot-token")}   # paste the bot token then Ctrl-D`,
+							`  cat > ${remoteShellQuote(join(secretsDir, "discord-bot-token"))}   # paste the bot token then Ctrl-D`,
 						]
 					: [
 							"next: put the two Slack tokens into files (never into chat or shell history), then run doctor:",
 							"  umask 077",
-							`  cat > ${join(secretsDir, "slack-bot-token")}   # paste xoxb-… then Ctrl-D`,
-							`  cat > ${join(secretsDir, "slack-app-token")}   # paste xapp-… then Ctrl-D`,
+							`  cat > ${remoteShellQuote(join(secretsDir, "slack-bot-token"))}   # paste xoxb-… then Ctrl-D`,
+							`  cat > ${remoteShellQuote(join(secretsDir, "slack-app-token"))}   # paste xapp-… then Ctrl-D`,
 						]),
 			`  ${homePrefix}bun src/main.ts doctor`,
 			"",

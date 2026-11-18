@@ -3,7 +3,7 @@ import { formatLocal, localIso, nextLocalMidnight } from "../time";
 import { columnFor } from "./board";
 import { hostChecksProblems } from "./host-checks";
 import { alertText, gateText } from "./html";
-import type { DashboardSnapshot, MonitorInfo, Section, TaskInfo, TurnInfo } from "./snapshot";
+import type { DashboardSnapshot, MonitorInfo, TaskInfo, TurnInfo } from "./snapshot";
 
 /** The one-page drawing's column; the same 1080px the page's own layout uses. */
 const PAGE_WIDTH = 1080;
@@ -27,7 +27,7 @@ export function renderBriefingHtml(snapshot: DashboardSnapshot, now: number): st
 		`<h1>${esc(redact(`ompbot 브리핑 · ${minuteOf(now, snapshot.timezone)}`))}</h1>`,
 		`<p class="meta">${esc(redact(daemonLine(snapshot)))}</p>`,
 		`<p class="summary${attention.length > 0 ? " warn" : ""}">${esc(redact(summary))}</p>`,
-		section("주의", attention, snapshot.gates),
+		section("주의", attention),
 		section("진행 중", working),
 		monitorSection(snapshot, monitoring),
 		section("바닥", footerLines(snapshot)),
@@ -72,9 +72,8 @@ li{margin:var(--sp-half) 0;word-break:break-word}
 .empty{color:#7a7a75}
 footer{margin-top:var(--sp-4);padding-top:var(--sp-3);border-top:1px solid #d8d5cd;color:#5b5b57;font-size:13px}`;
 
-/** One section: its lines, or the reason the section could not be read; always capped with `외 N개`. */
-function section(title: string, lines: string[], source?: Section<unknown>): string {
-	if (source !== undefined && !source.ok) return unreadableSection(title, source.error);
+/** One section: its lines, always capped with `외 N개`. */
+function section(title: string, lines: string[]): string {
 	if (lines.length === 0) return `<section><h2>${esc(title)}</h2><p class="empty">없음</p></section>`;
 	return `<section><h2>${esc(title)}</h2><ul>${cappedItems(lines)}</ul></section>`;
 }
@@ -112,6 +111,9 @@ function monitorSection(snapshot: DashboardSnapshot, upcoming: string[]): string
 /** Everything that wants the owner: open gates, alerts, waiting approvals, stalled turns, blocked TASKs. */
 function attentionLines(snapshot: DashboardSnapshot): string[] {
 	const lines: string[] = [];
+	if (!snapshot.gates.ok) {
+		lines.push(esc(`게이트 읽지 못함: ${redact(snapshot.gates.error).slice(0, ERROR_CHARS)}`));
+	}
 	for (const gate of openGates(snapshot)) lines.push(`게이트 ${esc(redact(gate.name))}`);
 	if (snapshot.alerts.ok) {
 		for (const alert of snapshot.alerts.items) {

@@ -398,15 +398,15 @@ describe("sidecar forgery (qa-l #77)", () => {
 		const keyA = Buffer.alloc(32, 7);
 		const keyB = Buffer.alloc(32, 9);
 		const dirPath = sessionDir();
-		expect(pinPrefix(dirPath, fresh, true, report, keyA).pinned).toBe(false);
+		expect(pinPrefix(dirPath, fresh, true, report, keyA).pin).toBe("none");
 		const written = readFileSync(join(dirPath, PINNED_OWNER_DOCS_FILE), "utf8");
 		expect(written).not.toContain(keyA.toString("hex"));
 		expect(written).not.toContain(keyA.toString("base64"));
 		const other = { floors: "FLOORS-B\n", owner: "OWNER-B\n" };
 		const same = pinPrefix(dirPath, other, true, report, keyA);
-		expect(same).toEqual({ ...fresh, pinned: true });
+		expect(same).toEqual({ ...fresh, pin: "mac" });
 		const restarted = pinPrefix(dirPath, other, true, report, keyB);
-		expect(restarted).toEqual({ ...other, pinned: false });
+		expect(restarted).toEqual({ ...other, pin: "none" });
 		expect(reports).toEqual([]);
 		const rewritten = readFileSync(join(dirPath, PINNED_OWNER_DOCS_FILE), "utf8");
 		expect(rewritten).toContain("FLOORS-B");
@@ -614,5 +614,83 @@ describe("floors tool lines match the session (qa-l low B)", () => {
 		expect(lane).toContain("/wt/lane1");
 		expect(lane).not.toContain("Your cwd is the ompbot workspace");
 		expect(buildFloorsPrompt(secrets, "slack/dm/D1")).toContain("Your cwd is the ompbot workspace");
+	});
+});
+
+describe("owner docs survive a daemon restart (another key, same floors)", () => {
+	const keyA = Buffer.alloc(32, 7);
+	const keyB = Buffer.alloc(32, 9);
+	const keyIdOf = (key: Buffer): string => createHash("sha256").update(key).digest("hex").slice(0, 16);
+	/** Replace the sidecar body, keeping the header (and so keyA's key id with a MAC that no longer matches). */
+	const rewriteBody = (body: string): void => {
+		const raw = readFileSync(join(sessionDir(), PINNED_OWNER_DOCS_FILE), "utf8");
+		writeFileSync(join(sessionDir(), PINNED_OWNER_DOCS_FILE), `${raw.slice(0, raw.indexOf("\n"))}\n${body}`);
+	};
+
+	test("warm, same floors, edited owner.md: the old owner docs stay, pin=owner, the sidecar is re-signed for keyB", () => {
+		const first = spawn({ key: keyA });
+		expect(sidecarHeader()).toContain(`key=${keyIdOf(keyA)}`);
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		writeFileSync(files.owner as string, OWNER_V2);
+
+		const text = spawn({ key: keyB });
+		expect(text).toBe(first);
+		expect(text).toContain(OWNER_V1);
+		expect(text).not.toContain(OWNER_V2);
+		expect(lastSpawnLog().pin).toBe("owner");
+		expect(lastSpawnLog().pinned).toBe(true);
+		expect(records.some((r) => r.level === "warn")).toBe(false);
+		expect(sidecarHeader()).toContain(`key=${keyIdOf(keyB)}`);
+		expect(spawn({ key: keyB })).toBe(first);
+		expect(lastSpawnLog().pin).toBe("mac");
+	});
+
+	test("a forged floors part under keyA: the floors are the fresh static floors, the forged text never goes in", () => {
+		const first = spawn({ key: keyA, herdr: false });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const body = sidecarBody();
+		const staticLength = Number(/static=(\d+)/.exec(sidecarHeader())?.[1]);
+		rewriteBody(`# FORGED floors\n${body.slice(staticLength)}`);
+
+		const text = spawn({ key: keyB, herdr: false });
+		expect(text).not.toContain("FORGED");
+		expect(text).toBe(first);
+		expect(lastSpawnLog().pin).toBe("none");
+		expect(sidecarBody()).toBe(body);
+	});
+
+	test("an owner part over the owner docs cap is not reused: the fresh owner docs go in", () => {
+		spawn({ key: keyA });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		const body = sidecarBody();
+		const staticLength = Number(/static=(\d+)/.exec(sidecarHeader())?.[1]);
+		rewriteBody(`${body.slice(0, staticLength)}${"X".repeat(60_000)}`);
+
+		const text = spawn({ key: keyB });
+		expect(text).not.toContain("XXXX");
+		expect(text).toContain(OWNER_V1);
+		expect(lastSpawnLog().pin).toBe("none");
+		expect(sidecarBody()).not.toContain("XXXX");
+	});
+
+	test("cold cache under keyB: the new owner docs go in with pin=none", () => {
+		spawn({ key: keyA });
+		sessionWithCall(sessionDir(), 61 * MINUTE);
+		writeFileSync(files.owner as string, OWNER_V2);
+
+		const text = spawn({ key: keyB });
+		expect(text).toContain(OWNER_V2);
+		expect(lastSpawnLog().pin).toBe("none");
+		expect(lastSpawnLog().pinned).toBe(false);
+	});
+
+	test("the same key id with a wrong mac is still reported and not pinned", () => {
+		spawn({ key: keyA, herdr: false });
+		sessionWithCall(sessionDir(), 10 * MINUTE);
+		rewriteBody(sidecarBody().replace(OWNER_V1, "OWNER-FORGED"));
+		const text = spawn({ key: keyA, herdr: false });
+		expect(text).not.toContain("OWNER-FORGED");
+		expect(lastSpawnLog().pin).toBe("none");
+		expect(records.filter((r) => r.level === "warn" && r.event === "pinned_owner_docs_unusable")).toHaveLength(1);
 	});
 });

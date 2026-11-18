@@ -1,4 +1,6 @@
-import type { LaneModelTier, LaneModelTiers } from "../config";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import type { LaneModelTier, LaneModelTiers, WorkerAgyConfig } from "../config";
 import { TASK_RISKS, type TaskRisk } from "./docs";
 
 /** The worker tier a new [TASK] runs on, fixed in its row for the task's life. */
@@ -63,6 +65,95 @@ export function workerLine(row: {
 }): string | undefined {
 	if (row.tier === null) return undefined;
 	if (row.workerModel === null) return `워커: 기본 모델 (${row.tier})`;
+	const agy = agyModelOf(row.workerModel);
+	if (agy !== undefined) return `워커: agy ${agy} (${row.tier})`;
 	const short = row.workerModel.slice(row.workerModel.lastIndexOf("/") + 1);
 	return `워커: ${short} (${row.tier} — ${row.tierReason ?? DEFAULT_TIER_REASON})`;
+}
+
+/**
+ * `tasks.worker_model` of an agy (Antigravity CLI) worker: this prefix and the agy model id. The schema is unchanged,
+ * so the prefix is the only mark of the worker kind (doc/plans/agy-task-worker.md).
+ */
+export const AGY_WORKER_PREFIX = "agy:";
+
+/** The agy model id of an agy worker's `workerModel`; `undefined` for an omp worker. */
+export function agyModelOf(workerModel: string | null): string | undefined {
+	return workerModel?.startsWith(AGY_WORKER_PREFIX) === true ? workerModel.slice(AGY_WORKER_PREFIX.length) : undefined;
+}
+
+/**
+ * Command prefixes an agy worker is refused (agy `permissions.deny` `command(…)`): measured on agy 1.5.9 to hold under
+ * `--dangerously-skip-permissions`, compound commands included (PROGRESS of T-20261116-13).
+ */
+export const AGY_DENIED_COMMANDS = [
+	"git push",
+	"git reset --hard",
+	"git clean",
+	"systemctl",
+	"ompbot",
+	"bun src/main.ts",
+	"rm -rf /",
+] as const;
+
+/**
+ * The agy worker's session-only `--settings` (never saved to agy's settings.json): the task worktree as the one
+ * trusted workspace (without it the start stops on agy's trust question) and the deny rules — the commands above and
+ * `read_file` of each secrets directory.
+ */
+export function agySettings(worktree: string, secretsDirs: readonly string[]): string {
+	const deny = [
+		...AGY_DENIED_COMMANDS.map((command) => `command(${command})`),
+		...secretsDirs.map((dir) => `read_file(${dir})`),
+	];
+	return JSON.stringify({ trustedWorkspaces: [worktree], permissions: { deny } });
+}
+
+/**
+ * The secrets directories an agy worker's `read_file` is refused: this bot home's and the default `~/.ompbot/secrets`.
+ * Concrete paths only — agy 1.5.9 does not expand a `*` in a `read_file(…)` rule (measured). A shell read (`cat`) is
+ * not a `read_file` and passes; the worker floors forbid it.
+ */
+export function agySecretsDirs(secretsDir: string): string[] {
+	const fallback = join(homedir(), ".ompbot", "secrets");
+	return fallback === secretsDir ? [secretsDir] : [secretsDir, fallback];
+}
+
+/**
+ * What agy gets after herdr's `--`: the model, no permission prompts (an unanswered one would hang the pane forever),
+ * and the session settings.
+ */
+export function agyWorkerArgs(model: string, worktree: string, secretsDirs: readonly string[]): string[] {
+	return ["--model", model, "--dangerously-skip-permissions", "--settings", agySettings(worktree, secretsDirs)];
+}
+
+/** Why a requested agy worker was not given; `undefined` when it was. */
+function agyRefusal(input: {
+	risk: TaskRisk;
+	host: string | null;
+	agy: WorkerAgyConfig | undefined;
+	busy: string | undefined;
+}): string | undefined {
+	if (input.agy === undefined) return "설정 workerAgy 없음";
+	if (input.risk !== "L0" && input.risk !== "L1") return `위험 ${input.risk}`;
+	if (input.host !== null) return `host ${input.host}`;
+	if (input.busy !== undefined) return `${input.busy} 점유 중`;
+	return undefined;
+}
+
+/**
+ * The worker of a new task that asked for agy (`taskSpec.worker: "agy"`): the trial runs only a local L0·L1 task, one
+ * at a time (`busy`: an agy task still working or blocked), with `workerAgy` set. Within that it is the omp tier's row
+ * on low with `agy:<model>`; outside it the omp worker as resolved, with a reply line saying why.
+ */
+export function resolveAgyWorker(
+	omp: WorkerTier,
+	input: { risk: TaskRisk; host: string | null; agy: WorkerAgyConfig | undefined; busy: string | undefined },
+): WorkerTier {
+	const refusal = agyRefusal(input);
+	if (refusal === undefined && input.agy !== undefined) {
+		return { tier: "low", tierReason: omp.tierReason, model: `${AGY_WORKER_PREFIX}${input.agy.model}` };
+	}
+	const line = `agy 워커는 L0·L1 로컬·동시 1개만 — omp ${omp.tier}로 띄움 (${refusal})`;
+	return { ...omp, note: omp.note === undefined ? line : `${omp.note}\n${line}` };
 }

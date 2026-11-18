@@ -33,6 +33,17 @@ type TeamsAuthReason =
 
 type TeamsAuthResult = { ok: true; issuer: string } | { ok: false; reason: TeamsAuthReason };
 
+/** What a header-only check keeps for the Activity checks after the body is read. */
+interface VerifiedToken {
+	issuer: string;
+	/** The token's `serviceurl` claim. */
+	serviceUrl: string | undefined;
+	/** The signing key's channel endorsements, when its key set lists them. */
+	endorsements: readonly string[] | undefined;
+}
+
+type TeamsTokenResult = { ok: true; token: VerifiedToken } | { ok: false; reason: TeamsAuthReason };
+
 interface TeamsAuthOptions {
 	appId: string;
 	tenantId: string;
@@ -162,14 +173,11 @@ export class TeamsAuth {
 	}
 
 	/**
-	 * Checks one request's `Authorization` header against the Activity it carries. Never throws: a failed metadata
-	 * fetch is `metadata_failed`.
+	 * Checks one request's `Authorization` header on its own — signature, issuer, audience, lifetime, tenant — so a
+	 * request is refused before its body is read. Never throws: a failed metadata fetch is `metadata_failed`.
 	 */
-	async verify(
-		authorization: string | null | undefined,
-		activity: { serviceUrl?: unknown; channelId?: unknown },
-	): Promise<TeamsAuthResult> {
-		const fail = (reason: TeamsAuthReason): TeamsAuthResult => ({ ok: false, reason });
+	async verifyToken(authorization: string | null | undefined): Promise<TeamsTokenResult> {
+		const fail = (reason: TeamsAuthReason): TeamsTokenResult => ({ ok: false, reason });
 		const match = /^Bearer ([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/.exec(authorization ?? "");
 		if (match === null) return fail(authorization ? "malformed" : "missing_bearer");
 		const [, headerPart = "", payloadPart = "", signaturePart = ""] = match;
@@ -198,20 +206,6 @@ export class TeamsAuth {
 		const now = this.#now();
 		if (typeof claims.exp !== "number" || now > claims.exp * 1000 + CLOCK_SKEW_MS) return fail("expired");
 		if (typeof claims.nbf === "number" && now < claims.nbf * 1000 - CLOCK_SKEW_MS) return fail("not_yet_valid");
-
-		const channelId = typeof activity.channelId === "string" ? activity.channelId : undefined;
-		if (key.endorsements !== undefined && (channelId === undefined || !key.endorsements.includes(channelId))) {
-			return fail("endorsement");
-		}
-		const serviceUrl = typeof activity.serviceUrl === "string" ? activity.serviceUrl : undefined;
-		const claimed = typeof claims.serviceurl === "string" ? claims.serviceurl : undefined;
-		// A Bot Framework token always names the service URL; an Entra one, when it does, must agree too.
-		if ((issuer === BOT_FRAMEWORK_ISSUER && claimed === undefined) || serviceUrl === undefined) {
-			return fail("service_url");
-		}
-		if (claimed !== undefined && normalizeServiceUrl(claimed) !== normalizeServiceUrl(serviceUrl)) {
-			return fail("service_url");
-		}
 		if (
 			issuer !== BOT_FRAMEWORK_ISSUER &&
 			typeof claims.tid === "string" &&
@@ -219,6 +213,26 @@ export class TeamsAuth {
 		) {
 			return fail("tenant");
 		}
-		return { ok: true, issuer };
+		const serviceUrl = typeof claims.serviceurl === "string" ? claims.serviceurl : undefined;
+		return { ok: true, token: { issuer, serviceUrl, endorsements: key.endorsements } };
+	}
+
+	/** The checks of a verified token that need the Activity it carries: the key's endorsement and the service URL. */
+	verifyActivity(token: VerifiedToken, activity: { serviceUrl?: unknown; channelId?: unknown }): TeamsAuthResult {
+		const fail = (reason: TeamsAuthReason): TeamsAuthResult => ({ ok: false, reason });
+		const channelId = typeof activity.channelId === "string" ? activity.channelId : undefined;
+		if (token.endorsements !== undefined && (channelId === undefined || !token.endorsements.includes(channelId))) {
+			return fail("endorsement");
+		}
+		const serviceUrl = typeof activity.serviceUrl === "string" ? activity.serviceUrl : undefined;
+		const claimed = token.serviceUrl;
+		// A Bot Framework token always names the service URL; an Entra one, when it does, must agree too.
+		if ((token.issuer === BOT_FRAMEWORK_ISSUER && claimed === undefined) || serviceUrl === undefined) {
+			return fail("service_url");
+		}
+		if (claimed !== undefined && normalizeServiceUrl(claimed) !== normalizeServiceUrl(serviceUrl)) {
+			return fail("service_url");
+		}
+		return { ok: true, issuer: token.issuer };
 	}
 }

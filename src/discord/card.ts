@@ -107,6 +107,23 @@ const codeBlock = (text: string): string => {
 	return `${fence}\n${text}\n${fence}`;
 };
 
+/** A link url with the characters that end its `(…)` or the line (`|`, `<`, `>`, blanks, parentheses) percent-encoded. */
+function markdownUrl(url: string): string {
+	return url.replace(/[|<>()\s]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+}
+
+/**
+ * A link label (an image alt or a Link's label): `\`, `[` and `]` are backslash-escaped so the alt cannot close the label, and a
+ * zero-width space after `@everyone`/`@here`'s `@` and the `<@` of a user/role mention keeps them plain text.
+ */
+function markdownLabel(alt: string | undefined): string {
+	if (!alt) return "image";
+	return alt
+		.replace(/[\\[\]]/g, "\\$&")
+		.replace(/@(everyone|here)/g, `@${EMPTY}$1`)
+		.replace(/<@/g, `<${EMPTY}@`);
+}
+
 /** One card child as description lines; fields and the first image go to the embed itself. */
 function childLines(child: CardChild, embed: { fields: DiscordEmbedField[]; image?: { url: string } }): string[] {
 	switch (child.type) {
@@ -132,9 +149,9 @@ function childLines(child: CardChild, embed: { fields: DiscordEmbedField[]; imag
 				embed.image = { url: child.url };
 				return [];
 			}
-			return [`[${child.alt || "image"}](${child.url})`];
+			return [`[${markdownLabel(child.alt)}](${markdownUrl(child.url)})`];
 		case "link":
-			return [`[${child.label}](${child.url})`];
+			return [`[${markdownLabel(child.label)}](${markdownUrl(child.url)})`];
 		case "section":
 			return child.children.flatMap((nested) => childLines(nested, embed));
 		default:

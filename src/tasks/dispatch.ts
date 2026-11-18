@@ -13,6 +13,7 @@ import {
 } from "../dispatch/omp";
 import { type DiskView, diskHeadroom, diskLow } from "../ops/host-resources";
 import { redact } from "../redact";
+import { buildWorkerFloorsPrompt } from "../safety/prompt";
 import type { HerdrPromptInput } from "../store/db";
 import { summarizeJudgement } from "./checker";
 import {
@@ -33,7 +34,7 @@ import type { TaskLedger, TaskRow } from "./ledger";
 import { buildAcceptedCard, postToThread, setStatusReaction, type TaskSlackLog } from "./notify";
 import { buildTaskPrompt, resumeCheckLines } from "./prompt";
 import { checkResume, type ResumeCheck, restatedHash } from "./resume-check";
-import { type WorkerTier, withWorkerModel, workerLine } from "./worker-tier";
+import { agyModelOf, agySecretsDirs, agyWorkerArgs, type WorkerTier, withWorkerModel, workerLine } from "./worker-tier";
 
 type HostEntry = DispatchHostConfig;
 
@@ -52,6 +53,8 @@ export interface TaskDispatchDeps {
 	dispatchHosts?: Record<string, HostEntry>;
 	/** Config `workerOmpArgs`: extra omp arguments of a local task agent (a remote one takes its host's `ompArgs`). */
 	workerOmpArgs?: string[];
+	/** This bot home's secrets directory: the agy worker's floors name it and its `read_file` deny rule covers it. */
+	secretsDir: string;
 	run?: ProcessRunner;
 	/** Test seam: host ops override. */
 	hostOps?: (host: string | null) => TaskHostOps & TaskResumeOps;
@@ -115,21 +118,35 @@ async function startAgent(
 ): Promise<{ ok: true; paneId: string } | { ok: false; error: string }> {
 	const entry = hostEntryOf(deps, row.host);
 	const options = herdrOptionsFor(deps, entry);
+	// An agy worker is local only (the trial's bound, `resolveAgyWorker`). agy takes no system prompt flag: its floors go
+	// ahead of the first prompt of every start, a new one and a restart by resume alike.
+	const agy = agyModelOf(row.workerModel);
+	const task = agy === undefined ? prompt : `${buildWorkerFloorsPrompt(deps.secretsDir, row)}\n\n${prompt}`;
 	// The model fixed at registration, on a start and on every restart by resume alike.
-	const agentArgs = withWorkerModel(entry === undefined ? deps.workerOmpArgs : entry.ompArgs, row.workerModel);
+	const agentArgs =
+		agy === undefined
+			? withWorkerModel(entry === undefined ? deps.workerOmpArgs : entry.ompArgs, row.workerModel)
+			: agyWorkerArgs(agy, row.worktree, agySecretsDirs(deps.secretsDir));
 	const base = {
 		name: row.agent,
-		task: prompt,
+		task,
 		cwd: row.worktree,
 		options,
 		closeOnPromptFailure,
 		...(agentArgs ? { agentArgs } : {}),
 	};
 	const started =
-		entry === undefined ? await herdrStartAgent(base) : await herdrRemoteStart({ ...base, sshTarget: entry.ssh });
+		entry === undefined
+			? await herdrStartAgent(agy === undefined ? base : { ...base, kind: "agy" })
+			: await herdrRemoteStart({ ...base, sshTarget: entry.ssh });
 	if (started.ok)
-		notePrompt(deps, { host: row.host, agent: row.agent, kind: "start", text: prompt, originKey: deps.originKey });
+		notePrompt(deps, { host: row.host, agent: row.agent, kind: "start", text: task, originKey: deps.originKey });
 	return started.ok ? { ok: true, paneId: started.paneId } : { ok: false, error: started.error };
+}
+
+/** The agy worker trial runs one task at a time: the agy task (other than `except`) still working or blocked, if any. */
+export function agyOccupant(ledger: TaskLedger, except?: string): string | undefined {
+	return ledger.listActive().find((row) => row.taskId !== except && agyModelOf(row.workerModel) !== undefined)?.taskId;
 }
 
 /** The board card of a just-started agent; `undefined` when no board is configured. */
@@ -336,6 +353,10 @@ export async function resumeTask(
 			? "살아 있는 에이전트에 재개 프롬프트를 보냈습니다"
 			: "살아 있는 에이전트에 재개 프롬프트를 보냈습니다(시작 확인 안 됨)";
 	} else {
+		// A dead agy worker comes back as agy or not at all: one task never mixes worker kinds.
+		const busy = agyModelOf(row.workerModel) === undefined ? undefined : agyOccupant(deps.ledger, row.taskId);
+		if (busy !== undefined)
+			return `재개 안 함: agy 워커는 동시 1개만 — ${busy}가 점유 중입니다(working·blocked). 그 작업이 끝나거나 닫힌 뒤 다시 재개하세요.`;
 		const present = await ops.pathExists(row.worktree);
 		if (!present.ok) return `재개 실패: ${present.error}`;
 		if (!present.value) return `재개 실패: 워크트리가 없습니다: ${row.worktree}`;

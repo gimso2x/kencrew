@@ -13,7 +13,14 @@ import { type ProcessRunner, runOmpPrint } from "../dispatch/omp";
 import type { Logger } from "../log";
 import { redact } from "../redact";
 import type { LaneQaPolicy } from "../tasks/notify";
-import { REVIEW_OVERLAY_YAML } from "./review";
+import {
+	checkLines,
+	type GateSubject,
+	gateFileStem,
+	type LaneReviewDeps,
+	laneSubject,
+	REVIEW_OVERLAY_YAML,
+} from "./review";
 import type { LaneQa, LaneRow } from "./status";
 import { defaultGit, type GitRunner } from "./verify";
 
@@ -28,7 +35,6 @@ import { defaultGit, type GitRunner } from "./verify";
 
 const FINDINGS_MAX = 10;
 const FINDING_CHARS = 200;
-const CHECK_DETAIL_MAX = 200;
 /** The QA run's stdout kept for the verdict (the JSON line is the last one). */
 const OUTPUT_MAX = 64_000;
 
@@ -50,6 +56,27 @@ export interface LaneQaDeps {
 	log?: Pick<Logger, "warn">;
 }
 
+/** The QA's deps out of the reviewer's setup (the lanes' and the [TASK] gate's QA share it): its overlays go to `reviewsDir`. */
+export function qaDepsOf(
+	reviewer: Omit<LaneReviewDeps, "headOf" | "now">,
+	worktreesDir: string,
+	now: () => number,
+	log: Logger,
+): LaneQaDeps {
+	return {
+		ompBin: reviewer.ompBin,
+		...(reviewer.ompProfile === undefined ? {} : { ompProfile: reviewer.ompProfile }),
+		systemPromptAppendix: reviewer.systemPromptAppendix,
+		worktreesDir,
+		overlaysDir: reviewer.reviewsDir,
+		now,
+		...(reviewer.run === undefined ? {} : { run: reviewer.run }),
+		...(reviewer.git === undefined ? {} : { git: reviewer.git }),
+		...(reviewer.inheritedEnv === undefined ? {} : { inheritedEnv: reviewer.inheritedEnv }),
+		log,
+	};
+}
+
 export interface LaneQaInput {
 	lane: LaneRow;
 	policy: LaneQaPolicy;
@@ -58,20 +85,21 @@ export interface LaneQaInput {
 
 /** The copy of one QA run: `<worktreesDir>/<laneId>-<sha>` (a fixed name: a leftover is found by the next cleanup). */
 export const qaWorktreePath = (worktreesDir: string, lane: LaneRow, sha: string): string =>
-	join(worktreesDir, `${lane.meta.laneId ?? lane.name}-${sha}`);
+	copyPath(worktreesDir, laneSubject(lane).id, sha);
+
+const copyPath = (worktreesDir: string, id: string, sha: string): string => join(worktreesDir, `${id}-${sha}`);
+const overlayPath = (overlaysDir: string, id: string, sha: string): string =>
+	`${gateFileStem(overlaysDir, id, sha)}.qa.omp.yml`;
 
 /** The QA's isolation overlay: `<overlaysDir>/<laneId>-<sha12>.qa.omp.yml` (dropped with the lane's review files). */
 export const qaOverlayPath = (overlaysDir: string, lane: LaneRow, sha: string): string =>
-	join(overlaysDir, `${lane.meta.laneId ?? lane.name}-${sha.slice(0, 12)}.qa.omp.yml`);
+	overlayPath(overlaysDir, laneSubject(lane).id, sha);
 
 /** The QA's prompt: what to run (spec and acceptance criteria), what the core re-ran, and the one-line JSON ending. */
-export function buildQaPrompt(lane: LaneRow, copy: string): string {
-	const sha = lane.meta.sha ?? "?";
-	const acceptance = (lane.meta.acceptance ?? []).map((item) => `- ${item.id}: ${item.text}`);
-	const checks = (lane.meta.checks?.head === lane.meta.sha ? (lane.meta.checks?.results ?? []) : []).map(
-		(check) =>
-			`- ${check.id}: ${check.ok ? "통과" : check.inconclusive ? "확인 불가" : "실패"} — ${redact(check.detail).slice(0, CHECK_DETAIL_MAX)}`,
-	);
+function qaPrompt(subject: GateSubject, copy: string): string {
+	const sha = subject.sha === "" ? "?" : subject.sha;
+	const acceptance = subject.acceptance.map((item) => `- ${item.id}: ${item.text}`);
+	const checks = checkLines(subject.checks);
 	return [
 		"너는 이 변경을 실제로 돌려 보는 실행 QA다.",
 		`지금 작업 디렉터리(${copy})는 레인의 클레임 커밋 ${sha}만 꺼낸 임시 사본이고, 끝나면 지워진다.`,
@@ -81,9 +109,9 @@ export function buildQaPrompt(lane: LaneRow, copy: string): string {
 		'마지막 줄에는 정확히 JSON 한 줄 `{"verdict":"PASS"|"FAIL","findings":["<발견 1>", ...]}`만 쓴다. findings에는 실행한 명령과 결과·실패 지점을 10개 이내로 쓴다.',
 		"",
 		"## 1. 스펙",
-		`제목: ${lane.title}`,
+		`제목: ${subject.title}`,
 		"",
-		lane.meta.brief === undefined ? "(브리프 없음)" : lane.meta.brief,
+		subject.brief === undefined ? "(브리프 없음)" : subject.brief,
 		"",
 		"수락기준:",
 		...(acceptance.length === 0 ? ["(없음)"] : acceptance),
@@ -126,9 +154,21 @@ export function parseQaVerdict(output: string): { verdict: "PASS" | "FAIL"; find
 }
 
 /** Runs the QA of the lane's claim commit once; resolves with its receipt and never throws. */
-export async function runLaneQa(input: LaneQaInput, deps: LaneQaDeps): Promise<LaneQa> {
-	const { lane, policy } = input;
-	const sha = lane.meta.sha ?? "";
+export function runLaneQa(input: LaneQaInput, deps: LaneQaDeps): Promise<LaneQa> {
+	const { lane, ...rest } = input;
+	return runQa({ subject: laneSubject(lane), ...rest }, deps);
+}
+
+export interface GateQaInput {
+	subject: GateSubject;
+	policy: LaneQaPolicy;
+	signal?: AbortSignal;
+}
+
+/** Runs the QA of the subject's commit once; resolves with its receipt and never throws. */
+export async function runQa(input: GateQaInput, deps: LaneQaDeps): Promise<LaneQa> {
+	const { subject, policy } = input;
+	const { sha } = subject;
 	const receipt = (verdict: LaneQa["verdict"], findings: string[], reason?: string): LaneQa => ({
 		sha,
 		verdict,
@@ -138,11 +178,11 @@ export async function runLaneQa(input: LaneQaInput, deps: LaneQaDeps): Promise<L
 		...(reason === undefined ? {} : { reason }),
 	});
 	const inconclusive = (reason: string): LaneQa => receipt("inconclusive", [], reason);
-	const { repo, worktree } = lane.meta;
+	const { repo, worktree } = subject;
 	if (sha === "" || repo === undefined) return inconclusive("레인에 저장소나 클레임 커밋이 없음");
 	const git = deps.git ?? defaultGit;
-	const copy = qaWorktreePath(deps.worktreesDir, lane, sha);
-	const overlay = qaOverlayPath(deps.overlaysDir, lane, sha);
+	const copy = copyPath(deps.worktreesDir, subject.id, sha);
+	const overlay = overlayPath(deps.overlaysDir, subject.id, sha);
 	try {
 		mkdirSync(deps.worktreesDir, { recursive: true, mode: 0o700 });
 		chmodSync(deps.worktreesDir, 0o700);
@@ -159,7 +199,7 @@ export async function runLaneQa(input: LaneQaInput, deps: LaneQaDeps): Promise<L
 			writeFileSync(overlay, REVIEW_OVERLAY_YAML, { mode: 0o600 });
 			chmodSync(overlay, 0o600);
 			const result = await runOmpPrint({
-				task: buildQaPrompt(lane, copy),
+				task: qaPrompt(subject, copy),
 				cwd: copy,
 				isolation: { configPath: overlay },
 				overlayConfig: policy.overlay,
@@ -190,6 +230,33 @@ export async function runLaneQa(input: LaneQaInput, deps: LaneQaDeps): Promise<L
 	} catch (error) {
 		return inconclusive(`QA 실행 실패: ${String(error).slice(0, 200)}`);
 	}
+}
+
+/** `work`'s value, or `undefined` as soon as `signal` aborts (at once when it already has). */
+export function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T | undefined> {
+	if (signal.aborted) return Promise.resolve(undefined);
+	const aborted = Promise.withResolvers<undefined>();
+	const onAbort = (): void => aborted.resolve(undefined);
+	signal.addEventListener("abort", onAbort, { once: true });
+	return Promise.race([work, aborted.promise]).finally(() => signal.removeEventListener("abort", onAbort));
+}
+
+/** Waits for a place in the gate slot; resolves with the function that frees it. */
+export type GateSlot = () => Promise<() => void>;
+
+/**
+ * One review or QA at a time: a QA removes every copy in `qa-worktrees` when it starts, so the lanes' and the [TASK]s'
+ * reviews and QAs share one slot (the daemon makes it and hands it to the lane manager and the task gate).
+ */
+export function createGateSlot(): GateSlot {
+	let tail: Promise<void> = Promise.resolve();
+	return async () => {
+		const previous = tail;
+		const freed = Promise.withResolvers<void>();
+		tail = previous.then(() => freed.promise);
+		await previous;
+		return freed.resolve;
+	};
 }
 
 /**

@@ -94,13 +94,19 @@ export async function runScript(
 	// stdout: the head (payload) up to the collect bound, then a rolling tail (last line); the hash takes every chunk.
 	let head = "";
 	let tail: string | undefined;
+	/** The rolling tail dropped its oldest chars, so its first line is a fragment whatever the head ended with. */
+	let tailCut = false;
 	const hash = trimmedHash();
 	child.stdout?.setEncoding("utf8");
 	child.stdout?.on("data", (chunk: string) => {
 		hash.update(chunk);
 		const room = MAX_SCRIPT_COLLECT_CHARS - head.length;
 		if (room > 0) head += chunk.slice(0, room);
-		if (chunk.length > room) tail = `${tail ?? ""}${chunk.slice(Math.max(room, 0))}`.slice(-SCRIPT_TAIL_CHARS);
+		if (chunk.length > room) {
+			const joined = `${tail ?? ""}${chunk.slice(Math.max(room, 0))}`;
+			if (joined.length > SCRIPT_TAIL_CHARS) tailCut = true;
+			tail = joined.slice(-SCRIPT_TAIL_CHARS);
+		}
 	});
 	// Only the last `MAX_SCRIPT_STDERR_TAIL_CHARS` chars reach the log: a rolling tail is enough.
 	let stderr = "";
@@ -151,10 +157,14 @@ export async function runScript(
 		return notRun(spawnError);
 	}
 	// Hash and wake gate come from the whole output; only the payload handed to the agent is cut. Past the collect
-	// bound the text is the head plus the tail's whole lines (its first line is cut off at the tail's start).
+	// bound the text is the head plus the tail's whole lines (its first line is cut off at the tail's start), unless
+	// the head ended exactly at a line end and the tail is the untouched rest: then every tail line is whole.
+	const headEndsLine = head.endsWith("\n");
+	const tailWhole = headEndsLine && !tailCut;
 	const newline = tail?.indexOf("\n") ?? -1;
-	const lastLines = tail === undefined ? "" : newline === -1 ? undefined : tail.slice(newline + 1);
-	const full = tail === undefined ? head.trim() : `${head.trimStart()}\n${(lastLines ?? tail).trimEnd()}`;
+	const lastLines = tail === undefined ? "" : tailWhole ? tail : newline === -1 ? undefined : tail.slice(newline + 1);
+	const full =
+		tail === undefined ? head.trim() : `${head.trimStart()}${headEndsLine ? "" : "\n"}${(lastLines ?? tail).trimEnd()}`;
 	return {
 		fired: !timedOut && !aborted && code === 0,
 		exitCode: code,

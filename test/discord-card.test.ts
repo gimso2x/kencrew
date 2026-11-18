@@ -353,3 +353,30 @@ describe("fitEmbed description cut (qa-l #61)", () => {
 		}
 	});
 });
+
+describe("second Image label (qa-q #22)", () => {
+	test("an alt with brackets and a mention never becomes a link or a ping", () => {
+		const card = {
+			type: "card",
+			children: [
+				{ type: "image", url: "https://a.example/1.png", alt: "first" },
+				{ type: "image", url: "https://a.example/2.png", alt: "x](https://evil) @everyone <@123>" },
+				{ type: "image", url: "https://a.example/3.png", alt: "" },
+			],
+		} as unknown as Parameters<typeof discordCard.cardToEmbed>[0];
+		const lines = (discordCard.cardToEmbed(card).description ?? "").split("\n");
+		expect(lines[0]).toBe("[x\\](https://evil) @\u200beveryone <\u200b@123>](https://a.example/2.png)");
+		expect(lines[1]).toBe("[image](https://a.example/3.png)");
+	});
+});
+
+describe("Link element (qa-r #21)", () => {
+	test("a label with brackets and mentions and a url with parentheses never break the link or ping", () => {
+		const card = {
+			type: "card",
+			children: [{ type: "link", label: "a|b> <!here> @everyone x](https://evil)", url: "https://x.test/a)b c" }],
+		} as unknown as Parameters<typeof discordCard.cardToEmbed>[0];
+		const description = discordCard.cardToEmbed(card).description ?? "";
+		expect(description).toBe("[a|b> <!here> @\u200beveryone x\\](https://evil)](https://x.test/a%29b%20c)");
+	});
+});

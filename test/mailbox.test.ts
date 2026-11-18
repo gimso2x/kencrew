@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ChannelPort } from "../src/channel/port";
 import {
 	type CacheMissInfo,
 	type ColdCacheInfo,
@@ -38,6 +39,7 @@ import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
 import { INTERIM_CLOSING, NO_ANSWER } from "../src/omp/answers";
 import {
+	type OmpDialogRequest,
 	OmpDriverError,
 	type OmpEntries,
 	type OmpEvent,
@@ -54,9 +56,12 @@ import {
 } from "../src/omp/fake-driver";
 import { healSessionModelFile } from "../src/omp/session-heal";
 import { redact } from "../src/redact";
+import { ApprovalBroker } from "../src/safety/approval";
+import { answerDialogOnSlack } from "../src/safety/choice";
 import { peerTouchedTurnNotice } from "../src/safety/prompt";
 import { openStore, type Store } from "../src/store/db";
 import { localDay } from "../src/time";
+import { registryOf } from "./helpers/channels";
 
 class FakeClock {
 	t = 1_000_000;
@@ -2183,6 +2188,158 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 	});
 });
 
+describe("mailbox + real ApprovalBroker: a message outside a select's options", () => {
+	const ORIGIN_KEY = "slack/dm/D8";
+	const OTHER = "Other (type your own)";
+	let opened: FakeOmpDriver[];
+	let broker: ApprovalBroker;
+	let posts: string[];
+	let requested: Array<() => void>;
+	let requests: number;
+
+	function realMailbox(): OriginMailbox {
+		return new OriginMailbox({
+			timezone: "Asia/Seoul",
+			originKey: ORIGIN_KEY,
+			store,
+			clock,
+			log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
+			statusProvider: () => "status: ok",
+			sessionDirFor: (key, epoch) => sessionDirFor(join(dir, "sessions"), key, epoch),
+			driverFactory: (_origin, sessionDir) => {
+				const driver = new FakeOmpDriver({ holdTurns: true, sessionDir, store: sessionStore });
+				opened.push(driver);
+				return driver;
+			},
+			onTurnSettled: (info) => broker.dropInput(info.originKey, "turn_ended"),
+			dialogs: {
+				open: (originKey) => broker.openDialogs(originKey),
+				answer: (originKey, text) => broker.answerDialog(originKey, text),
+				ambiguous: () => undefined,
+			},
+		});
+	}
+
+	/** The fake driver's side: omp's dialog answerer, backed by the real broker. */
+	function ask(mailbox: OriginMailbox, request: OmpDialogRequest, signal = new AbortController().signal) {
+		const origin = { originKey: ORIGIN_KEY, channel: "D8", threadTs: "1.1", opRef: mailbox.turnOpRef };
+		return answerDialogOnSlack(broker, origin, request, signal);
+	}
+
+	/** Resolves once the n-th choice card is registered (the broker logs it right after). */
+	function cardOpen(n: number): Promise<void> {
+		if (requests >= n) return Promise.resolve();
+		const { promise, resolve } = Promise.withResolvers<void>();
+		requested.push(() => requests >= n && resolve());
+		return promise;
+	}
+
+	beforeEach(() => {
+		opened = [];
+		posts = [];
+		requested = [];
+		requests = 0;
+		const port: ChannelPort = {
+			platform: "slack",
+			post: async (target, msg) => {
+				posts.push(msg.text);
+				return { platform: "slack", conversationId: target.conversationId, messageId: `${200 + posts.length}.0` };
+			},
+			edit: async () => undefined,
+			react: async () => undefined,
+			uploadFile: async () => ({ fileId: "F1" }),
+			permalink: async () => undefined,
+			mentionUser: (userId) => `<@${userId}>`,
+		};
+		broker = new ApprovalBroker({
+			timezone: "Asia/Seoul",
+			channels: registryOf(port),
+			ownerUserId: "U_OWNER",
+			log: createLogger({
+				sink: (line) => {
+					if (!line.includes("choice_requested")) return;
+					requests += 1;
+					for (const check of requested) check();
+				},
+				clock,
+				redact,
+			}),
+			store,
+			clock,
+		});
+	});
+
+	test("with an Other row: dispatched with the turn's opRef; the driver gets the Other row, then the text as input", async () => {
+		const mailbox = realMailbox();
+		try {
+			const lead = msg("배포 준비해", { originKey: ORIGIN_KEY });
+			await mailbox.enqueue(lead);
+			const driver = opened[0] as FakeOmpDriver;
+			const select = ask(mailbox, { method: "select", id: "s1", title: "방식", options: ["a", "b", "c", "d", OTHER] });
+			await cardOpen(1);
+			const reply = msg("먼저 분석부터 보여줘", { originKey: ORIGIN_KEY, threadRef: lead.threadRef });
+			await mailbox.enqueue(reply);
+			expect(await select).toEqual({ value: OTHER });
+			const row = store.getInbound(reply.platformMessageId);
+			expect(row?.state).toBe("dispatched");
+			expect(row?.opRef).toBe(store.getInbound(lead.platformMessageId)?.opRef ?? "missing");
+			expect(driver.calls.filter((c) => c.startsWith("steer:"))).toEqual([]);
+			// omp's next request is the input behind the Other row: answered without a card.
+			expect(await ask(mailbox, { method: "input", id: "i1", title: "방식" })).toEqual({
+				value: "먼저 분석부터 보여줘",
+			});
+			expect(posts).toHaveLength(1);
+			await untilFinal(mailbox, driver, () => driver.release());
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("a text held behind the Other row is dropped when its turn settles: the next turn's input opens a card", async () => {
+		const mailbox = realMailbox();
+		try {
+			const lead = msg("배포 준비해", { originKey: ORIGIN_KEY });
+			await mailbox.enqueue(lead);
+			const driver = opened[0] as FakeOmpDriver;
+			const select = ask(mailbox, { method: "select", id: "s1", title: "방식", options: ["a", OTHER] });
+			await cardOpen(1);
+			await mailbox.enqueue(msg("보류될 글", { originKey: ORIGIN_KEY, threadRef: lead.threadRef }));
+			expect(await select).toEqual({ value: OTHER });
+			await untilFinal(mailbox, driver, () => driver.release());
+			const next = msg("다음 일", { originKey: ORIGIN_KEY });
+			await mailbox.enqueue(next);
+			const input = ask(mailbox, { method: "input", id: "i1", title: "방식" });
+			await cardOpen(2);
+			expect(broker.openDialogs(ORIGIN_KEY)).toBe(1);
+			expect(await broker.answerDialog(ORIGIN_KEY, "직접 쓴 글")).toBe(true);
+			expect(await input).toEqual({ value: "직접 쓴 글" });
+			await untilFinal(mailbox, opened.at(-1) as FakeOmpDriver, () => (opened.at(-1) as FakeOmpDriver).release());
+		} finally {
+			await mailbox.close();
+		}
+	});
+
+	test("without an Other row: the message is steered, the card stays open and a number still answers", async () => {
+		const mailbox = realMailbox();
+		try {
+			const lead = msg("배포 준비해", { originKey: ORIGIN_KEY });
+			await mailbox.enqueue(lead);
+			const driver = opened[0] as FakeOmpDriver;
+			const select = ask(mailbox, { method: "select", id: "s1", title: "방식", options: ["a", "b", "c"] });
+			await cardOpen(1);
+			const reply = msg("먼저 분석부터 보여줘", { originKey: ORIGIN_KEY, threadRef: lead.threadRef });
+			await mailbox.enqueue(reply);
+			expect(driver.calls.filter((c) => c.startsWith("steer:"))).toEqual(["steer:먼저 분석부터 보여줘"]);
+			expect(broker.openDialogs(ORIGIN_KEY)).toBe(1);
+			expect(await broker.answerDialog(ORIGIN_KEY, "2")).toBe(true);
+			expect(await select).toEqual({ value: "b" });
+			await untilFinal(mailbox, driver, () => driver.release());
+		} finally {
+			await mailbox.close();
+		}
+	});
+});
+
 describe("mailbox: a child started before a peer bot wrote in its conversation", () => {
 	test("is kept; the notice leads the first prompted turn after the taint, survives a failed prompt, then is gone", async () => {
 		const mailbox = router.mailbox(ORIGIN);
@@ -2734,4 +2891,33 @@ describe("mailbox: !restart runs without a driver or a turn", () => {
 		expect(restartCalls).toEqual([]);
 		expect(drivers).toHaveLength(0);
 	});
+});
+
+describe("mailbox: a failed usage_daily write never holds up the answer or the queue", () => {
+	const turnUsage = () => ({ calls: 1, input: 10, cacheRead: 0, output: 5, rotated: false });
+	for (const source of ["session transcript", "agy final usage"] as const) {
+		test(`${source}: the turn's answer is recorded and the next queued row starts`, async () => {
+			driverOptions =
+				source === "agy final usage"
+					? { holdTurns: true, turnUsage }
+					: { holdTurns: true, sessionFile: join(dir, "missing-session.jsonl") };
+			// A steer the child refuses leaves the second row pending: it is the queue's next turn.
+			failSteers = 1;
+			store.addDailyUsage = () => {
+				throw new Error("disk full");
+			};
+			const mailbox = router.mailbox(ORIGIN);
+			const a = msg("first");
+			const b = msg("second");
+			await router.route(a);
+			await router.route(b);
+			const driver = drivers[0] as SteerFailingDriver;
+			expect(store.getInbound(b.platformMessageId)?.state).toBe("pending");
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(store.getInbound(a.platformMessageId)?.state).toBe("answered");
+			expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual(["ECHO first"]);
+			expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:first", "prompt:second"]);
+			expect(logLines.some((line) => line.includes("usage_daily_failed") && line.includes("disk full"))).toBe(true);
+		});
+	}
 });

@@ -10,6 +10,8 @@ import { callDaemon } from "../src/daemon/ipc";
 import { acquireLock, currentBootId, LockHeldError } from "../src/daemon/lock";
 import { INTERRUPTED_NOTICE } from "../src/daemon/recovery";
 import { runDaemon } from "../src/daemon/run";
+import { DiscordBinding } from "../src/discord/binding";
+import { DiscordChannel } from "../src/discord/channel";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
@@ -17,7 +19,15 @@ import { redact } from "../src/redact";
 import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { acceptanceItems } from "../src/tasks/docs";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	DISCORD_OWNER,
+	makeHome,
+	OWNER,
+	type TestHome,
+	WaitingDiscordTransport,
+	WaitingTransport,
+	withDiscord,
+} from "./helpers/bot-home";
 
 const ORIGIN = "slack/dm/D1";
 const BOOT_ID = "kernel-boot-id"; // the kernel boot id is the same for every daemon incarnation
@@ -938,5 +948,191 @@ describe("inject and owner-message buttons outside card threads (card guard regr
 			actions: [{ action_id: `ompbot:approval:retry:D1:${card}`, value: "retry" }],
 		});
 		expect(inbound(daemon, "다시 요청: force push main").map((row) => row.threadRef)).toEqual([`D1:${asking}`]);
+	});
+});
+
+/** A log sink plus a bounded wait for the first line holding `needle` (woken by the sink, no polling). */
+function logTap(): { lines: string[]; sink: (line: string) => void; until(needle: string): Promise<void> } {
+	const lines: string[] = [];
+	const waiters = new Set<() => void>();
+	return {
+		lines,
+		sink: (line) => {
+			lines.push(line);
+			for (const wake of [...waiters]) wake();
+		},
+		until(needle) {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			const check = (): void => {
+				if (!lines.some((line) => line.includes(needle))) return;
+				clearTimeout(timer);
+				waiters.delete(check);
+				resolve();
+			};
+			const timer = setTimeout(() => {
+				waiters.delete(check);
+				reject(new Error(`log line never appeared: ${needle}`));
+			}, 5_000);
+			waiters.add(check);
+			check();
+			return promise;
+		},
+	};
+}
+
+// Muse review 2, defect 2: one chat adapter that cannot start must not keep the daemon (and the other platforms) down.
+describe("adapter start isolation", () => {
+	const DISCORD_DM = "123456789012345678"; // gitleaks:allow (fake snowflake)
+
+	/** A Slack transport whose connect is refused (a revoked app token); counts the stops that close it. */
+	class RefusedSlackTransport extends WaitingTransport {
+		stops = 0;
+		override async start(_handlers: Parameters<WaitingTransport["start"]>[0]): Promise<{ botUserId: string }> {
+			throw new Error("slack refused the app token: invalid_auth");
+		}
+		override async stop(): Promise<void> {
+			this.stops += 1;
+			await super.stop();
+		}
+	}
+
+	class RefusedDiscordTransport extends WaitingDiscordTransport {
+		override async start(): Promise<{ botUserId: string; applicationId: string }> {
+			throw new Error("discord refused the bot token");
+		}
+	}
+
+	function bootPair(slack: WaitingTransport, discord: WaitingDiscordTransport, tap: ReturnType<typeof logTap>) {
+		const answered: Array<() => void> = [];
+		const daemon = new Daemon({
+			config: withDiscord(home),
+			channels: [
+				new SlackBinding(new SlackChannel(slack)),
+				new DiscordBinding(new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER })),
+			],
+			log: createLogger({ sink: tap.sink, clock, redact }),
+			ompVersion: "omp-test 0",
+			bootId: BOOT_ID,
+			hostLoad: IDLE_HOST_LOAD,
+			// Called inside recordAnswer: the deterministic "an answer was recorded" signal.
+			crash: (point) => {
+				if (point === "after_final_before_answered") for (const wake of answered.splice(0)) wake();
+			},
+			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+		});
+		daemons.push(daemon);
+		const nextAnswer = (): Promise<void> => {
+			const { promise, resolve, reject } = Promise.withResolvers<void>();
+			const timer = setTimeout(() => reject(new Error("no answer recorded within 5000ms")), 5_000);
+			answered.push(() => {
+				clearTimeout(timer);
+				resolve();
+			});
+			return promise;
+		};
+		return { daemon, nextAnswer };
+	}
+
+	test("a Slack start that throws leaves Discord up and the daemon running; Slack's half-open socket is closed", async () => {
+		const slack = new RefusedSlackTransport();
+		const discord = new WaitingDiscordTransport();
+		const tap = logTap();
+		const { daemon } = bootPair(slack, discord, tap);
+		await daemon.start();
+
+		expect(tap.lines.some((line) => line.includes("event=adapter_start_failed") && line.includes("slack"))).toBe(true);
+		expect(slack.stops).toBe(1);
+		expect(tap.lines.some((line) => line.includes("event=daemon_ready") && line.includes("discord=on"))).toBe(true);
+		expect(tap.lines.some((line) => line.includes("event=daemon_ready") && line.includes("slack=off"))).toBe(true);
+		await discord.emitMessage({
+			id: "700000000000000001",
+			channel_id: DISCORD_DM,
+			author: { id: DISCORD_OWNER },
+			content: "슬랙이 죽어도",
+			type: 0,
+		});
+		await discord.waitForPosts((text) => text.includes("ECHO 슬랙이 죽어도"));
+	});
+
+	test("the failed platform's pending rows are still answered; their deliveries wait and go out on the next boot", async () => {
+		const seed = openBotStore(join(home.dir, "ompbot.db"), clock, "Asia/Seoul");
+		seed.ensureOrigin(ORIGIN, "sess/e1");
+		seed.recordInbound({ originKey: ORIGIN, platformMessageId: "D1:6.6", textRef: "slack-down", threadRef: "D1:6.6" });
+		seed.close();
+
+		const tap = logTap();
+		const first = bootPair(new RefusedSlackTransport(), new WaitingDiscordTransport(), tap);
+		const answered = first.nextAnswer();
+		await first.daemon.start();
+		await answered;
+		await first.daemon.pump();
+		const waiting = first.daemon.store.listDeliveries().filter((row) => row.originKey === ORIGIN);
+		expect(waiting.map((row) => row.state)).toEqual(["pending"]);
+		expect(first.daemon.store.getInbound("D1:6.6")?.state).toBe("answered");
+		await first.daemon.stop();
+
+		const slack = new WaitingTransport();
+		const second = bootPair(slack, new WaitingDiscordTransport(), logTap());
+		await second.daemon.start();
+		await slack.waitForPosts(echoes("slack-down"));
+		expect(slack.posts(echoes("slack-down"))[0]?.threadTs).toBe("6.6");
+	});
+
+	test("only when every adapter fails does the start fail", async () => {
+		const tap = logTap();
+		const { daemon } = bootPair(new RefusedSlackTransport(), new RefusedDiscordTransport(), tap);
+		await expect(daemon.start()).rejects.toThrow("every chat adapter failed to start");
+		expect(tap.lines.filter((line) => line.includes("event=adapter_start_failed"))).toHaveLength(2);
+	});
+});
+
+// Muse review 2, defect 3: a store write that throws while the core settles a lane message (its callers fire and forget
+// it) must neither become an unhandled rejection nor leave the row dispatched.
+describe("lane settle failure", () => {
+	test("a recordAnswer that throws during a lane start: the process lives, the row is discarded, the failure logged", async () => {
+		const rejections: unknown[] = [];
+		const onRejection = (reason: unknown): void => {
+			rejections.push(reason);
+		};
+		process.on("unhandledRejection", onRejection);
+		try {
+			const transport = new WaitingTransport();
+			const tap = logTap();
+			const daemon = new Daemon({
+				config: home.config,
+				channels: [new SlackBinding(new SlackChannel(transport))],
+				log: createLogger({ sink: tap.sink, clock, redact }),
+				ompVersion: "omp-test 0",
+				bootId: BOOT_ID,
+				hostLoad: IDLE_HOST_LOAD,
+				driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
+			});
+			daemons.push(daemon);
+			await daemon.start();
+			const store = daemon.store;
+			const recordAnswer = store.recordAnswer.bind(store);
+			store.recordAnswer = (input) => {
+				if (input.opRef.startsWith("lane:")) throw new Error("database is locked");
+				return recordAnswer(input);
+			};
+
+			await transport.emitMessage({
+				type: "message",
+				channel: "D1",
+				channel_type: "im",
+				user: OWNER,
+				text: "작업: 고착 확인 @/nonexistent/repo",
+				ts: "1700.000500",
+			});
+			await tap.until("event=lane_settle_failed");
+
+			expect(tap.lines.some((line) => line.includes("event=lane_settle_failed") && line.includes("lane_start"))).toBe(
+				true,
+			);
+			expect(store.getInbound("D1:1700.000500")?.state).toBe("discarded");
+			expect(rejections).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onRejection);
+		}
 	});
 });

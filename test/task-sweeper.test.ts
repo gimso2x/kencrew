@@ -24,6 +24,7 @@ import {
 	renderSpec,
 } from "../src/tasks/docs";
 import type { TaskEvaluation } from "../src/tasks/evaluate";
+import type { TaskLandOutcome } from "../src/tasks/land";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { formatAgentWaitingNotice, NUDGE_MAX } from "../src/tasks/notify";
 import { restatedHash } from "../src/tasks/resume-check";
@@ -141,7 +142,7 @@ function rig(
 			| "autoLandHold"
 		>
 	> = {},
-	task: Partial<Pick<TaskRow, "host" | "risk">> = {},
+	task: Partial<Pick<TaskRow, "host" | "risk">> & { workerModel?: string } = {},
 ): Rig {
 	const clock = { ms: T0 };
 	const db = new Database(":memory:", { strict: true });
@@ -154,6 +155,9 @@ function rig(
 		host: task.host ?? null,
 		repo: "/r/repo",
 		acceptance: acceptanceItems(["하나", "둘"]),
+		...(task.workerModel === undefined
+			? {}
+			: { worker: { tier: "low" as const, tierReason: "기본값", model: task.workerModel } }),
 	});
 	const transport = new FakeSlackTransport();
 	const next: { value: TaskEvaluation } = { value: { ok: true, judgement: judgement() } };
@@ -1093,6 +1097,7 @@ describe("TaskSweeper", () => {
 		const herdr: string[][] = [];
 		const dispatch: TaskDispatchDeps = {
 			ledger: r.ledger,
+			secretsDir: "/home/secrets",
 			timezone: "Asia/Seoul",
 			originKey: "slack/ch/C1/t/100.1",
 			threadRef: () => "C1:100.1",
@@ -1295,6 +1300,7 @@ describe("TaskSweeper: worker prose with a secret never reaches the ledger or th
 });
 
 describe("TaskSweeper: auto-land (taskAutoLand)", () => {
+	const HANDOFF: TaskLandOutcome = { state: "handoff", reason: "재판정 문제" };
 	const POLICY = { repos: ["/r/repo"], maxRisk: "L2" as const };
 	const PASSED = [{ id: "AC-2", signal: 'command ["bun","test"]', ok: true, detail: "exit 0" }];
 	const textOf = (post: FakeCall | undefined): string => (post && "text" in post ? post.text : "");
@@ -1306,7 +1312,7 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 
 	/** A rig with the policy on, `repoMatches` answering `matched`, and `autoLand` answering `landed`. */
 	function autoRig(
-		opts: { matched?: boolean; landed?: (row: TaskRow) => Promise<boolean>; frozen?: boolean } = {},
+		opts: { matched?: boolean; landed?: (row: TaskRow) => Promise<TaskLandOutcome>; frozen?: boolean } = {},
 		task: Partial<Pick<TaskRow, "host" | "risk">> = {},
 	) {
 		const calls = { autoLand: 0, repoMatches: 0, postsAtAutoLand: [] as number[], repos: [] as string[][] };
@@ -1325,7 +1331,7 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 				autoLand: async (row) => {
 					calls.autoLand += 1;
 					calls.postsAtAutoLand.push(posts(r).length);
-					return opts.landed === undefined ? true : opts.landed(row);
+					return opts.landed === undefined ? HANDOFF : opts.landed(row);
 				},
 				log: { info() {}, warn: (event) => warnings.push(event) },
 			},
@@ -1346,7 +1352,7 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 			},
 			autoLand: async () => {
 				autoLands += 1;
-				return true;
+				return HANDOFF;
 			},
 		});
 		off.next.value = { ok: true, judgement: reached };
@@ -1382,7 +1388,7 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 		expect(posts(r)).toHaveLength(1);
 		const card = posts(r)[0];
 		expect(card).toMatchObject({ channel: "C1", threadTs: "100.1" });
-		expect(header(card)).toContain("🚚 자동 머지 · 로그 회전");
+		expect(header(card)).toContain("🚚 자동 머지 · 모델 턴 · 로그 회전");
 		expect(blocksOf(card).some((b) => typeof b === "object" && b !== null && "type" in b && b.type === "actions")).toBe(
 			false,
 		);
@@ -1394,6 +1400,19 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 		await r.sweeper.sweep();
 		expect(calls.autoLand).toBe(1);
 		expect(posts(r)).toHaveLength(1);
+	});
+
+	test("autoLand gets the task as it is after the reach: status review, not the swept working row", async () => {
+		const seen: string[] = [];
+		const { r } = autoRig({
+			landed: async (row) => {
+				seen.push(row.status);
+				return HANDOFF;
+			},
+		});
+		r.next.value = { ok: true, judgement: reachedJudgement({ checks: PASSED }) };
+		await r.sweeper.sweep();
+		expect(seen).toEqual(["review"]);
 	});
 
 	const failed = { id: "AC-2", signal: 'command ["bun","test"]', ok: false, detail: "exit 1" };
@@ -1452,6 +1471,30 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 		expect(calls.autoLand).toBe(0);
 	});
 
+	test.each<[TaskLandOutcome, string, boolean]>([
+		[{ state: "landed", baseBranch: "main", sha: "a".repeat(40), notes: [] }, "✅ 자동 머지 완료", false],
+		[
+			{ state: "merged-not-pushed", baseBranch: "main", sha: "a".repeat(40), reason: "rejected", notes: [] },
+			"⚠️ 자동 머지 · push 거부",
+			false,
+		],
+		[{ state: "handoff", reason: "rebase 실패(충돌)" }, "🚚 자동 머지 · 모델 턴", false],
+		[{ state: "in_flight" }, "🚚 자동 머지 · 이미 착지 중", false],
+		[{ state: "blocked", reason: "동결 중" }, "🔍 머지 대기", true],
+	])("task-core-land AC-6: autoLand %o posts exactly one card (%s)", async (outcome, title, button) => {
+		const { r, calls } = autoRig({ landed: async () => outcome });
+		r.next.value = { ok: true, judgement: reachedJudgement({ checks: PASSED }) };
+		await r.sweeper.sweep();
+		await r.sweeper.sweep();
+		expect(calls.autoLand).toBe(1);
+		expect(posts(r)).toHaveLength(1);
+		expect(header(posts(r)[0])).toContain(title);
+		expect(hasMergeButton(posts(r)[0])).toBe(button);
+		if (outcome.state === "merged-not-pushed")
+			expect(textOf(posts(r)[0])).toContain("push 거부: rejected — 손으로 push 필요");
+		if (outcome.state === "blocked") expect(textOf(posts(r)[0])).toContain("자동 머지 안 함: ⛔ 착지 멈춤: 동결 중");
+	});
+
 	test("AC-7: a remote task (host set) never reaches repoMatches", async () => {
 		const { r, calls } = autoRig({}, { host: "wsl" });
 		r.next.value = { ok: true, judgement: reachedJudgement({ checks: PASSED }) };
@@ -1461,8 +1504,8 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 		expect(posts(r)).toHaveLength(1);
 	});
 
-	test.each<[string, () => Promise<boolean>]>([
-		["returns false", async () => false],
+	test.each<[string, () => Promise<TaskLandOutcome>]>([
+		["returns not_accepted", async () => ({ state: "not_accepted" })],
 		[
 			"throws",
 			async () => {
@@ -1473,7 +1516,7 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 		"AC-4: autoLand %s: one 머지 card with the ⚠️ line, no 🚚 card; the other task goes on; a repeat sweep adds nothing",
 		async (_name, failure) => {
 			const { r, calls, warnings } = autoRig({
-				landed: async (row) => (row.taskId === r.row.taskId ? failure() : true),
+				landed: async (row) => (row.taskId === r.row.taskId ? failure() : HANDOFF),
 			});
 			const other = r.ledger.register({ ...r.row, host: null, acceptance: r.row.acceptance, threadRef: "C1:200.1" });
 			r.next.value = { ok: true, judgement: reachedJudgement({ checks: PASSED }) };
@@ -1509,7 +1552,7 @@ describe("TaskSweeper: auto-land (taskAutoLand)", () => {
 			autoLandHold: () => hold,
 			autoLand: async () => {
 				autoLands += 1;
-				return true;
+				return HANDOFF;
 			},
 			log: { info: (event, fields) => infos.push([event, fields]), warn() {} },
 		});
@@ -2410,6 +2453,7 @@ describe("TaskSweeper: one retry prompt before a blocked card", () => {
 
 		const dispatch: TaskDispatchDeps = {
 			ledger: r.ledger,
+			secretsDir: "/home/secrets",
 			timezone: "Asia/Seoul",
 			originKey: "slack/ch/C1/t/100.1",
 			threadRef: () => "C1:100.1",
@@ -2685,5 +2729,71 @@ describe("TaskSweeper: a worker that asks in prose and stops (question stop)", (
 		}
 		expect(r.answerCalls).toEqual([]);
 		expect(questionCards(r)).toHaveLength(0);
+	});
+});
+
+describe("agy worker limit (doc/plans/agy-task-worker.md 6)", () => {
+	const LIMIT_SCREEN = "● Ran (bun test) ok\n  Error: RESOURCE_EXHAUSTED: You have exhausted your capacity\n>";
+	const agyRig = () => {
+		const r = rig({}, { risk: "L1", workerModel: "agy:gemini-4-hydrogen-high" });
+		// Unmet conditions with the agent idle and PROGRESS stale: both the nudge and the reminder would go out.
+		r.next.value = { ok: true, judgement: judgement({ problems: ["AC-1 증거 없음"] }) };
+		r.clock.ms = T0 + 40 * MIN;
+		return r;
+	};
+	const texts = (r: Rig) => posts(r).map((post) => ("text" in post ? post.text : ""));
+
+	test("AC-6: RESOURCE_EXHAUSTED on the screen blocks the task, posts one agy 한도 card and sends no nudge", async () => {
+		const r = agyRig();
+		r.screen.value = { ok: true, output: LIMIT_SCREEN };
+		await r.sweeper.sweep();
+		expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+		expect(r.ledger.history(r.row.taskId).at(-1)).toMatchObject({ toStatus: "blocked", reason: "agy 한도" });
+		expect(texts(r)).toHaveLength(1);
+		expect(texts(r)[0]?.split("\n")[0]).toStartWith("⛔ agy 한도 · 로그 회전");
+		expect(texts(r)[0]).toContain("<@UOWN>");
+		expect(texts(r)[0]).toContain("RESOURCE_EXHAUSTED");
+		expect(r.reminders).toEqual([]);
+		for (let i = 0; i < 3; i++) {
+			r.clock.ms += 40 * MIN;
+			await r.sweeper.sweep();
+		}
+		expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+		expect(texts(r).filter((text) => text.includes("agy 한도"))).toHaveLength(1);
+		expect(r.reminders).toEqual([]);
+	});
+
+	test("AC-6: a resume lifts the hold; the same limit then blocks again with a new card", async () => {
+		const r = agyRig();
+		r.screen.value = { ok: true, output: LIMIT_SCREEN };
+		await r.sweeper.sweep();
+		r.clock.ms += 60 * MIN;
+		r.ledger.transition(r.row.taskId, "working", "bot", "resume dispatch");
+		r.ledger.recordNotice(r.row.taskId, `resume:${r.clock.ms}`);
+		r.clock.ms += 5 * MIN;
+		await r.sweeper.sweep();
+		expect(r.ledger.require(r.row.taskId).status).toBe("blocked");
+		expect(texts(r).filter((text) => text.includes("agy 한도"))).toHaveLength(2);
+		expect(r.reminders).toEqual([]);
+	});
+
+	test("no limit line, an unreadable screen, or an omp worker: the nudge goes out as before", async () => {
+		const clean = agyRig();
+		clean.screen.value = { ok: true, output: "● Ran (bun test) ok\n>" };
+		await clean.sweeper.sweep();
+		const unread = agyRig();
+		unread.screen.value = { ok: false, error: "agent read failed" };
+		await unread.sweeper.sweep();
+		const omp = rig({}, { risk: "L1" });
+		omp.next.value = { ok: true, judgement: judgement({ problems: ["AC-1 증거 없음"] }) };
+		omp.screen.value = { ok: true, output: LIMIT_SCREEN };
+		await omp.sweeper.sweep();
+		for (const r of [clean, unread, omp]) {
+			expect(r.ledger.require(r.row.taskId).status).toBe("working");
+			expect(r.reminders).toHaveLength(1);
+			expect(texts(r).some((text) => text.includes("agy 한도"))).toBe(false);
+		}
+		expect(unread.infos.some((entry) => entry.event === "task_agy_screen_read_failed")).toBe(true);
+		expect(omp.readCalls.count).toBe(0);
 	});
 });

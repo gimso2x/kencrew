@@ -177,9 +177,9 @@ export class TeamsAdapter implements ChannelAdapter {
 			this.#upSince = this.#clock.now();
 			this.#log.info("teams_listening", { host: listen.hostname, port: this.#boundPort });
 		} catch (err) {
-			// A taken port leaves Teams off; the rest of the daemon keeps running.
+			// A taken port leaves Teams off; the daemon drops it and keeps the other platforms running.
 			this.#server = undefined;
-			this.#log.error("teams_start_failed", { error: errorText(err) });
+			throw err;
 		}
 	}
 

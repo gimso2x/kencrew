@@ -1,6 +1,6 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import type { LaneModelTiers } from "../src/config";
+import type { LaneModelTiers, WorkerAgyConfig } from "../src/config";
 import type { HerdrBoardConfig } from "../src/dispatch/board";
 import type { ProcessRunner } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
@@ -13,7 +13,7 @@ import { acceptanceItems, docsDirOf, type TaskRisk } from "../src/tasks/docs";
 import type { HostResult, ProgressLag, TaskHostOps, TaskResumeOps } from "../src/tasks/host";
 import { TaskLedger } from "../src/tasks/ledger";
 import { buildAcceptedCard, buildAutoLandCard, buildReachedCard } from "../src/tasks/notify";
-import { resolveWorkerTier } from "../src/tasks/worker-tier";
+import { agySecretsDirs, agySettings, resolveWorkerTier } from "../src/tasks/worker-tier";
 import { registryOf } from "./helpers/channels";
 import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
@@ -140,6 +140,8 @@ function harness(
 		noRoot?: boolean;
 		/** Config `lanes.models` as the daemon holds it: `current` may be swapped between calls (a reload). */
 		models?: { current: LaneModelTiers | undefined };
+		/** Config `workerAgy` as the daemon holds it (live). */
+		agy?: WorkerAgyConfig;
 	} = {},
 ): Harness {
 	const db = new Database(":memory:", { strict: true });
@@ -200,6 +202,7 @@ function harness(
 		},
 		...(options.workerOmpArgs === undefined ? {} : { workerOmpArgs: options.workerOmpArgs }),
 		...(options.models === undefined ? {} : { laneModels: () => options.models?.current }),
+		...(options.agy === undefined ? {} : { workerAgy: () => options.agy }),
 		run,
 		log: { info: record, warn: record },
 		recordPrompt: (input) => prompts.push(input),
@@ -1169,7 +1172,10 @@ describe("worker tier (taskSpec tier, lanes.models)", () => {
 		expect((post && "text" in post ? post.text : "").split("\n")).toContain(line);
 		const row = h.ledger.require(TASK_ID);
 		expect(buildAcceptedCard(row, { goal: "g" }, undefined).body.split("\n")).toContain(line);
-		for (const card of [buildReachedCard(row, reached, "U1"), buildAutoLandCard(row, reached)]) {
+		for (const card of [
+			buildReachedCard(row, reached, "U1"),
+			buildAutoLandCard(row, reached, { state: "in_flight" }),
+		]) {
 			expect(card.text.split("\n")).toContain(line);
 			expect(card.body.split("\n")).toContain(line);
 		}
@@ -1184,9 +1190,170 @@ describe("worker tier (taskSpec tier, lanes.models)", () => {
 		const cards = (row: typeof base) => [
 			buildAcceptedCard(row, { goal: "g" }, undefined),
 			buildReachedCard(row, reached, "U1"),
-			buildAutoLandCard(row, reached),
+			buildAutoLandCard(row, reached, { state: "in_flight" }),
 		];
 		for (const card of cards(old)) expect(card.text).not.toContain("워커:");
 		for (const card of cards(unset)) expect(card.text.split("\n")).toContain("워커: 기본 모델 (middle)");
+	});
+});
+
+describe("agy worker trial (taskSpec worker: agy, config workerAgy)", () => {
+	const AGY: WorkerAgyConfig = { model: "gemini-4-hydrogen-high" };
+	const L1 = { ...GOOD_SPEC, risk: "L1", worker: "agy" };
+	const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 2) : cmd);
+	const starts = (h: Harness): string[][] =>
+		h.herdr.map(words).filter((args) => args[1] === "agent" && args[2] === "start");
+	/** The first prompt herdr was handed after a start (`agent prompt <name> <text>`, no `--wait`). */
+	const firstPrompts = (h: Harness): string[] =>
+		h.herdr
+			.filter((args) => args[1] === "agent" && args[2] === "prompt" && !args.includes("--wait"))
+			.map((args) => args[4] as string);
+	const agyStart = (agent: string, worktree: string): string[] => [
+		"herdr",
+		"agent",
+		"start",
+		agent,
+		"--kind",
+		"agy",
+		"--pane",
+		"P1",
+		"--timeout",
+		"60000",
+		"--",
+		"--model",
+		AGY.model,
+		"--dangerously-skip-permissions",
+		"--settings",
+		agySettings(worktree, agySecretsDirs("/home/secrets")),
+	];
+	const FALLBACK = "agy 워커는 L0·L1 로컬·동시 1개만 — omp ";
+
+	test("AC-1: an L1 local TASK starts `--kind agy` with the model, no prompts, session settings; row agy:<model>", async () => {
+		const h = harness({ agy: AGY });
+		const out = await call(h, { taskSpec: L1, task: "go" });
+		const row = h.ledger.require("T-20261026-01");
+		expect(starts(h)).toEqual([agyStart("t-20261026-01", row.worktree)]);
+		const settings = JSON.parse(starts(h)[0]?.at(-1) as string);
+		expect(settings.trustedWorkspaces).toEqual([row.worktree]);
+		expect(settings.permissions.deny).toContain("command(git push)");
+		expect(settings.permissions.deny).toContain("read_file(/home/secrets)");
+		expect(row).toMatchObject({ workerModel: `agy:${AGY.model}`, tier: "low", risk: "L1" });
+		expect(out.split("\n")).toContain(`워커: agy ${AGY.model} (low)`);
+		expect(out).not.toContain(FALLBACK);
+	});
+
+	test("AC-2: L2, a host, no workerAgy, another agy TASK working or blocked → omp tier worker with a reason line", async () => {
+		const cases: Array<[string, Harness, Record<string, unknown>]> = [];
+		const l2 = harness({ agy: AGY });
+		cases.push(["L2", l2, { taskSpec: { ...L1, risk: "L2" }, task: "go" }]);
+		const remote = harness({ agy: AGY });
+		cases.push(["host", remote, { taskSpec: L1, task: "go", host: "wsl" }]);
+		const unset = harness();
+		cases.push(["workerAgy", unset, { taskSpec: L1, task: "go" }]);
+		const working = harness({ agy: AGY });
+		await call(working, { taskSpec: L1, task: "go" });
+		cases.push(["working", working, { taskSpec: L1, task: "go" }]);
+		const blocked = harness({ agy: AGY });
+		await call(blocked, { taskSpec: L1, task: "go" });
+		blocked.ledger.transition("T-20261026-01", "blocked", "bot", "test");
+		cases.push(["blocked", blocked, { taskSpec: L1, task: "go" }]);
+		const tiers: Array<string | null> = [];
+		for (const [label, h, params] of cases) {
+			const out = await call(h, params);
+			const row = h.ledger.require(`T-20261026-0${h.ledger.list().length}`);
+			const reasons = out.split("\n").filter((line) => line.startsWith(FALLBACK));
+			expect({ label, reasons: reasons.length }).toEqual({ label, reasons: 1 });
+			expect({ label, kind: starts(h).at(-1)?.[5] }).toEqual({ label, kind: "omp" });
+			expect({ label, model: row.workerModel }).toEqual({ label, model: null });
+			tiers.push(row.tier);
+		}
+		expect(tiers).toEqual(["middle", "low", "low", "low", "low"]);
+	});
+
+	test("AC-2: a dead agy TASK is not resumed while another agy TASK holds the slot; it says why", async () => {
+		const h = harness({ agy: AGY });
+		await call(h, { taskSpec: L1, task: "go" });
+		h.ledger.transition("T-20261026-01", "review", "bot", "test"); // frees the slot
+		await call(h, { taskSpec: L1, task: "go" });
+		expect(h.ledger.require("T-20261026-02").workerModel).toBe(`agy:${AGY.model}`);
+		h.agents.clear();
+		h.herdr.length = 0;
+		const out = await call(h, { taskSpec: { id: "T-20261026-01" } });
+		expect(out).toBe(
+			"재개 안 함: agy 워커는 동시 1개만 — T-20261026-02가 점유 중입니다(working·blocked). 그 작업이 끝나거나 닫힌 뒤 다시 재개하세요.",
+		);
+		expect(starts(h)).toEqual([]);
+		expect(h.ledger.require("T-20261026-01").status).toBe("review");
+	});
+
+	test("AC-3: resume and follow-up of an agy TASK start `--kind agy` with the same --settings", async () => {
+		const h = harness({ agy: AGY });
+		await call(h, { taskSpec: L1, task: "go" });
+		const row = h.ledger.require("T-20261026-01");
+		const first = starts(h)[0];
+		h.agents.clear();
+		expect(await call(h, { taskSpec: { id: row.taskId } })).toContain("같은 워크트리에서 새 에이전트를 시작했습니다");
+		h.agents.clear();
+		await call(h, { taskSpec: { id: row.taskId }, task: "오너 답: 그대로 진행" });
+		expect(starts(h)).toEqual([first, first, first].map((args) => args as string[]));
+		expect(first).toEqual(agyStart(row.agent, row.worktree));
+	});
+
+	test("AC-3: an omp TASK's start and resume arguments are unchanged by workerAgy", async () => {
+		const plain = harness({ workerOmpArgs: ["--prewalk"] });
+		const withAgy = harness({ workerOmpArgs: ["--prewalk"], agy: AGY });
+		for (const h of [plain, withAgy]) {
+			await call(h, { taskSpec: GOOD_SPEC, task: "go" });
+			h.agents.clear();
+			await call(h, { taskSpec: { id: "T-20261026-01" } });
+		}
+		expect(starts(withAgy)).toEqual(starts(plain));
+		expect(firstPrompts(withAgy)).toEqual(firstPrompts(plain));
+		expect(starts(plain)[0]).toEqual([
+			"herdr",
+			"agent",
+			"start",
+			"t-20261026-01",
+			"--kind",
+			"omp",
+			"--pane",
+			"P1",
+			"--timeout",
+			"60000",
+			"--",
+			"--prewalk",
+		]);
+	});
+
+	test("AC-4: the agy first prompt opens with the worker floors and has no conversation-only line", async () => {
+		const h = harness({ agy: AGY });
+		await call(h, { taskSpec: L1, task: "go" });
+		h.agents.clear();
+		await call(h, { taskSpec: { id: "T-20261026-01" } });
+		const prompts = firstPrompts(h);
+		expect(prompts).toHaveLength(2);
+		for (const prompt of prompts) {
+			expect(prompt.startsWith("# ompbot 워커 안내 / ompbot worker floors\n")).toBe(true);
+			expect(prompt).toContain("`task/T-20261026-01` 브랜치에만");
+			expect(prompt).toContain("needs_owner: yes");
+			expect(prompt).toContain("사람에게 보이는 글(PROGRESS·outcome·커밋 메시지·답)은 한국어로 쓴다");
+			expect(prompt).toContain(
+				"outcome 요약이나 답에서 '통과·검증됨·확인함'을 주장할 때는 같은 문장에 실제로 돌린 명령과 결과 숫자를 함께 쓴다",
+			);
+			expect(prompt).not.toContain("ompbot apply");
+			expect(prompt).not.toContain("ompbot workspace");
+		}
+	});
+
+	test("worker on a resume, or a worker other than agy, is refused before anything runs", async () => {
+		const h = harness({ agy: AGY });
+		await expect(call(h, { taskSpec: { ...L1, worker: "claude" }, task: "go" })).rejects.toThrow(
+			"taskSpec.worker는 agy만 받습니다",
+		);
+		await expect(call(h, { taskSpec: { id: "T-20261026-01", worker: "agy" } })).rejects.toThrow(
+			"재개에는 worker를 줄 수 없습니다",
+		);
+		expect(h.herdr).toEqual([]);
+		expect(h.ledger.list()).toEqual([]);
 	});
 });

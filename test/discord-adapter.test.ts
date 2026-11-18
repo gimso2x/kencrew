@@ -13,10 +13,16 @@ import { parseCommand } from "../src/core/types";
 import { DiscordAdapter, type DiscordAdapterOptions } from "../src/discord/adapter";
 import { snowflakeTime } from "../src/discord/backfill";
 import { DiscordChannel } from "../src/discord/channel";
-import { DiscordCallError, type DiscordMessageEvent, DiscordRateLimitedError } from "../src/discord/transport";
+import {
+	DiscordCallError,
+	DiscordGatewayFatalError,
+	type DiscordMessageEvent,
+	DiscordRateLimitedError,
+} from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { PEER_HOP_NOTICE } from "../src/slack/adapter";
+import { PendingDiscordTransport } from "./helpers/bot-home";
 import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const OWNER = "100000000000000001";
@@ -1040,5 +1046,40 @@ describe("a new turn in a thread whose previous turn is still finishing", () => 
 		expect(deleted()).toEqual([oldStatus, oldStatus, newStatus]);
 		await made.tick();
 		expect(deleted()).toHaveLength(3);
+	});
+});
+
+describe("start without a first Ready (qa-q #19)", () => {
+	test("start() returns after the wait with discord_start_pending; the later Ready records the bot id and runs recovery", async () => {
+		const pending = new PendingDiscordTransport({ botUserId: BOT });
+		transport = pending;
+		pending.setChannel({ id: CH, type: 0, guildId: GUILD });
+		const cursors = new Map<string, string>([[`dc:${CH}`, "1"]]);
+		const made = await adapter({
+			startWaitMs: 10,
+			recovery: {
+				cursors: { getCursor: (key) => cursors.get(key), setCursor: (key, value) => void cursors.set(key, value) },
+				targets: () => [{ channelId: CH, dm: false }],
+			},
+		});
+		expect(logged("event=discord_start_pending")).toBe(true);
+		expect(made.botUserId).toBeUndefined();
+		expect(calls("listMessages")).toHaveLength(0);
+		made.recover();
+		const idle = made.recoveryIdle();
+		expect(calls("listMessages")).toHaveLength(0);
+		pending.release();
+		await idle;
+		expect(made.botUserId).toBe(BOT);
+		expect(logged("event=discord_ready")).toBe(true);
+		expect(calls("listMessages").length).toBeGreaterThan(0);
+	});
+
+	test("a fatal close after start() returned reaches onFatal once", async () => {
+		const fatals: Error[] = [];
+		await adapter({ onFatal: (error) => fatals.push(error) });
+		transport.emitFatal(new DiscordGatewayFatalError(4004, "Authentication failed"));
+		expect(fatals).toHaveLength(1);
+		expect(fatals[0]).toBeInstanceOf(DiscordGatewayFatalError);
 	});
 });

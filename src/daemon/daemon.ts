@@ -40,6 +40,8 @@ import { boardCardLink } from "../dispatch/board";
 import {
 	herdrAgentPane,
 	herdrAgentStatus,
+	herdrAgentWorkspace,
+	herdrCloseWorkspace,
 	herdrInterruptAgent,
 	herdrPromptExisting,
 	herdrReadAgent,
@@ -51,8 +53,9 @@ import {
 import { boardNoticeFor, buildBoardTools } from "../lanes/board";
 import { type LaneAction, parseLaneActionId } from "../lanes/card";
 import { classifyLaneControl } from "../lanes/control";
-import type { LandLane } from "../lanes/land";
+import { confidentBand, createLaneLander, type LandLane } from "../lanes/land";
 import { DEFAULT_COMPLETION_NUDGES, LaneInputError, LaneManager } from "../lanes/manager";
+import { createGateSlot } from "../lanes/qa";
 import { isLaneOrigin, type LaneRow } from "../lanes/status";
 import { buildLaneTools, buildWorkStartTool } from "../lanes/tools";
 import {
@@ -129,7 +132,9 @@ import {
 } from "../store/db";
 import { notePrompt } from "../tasks/dispatch";
 import { evaluateTask } from "../tasks/evaluate";
+import { type TaskGateHooks, TaskGateRunner } from "../tasks/gate";
 import { resolveTaskHost } from "../tasks/host";
+import { landTask, type TaskLandDeps, type TaskLandOutcome, type TaskLandResult, taskLandHold } from "../tasks/land";
 import type { TaskRow } from "../tasks/ledger";
 import {
 	type AutoLandPolicy,
@@ -139,7 +144,9 @@ import {
 	parseTaskMergeActionId,
 	parseTaskRecommendActionId,
 	RECOMMEND_VALUE_MAX,
+	setStatusReaction,
 	type TaskCard,
+	taskLandNote,
 } from "../tasks/notify";
 import { repoMatchesCommonDir } from "../tasks/repo-match";
 import { TASK_SWEEP_MS, TaskSweeper, taskChangedPaths } from "../tasks/sweeper";
@@ -297,8 +304,13 @@ export interface DaemonOptions {
 	threadContextTimeoutMs?: number;
 	/** Test seam for done-claim verification; default checks the real git repository. */
 	verifyClaim?: (evidence: ClaimEvidence, cwd: string) => Promise<VerifyResult>;
-	/** Test seam for landing a closed work lane; default merges, pushes and cleans up with real git. */
+	/**
+	 * Test seam for landing a closed work lane or a reached local [TASK] (one lander, serialized per repository);
+	 * default merges, pushes and cleans up with real git.
+	 */
 	landLane?: LandLane;
+	/** Test seam for the core's [TASK] landing (`landTask` with the daemon's deps); default `landTask`. */
+	taskLand?: (row: TaskRow, deps: TaskLandDeps) => Promise<TaskLandResult>;
 	/** Test seam for the lanes' independent review (`taskAutoLand.review`); default runs the real `omp -p`. */
 	laneReviewRun?: ProcessRunner;
 	/** Test seam for whether an `ompbot lanes attach` process lives; default signal 0 on this machine. */
@@ -339,6 +351,8 @@ export interface InjectResult {
 
 /** Card note when a `머지` click could not reach the task thread: the owner answers by hand instead. */
 const MERGE_REJECTED_NOTE = '⚠️ 머지 요청을 넣지 못함 — 스레드에 "머지해"라고 답해 주세요';
+/** Card note of a `머지` click while the task holds its landing lock (`#taskLanding`). */
+const TASK_LANDING_NOTE = "이미 착지 중";
 /** Card note when a `추천대로` click could not reach the task thread. */
 const RECOMMEND_REJECTED_NOTE = '⚠️ 추천을 넣지 못함 — 스레드에 "추천대로"라고 답해 주세요';
 /** The owner text and marker of an auto-merge (`taskAutoLand`): the landing starts exactly as after a typed "머지해". */
@@ -504,8 +518,15 @@ export class Daemon {
 	readonly #mergeClicks = new Set<string>();
 	/** Approvals (canonical `<channel>:<ts>`) whose `다시 요청` was clicked in this process, on either card. Never cleared. */
 	readonly #retryClicks = new Set<string>();
-	/** Tasks whose auto-merge "머지해" is being put in right now (a concurrent second call is refused); removed when it settles. */
-	readonly #autoLanding = new Set<string>();
+	/**
+	 * Tasks being landed (auto-merge or `머지` button, one lock for both): held through `landTask` and, after a handoff,
+	 * until the thread turn that took the "머지해" ended. A call meanwhile is `in_flight`.
+	 */
+	readonly #taskLanding = new Set<string>();
+	/** The one lander of lanes and [TASK]s: landings of one repository never overlap. */
+	#lander: LandLane | undefined;
+	/** The [TASK] review·QA gate (src/tasks/gate.ts); its running gates are the `#taskGating` of the spec. */
+	#taskGates: TaskGateRunner | undefined;
 	/** The owner's delegated Graph session for the Teams chat tools; set when `channels.teams.graph` is on in `full`. */
 	readonly #teamsGraph: TeamsGraphClient | undefined;
 
@@ -732,6 +753,7 @@ export class Daemon {
 			...(config.workerOmpArgs === undefined ? {} : { workerOmpArgs: config.workerOmpArgs }),
 			// A live setting like the lane manager's: each new [TASK] reads the config the last reload left.
 			laneModels: () => this.#options.config.lanes?.models,
+			workerAgy: () => this.#options.config.workerAgy,
 			...(config.herdrBoard === undefined ? {} : { herdrBoard: config.herdrBoard }),
 			...(config.herdr === undefined ? {} : { herdr: config.herdr }),
 			...(teamsGraph === undefined ? {} : { teamsGraph }),
@@ -824,15 +846,21 @@ export class Daemon {
 		if (channel === undefined) return undefined;
 		return (request, signal) => {
 			const threadTs = this.#uploadThreadTs(originKey, lane?.threadRef);
+			const mailbox = this.#router?.mailbox(originKey);
+			const opRef = mailbox?.turnOpRef;
 			const ask = () =>
 				answerDialogOnSlack(
 					this.#approval,
-					{ originKey, channel, ...(threadTs === undefined ? {} : { threadTs }) },
+					{
+						originKey,
+						channel,
+						...(threadTs === undefined ? {} : { threadTs }),
+						...(opRef === undefined ? {} : { opRef }),
+					},
 					request,
 					signal,
 				);
 			// Like host tools: the owner can take minutes, so stall alerts rest and `drain` counts the wait.
-			const mailbox = this.#router?.mailbox(originKey);
 			return mailbox ? mailbox.trackHostTool(ask) : ask();
 		};
 	}
@@ -1046,6 +1074,7 @@ export class Daemon {
 			// A new lane session starts with its acceptance criteria as omp todos; a lane turn's end may nudge it.
 			initialTodos: (originKey) => (isLaneOrigin(originKey) ? this.#lanes?.initialTodos(originKey) : undefined),
 			onTurnSettled: (info) => {
+				this.#approval.dropInput(info.originKey, "turn_ended");
 				if (isLaneOrigin(info.originKey)) this.#lanes?.onTurnSettled(info);
 			},
 			onStallEscalate: (info) => {
@@ -1058,6 +1087,39 @@ export class Daemon {
 				ambiguous: (info) => this.#postThreadNotices([info.threadRef], DIALOG_AMBIGUOUS_NOTICE),
 			},
 			driverFactory: (origin, dir) => this.#makeDriver(origin, dir),
+		});
+		const localOps = resolveTaskHost(null, undefined);
+		const lander =
+			this.#options.landLane ?? createLaneLander({ removeWorktree: (input) => localOps.removeWorktree(input) });
+		this.#lander = lander;
+		// The independent review before an auto-merge: a one-shot `omp -p` under the same safety floors.
+		const reviewer = {
+			ompBin: config.ompExecutable,
+			...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
+			systemPromptAppendix: buildFloorsPrompt(
+				join(config.homeDir, "secrets"),
+				undefined,
+				false,
+				false,
+				false,
+				{},
+				false,
+			),
+			reviewsDir: join(config.homeDir, "reviews"),
+			...(this.#options.laneReviewRun === undefined ? {} : { run: this.#options.laneReviewRun }),
+		};
+		const qaWorktreesDir = join(config.homeDir, "qa-worktrees");
+		// One review or QA at a time, lanes and [TASK]s alike: a QA clears every copy in qa-worktrees when it starts.
+		const gateSlot = createGateSlot();
+		this.#taskGates = new TaskGateRunner({
+			ledger: store.tasks,
+			slot: gateSlot,
+			reviewer,
+			qaWorktreesDir,
+			headOf: (worktree) => localOps.headOf(worktree),
+			now: () => this.#clock.now(),
+			log,
+			land: (row) => this.#landAuto(row),
 		});
 		this.#lanes = new LaneManager({
 			store,
@@ -1089,27 +1151,13 @@ export class Daemon {
 			laneModels: () => this.#options.config.lanes?.models,
 			// A merged lane's non-blocking leftovers (`ompbot_claim_done` `leftovers`).
 			followupsFile: join(config.homeDir, "followups.jsonl"),
-			// The independent review before a lane's auto-merge: a one-shot `omp -p` under the same safety floors.
-			reviewer: {
-				ompBin: config.ompExecutable,
-				...(config.ompProfile === undefined ? {} : { ompProfile: config.ompProfile }),
-				systemPromptAppendix: buildFloorsPrompt(
-					join(config.homeDir, "secrets"),
-					undefined,
-					false,
-					false,
-					false,
-					{},
-					false,
-				),
-				reviewsDir: join(config.homeDir, "reviews"),
-				...(this.#options.laneReviewRun === undefined ? {} : { run: this.#options.laneReviewRun }),
-			},
+			reviewer,
 			// The run QA (`taskAutoLand.qa`) runs in detached copies here, under the reviewer's omp setup.
-			qaWorktreesDir: join(config.homeDir, "qa-worktrees"),
+			qaWorktreesDir,
+			gateSlot,
 			...(this.#options.maxLanes === undefined ? {} : { maxLanes: this.#options.maxLanes }),
 			...(this.#options.verifyClaim === undefined ? {} : { verify: this.#options.verifyClaim }),
-			...(this.#options.landLane === undefined ? {} : { land: this.#options.landLane }),
+			land: lander,
 		});
 		this.#monitors = new MonitorScheduler({
 			store,
@@ -1356,11 +1404,31 @@ export class Daemon {
 				log,
 				config,
 				store,
+				detach: (error) => void this.#dropAdapter(adapter, "adapter_detached", error),
 			});
 			this.#adapters.set(platform, adapter);
 		}
-		for (const adapter of this.#adapters.values()) await adapter.start();
-		this.#announceMarker("back");
+		// One platform that cannot come up (a revoked token, a taken port) must not keep the others down: it is stopped
+		// (closing whatever it half-opened) and dropped from recovery, stop and the delivery pump. Its pending rows are
+		// still dispatched and its answers wait in deliveries for the next boot. Only when every platform fails does
+		// the start fail.
+		const started = [...this.#adapters.values()];
+		const failed = (
+			await Promise.all(
+				started.map(async (adapter) => {
+					try {
+						await adapter.start();
+						return [];
+					} catch (error) {
+						await this.#dropAdapter(adapter, "adapter_start_failed", error);
+						return [adapter.platform];
+					}
+				}),
+			)
+		).flat();
+		if (started.length > 0 && failed.length === started.length) {
+			throw new Error(`every chat adapter failed to start: ${failed.join(", ")}`);
+		}
 
 		// A waiting click cannot outlive the process: expire every pending card and say so on them.
 		void this.#broker.expireStale(false).catch((error) => log.warn("approval_expire_failed", { error: String(error) }));
@@ -1465,7 +1533,11 @@ export class Daemon {
 					}
 					return undefined;
 				},
-				autoLand: (row) => this.autoLand(row),
+				autoLand: (row, gate) => this.autoLand(row, gate),
+				gatePending: async (row) => {
+					const policy = this.#autoLandPolicy();
+					return policy !== undefined && (this.#taskGates?.pending(row, policy) ?? false);
+				},
 				autoLandHold: () => readAutoLandHold(config.homeDir),
 				channels: this.#channels,
 				ownerUserId: primaryOwnerUserId(config.channels),
@@ -1474,6 +1546,9 @@ export class Daemon {
 			});
 		}
 		this.#ipc = startIpcServer(this.socketPath, (request) => this.#handleIpc(request));
+		// "Back" is told only once the process can be reached: a start that fails earlier leaves the marker for the next one,
+		// and the notice goes out before a recovered turn's first post.
+		this.#announceMarker("back");
 
 		// Rule (1): rows still pending in the ledger are dispatched again (a frozen bot's mailboxes hold autonomous rows).
 		this.#noteFrozenHeld(store.listInbound({ state: "pending" }));
@@ -1503,32 +1578,46 @@ export class Daemon {
 	 * sent to the DM conversation's omp session.
 	 */
 	async #startLane(row: InboundRow, trigger: LaneTrigger): Promise<void> {
-		const store = this.store;
-		const opRef = `lane:${row.platformMessageId}`;
-		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
-		const channel = this.#laneChannelOf(row.originKey, parseThreadRef(row.threadRef)?.channel);
-		let reply: string;
-		try {
-			if (channel === undefined && parseChatOrigin(row.originKey)?.platform === "discord") {
-				throw new LaneInputError(DISCORD_LANE_CHANNEL_MISSING);
-			}
-			if (!this.#lanes || channel === undefined) throw new Error("lanes unavailable");
-			const lane = await this.#lanes.start({ ...trigger, channel });
-			const link = await this.#lanes.threadLink(lane);
-			reply =
-				link === undefined
-					? `🔄 작업 레인 \`${lane.name}\`을 시작했습니다. 새 스레드에서 진행 상황을 확인하세요.`
-					: `🔄 작업 레인 \`${lane.name}\`을 시작했습니다. 레인 스레드에서 진행 상황을 확인하세요: ${link}`;
-			if (lane.startNote !== undefined) reply += `\n${lane.startNote}`;
-		} catch (error) {
-			if (error instanceof LaneInputError) {
-				reply = `⚠️ 작업 레인을 시작하지 못했습니다: ${error.message}`;
-			} else {
+		await this.#settleOwn("lane", "lane_start", row, async () => {
+			const channel = this.#laneChannelOf(row.originKey, parseThreadRef(row.threadRef)?.channel);
+			try {
+				if (channel === undefined && parseChatOrigin(row.originKey)?.platform === "discord") {
+					throw new LaneInputError(DISCORD_LANE_CHANNEL_MISSING);
+				}
+				if (!this.#lanes || channel === undefined) throw new Error("lanes unavailable");
+				const lane = await this.#lanes.start({ ...trigger, channel });
+				const link = await this.#lanes.threadLink(lane);
+				const reply =
+					link === undefined
+						? `🔄 작업 레인 \`${lane.name}\`을 시작했습니다. 새 스레드에서 진행 상황을 확인하세요.`
+						: `🔄 작업 레인 \`${lane.name}\`을 시작했습니다. 레인 스레드에서 진행 상황을 확인하세요: ${link}`;
+				return lane.startNote === undefined ? reply : `${reply}\n${lane.startNote}`;
+			} catch (error) {
+				if (error instanceof LaneInputError) return `⚠️ 작업 레인을 시작하지 못했습니다: ${error.message}`;
 				this.#log.error("lane_start_failed", { id: row.platformMessageId, error: String(error) });
-				reply = "⚠️ 작업 레인을 시작하지 못했습니다. 로그를 확인하세요.";
+				return "⚠️ 작업 레인을 시작하지 못했습니다. 로그를 확인하세요.";
 			}
+		});
+	}
+
+	/**
+	 * A message the core answers itself (`<kind>:<id>` op ref): settled with the text `answer` makes, never sent to the
+	 * conversation's omp session. A throw anywhere settles it as failed (`failedAs`).
+	 */
+	async #settleOwn(
+		kind: "lane" | "task",
+		failedAs: string,
+		row: InboundRow,
+		answer: () => Promise<string>,
+	): Promise<void> {
+		try {
+			const opRef = `${kind}:${row.platformMessageId}`;
+			this.store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
+			const reply = await answer();
+			this.store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
+		} catch (error) {
+			this.#settleFailed(failedAs, row, error);
 		}
-		store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
 	}
 
 	/**
@@ -1541,20 +1630,17 @@ export class Daemon {
 		name: string,
 		command: { kind: "land" | "discard" } | { kind: "refused"; text: string },
 	): Promise<void> {
-		const store = this.store;
-		const opRef = `lane:${row.platformMessageId}`;
-		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
-		let reply: string;
-		try {
-			const lanes = this.#lanes;
-			if (!lanes) throw new Error("lanes unavailable");
-			if (command.kind === "refused") reply = `⚠️ ${command.text}`;
-			else reply = (command.kind === "land" ? await lanes.requestLand(name, "owner") : await lanes.discard(name)).text;
-		} catch (error) {
-			this.#log.error("lane_command_failed", { lane: name, command: command.kind, error: String(error) });
-			reply = "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
-		}
-		store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
+		await this.#settleOwn("lane", "lane_command", row, async () => {
+			try {
+				const lanes = this.#lanes;
+				if (!lanes) throw new Error("lanes unavailable");
+				if (command.kind === "refused") return `⚠️ ${command.text}`;
+				return (command.kind === "land" ? await lanes.requestLand(name, "owner") : await lanes.discard(name)).text;
+			} catch (error) {
+				this.#log.error("lane_command_failed", { lane: name, command: command.kind, error: String(error) });
+				return "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
+			}
+		});
 	}
 
 	/**
@@ -1563,21 +1649,18 @@ export class Daemon {
 	 * manager re-read after stopping (or resuming) the lane.
 	 */
 	async #settleLaneControl(row: InboundRow, name: string, control: "pause" | "resume"): Promise<void> {
-		const store = this.store;
-		const opRef = `lane:${row.platformMessageId}`;
-		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
-		let reply: string;
-		try {
-			const lanes = this.#lanes;
-			if (!lanes) throw new Error("lanes unavailable");
-			const outcome =
-				control === "pause" ? await lanes.pause(name, "owner-message") : await lanes.resume(name, "owner-message");
-			reply = outcome.text;
-		} catch (error) {
-			this.#log.error("lane_control_failed", { lane: name, control, error: String(error) });
-			reply = "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
-		}
-		store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
+		await this.#settleOwn("lane", "lane_control", row, async () => {
+			try {
+				const lanes = this.#lanes;
+				if (!lanes) throw new Error("lanes unavailable");
+				return (
+					control === "pause" ? await lanes.pause(name, "owner-message") : await lanes.resume(name, "owner-message")
+				).text;
+			} catch (error) {
+				this.#log.error("lane_control_failed", { lane: name, control, error: String(error) });
+				return "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
+			}
+		});
 	}
 
 	/** A thread's working or blocked [TASK]s: the ones a `멈춰`/`계속` there can act on. */
@@ -1592,22 +1675,38 @@ export class Daemon {
 	 * more than one active task in the thread nothing is applied and the answer lists their ids.
 	 */
 	async #settleTaskControl(row: InboundRow, control: "pause" | "resume"): Promise<void> {
-		const store = this.store;
-		const opRef = `task:${row.platformMessageId}`;
-		store.markDispatched(row.platformMessageId, { opRef, entryCursor: null });
-		let reply: string;
-		try {
-			const active = this.#activeTasksOf(row.threadRef);
-			const only = active.length === 1 ? active[0] : undefined;
-			reply =
-				only === undefined
+		await this.#settleOwn("task", "task_control", row, async () => {
+			try {
+				const active = this.#activeTasksOf(row.threadRef);
+				const only = active.length === 1 ? active[0] : undefined;
+				return only === undefined
 					? `이 스레드에 활성 TASK가 여럿입니다(${active.map((task) => task.taskId).join(", ")}) — 아무것도 ${control === "pause" ? "멈추지" : "재개하지"} 않았습니다. \`ompbot tasks ${control} <id>\`로 하나를 고르세요.`
 					: (await this.controlTask(only.taskId, control)).text;
-		} catch (error) {
-			this.#log.error("task_control_failed", { thread: row.threadRef, control, error: String(error) });
-			reply = "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
+			} catch (error) {
+				this.#log.error("task_control_failed", { thread: row.threadRef, control, error: String(error) });
+				return "⚠️ 처리하지 못했습니다. 로그를 확인하세요.";
+			}
+		});
+	}
+
+	/**
+	 * A core-settled message whose store write threw (its callers fire and forget it): logged, and a row already
+	 * marked dispatched is discarded — left dispatched it would trip `inbound_starved` and get the restart's
+	 * interrupted notice for a turn that never ran.
+	 */
+	#settleFailed(kind: string, row: InboundRow, error: unknown): void {
+		this.#log.error("lane_settle_failed", { kind, id: row.platformMessageId, error: String(error) });
+		try {
+			if (this.store.getInbound(row.platformMessageId)?.state === "dispatched") {
+				this.store.discard(row.platformMessageId);
+			}
+		} catch (discardError) {
+			this.#log.error("lane_settle_discard_failed", {
+				kind,
+				id: row.platformMessageId,
+				error: String(discardError),
+			});
 		}
-		store.recordAnswer({ originKey: row.originKey, opRef, threadRef: row.threadRef, parts: [reply] });
 	}
 
 	/**
@@ -1887,6 +1986,25 @@ export class Daemon {
 			owner.channel,
 			formatPendingDispatchNotice(originKey, now - (oldest?.createdAt ?? now), redact(sign), incident.count),
 		);
+	}
+
+	/**
+	 * Takes one platform out of the daemon — recovery, stop and the delivery pump — and stops it (closing whatever it
+	 * half-opened). Its pending rows are left as they are for the next boot. The daemon runs on with the others, or
+	 * with none: the owner commands and the dashboard stay up.
+	 */
+	async #dropAdapter(
+		adapter: ChannelAdapter,
+		event: "adapter_start_failed" | "adapter_detached",
+		error: unknown,
+	): Promise<void> {
+		this.#log.error(event, { platform: adapter.platform, error: String(error) });
+		if (this.#adapters.get(adapter.platform) === adapter) this.#adapters.delete(adapter.platform);
+		await adapter
+			.stop()
+			.catch((stopError: unknown) =>
+				this.#log.warn("adapter_stop_failed", { platform: adapter.platform, error: String(stopError) }),
+			);
 	}
 
 	/** Rule (3) plus the periodic work: deliver due rows, update status messages, stop quiet omp children. */
@@ -2852,28 +2970,49 @@ export class Daemon {
 	}
 
 	/**
-	 * Auto-merge of a reached task (`taskAutoLand`): the bot answers "머지해" in the task thread as the owner, under a
-	 * `🤖 자동 머지` marker, so the thread's session runs the usual landing. True only when the message went in. A
-	 * draining or unstarted daemon, a top-level or unreadable thread and a call while the same task is still going in
-	 * put nothing in. Repeats across sweeps are kept out by the sweep's `reached:<reachKey>` notice key.
+	 * Auto-merge of a reached task (`taskAutoLand`). A local task is landed by the core (`landTask`); only its `handoff`
+	 * — and every remote task — has the bot answer "머지해" in the task thread as the owner, under a `🤖 자동 머지`
+	 * marker, so the thread's session runs the usual landing. `not_accepted`: a draining or unstarted daemon, a
+	 * top-level or unreadable thread, or a "머지해" that did not go in. `in_flight`: the task holds its landing lock
+	 * (another auto-merge, a `머지` click, or the turn of a handed-off "머지해"). Repeats across sweeps are kept out by
+	 * the sweep's `reached:<reachKey>` notice key.
 	 */
-	async autoLand(row: TaskRow): Promise<boolean> {
+	async autoLand(row: TaskRow, gate?: TaskGateHooks): Promise<TaskLandOutcome> {
 		const log = this.#log;
 		if (this.#router?.draining === true || this.#adapters.size === 0 || this.#store === undefined) {
 			log.info("task_autoland_ignored", { task: row.taskId, reason: "not_ready" });
-			return false;
+			return { state: "not_accepted" };
 		}
-		if (this.#autoLanding.has(row.taskId)) {
+		if (this.#taskGates?.has(row.taskId) === true) {
+			log.info("task_autoland_ignored", { task: row.taskId, reason: "gating" });
+			return { state: "in_flight" };
+		}
+		// A local task in the confident band lands only after the review·QA gate (`TaskGateRunner`), never on the reach.
+		const policy = this.#autoLandPolicy();
+		if (gate !== undefined && policy !== undefined && row.host === null && confidentBand(row.risk, policy)) {
+			const decided = await this.#taskGates?.decide(row, gate, policy);
+			if (decided !== undefined) return decided;
+		}
+		return this.#landAuto(row);
+	}
+
+	/** The landing half of `autoLand`: the core's landing under the task's landing lock, "머지해" on a handoff. */
+	async #landAuto(row: TaskRow): Promise<TaskLandOutcome> {
+		const log = this.#log;
+		if (this.#taskLanding.has(row.taskId)) {
 			log.info("task_autoland_ignored", { task: row.taskId, reason: "in_flight" });
-			return false;
+			return { state: "in_flight" };
 		}
-		this.#autoLanding.add(row.taskId);
+		this.#taskLanding.add(row.taskId);
+		let handedOff = false;
 		try {
 			const thread = parseThreadRef(row.threadRef);
 			if (thread === undefined || thread.threadTs === TOP_LEVEL_TS) {
 				log.warn("task_autoland_rejected", { task: row.taskId, reason: "bad_thread", thread: row.threadRef });
-				return false;
+				return { state: "not_accepted" };
 			}
+			const result = await this.#coreLand(row, "auto");
+			if (result.state !== "handoff") return result;
 			const posted: { ts?: string } = {};
 			const { outcome } = await this.#ingestOwnerText(
 				{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
@@ -2884,13 +3023,94 @@ export class Daemon {
 			);
 			if (outcome === "dropped" || outcome === "card_rejected") {
 				log.warn("task_autoland_rejected", { task: row.taskId, reason: outcome, marker: posted.ts });
-				return false;
+				return { state: "not_accepted" };
 			}
 			log.info("task_autoland_requested", { task: row.taskId, marker: posted.ts, outcome });
-			return true;
+			handedOff = true;
+			this.#releaseAfterTurn(row.taskId, thread.channel, posted.ts);
+			return result;
 		} finally {
-			this.#autoLanding.delete(row.taskId);
+			if (!handedOff) this.#taskLanding.delete(row.taskId);
 		}
+	}
+
+	/**
+	 * The core's landing of a task (`landTask` with the daemon's deps and its one lander). A remote task is never
+	 * landed by the core: it is the model turn's, as before.
+	 */
+	async #coreLand(row: TaskRow, mode: "auto" | "button"): Promise<TaskLandResult> {
+		const log = this.#log;
+		if (row.host !== null) {
+			log.info("task_land_handoff", { task: row.taskId, mode, reason: "remote" });
+			return { state: "handoff", reason: `원격 호스트(${row.host}) TASK` };
+		}
+		const store = this.#store;
+		const land = this.#lander;
+		if (store === undefined || land === undefined) throw new Error("daemon not started");
+		const homeDir = this.#options.config.homeDir;
+		const result = await (this.#options.taskLand ?? landTask)(row, {
+			land,
+			judge: (task) => evaluateTask(task, resolveTaskHost(null, undefined), new Map()),
+			holdReason: () => {
+				const fresh = store.tasks.get(row.taskId);
+				return taskLandHold(fresh, {
+					frozen: this.#frozen() !== undefined,
+					paused: fresh !== undefined && store.tasks.isPaused(fresh),
+					hold: mode === "auto" ? readAutoLandHold(homeDir) : undefined,
+				});
+			},
+			ledger: store.tasks,
+			afterDone: (task) => this.#afterTaskLanded(task),
+		});
+		const fields = { task: row.taskId, mode, ...result };
+		if (result.state === "landed") log.info("task_land_landed", fields);
+		else log.warn(`task_land_${result.state.replace(/-/g, "_")}`, fields);
+		return result;
+	}
+
+	/**
+	 * After a core landing closed the task: the thread reaction follows the ledger (as `tasks_sync`), and the task's
+	 * herdr workspace is closed. A failure is logged and becomes a card line; the landing stands.
+	 */
+	async #afterTaskLanded(row: TaskRow): Promise<string[]> {
+		const log = this.#log;
+		const notes: string[] = [];
+		const status = this.#store?.tasks.get(row.taskId)?.status ?? "done";
+		await setStatusReaction(this.#channels, log, row.threadRef, status);
+		const config = this.#options.config;
+		if (config.herdr === undefined) return notes;
+		const herdrRun = this.#options.herdrRun;
+		const options = { cwd: config.workspaceDir, ...(herdrRun === undefined ? {} : { run: herdrRun }) };
+		const found = await herdrAgentWorkspace(row.agent, options);
+		const closed =
+			!found.ok || found.workspaceId === undefined ? found : await herdrCloseWorkspace(found.workspaceId, options);
+		if (!closed.ok) {
+			log.warn("task_land_workspace_close_failed", { task: row.taskId, agent: row.agent, error: closed.error });
+			notes.push(`herdr 워크스페이스 정리 실패: ${closed.error.slice(0, 160)}`);
+		}
+		return notes;
+	}
+
+	/**
+	 * Frees a task's landing lock once the thread turn that took its handed-off "머지해" (the inbound
+	 * `<channel>:<markerTs>`) has ended: the queued dispatch runs first, then the turn it started is waited for. An
+	 * inbound that cannot be found frees the lock at once.
+	 */
+	#releaseAfterTurn(taskId: string, channel: string, markerTs: string | undefined): void {
+		const inbound = markerTs === undefined ? undefined : this.#store?.getInbound(`${channel}:${markerTs}`);
+		const router = this.#router;
+		if (inbound === undefined || router === undefined) {
+			this.#log.warn("task_land_release_early", { task: taskId, marker: markerTs });
+			this.#taskLanding.delete(taskId);
+			return;
+		}
+		const originKey = inbound.originKey;
+		const mailbox = router.mailbox(originKey);
+		void mailbox
+			.resumePending()
+			.then(() => mailbox.whenTurnEnds())
+			.catch((error: unknown) => this.#log.warn("task_land_release_failed", { task: taskId, error: String(error) }))
+			.finally(() => this.#taskLanding.delete(taskId));
 	}
 
 	/**
@@ -2971,30 +3191,60 @@ export class Daemon {
 			await redraw(rejected);
 			return;
 		}
-		await redraw(button.settledCard(row, button.requestedNote(this.#clockFormat.format(this.#clock.now()))));
-		const posted: { ts?: string } = {};
-		try {
-			const { outcome } = await this.#ingestOwnerText(
-				{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
-				button.ownerText,
-				button.marker,
-				undefined,
-				posted,
-			);
-			if (outcome !== "dropped" && outcome !== "card_rejected") {
-				log.info(`task_${kind}_requested`, { task: taskId, marker: posted.ts, outcome });
-				return;
-			}
-			log.warn(`task_${kind}_inject_rejected`, { task: taskId, reason: "dropped", marker: posted.ts });
-		} catch (error) {
-			log.warn(`task_${kind}_inject_rejected`, {
-				task: taskId,
-				reason: "error",
-				...(posted.ts === undefined ? {} : { marker: posted.ts }),
-				error: String(error),
-			});
+		// `머지` lands through the core first (`landTask`), under the task's landing lock shared with auto-merge; only a
+		// handoff puts "머지해" in, and the lock then waits for that thread turn.
+		const merge = kind === "merge";
+		// The owner's 머지 goes without the gate: a running one is aborted (no receipt) and waited for first.
+		if (merge) await this.#taskGates?.abort(taskId);
+		if (merge && this.#taskLanding.has(taskId)) {
+			log.info("task_merge_ignored", { task: taskId, reason: "in_flight" });
+			await redraw(button.settledCard(row, TASK_LANDING_NOTE));
+			return;
 		}
-		await redraw(rejected);
+		if (merge) this.#taskLanding.add(taskId);
+		let handedOff = false;
+		try {
+			let requested = button.requestedNote(this.#clockFormat.format(this.#clock.now()));
+			if (merge) {
+				await redraw(button.settledCard(row, `${requested} — 코어 착지 중`));
+				const result = await this.#coreLand(row, "button");
+				if (result.state !== "handoff") {
+					await redraw(button.settledCard(row, taskLandNote(result)));
+					return;
+				}
+				requested = `${requested} — ${taskLandNote(result)}`;
+			}
+			await redraw(button.settledCard(row, requested));
+			const posted: { ts?: string } = {};
+			try {
+				const { outcome } = await this.#ingestOwnerText(
+					{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
+					button.ownerText,
+					button.marker,
+					undefined,
+					posted,
+				);
+				if (outcome !== "dropped" && outcome !== "card_rejected") {
+					log.info(`task_${kind}_requested`, { task: taskId, marker: posted.ts, outcome });
+					if (merge) {
+						handedOff = true;
+						this.#releaseAfterTurn(taskId, thread.channel, posted.ts);
+					}
+					return;
+				}
+				log.warn(`task_${kind}_inject_rejected`, { task: taskId, reason: "dropped", marker: posted.ts });
+			} catch (error) {
+				log.warn(`task_${kind}_inject_rejected`, {
+					task: taskId,
+					reason: "error",
+					...(posted.ts === undefined ? {} : { marker: posted.ts }),
+					error: String(error),
+				});
+			}
+			await redraw(rejected);
+		} finally {
+			if (merge && !handedOff) this.#taskLanding.delete(taskId);
+		}
 	}
 
 	/**
@@ -3269,6 +3519,8 @@ export class Daemon {
 		clearInterval(this.#timer);
 		// Running lane checks are killed now; the verdicts are not awaited (the claims stay pending for the next boot).
 		this.#lanes?.stop();
+		// Running [TASK] gates are aborted and waited for (their copies removed); nothing is recorded.
+		await this.#taskGates?.stop();
 		this.#heartbeat?.stop();
 		this.#heartbeat = undefined;
 		installProcessAudit(undefined);

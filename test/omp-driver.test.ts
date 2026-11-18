@@ -395,6 +395,19 @@ test("tapExtensionUi hands dialogs to the answerer and writes its response; unde
 	);
 });
 
+test("tapExtensionUi: a select frame carries omp's selectionMarker to the answerer, and none when omp sends none", async () => {
+	const seen: unknown[] = [];
+	const live = liveTap(async (request) => {
+		seen.push(request.method === "select" ? request.selectionMarker : "n/a");
+		return { cancelled: true };
+	});
+	live.send({ method: "select", id: "u1", title: "t", options: ["a"], selectionMarker: "checkbox" });
+	live.send({ method: "select", id: "u2", title: "t", options: ["a"] });
+	await live.untilReplies(2);
+	await live.close();
+	expect(new Set(seen)).toEqual(new Set(["checkbox", undefined]));
+});
+
 test("tapExtensionUi: omp's cancel aborts the waiting answer and its late response is never written", async () => {
 	const late = Promise.withResolvers<OmpDialogResponse>();
 	const aborted = Promise.withResolvers<void>();

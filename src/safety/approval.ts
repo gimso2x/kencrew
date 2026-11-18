@@ -13,6 +13,8 @@ export type ApprovalResult = ApprovalOutcome | { replied: string };
 /** The conversation an approval request comes from; lets the card point back and a reply find its way home. */
 export interface ApprovalOrigin {
 	originKey: string;
+	/** The running turn's opRef when the dialog was asked: a text held for an `input` is only used within its turn. */
+	opRef?: string | undefined;
 	/** Slack channel of the conversation. */
 	channel: string;
 	/** The conversation's current thread (absent: the channel's main view). */
@@ -283,6 +285,12 @@ export interface ChoiceCard {
 	fallback: string;
 	/** Deadline of this card; default: the broker's `timeoutMs`. */
 	timeoutMs?: number | undefined;
+	/**
+	 * Which reply texts the card takes as an answer. A text it refuses is not consumed (the conversation message goes
+	 * its normal way, a card-thread reply is ignored) and the card shows `rejectHint` once. Default: every text.
+	 */
+	acceptsText?: ((text: string) => boolean) | undefined;
+	rejectHint?: string | undefined;
 }
 
 /** One owner input on a choice card: a button click or a text answer (card-thread or conversation reply). */
@@ -323,6 +331,8 @@ interface ChoicePending {
 const CHOICE_LEDGER_GRACE_MS = 60_000;
 /** First characters of every choice card body (choice.ts): how a ledger row tells a choice card from an approval. */
 const CHOICE_HEADS = ["❓", "🔒"];
+/** A free text held for the `input` dialog behind an "Other" row is used within this long, else dropped. */
+const HELD_INPUT_TTL_MS = 60_000;
 /** Slack: at most 75 characters per button label. */
 const BUTTON_LABEL_LIMIT = 75;
 
@@ -359,6 +369,7 @@ export class ApprovalBroker {
 	readonly #deadline: Intl.DateTimeFormat;
 	readonly #pending = new Map<string, Pending>();
 	readonly #choices = new Map<string, ChoicePending>();
+	readonly #heldInput = new Map<string, { text: string; opRef: string | undefined; at: number }>();
 	/** Requests withdrawn by `cancelForRestart`: their final card keeps the restart text, not the abort/timeout one. */
 	readonly #cut = new Set<string>();
 	#escalation: EscalationChannels = {};
@@ -725,6 +736,7 @@ export class ApprovalBroker {
 		let wake: (() => void) | undefined;
 		let ended: ChoiceResult | undefined;
 		let closed = false;
+		let hinted = false;
 		/** The latest card-thread reply the card read: the ledger's `reply_ts`, so its backfill replay is a duplicate. */
 		let replyTs: string | undefined;
 		const enqueue = (result: ChoiceResult, source?: ChoiceSource): void => {
@@ -744,6 +756,18 @@ export class ApprovalBroker {
 			buttons: card.buttons.length,
 			push: (event, source) => {
 				if (closed || ended !== undefined) return false;
+				if (event.kind === "text" && card.acceptsText?.(event.text) === false) {
+					if (card.rejectHint !== undefined && !hinted) {
+						hinted = true;
+						body = `${body}\n${card.rejectHint}`;
+						port.edit(posted, render(body, card.buttons)).catch((error) => {
+							log.warn("choice_hint_failed", { channel, ts, error: String(error) });
+						});
+					}
+					log.info("choice_text_refused", { channel, ts });
+					source?.onRead?.(false);
+					return false;
+				}
 				enqueue(event, source);
 				return true;
 			},
@@ -828,6 +852,36 @@ export class ApprovalBroker {
 		let open = 0;
 		for (const choice of this.#choices.values()) if (choice.originKey === originKey && choice.isOpen()) open += 1;
 		return open;
+	}
+
+	/**
+	 * Keeps the owner's free text for the next `input` dialog of `originKey` (omp opens it right after the "Other"
+	 * row of a select is picked). One slot per origin; a newer text replaces an unused one.
+	 */
+	holdInput(originKey: string, opRef: string | undefined, text: string): void {
+		this.#heldInput.set(originKey, { text, opRef, at: this.#clock.now() });
+	}
+
+	/** The held text, once: `undefined` when nothing is held or it is older than `HELD_INPUT_TTL_MS` (then dropped). */
+	takeInput(originKey: string, opRef: string | undefined): string | undefined {
+		const held = this.#heldInput.get(originKey);
+		if (held === undefined) return undefined;
+		this.#heldInput.delete(originKey);
+		if (held.opRef !== opRef || this.#clock.now() - held.at > HELD_INPUT_TTL_MS) {
+			this.#options.log.info("dialog_pending_text_dropped", {
+				origin: originKey,
+				reason: held.opRef !== opRef ? "other_turn" : "expired",
+			});
+			return undefined;
+		}
+		return held.text;
+	}
+
+	/** Drops a held text that will not be used (the next dialog is no `input`, or the turn ended). */
+	dropInput(originKey: string, reason: string): void {
+		if (this.#heldInput.delete(originKey)) {
+			this.#options.log.info("dialog_pending_text_dropped", { origin: originKey, reason });
+		}
 	}
 
 	/**
@@ -919,6 +973,8 @@ export class ApprovalBroker {
 			log.info("choice_reply", { id: reply.approvalId, ts: reply.ts });
 			return { kind: "settled" };
 		}
+		// An open card that refused the text stays open: the reply is ignored, never settled as the card's answer.
+		if (choice?.isOpen()) return { kind: "duplicate" };
 		const row = store.getApproval(reply.approvalId);
 		if (row === undefined) return undefined;
 		// A backfill replay of the reply that settled the card: consumed already.

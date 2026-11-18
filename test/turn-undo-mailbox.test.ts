@@ -34,6 +34,8 @@ let repos: string[];
 let gitCalls: string[];
 let gitFails: boolean;
 let gitFailRepos: Set<string>;
+/** Runs at the start of every git call: a test turns the capture into a slow one by moving the clock here. */
+let gitHook: (() => void) | undefined;
 /** A git subcommand (`restore`) that fails while every other call runs. */
 let gitFailCommand: string | undefined;
 interface ApprovalCard {
@@ -52,6 +54,7 @@ const countingGit =
 	(real: GitRunner): GitRunner =>
 	async (repo, args, options) => {
 		gitCalls.push(args[0] ?? "");
+		gitHook?.();
 		if (gitFails || gitFailRepos.has(repo) || args[0] === gitFailCommand) throw new Error("git exploded");
 		return real(repo, args, options);
 	};
@@ -123,6 +126,7 @@ beforeEach(() => {
 	gitCalls = [];
 	gitFails = false;
 	gitFailRepos = new Set();
+	gitHook = undefined;
 	gitFailCommand = undefined;
 	approvals = [];
 	sessionStore = new FakeSessionStore();
@@ -233,6 +237,24 @@ describe("turn snapshots around a turn (AC-3)", () => {
 		expect(rows[0]?.repo).toBe(repo);
 		expect(rows[0]?.revertedAt).toBeNull();
 		expect(rows[0]?.endedAt as number).toBeGreaterThanOrEqual(rows[0]?.startedAt as number);
+	});
+
+	test("startedAt is the time the before-capture began, not when it finished", async () => {
+		const repo = makeRepo(repos);
+		const beganAt = clock.t;
+		gitHook = () => {
+			clock.t += 5_000;
+		};
+		driverOptions = {
+			respond: () => {
+				writeFileSync(join(repo, "touched.txt"), "by the turn\n");
+				return "고쳤습니다";
+			},
+		};
+		await runRecordedTurn("고쳐줘");
+		const rows = store.listTurnSnapshots({ originKey: ORIGIN });
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.startedAt).toBe(beganAt);
 	});
 
 	test("a failed snapshot never blocks the turn", async () => {

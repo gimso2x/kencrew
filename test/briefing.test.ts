@@ -236,6 +236,41 @@ describe("AC-1: briefing render", () => {
 		expect(body).toContain("아침 브리핑");
 	});
 
+	test("an unreadable gate section keeps the other attention lines and the summary matches the list", () => {
+		const html = renderBriefingHtml(
+			snapshot({
+				gates: { ok: false, error: "ledger unreadable" },
+				approvals: {
+					ok: true,
+					items: [
+						{
+							approvalId: "a1",
+							summary: "레인 L-1 머지",
+							createdAt: "2026-11-11T07:20:00+09:00",
+							expiresAt: "2026-11-11T07:35:00+09:00",
+							originKey: null,
+							title: "레인 L-1 머지",
+							detail: null,
+							cardUrl: null,
+							originUrl: null,
+							remainingMs: 5 * 60_000,
+							originLabel: null,
+						},
+					],
+					recent: [],
+					stats: { days: 7, approved: 0, denied: 0, expired: 0, replied: 0, medianAnswerMs: null },
+				},
+			}),
+			NOW,
+		);
+		const body = text(html);
+		expect(body).toContain("승인 대기 레인 L-1 머지");
+		expect(body).toContain("게이트 읽지 못함: ledger unreadable");
+		expect(body).toContain("주의 2");
+		const attention = html.match(/<h2>주의<\/h2><ul>(.*?)<\/ul>/)?.[1] ?? "";
+		expect(attention.match(/<li>/g)?.length).toBe(2);
+	});
+
 	test("previews are escaped and secret-shaped text is masked", () => {
 		const token = ["xoxb", "1234", "abcd"].join("-");
 		const body = text(

@@ -15,6 +15,8 @@ export const LIVE_FIELDS = [
 	"skillReviewTurns",
 	"dispatchHosts",
 	"workerOmpArgs",
+	// Each new [TASK] and each agy resume reads it (`DispatchToolDeps.workerAgy`).
+	"workerAgy",
 	"herdrBoard",
 	"taskAutoLand",
 	"restartNotice",

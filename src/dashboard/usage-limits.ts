@@ -1,6 +1,7 @@
 import type { ProcessRunner } from "../dispatch/omp";
 import { isRecord } from "../omp/type-guards";
 import { redact } from "../redact";
+import { cleanError, sectionCache } from "./section-cache";
 import type { Section } from "./snapshot";
 
 /**
@@ -14,7 +15,6 @@ import type { Section } from "./snapshot";
 export const USAGE_LIMITS_TTL_MS = 15 * 60_000;
 const COMMAND_TIMEOUT_MS = 20_000;
 const STDOUT_CAP = 1_000_000;
-const ERROR_CHARS = 200;
 
 export interface UsageRow {
 	label: string;
@@ -33,7 +33,6 @@ export type UsageSource = { name: string; account?: string } & (
 
 export interface UsageLimitsInfo {
 	sources: UsageSource[];
-	fetchedAt: number;
 }
 
 export interface UsageLimitsConfig {
@@ -47,41 +46,21 @@ type Kind = "omp" | "agy";
 
 const PROVIDER_NAMES: Record<string, string> = { anthropic: "Claude", zai: "GLM" };
 
-const cache = new Map<string, { at: number; result: Promise<Section<UsageLimitsInfo>> }>();
+const cache = sectionCache<UsageLimitsInfo>(USAGE_LIMITS_TTL_MS);
 
 /** Test only: forget every cached run. */
-export function clearUsageLimitsCache(): void {
-	cache.clear();
-}
+export const clearUsageLimitsCache = (): void => cache.clear();
 
-/**
- * The card's section. Cached per config at module level (a `snapshotReader` is made anew for every `!brief`): a run
- * younger than {@link USAGE_LIMITS_TTL_MS}, finished or still running, is shared. Never rejects.
- */
+/** The card's section, one run per config within {@link USAGE_LIMITS_TTL_MS}. Never rejects. */
 export function readUsageLimits(
 	config: UsageLimitsConfig,
 	run: ProcessRunner,
 	now: () => number,
 ): Promise<Section<UsageLimitsInfo>> {
-	const key = JSON.stringify(config);
-	const started = now();
-	const hit = cache.get(key);
-	if (hit !== undefined && started - hit.at >= 0 && started - hit.at < USAGE_LIMITS_TTL_MS) return hit.result;
-	const result = collect(config, run, now).catch(
-		(error: unknown): Section<UsageLimitsInfo> => ({
-			ok: false,
-			error: clean(error instanceof Error ? error.message : String(error)),
-		}),
-	);
-	cache.set(key, { at: started, result });
-	return result;
+	return cache.read(JSON.stringify(config), now, () => collect(config, run));
 }
 
-async function collect(
-	config: UsageLimitsConfig,
-	run: ProcessRunner,
-	now: () => number,
-): Promise<Section<UsageLimitsInfo>> {
+async function collect(config: UsageLimitsConfig, run: ProcessRunner): Promise<Section<UsageLimitsInfo>> {
 	const jobs: Array<{ kind: Kind; argv: string[] }> = [
 		...(config.omp ?? []).map((argv) => ({ kind: "omp" as const, argv })),
 		...(config.agy === undefined ? [] : [{ kind: "agy" as const, argv: config.agy }]),
@@ -94,7 +73,7 @@ async function collect(
 			return job.kind === "agy" && account !== undefined ? { ...source, account: await account } : source;
 		}),
 	);
-	return { ok: true, sources, fetchedAt: now() };
+	return { ok: true, sources };
 }
 
 const ACCOUNT_CHARS = 40;
@@ -125,7 +104,7 @@ const displayName = (provider: string): string => PROVIDER_NAMES[provider] ?? pr
 
 async function readSource(kind: Kind, argv: string[], run: ProcessRunner): Promise<UsageSource> {
 	const name = kind === "agy" ? "Antigravity" : displayName(providerOf(argv));
-	const failed = (error: string): UsageSource => ({ name, ok: false, error: clean(error) });
+	const failed = (error: string): UsageSource => ({ name, ok: false, error: cleanError(error) });
 	let out: Awaited<ReturnType<ProcessRunner>>;
 	try {
 		out = await run(argv, { timeoutMs: COMMAND_TIMEOUT_MS, stdoutCap: STDOUT_CAP });
@@ -232,8 +211,4 @@ export function resetIn(resetsAt: number | undefined, now: number): string {
 	const hours = Math.floor(minutes / 60);
 	if (hours >= 24) return `${Math.floor(hours / 24)}d${hours % 24}h`;
 	return hours >= 1 ? `${hours}h${minutes % 60}m` : `${minutes}m`;
-}
-
-function clean(error: string): string {
-	return redact(error).replace(/\s+/g, " ").trim().slice(0, ERROR_CHARS);
 }

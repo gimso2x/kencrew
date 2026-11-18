@@ -776,6 +776,24 @@ describe("herdr", () => {
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain(field);
 	});
+
+	test("workerAgy loads as given; absent stays absent", () => {
+		writeConfig(baseConfig({ herdr: {} }));
+		expect(loadConfig(home).workerAgy).toBeUndefined();
+		writeConfig(baseConfig({ herdr: {}, workerAgy: { model: "gemini-4-hydrogen-high" } }));
+		expect(loadConfig(home).workerAgy).toEqual({ model: "gemini-4-hydrogen-high" });
+	});
+
+	test.each([
+		["a string workerAgy", { workerAgy: "gemini" }, "(field=workerAgy)"],
+		["a missing model", { workerAgy: {} }, "(field=workerAgy.model)"],
+		["a model read as an option", { workerAgy: { model: "--yolo" } }, "(field=workerAgy.model)"],
+	])("workerAgy: %s is rejected naming the key", (_name, extra, field) => {
+		writeConfig(baseConfig({ herdr: {}, ...extra }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(field);
+	});
 });
 
 describe("taskAutoLand", () => {

@@ -42,11 +42,18 @@ export class TeamsServer {
 		const { auth, log, onActivity } = this.#options;
 		if (new URL(request.url).pathname !== "/api/messages") return new Response("not found", { status: 404 });
 		if (request.method !== "POST") return new Response("method not allowed", { status: 405 });
+		const unauthorized = (reason: string): Response => {
+			log.warn("teams_auth_rejected", { reason });
+			return new Response("unauthorized", { status: 401 });
+		};
+		// The token is checked from the header alone: an unauthenticated sender gets nothing buffered.
+		const token = await auth.verifyToken(request.headers.get("authorization"));
+		if (!token.ok) return unauthorized(token.reason);
 		if (Number(request.headers.get("content-length") ?? 0) > MAX_ACTIVITY_BYTES) {
 			return new Response("too large", { status: 413 });
 		}
-		const text = await request.text();
-		if (text.length > MAX_ACTIVITY_BYTES) return new Response("too large", { status: 413 });
+		const text = await readBounded(request);
+		if (text === undefined) return new Response("too large", { status: 413 });
 		let activity: TeamsActivity;
 		try {
 			const parsed: unknown = JSON.parse(text);
@@ -55,12 +62,31 @@ export class TeamsServer {
 		} catch {
 			return new Response("bad request", { status: 400 });
 		}
-		const verdict = await auth.verify(request.headers.get("authorization"), activity);
-		if (!verdict.ok) {
-			log.warn("teams_auth_rejected", { reason: verdict.reason });
-			return new Response("unauthorized", { status: 401 });
-		}
+		const verdict = auth.verifyActivity(token.token, activity);
+		if (!verdict.ok) return unauthorized(verdict.reason);
 		await onActivity(activity);
 		return new Response(null, { status: 200 });
 	}
+}
+
+/**
+ * The body as text, read chunk by chunk and given up (`undefined`) the moment its bytes pass `MAX_ACTIVITY_BYTES` —
+ * a chunked request has no content-length to refuse it by up front.
+ */
+async function readBounded(request: Request): Promise<string | undefined> {
+	if (request.body === null) return "";
+	const reader = request.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let total = 0;
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		total += value.byteLength;
+		if (total > MAX_ACTIVITY_BYTES) {
+			await reader.cancel();
+			return undefined;
+		}
+		chunks.push(value);
+	}
+	return new TextDecoder().decode(Buffer.concat(chunks));
 }

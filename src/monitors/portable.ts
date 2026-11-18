@@ -33,9 +33,16 @@ function splitOption(value: string): [string, string] {
 	return match === null ? ["", value] : [match[1] as string, match[2] as string];
 }
 
-/** Removes a symlink standing at `path` so a write there creates a file instead of following the link out. */
-function unlinkSymlink(path: string): void {
-	if (lstatSync(path, { throwIfNoEntry: false })?.isSymbolicLink()) rmSync(path);
+/**
+ * Readies `path` for a write: a symlink standing there is removed so the write creates a file instead of following the
+ * link out. Anything else that is not a regular file (a FIFO would block the write forever, a socket or directory
+ * cannot take it) is refused and left alone — the owner's special files are never deleted for an export.
+ */
+function clearWriteTarget(path: string): void {
+	const found = lstatSync(path, { throwIfNoEntry: false });
+	if (found === undefined || found.isFile()) return;
+	if (found.isSymbolicLink()) rmSync(path);
+	else throw new PortableUsageError(`export target is not a regular file: ${path}`);
 }
 
 /** The spec context of one home; export and apply need the workspace to map paths against. */
@@ -213,7 +220,7 @@ export function exportMonitors(
 		let file = `${stem}.json`;
 		for (let n = 2; written.has(file); n++) file = `${stem}-${n}.json`;
 		written.add(file);
-		unlinkSymlink(join(dir, file));
+		clearWriteTarget(join(dir, file));
 		writeFileSync(join(dir, file), `${JSON.stringify(portable, null, 2)}\n`);
 		if (!options.withFiles) continue;
 		const referenced = [
@@ -254,7 +261,7 @@ export function exportMonitors(
 		}
 		try {
 			mkdirSync(dirname(target), { recursive: true });
-			unlinkSymlink(target);
+			clearWriteTarget(target);
 			copyFileSync(real, target);
 			chmodSync(target, mode);
 		} catch (error) {

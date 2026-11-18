@@ -658,3 +658,161 @@ describe("qa-l low A: secrets reached through the bot home", () => {
 			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: [] });
 	});
 });
+
+describe("qa-q: safety heuristic holes", () => {
+	const verdict = (brief: string) => scanHandoffBrief(brief).verdict;
+	const high = (briefs: string[]) => {
+		for (const brief of briefs) expect({ brief, verdict: verdict(brief) }).toEqual({ brief, verdict: "high_risk" });
+	};
+	const clear = (briefs: string[]) => {
+		for (const brief of briefs) expect({ brief, verdict: verdict(brief) }).toEqual({ brief, verdict: "clear" });
+	};
+
+	test("#6 a glob or brace under the bot home that can spell secrets is secret_path", () => {
+		high([
+			"cat ~/.ompbot/sec*/slack.json",
+			"cat ~/.ompbot/{secrets,logs}/x",
+			"cat $OMPBOT_HOME/s?crets/x",
+			"cat ~/.ompbot/[s]ecrets/x",
+		]);
+		expect(rulesOf("cat ~/.ompbot/sec*/slack.json")).toEqual(["secret_path"]);
+		clear(["ls ~/.ompbot/logs/*", "ls ~/.ompbot/{logs,db}/x", "cat ~/.ompbot/lo*/x"]);
+	});
+
+	test("#7 checkout / restore of every file by glob is git_discard_worktree", () => {
+		high(["git checkout -- *", "git restore -- '*'", 'git restore -- "*"', "git checkout -- ./*", "git restore :/*"]);
+		expect(rulesOf("git checkout -- *")).toEqual(["git_discard_worktree"]);
+		clear(["git checkout -- src/*.ts", "git restore -- 'src/*'"]);
+	});
+
+	test("#8 power commands are service_control, at a command position only", () => {
+		high([
+			"sudo reboot",
+			"systemctl reboot",
+			"sudo shutdown -h now",
+			"foo || sudo reboot",
+			"env X=1 nohup shutdown now",
+			"(reboot)",
+			"- poweroff",
+			"$ halt",
+			"systemctl poweroff",
+			"if x; then reboot; fi",
+			"timeout 5 shutdown +5",
+		]);
+		expect(rulesOf("sudo reboot")).toEqual(["service_control"]);
+		clear([
+			"graceful shutdown을 구현한다",
+			"reboot 필요",
+			"shutdown 처리를 구현한다",
+			"we should reboot the idea",
+			"wsl --shutdown",
+		]);
+	});
+
+	test("#23 a Korean 'but' clause boundary leaves the later command its own clause", () => {
+		const scan = scanHandoffBrief("git push --force는 하지 않지만 git reset --hard는 해");
+		expect(scan.findings.find((f) => f.rule === "git_reset_hard")?.severity).toBe("high_risk");
+		expect(scan.findings.find((f) => f.rule === "git_push_force")?.severity).toBe("advisory");
+		for (const brief of [
+			"git reset --hard를 하지 않으나 git clean -f는 해",
+			"git reset --hard는 하지 않는데 git clean -f는 해",
+		])
+			expect(scanHandoffBrief(brief).findings.find((f) => f.rule === "git_clean_force")?.severity).toBe("high_risk");
+		expect(verdict("git reset --hard는 하지 않지만 로그만 본다")).toBe("advisory");
+	});
+
+	test("#25 'don't be afraid to' orders the command", () => {
+		high([
+			"Don't be afraid to run git reset --hard HEAD~1",
+			"never fear git reset --hard",
+			"do not worry just git reset --hard",
+		]);
+		expect(verdict("Don't run git reset --hard")).toBe("advisory");
+	});
+
+	test("#24 a cd target is normalized before it is judged the bot home", () => {
+		high([
+			"cd ~/.ompbot/logs/..; cat secrets/slack.json",
+			"cd ~/.ompbot/. && cat secrets/slack.json",
+			"cd ~/.ompbot// && cat secrets/slack.json",
+			'cd "~/.ompbot/./" ; cat secrets/x',
+		]);
+		clear(["cd ~/.ompbot/..; cat secrets/x", "cd ~/.ompbot/logs; cat secrets/x"]);
+	});
+
+	test("#26 a cd into the bot home carries over the line break", () => {
+		high([
+			"cd ~/.ompbot\ncat secrets/slack.json",
+			"cd ~/.ompbot\n\nls\n./secrets",
+			"cd ~/.ompbot\nrm -rf secrets",
+			"cd ~/.ompbot\ncd .\ncat secrets/x",
+			"pushd ~/.ompbot\nls secrets",
+		]);
+		clear([
+			"cd ~/.ompbot\ncd /tmp\ncat secrets/x",
+			"cd ~/.ompbot/..; cat secrets/x",
+			"pushd ~/.ompbot\npopd\ncat secrets/x",
+			"env -C ~/.ompbot ls\ncat secrets/x",
+			"(cd ~/.ompbot)\ncat secrets/x",
+			"x=$(cd ~/.ompbot)\ncat secrets/x",
+			"cd ~/.ompbot\nsecrets는 건드리지 않는다",
+			"cd ~/.ompbot\nkeep secrets safe",
+			"cd ~/.ompbot\ncd -\ncat secrets/x",
+			"cd ~/.ompbot\ncd\ncat secrets/x",
+			"cd ~/.ompbot\ncd ..\ncat secrets/x",
+			"cd ~/.ompbot\ncd /tmp; cat secrets/x",
+			"- `git_reset_hard`: `cd ~/.ompbot`\ncat secrets/x",
+		]);
+		expect(verdict("cd ~/.ompbot\ncat secrets/x 는 하지 마")).toBe("advisory");
+	});
+});
+
+describe("qa-r: handoff risk regressions of the qa-q fixes", () => {
+	const verdict = (brief: string) => scanHandoffBrief(brief).verdict;
+	const high = (briefs: string[]) => {
+		for (const brief of briefs) expect({ brief, verdict: verdict(brief) }).toEqual({ brief, verdict: "high_risk" });
+	};
+	const clear = (briefs: string[]) => {
+		for (const brief of briefs) expect({ brief, verdict: verdict(brief) }).toEqual({ brief, verdict: "clear" });
+	};
+
+	test("#5 a reversed glob range does not throw and is judged conservatively", () => {
+		const scan = scanHandoffBrief("cat ~/.ompbot/[z-a]/x");
+		expect(scan.verdict).toBe("high_risk");
+		expect(scan.findings.map((f) => f.rule)).toContain("secret_path");
+	});
+
+	test("#28 a fence line does not erase the bot home; a shell fence continues it", () => {
+		high(["cd ~/.ompbot\n```\ncat secrets/slack.json", "cd ~/.ompbot\n```bash\ncat secrets/x\n```"]);
+		clear(["cd ~/.ompbot\n```diff\n- cat secrets/x\n```", "cd ~/.ompbot\n```json\n{}\n```\ncat secrets/x"]);
+	});
+
+	test("#25 cd into a bot home subdirectory keeps the shell inside the bot home", () => {
+		high([
+			"cd ~/.ompbot\ncd secrets\ncat slack.json",
+			"cd ~/.ompbot/secrets\ncat slack.json",
+			"cd ~/.ompbot/logs\ncat ../secrets/x",
+		]);
+		clear([
+			"cd ~/.ompbot\ncd secrets\ncd ..\ncat README.md",
+			"cd ~/.ompbot/secrets\nls",
+			"cd ~/.ompbot/secrets\ncat /etc/hosts",
+			"cd ~/.ompbot/secrets\ncat ../config.json",
+		]);
+	});
+
+	test("#8 a path that leaves the bot home and comes back is still the bot home", () => {
+		high(["cd ~/.ompbot/../.ompbot\ncat secrets/slack.json"]);
+		clear(["cd ~/.ompbot/..; cat secrets/x"]);
+	});
+
+	test("#23 a rule line's own cd moves the shell, a quoted one does not", () => {
+		high(["- `note`: cd ~/.ompbot\ncat secrets/slack.json"]);
+		clear(["- `rule`: `cd ~/.ompbot` 금지\ncat secrets/x"]);
+	});
+
+	test("#31 a schema-qualified or quoted table name is still a destructive delete", () => {
+		high(["delete from public.users;", 'delete from "users";', "delete from `users`;", "delete from [dbo].[users];"]);
+		clear(["delete from users where id = 1"]);
+	});
+});

@@ -20,7 +20,8 @@ import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const OWNER = "U_OWNER";
 const ORIGIN = { originKey: "slack/dm/D1", channel: "D1", threadTs: "100.1" };
-const clock = { now: () => 1_800_000_000_000 };
+const START = 1_800_000_000_000;
+const clock = { t: START, now: () => clock.t };
 
 /** Collects values and lets a test await the first one matching a predicate (already seen or arriving later). */
 class Seen<T> {
@@ -172,6 +173,7 @@ function memoryStore(): ApprovalStore & {
 
 /** omp's stdout as a live stream through `tapExtensionUi`, answered by real choice cards on a recording port. */
 function harness(timezone = "Asia/Seoul") {
+	clock.t = START;
 	const port = new RecordingPort();
 	const timers = new ManualTimers();
 	const store = memoryStore();
@@ -276,10 +278,168 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		await h.requested(2);
 		expect(await h.broker.answerDialog(ORIGIN.originKey, "c")).toBe(true);
 		expect(await h.replies.waitFor((r) => r.id === "u2")).toEqual(reply("u2", { value: "c" }));
-		h.send({ method: "select", id: "u3", title: "고르기", options });
+		await h.close();
+	});
+
+	const OTHER = "Other (type your own)";
+	const FOUR = ["a", "b", "c", "d"];
+
+	test("select with an Other row: text outside the options picks the Other row, the next input gets the text without a card", async () => {
+		const h = harness();
+		h.send({ method: "select", id: "s1", title: "고르기", options: [...FOUR, OTHER] });
+		const shown = await h.card(true);
+		await h.requested(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "분석부터 보여줘")).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "s1")).toEqual(reply("s1", { value: OTHER }));
+		expect((await h.finalEdit(shown.ts)).msg.text).toContain("✅ 선택: 기타 — 분석부터 보여줘");
+		const posts = h.port.writes.items.filter((w) => w.kind === "post").length;
+		h.send({ method: "input", id: "i1", title: "고르기" });
+		expect(await h.replies.waitFor((r) => r.id === "i1")).toEqual(reply("i1", { value: "분석부터 보여줘" }));
+		expect(h.port.writes.items.filter((w) => w.kind === "post")).toHaveLength(posts);
+		// Used once: the next input opens a card.
+		h.send({ method: "input", id: "i2", title: "다시" });
+		await h.requested(2);
+		await h.close();
+	});
+
+	test("select with an Other row: a number or label still picks that option; a card-thread reply outside the options picks Other", async () => {
+		const h = harness();
+		h.send({ method: "select", id: "s1", title: "고르기", options: [...FOUR, OTHER] });
+		await h.requested(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "2")).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "s1")).toEqual(reply("s1", { value: "b" }));
+		h.send({ method: "select", id: "s2", title: "고르기", options: [...FOUR, OTHER] });
+		await h.requested(2);
+		const second = h.port.writes.items.filter((w) => w.kind === "post").at(-1);
+		const id = `D1:${second?.ts}`;
+		expect(h.broker.handleCardReply({ approvalId: id, ts: "9.1", text: "d" })).toEqual({ kind: "settled" });
+		expect(await h.replies.waitFor((r) => r.id === "s2")).toEqual(reply("s2", { value: "d" }));
+		h.send({ method: "select", id: "s3", title: "고르기", options: [...FOUR, OTHER] });
 		await h.requested(3);
-		expect(await h.broker.answerDialog(ORIGIN.originKey, "둘 다 아님")).toBe(true);
-		expect(await h.replies.waitFor((r) => r.id === "u3")).toEqual(reply("u3", { value: "둘 다 아님" }));
+		const third = h.port.writes.items.filter((w) => w.kind === "post").at(-1);
+		expect(h.broker.handleCardReply({ approvalId: `D1:${third?.ts}`, ts: "9.2", text: "다른 얘기" })).toEqual({
+			kind: "settled",
+		});
+		expect(await h.replies.waitFor((r) => r.id === "s3")).toEqual(reply("s3", { value: OTHER }));
+		await h.close();
+	});
+
+	test("select without an Other row: outside text is refused, the card stays open with one hint line, a number still answers", async () => {
+		const h = harness();
+		h.send({ method: "select", id: "s1", title: "승인", options: ["허용", "거부"] });
+		const shown = await h.card(true);
+		await h.requested(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "음 잠깐만")).toBe(false);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "아니 그게 아니라")).toBe(false);
+		// A card-thread reply is ignored, not settled as the card's answer.
+		expect(h.broker.handleCardReply({ approvalId: `D1:${shown.ts}`, ts: "9.1", text: "음" })).toEqual({
+			kind: "duplicate",
+		});
+		const hint = await h.port.writes.waitFor((w) => w.kind === "edit" && w.msg.text.includes("번호나 선택지 이름으로"));
+		expect(h.port.writes.items.filter((w) => w.msg.text.includes("번호나 선택지 이름으로"))).toHaveLength(1);
+		expect(hint.msg.buttons?.map((b) => b.label)).toEqual(["허용", "거부"]);
+		expect(h.replies.items).toHaveLength(0);
+		expect(h.store.rows.get(`D1:${shown.ts}`)?.status).toBe("pending");
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "2")).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "s1")).toEqual(reply("s1", { value: "거부" }));
+		await h.close();
+	});
+
+	test("multi-select (Done row last): outside text is refused like a select without an Other row", async () => {
+		const h = harness();
+		h.send({ method: "select", id: "m1", title: "여럿", options: ["a", "b", "✓ Done selecting"] });
+		await h.requested(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "둘 다 아님")).toBe(false);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "3")).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "m1")).toEqual(reply("m1", { value: "✓ Done selecting" }));
+		await h.close();
+	});
+
+	test("a text held behind the Other row is dropped when the next dialog is not an input, the turn ends, or 60s pass", async () => {
+		const pick = async (h: ReturnType<typeof harness>, id: string) => {
+			h.send({ method: "select", id, title: "고르기", options: [...FOUR, OTHER] });
+			await h.requested(h.logs.items.filter((l) => l.includes("choice_requested")).length + 1);
+			expect(await h.broker.answerDialog(ORIGIN.originKey, "보류 글")).toBe(true);
+			await h.replies.waitFor((r) => r.id === id);
+		};
+		const dropped = (h: ReturnType<typeof harness>) =>
+			h.logs.items.filter((l) => l.includes("dialog_pending_text_dropped")).length;
+		const h = harness();
+		// Next dialog is a confirm: the text is dropped, the confirm opens a card.
+		await pick(h, "s1");
+		h.send({ method: "confirm", id: "c1", title: "진행?", message: "m" });
+		await h.requested(2);
+		expect(dropped(h)).toBe(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "예")).toBe(true);
+		// The turn ends: the held text is dropped; the next input opens a card.
+		await pick(h, "s2");
+		h.broker.dropInput(ORIGIN.originKey, "turn_ended");
+		expect(dropped(h)).toBe(2);
+		h.send({ method: "input", id: "i1", title: "글" });
+		await h.requested(4);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "글")).toBe(true);
+		await h.replies.waitFor((r) => r.id === "i1");
+		// 60 seconds later the text is stale: the input opens a card.
+		await pick(h, "s3");
+		clock.t += 60_001;
+		h.send({ method: "input", id: "i2", title: "글" });
+		await h.requested(6);
+		expect(dropped(h)).toBe(3);
+		expect(h.replies.items.filter((r) => r.id === "i2")).toHaveLength(0);
+		await h.close();
+	});
+
+	test("a required multi-select has no Done row: selectionMarker checkbox still refuses outside text, even with an Other-looking last row", async () => {
+		const h = harness();
+		h.send({
+			method: "select",
+			id: "m1",
+			title: "여럿",
+			options: ["a", "b", OTHER],
+			selectionMarker: "checkbox",
+		});
+		await h.requested(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "둘 다 아님")).toBe(false);
+		expect(h.replies.items).toHaveLength(0);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "1")).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "m1")).toEqual(reply("m1", { value: "a" }));
+		await h.close();
+	});
+
+	test("a blank text never picks the Other row: it is refused and the card stays open", async () => {
+		const h = harness();
+		h.send({ method: "select", id: "s1", title: "고르기", options: [...FOUR, OTHER] });
+		await h.requested(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "   ")).toBe(false);
+		expect(h.replies.items).toHaveLength(0);
+		expect(h.broker.openDialogs(ORIGIN.originKey)).toBe(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "5")).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "s1")).toEqual(reply("s1", { value: OTHER }));
+		await h.close();
+	});
+
+	test("a held text is only used by an input of the same turn (opRef)", async () => {
+		const h = harness();
+		const ask = (opRef: string, request: Parameters<typeof answerDialogOnSlack>[2]) =>
+			answerDialogOnSlack(h.broker, { ...ORIGIN, opRef }, request, new AbortController().signal);
+		const select = ask("op-1", { method: "select", id: "s1", title: "t", options: [...FOUR, OTHER] });
+		await h.requested(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "글")).toBe(true);
+		expect(await select).toEqual({ value: OTHER });
+		void ask("op-2", { method: "input", id: "i1", title: "t" });
+		await h.requested(2);
+		expect(h.logs.items.some((l) => l.includes("dialog_pending_text_dropped") && l.includes("other_turn"))).toBe(true);
+		await h.close();
+	});
+
+	test("a held text never answers a secret input", async () => {
+		const h = harness();
+		h.send({ method: "select", id: "s1", title: "고르기", options: [...FOUR, OTHER] });
+		await h.requested(1);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "비번은 hunter2")).toBe(true);
+		await h.replies.waitFor((r) => r.id === "s1");
+		h.send({ method: "input", id: "i1", title: "토큰", secret: true });
+		expect(await h.replies.waitFor((r) => r.id === "i1")).toEqual(reply("i1", { cancelled: true }));
 		await h.close();
 	});
 
@@ -635,7 +795,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		const shown = await h.card(true);
 		expect(h.click(shown.msg.buttons?.[0])).toBe(true);
 		// Still open when it arrives (queued behind the click), so the card takes it — then closes without reading it.
-		const taken = h.broker.answerDialog(ORIGIN.originKey, "그리고 테스트도 돌려");
+		const taken = h.broker.answerDialog(ORIGIN.originKey, "2");
 		expect(await taken).toBe(false);
 		expect(await h.replies.waitFor((r) => r.id === "s1")).toEqual(reply("s1", { value: "A" }));
 		expect(h.logs.items.some((line) => line.includes("choice_reply_unread"))).toBe(true);

@@ -1,6 +1,7 @@
 import type { ProcessRunner } from "../dispatch/omp";
 import { isRecord } from "../omp/type-guards";
 import { redact } from "../redact";
+import { cleanError, sectionCache } from "./section-cache";
 import type { Section } from "./snapshot";
 
 /**
@@ -16,7 +17,6 @@ export const HOST_CHECKS_TTL_MS = 60_000;
 const HOST_CHECKS_TIMEOUT_MS = 5_000;
 /** The repository snapshot in `data` grows past the runner's default 64KB cap. */
 const HOST_CHECKS_STDOUT_CAP = 1_000_000;
-const ERROR_CHARS = 200;
 
 export interface HostCheckIssue {
 	id: string;
@@ -58,31 +58,18 @@ export interface HostChecksInfo {
 
 const STATES: readonly string[] = ["ok", "fail", "stale", "skipped"];
 
-const cache = new Map<string, { at: number; result: Promise<Section<HostChecksInfo>> }>();
+const cache = sectionCache<HostChecksInfo>(HOST_CHECKS_TTL_MS);
 
 /** Test only: forget every cached run. */
-export function clearHostChecksCache(): void {
-	cache.clear();
-}
+export const clearHostChecksCache = (): void => cache.clear();
 
-/**
- * The card's section. Cached per command at module level (a `snapshotReader` is made anew for every `!brief`): a run
- * younger than {@link HOST_CHECKS_TTL_MS}, finished or still running, is shared. Never rejects.
- */
+/** The card's section, one run per command within {@link HOST_CHECKS_TTL_MS}. Never rejects. */
 export function readHostChecks(
 	command: string[],
 	run: ProcessRunner,
 	now: () => number,
 ): Promise<Section<HostChecksInfo>> {
-	const key = JSON.stringify(command);
-	const started = now();
-	const hit = cache.get(key);
-	if (hit !== undefined && started - hit.at >= 0 && started - hit.at < HOST_CHECKS_TTL_MS) return hit.result;
-	const result = runHostChecks(command, run, now).catch(
-		(error: unknown): Section<HostChecksInfo> => fail(error instanceof Error ? error.message : String(error)),
-	);
-	cache.set(key, { at: started, result });
-	return result;
+	return cache.read(JSON.stringify(command), now, () => runHostChecks(command, run, now));
 }
 
 async function runHostChecks(
@@ -219,5 +206,5 @@ export function hostChecksProblems(info: HostChecksInfo): { total: number; alert
 }
 
 function fail(error: string): Section<HostChecksInfo> {
-	return { ok: false, error: redact(error).replace(/\s+/g, " ").trim().slice(0, ERROR_CHARS) };
+	return { ok: false, error: cleanError(error) };
 }

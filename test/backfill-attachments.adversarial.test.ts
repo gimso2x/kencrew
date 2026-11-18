@@ -638,15 +638,30 @@ describe("backfill: threads, quarantine, isolation, runner", () => {
 			if (builds <= 2) throw new Error("config unreadable"); // the pass AND the error logger both need deps
 			return good;
 		});
-		runner.trigger();
-		const outcome = await runner.waitForIdle().then(
-			() => "resolved",
-			() => "rejected",
-		);
-		expect(outcome).toBe("resolved");
-		runner.trigger();
-		await runner.waitForIdle().catch(() => undefined);
-		expect(good.recorded.size).toBe(1);
+		// When buildDeps() itself fails there is no logger, so BackfillRunner falls back to
+		// console.error. That stderr fallback is intended behavior: intercept it only here to
+		// assert the message instead of letting it leak into `bun test` output.
+		const fallbackErrors: string[] = [];
+		const originalError = console.error;
+		console.error = (line: string) => fallbackErrors.push(String(line));
+		try {
+			runner.trigger();
+			const outcome = await runner.waitForIdle().then(
+				() => "resolved",
+				() => "rejected",
+			);
+			expect(outcome).toBe("resolved");
+			runner.trigger();
+			await runner.waitForIdle().catch(() => undefined);
+			expect(good.recorded.size).toBe(1);
+		} finally {
+			console.error = originalError;
+		}
+		expect(fallbackErrors.length).toBeGreaterThan(0);
+		for (const line of fallbackErrors) {
+			expect(line).toContain("[ompbot] slack_backfill_failed");
+			expect(line).toContain("Error: config unreadable");
+		}
 	});
 
 	test("a throwing cursor store (SQLITE_BUSY) is logged by the runner and the next trigger recovers", async () => {

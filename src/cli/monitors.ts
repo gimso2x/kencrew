@@ -10,7 +10,13 @@ import {
 	nextFireOf,
 	openMonitorLedger,
 } from "../monitors/ledger";
-import { applyMonitors, exportMonitors, PortableApplyError, type PortableContext } from "../monitors/portable";
+import {
+	applyMonitors,
+	exportMonitors,
+	PortableApplyError,
+	type PortableContext,
+	PortableUsageError,
+} from "../monitors/portable";
 import { runScript } from "../monitors/script";
 import { MonitorSpecError, mergeMonitorSpec, parseMonitorSpec } from "../monitors/spec";
 import { webhookUrl } from "../monitors/webhook";
@@ -126,6 +132,10 @@ function portableCommand(sub: "export" | "apply", args: string[], homeDir: strin
 		);
 		return 0;
 	} catch (error) {
+		if (error instanceof PortableUsageError) {
+			process.stderr.write(`monitors ${sub}: ${error.message}\n`);
+			return 2;
+		}
 		if (!(error instanceof PortableApplyError)) throw error;
 		for (const problem of error.problems) process.stderr.write(`monitors apply: ${problem}\n`);
 		process.stderr.write(`monitors apply: ${error.message}; nothing was changed\n`);

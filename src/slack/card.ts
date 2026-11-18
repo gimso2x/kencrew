@@ -117,7 +117,12 @@ function childToBlocks(child: CardChild, state: ConvertState): SlackBlock[] {
 				},
 			];
 		case "link":
-			return [{ text: mrkdwn(`<${child.url}|${child.label}>`, LIMITS.sectionText), type: "section" }];
+			return [
+				{
+					text: mrkdwn(`<${slackLinkUrl(child.url)}|${slackLinkLabel(child.label)}>`, LIMITS.sectionText),
+					type: "section",
+				},
+			];
 		case "section":
 			return child.children.flatMap((nested) => childToBlocks(nested, state));
 		case "table":
@@ -195,10 +200,29 @@ function chartToBlock(element: ChartChild, state: ConvertState): SlackBlock {
 }
 
 function fencedFallbackText(content: string): SlackBlock {
-	const fence = (body: string) => `\`\`\`\n${body}\n\`\`\``;
-	const budget = LIMITS.sectionText - fence("").length;
-	const text = content.length > budget ? fence(`${content.slice(0, budget - 1)}\u2026`) : fence(content);
-	return { text, type: "mrkdwn" };
+	return { text: slackCodeFence(content, LIMITS.sectionText), type: "mrkdwn" };
+}
+
+/**
+ * `body` in a ``` fence that nothing inside can close. mrkdwn has no longer fence (a fourth backtick is not read as
+ * part of the marker), so every run of three or more backticks in the body is broken with zero-width spaces; the
+ * body, the fence lines and the newlines then fit `limit` (a cut body ends in `…`).
+ */
+export function slackCodeFence(body: string, limit = Number.POSITIVE_INFINITY): string {
+	const wrap = (text: string): string => `\`\`\`\n${text}\n\`\`\``;
+	const safe = body.replace(/`{3,}/g, (run) => [...run].join("\u200b"));
+	const budget = limit - wrap("").length;
+	return safe.length > budget ? wrap(`${cutCodePointSafe(safe, budget - 1)}\u2026`) : wrap(safe);
+}
+
+/** A link url as a Slack `<url|label>` token holds it: `|`, `<`, `>` and blanks percent-encoded. */
+export function slackLinkUrl(url: string): string {
+	return url.replace(/[|<>\s]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`);
+}
+
+/** A link label as a Slack token holds it: `&`, `<`, `>` as entities and `|` (no escape exists) as a full-width bar. */
+function slackLinkLabel(label: string): string {
+	return label.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\|/g, "\uFF5C");
 }
 
 function isValidChartLabel(label: string): boolean {

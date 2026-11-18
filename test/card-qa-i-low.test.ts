@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CARD_LIMITS, chartToAscii, validateCard } from "../src/channel/card";
+import { CARD_LIMITS, cardUrlIssues, chartToAscii, validateCard } from "../src/channel/card";
 
 const el = (type: string, props: Record<string, unknown> = {}, children: string[] = []) => ({ type, props, children });
 const spec = (elements: Record<string, unknown>, root = "c"): string => JSON.stringify({ root, elements });
@@ -75,5 +75,34 @@ describe("chart category limit (qa-i 80)", () => {
 		const child = checked.card.children[0];
 		if (child?.type !== "chart" || child.chart.type === "pie") throw new Error("expected a chart");
 		expect(chartToAscii(child).split("\n").slice(1)).toEqual(["   | n", "d0 | 0", "d1 | 1"]);
+	});
+});
+
+describe("validateCard on a huge child list (qa-q #5)", () => {
+	test("a million children are judged without throwing", () => {
+		const children = Array.from({ length: 1_000_000 }, (_, i) => `k${i}`);
+		const json = spec({ c: el("Card", { title: "t" }, children) });
+		expect(() => validateCard(json)).not.toThrow();
+		expect(validateCard(json).ok).toBe(false);
+	}, 30_000);
+});
+
+describe("Link urls (qa-r #21)", () => {
+	// json-render's catalog has no Link element (LinkButton only lives in the removed Actions), so no spec reaches
+	// validateCard with one today; the check validateCard runs on the converted card is tested on a card of its own.
+	const card = (children: unknown[]) => ({ type: "card", children }) as unknown as Parameters<typeof cardUrlIssues>[0];
+	const link = (url: string) => ({ type: "link", label: "x", url });
+
+	test.each(["javascript:alert(1)", "data:text/html,x", "file:///etc/passwd"])("a Link url %s is refused", (url) => {
+		expect(cardUrlIssues(card([link(url)]))).toEqual([expect.stringContaining("must be an http(s) URL")]);
+		expect(cardUrlIssues(card([{ type: "section", children: [link(url)] }]))).toEqual([
+			expect.stringContaining("must be an http(s) URL"),
+		]);
+	});
+
+	test("an https Link url passes, at the top and inside a Section", () => {
+		expect(
+			cardUrlIssues(card([link("https://x.test/a"), { type: "section", children: [link("http://x.test")] }])),
+		).toEqual([]);
 	});
 });

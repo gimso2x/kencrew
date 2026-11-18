@@ -11,6 +11,7 @@ import { SlackBinding } from "../src/slack/binding";
 import { SlackChannel } from "../src/slack/channel";
 import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
 import { killSpawned, runMain, spawnDaemon } from "./helpers/daemon-process";
+import { ROOMY_STATFS } from "./helpers/disk";
 
 const CHANNEL = "C0SOLO00001";
 
@@ -353,6 +354,7 @@ test("AC-9 (T-20261115-03): a reloaded lanes.models.middle reaches the next [TAS
 		sweepMs: 3_600_000,
 		gateSweepMs: 0,
 		taskSweepMs: 0,
+		statfs: ROOMY_STATFS, // the [TASK] start's disk check never depends on this machine's free space
 		driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
 	});
 	await daemon.start();

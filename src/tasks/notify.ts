@@ -1,16 +1,20 @@
 import {
 	type ActionButton,
 	type ChannelPort,
+	type MessageRef,
 	mentionToken,
 	type OutboundMessage,
 	renderMentions,
 } from "../channel/port";
 import type { ChannelRegistry } from "../channel/registry";
 import { parseThreadRef } from "../core/normalize";
+import { confidentBand, receiptBlockers } from "../lanes/land";
+import { formatConfidence } from "../lanes/review";
 import { redact } from "../redact";
 import type { TaskCheck, TaskJudgement } from "./checker";
 import { TASK_RISKS, type TaskRisk } from "./docs";
-import { TASK_STATUSES, type TaskRow, type TaskStatus } from "./ledger";
+import type { TaskLandOutcome, TaskLandRebase } from "./land";
+import { TASK_STATUSES, type TaskGate, type TaskRow, type TaskStatus } from "./ledger";
 import { workerLine } from "./worker-tier";
 
 /** One status reaction lives on the task root: ⏳ working, 🔍 review, 🚧 blocked, ✅ done, ❌ cancelled. */
@@ -96,14 +100,40 @@ export async function postToThread(
 	threadRef: string,
 	card: TaskCard | string,
 ): Promise<boolean> {
+	return (await postCardToThread(channels, log, threadRef, card)) !== undefined;
+}
+
+/** `postToThread` that resolves with where the card went (for a later `editThreadCard`); `undefined` = not posted. */
+export async function postCardToThread(
+	channels: ChannelRegistry,
+	log: TaskSlackLog,
+	threadRef: string,
+	card: TaskCard | string,
+): Promise<MessageRef | undefined> {
 	const target = parseThreadRef(threadRef);
-	if (target === undefined) return false;
+	if (target === undefined) return undefined;
 	try {
 		const port = channels.portFor(target.channel);
-		await port.post({ conversationId: target.channel, threadId: target.threadTs }, cardMessage(card, port));
-		return true;
+		return await port.post({ conversationId: target.channel, threadId: target.threadTs }, cardMessage(card, port));
 	} catch (error) {
 		log.warn("task_post_failed", { thread: threadRef, error: String(error) });
+		return undefined;
+	}
+}
+
+/** Redraws a posted task card; a failure is logged and reported as `false`. */
+export async function editThreadCard(
+	channels: ChannelRegistry,
+	log: TaskSlackLog,
+	ref: MessageRef,
+	card: TaskCard,
+): Promise<boolean> {
+	try {
+		const port = channels.portFor(ref.conversationId);
+		await port.edit(ref, cardMessage(card, port));
+		return true;
+	} catch (error) {
+		log.warn("task_card_edit_failed", { message: ref.messageId, error: String(error) });
 		return false;
 	}
 }
@@ -253,9 +283,12 @@ const evidenceLine = (row: TaskRow): string =>
 export interface AutoLandPolicy {
 	repos: string[];
 	maxRisk: TaskRisk;
-	/** Lanes only: the independent review a lane's claim commit needs a `CLEAR` receipt from before it merges unasked. */
+	/**
+	 * The independent review a lane's claim commit needs a `CLEAR` receipt from before it merges unasked; a local [TASK]
+	 * needs one for its tip only in the `confident` band (src/tasks/gate.ts).
+	 */
 	review?: { model: string; timeoutMs: number; confident?: LaneReviewConfident };
-	/** Lanes only: the run QA a reviewed lane at `minRisk` or above needs a `PASS` receipt from for its claim commit. */
+	/** The run QA a reviewed lane or banded [TASK] at `minRisk` or above needs a `PASS` receipt from for that commit. */
 	qa?: LaneQaPolicy;
 }
 
@@ -288,38 +321,81 @@ export function checkBlockers(checks: readonly TaskCheck[]): string[] {
 }
 
 /**
+ * The integrity warnings that hold a task's merge: all of them, except that an L0·L1 task is not held by an unproven
+ * claim word in its summary alone (owner decision 11-16 — the re-run checks already stand behind the claim).
+ */
+export function holdingIntegrityWarnings(risk: TaskRisk, warnings: readonly string[]): string[] {
+	if (TASK_RISKS.indexOf(risk) > TASK_RISKS.indexOf("L1")) return [...warnings];
+	return warnings.filter((line) => !line.startsWith("무결성 unproven_claim_word:"));
+}
+
+/**
  * Why a reached task is not merged without asking; `[]` = merge it. `repoMatched` is the sweep's git common-directory
- * comparison (always false for a remote task, which is refused for being remote in the first place).
+ * comparison (always false for a remote task, which is refused for being remote in the first place). A task in the
+ * `confidentBand` has no risk reason: it needs the gate's receipts for `head` (its branch tip) instead — a review
+ * `CLEAR` of at least `minConfidence`, then a QA `PASS` (`receiptBlockers`, the lanes' rule). Without `head` no
+ * receipt counts.
  */
 export function autoLandBlockers(
 	row: TaskRow,
 	judgement: TaskJudgement,
 	policy: AutoLandPolicy,
 	repoMatched: boolean,
+	head?: string,
 ): string[] {
 	const blockers: string[] = [];
 	if (row.host !== null) blockers.push(`원격 호스트(${row.host}) TASK`);
 	else if (!repoMatched) blockers.push("저장소가 taskAutoLand.repos 밖");
-	if (TASK_RISKS.indexOf(row.risk) > TASK_RISKS.indexOf(policy.maxRisk)) {
+	const band = confidentBand(row.risk, policy);
+	if (band === undefined && TASK_RISKS.indexOf(row.risk) > TASK_RISKS.indexOf(policy.maxRisk)) {
 		blockers.push(`위험 ${row.risk} > ${policy.maxRisk}`);
 	}
 	if (judgement.checks.length === 0) blockers.push("재실행 검사 없음");
 	else blockers.push(...checkBlockers(judgement.checks));
-	if (judgement.integrityWarnings.length > 0) blockers.push(`무결성 경고 ${judgement.integrityWarnings.length}건`);
+	const holding = holdingIntegrityWarnings(row.risk, judgement.integrityWarnings);
+	if (holding.length > 0) blockers.push(`무결성 경고 ${holding.length}건`);
 	if (sharedCommitWarnings(row, judgement).length > 0) blockers.push("공유 커밋 증거 경고");
 	const unfinished = (judgement.steps ?? []).filter((step) => !step.done);
 	if (unfinished.length > 0) {
 		const names = unfinished.map((s) => s.id).join(", ");
 		blockers.push(`PROGRESS 미완료 단계 ${unfinished.length}개(${names})`);
 	}
+	if (band !== undefined) blockers.push(...receiptBlockers(row.gate ?? {}, head, row.risk, policy));
 	return blockers;
+}
+
+/** The line of a reached card while the gate runs (no owner mention: nothing to decide yet). */
+export const GATE_RUNNING_LINE = "🔎 독립 리뷰 → 실행 QA(뚱기) 진행 중";
+
+/** The gate's receipts as card lines, in the lane card's words. */
+export function gateReceiptLines(gate: TaskGate | null): string[] {
+	const lines: string[] = [];
+	const review = gate?.review;
+	if (review !== undefined) {
+		const label = review.verdict === "inconclusive" ? `확인 불가(${review.reason ?? "?"})` : review.verdict;
+		const scored = review.confidence === undefined ? label : `${label} ${formatConfidence(review.confidence)}`;
+		lines.push(`🔎 독립 리뷰 ${scored} · ${review.model}`);
+	}
+	const qa = gate?.qa;
+	if (qa !== undefined) {
+		const label = qa.verdict === "inconclusive" ? `확인 불가(${qa.reason ?? "?"})` : qa.verdict;
+		lines.push(`🧪 실행 QA(뚱기 · ${qa.model.replace(/^.*\//, "").replace(/:[^:]*$/, "")}): ${label}`);
+		lines.push(...qa.findings.slice(0, 3).map((finding) => `> ${clip(finding, 200)}`));
+	}
+	return lines;
 }
 
 /** The line a reached card leads with when the bot tried to merge on its own and could not start. */
 export const AUTO_LAND_FAILED_LINE = "⚠️ 자동 머지를 시작하지 못해 직접 정해 주세요.";
 
 /** What auto-merge did not do, as one extra line on the reached card: it failed to start, or why it was skipped. */
-export type ReachedAutoLandNote = { kind: "failed" } | { kind: "skipped"; reasons: readonly string[] };
+export type ReachedAutoLandNote =
+	| { kind: "failed" }
+	| { kind: "skipped"; reasons: readonly string[]; gate?: TaskGate | null }
+	/** The gate runs: its line replaces the owner mention (the result card that follows mentions the owner). */
+	| { kind: "gating" }
+	/** The gate's receipts in place of the running line, still without a mention. */
+	| { kind: "gated"; gate: TaskGate | null };
 
 /**
  * The owner reads the agent's outcome.md `## 요약` (at most three lines), not the criteria and evidence: those stay in
@@ -334,7 +410,13 @@ export function buildReachedCard(
 ): TaskCard {
 	const summary = [...summaryLines(row, judgement), ...workerLines(row)];
 	const lead = autoLand?.kind === "failed" ? [AUTO_LAND_FAILED_LINE] : [];
-	const skipped = autoLand?.kind === "skipped" ? [`자동 머지 안 함: ${autoLand.reasons.join(" · ")}`] : [];
+	const skipped = [
+		...(autoLand?.kind === "skipped" ? [`자동 머지 안 함: ${autoLand.reasons.join(" · ")}`] : []),
+		...(autoLand?.kind === "gating" ? [GATE_RUNNING_LINE] : []),
+		...(autoLand?.kind === "gated" || autoLand?.kind === "skipped" ? gateReceiptLines(autoLand.gate ?? null) : []),
+	];
+	const quiet = autoLand?.kind === "gating" || autoLand?.kind === "gated";
+	const mention = quiet ? "" : ` ${mentionToken(ownerUserId)}`;
 	const warnings = sharedCommitWarnings(row, judgement);
 	// Judgement calls of the integrity classifier (guard deletion, unproven claim): the owner sees them, nothing is held.
 	const integrity =
@@ -349,7 +431,7 @@ export function buildReachedCard(
 			: [`✅ check ${passed}/${judgement.checks.length} 통과 — 봇이 워크트리에서 직접 다시 실행했습니다.`];
 	const text = [
 		...lead,
-		`🔍 Outcome 도달 · ${row.title} — 수락기준 ${judgement.acChecked}/${row.acceptance.length}에 체크와 증거가 있습니다. 머지할지 정해 주세요. (${ownerTag(row)}) ${mentionToken(ownerUserId)}`,
+		`🔍 Outcome 도달 · ${row.title} — 수락기준 ${judgement.acChecked}/${row.acceptance.length}에 체크와 증거가 있습니다. 머지할지 정해 주세요. (${ownerTag(row)})${mention}`,
 		"",
 		...summary,
 		...skipped,
@@ -373,7 +455,7 @@ export function buildReachedCard(
 			...integrity,
 			...(warnings.length === 0 ? [] : ["", ...warnings]),
 			"",
-			`${mentionToken(ownerUserId)} 머지할지 정해 주세요. 고칠 점이 있으면 이 스레드에 적어 주세요.`,
+			`${quiet ? "" : `${mentionToken(ownerUserId)} `}머지할지 정해 주세요. 고칠 점이 있으면 이 스레드에 적어 주세요.`,
 		].join("\n"),
 		fields: [
 			{ label: "수락기준", value: `${judgement.acChecked}/${row.acceptance.length}` },
@@ -395,15 +477,60 @@ export const formatReachedNotice = (
 	link?: string,
 ): string => buildReachedCard(row, judgement, ownerUserId, link).text;
 
+/** One line for what a core landing (`landTask`) or a landing call came to: card notes and the auto-merge card lead. */
+export function taskLandNote(outcome: TaskLandOutcome): string {
+	const rebase = (rebased: TaskLandRebase | undefined): string =>
+		rebased === undefined ? "" : ` · rebase ${rebased.oldSha.slice(0, 12)}→${rebased.newSha.slice(0, 12)}`;
+	const notes = (lines: readonly string[]): string => (lines.length === 0 ? "" : ` · ${lines.join(" · ")}`);
+	switch (outcome.state) {
+		case "landed":
+			return `✅ 코어 착지 완료: ${outcome.baseBranch} ← ${outcome.sha.slice(0, 12)}${outcome.pushed === undefined ? "" : ` · ${outcome.pushed} push`}${rebase(outcome.rebase)} · worktree 정리·done${notes(outcome.notes)}`;
+		case "merged-not-pushed":
+			return `⚠️ push 거부: ${outcome.reason} — 손으로 push 필요 (${outcome.baseBranch} ← ${outcome.sha.slice(0, 12)} 머지·done${rebase(outcome.rebase)})${notes(outcome.notes)}`;
+		case "handoff":
+			return `코어가 넘김: ${outcome.reason}${rebase(outcome.rebase)} — 모델 턴이 "머지해"로 이어받습니다`;
+		case "blocked":
+			return `⛔ 착지 멈춤: ${outcome.reason} — 기준 브랜치는 그대로입니다`;
+		case "in_flight":
+			return "이미 착지 중";
+		case "not_accepted":
+			return AUTO_LAND_FAILED_LINE;
+		case "gating":
+			return GATE_RUNNING_LINE;
+		case "held":
+			return `자동 머지 안 함: ${outcome.reasons.join(" · ")}`;
+	}
+}
+
+const AUTO_LAND_TITLES: Record<AutoLandCardOutcome["state"], string> = {
+	landed: "✅ 자동 머지 완료",
+	"merged-not-pushed": "⚠️ 자동 머지 · push 거부",
+	handoff: "🚚 자동 머지 · 모델 턴",
+	in_flight: "🚚 자동 머지 · 이미 착지 중",
+};
+
+/** Auto-merge results that get the auto-merge card; `blocked` and `not_accepted` get the reached card's question. */
+export type AutoLandCardOutcome = Extract<
+	TaskLandOutcome,
+	{ state: "landed" | "merged-not-pushed" | "handoff" | "in_flight" }
+>;
+
 /**
- * The reached card when the bot has put "머지해" into the thread itself (`taskAutoLand`): news, not a question — no
- * button, no owner mention. The summary and the `*근거*` line are the reached card's.
+ * The reached card of an auto-merge (`taskAutoLand`) that landed through the core, was handed to the model turn
+ * ("머지해" already in the thread) or found the task landing already: news, not a question — no button, no owner
+ * mention. The summary and the `*근거*` line are the reached card's.
  */
-export function buildAutoLandCard(row: TaskRow, judgement: TaskJudgement, link?: string): TaskCard {
-	const summary = [...summaryLines(row, judgement), ...workerLines(row)];
+export function buildAutoLandCard(
+	row: TaskRow,
+	judgement: TaskJudgement,
+	outcome: AutoLandCardOutcome,
+	link?: string,
+	gate?: TaskGate | null,
+): TaskCard {
+	const summary = [...gateReceiptLines(gate ?? null), ...summaryLines(row, judgement), ...workerLines(row)];
 	const passed = judgement.checks.filter((check) => check.ok).length;
-	const lead = `Outcome 도달 · 수락기준 ${judgement.acChecked}/${row.acceptance.length} · 재실행 검사 ${passed}/${judgement.checks.length} 통과 — 개인 저장소라 바로 머지합니다(close→ff 머지→push→정리).`;
-	const title = `🚚 자동 머지 · ${row.title}`;
+	const lead = `Outcome 도달 · 수락기준 ${judgement.acChecked}/${row.acceptance.length} · 재실행 검사 ${passed}/${judgement.checks.length} 통과 — ${taskLandNote(outcome)}`;
+	const title = `${AUTO_LAND_TITLES[outcome.state]} · ${row.title}`;
 	const note = cardNote(link);
 	return {
 		text: [`${title} (${ownerTag(row)})`, lead, "", ...summary, "", evidenceLine(row), ...boardFooter(link)].join("\n"),
@@ -569,6 +696,41 @@ export function buildAgentWaitingCard(
 		].join("\n"),
 		title: `⏸ 워커 대기 · ${row.title}`,
 		body: [`${waiting} ${mentionToken(ownerUserId)}`, ...details].join("\n"),
+		fields: [branchField(row), workerField(row)],
+		...(note === undefined ? {} : { note }),
+	};
+}
+
+/** agy's limit refusals (doc/plans/agy-task-worker.md 6): matched on the screen tail only, case-insensitive. */
+const AGY_LIMIT_PATTERN = /RESOURCE_EXHAUSTED|quota|rate limit/i;
+
+/** The screen tail line (as a card shows it) where an agy worker hit its limit; `undefined` when none does. */
+export function agyLimitLine(screen: string): string | undefined {
+	return cardTailLines(screen).find((line) => AGY_LIMIT_PATTERN.test(line));
+}
+
+/**
+ * The task's agy worker stopped on its (free, shared with 서팍) limit: the task is blocked and the bot stops prompting
+ * it, so only the owner moves it on — a resume once the limit lifts.
+ */
+export function buildAgyLimitCard(row: TaskRow, line: string, ownerUserId: string, link?: string): TaskCard {
+	const stopped = `agy 한도: herdr 에이전트 \`${row.agent}\`가 agy 사용 한도에 걸려 멈췄습니다. 이 작업을 blocked로 두고 독촉을 멈췄습니다.`;
+	const details = [
+		"*화면*:",
+		"```",
+		line,
+		"```",
+		`*이어가는 법*: 한도가 풀린 뒤 \`ompbot_dispatch {taskSpec:{id:"${row.taskId}"}}\`로 재개합니다.`,
+	];
+	const note = cardNote(link);
+	return {
+		text: [
+			`⛔ agy 한도 · ${row.title} — ${stopped} (${ownerTag(row)}) ${mentionToken(ownerUserId)}`,
+			...details,
+			...boardFooter(link),
+		].join("\n"),
+		title: `⛔ agy 한도 · ${row.title}`,
+		body: [`${stopped} ${mentionToken(ownerUserId)}`, ...details].join("\n"),
 		fields: [branchField(row), workerField(row)],
 		...(note === undefined ? {} : { note }),
 	};

@@ -371,7 +371,14 @@ function parseDialogRequest(frame: Record<string, unknown>): OmpDialogRequest | 
 		case "select":
 			if (typeof title !== "string" || !Array.isArray(frame.options)) return undefined;
 			if (!frame.options.every((option) => typeof option === "string")) return undefined;
-			return { method: "select", id, title, options: frame.options as string[], ...withTimeout };
+			return {
+				method: "select",
+				id,
+				title,
+				options: frame.options as string[],
+				...withTimeout,
+				...(typeof frame.selectionMarker === "string" ? { selectionMarker: frame.selectionMarker } : {}),
+			};
 		case "confirm":
 			if (typeof title !== "string" || typeof frame.message !== "string") return undefined;
 			return { method: "confirm", id, title, message: frame.message, ...withTimeout };

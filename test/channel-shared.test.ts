@@ -130,6 +130,14 @@ test("tableEndAt: Slack takes one hyphen per delimiter cell, Discord three", () 
 	expect(tableEndAt(["a | b", "---|---", "x \\| y"], 0, 3)).toBe(2);
 });
 
+test("tableEndAt: a quote, heading or list line after the rows ends the table", () => {
+	const table = ["| a | b |", "|---|---|", "| 1 | 2 |"];
+	for (const next of ["- x | y", "* x | y", "3. x | y", "> x | y", "## x | y"]) {
+		expect(tableEndAt([...table, next], 0, 3)).toBe(3);
+	}
+	expect(tableEndAt([...table, "-x | y"], 0, 3)).toBe(4);
+});
+
 test("countsTowardDeadLetter: the platform verdict wins, a busy ledger never counts", () => {
 	expect(countsTowardDeadLetter(new Error("x"), false)).toBe(false);
 	expect(countsTowardDeadLetter(new Error("SQLITE_BUSY: locked"), undefined)).toBe(false);

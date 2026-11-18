@@ -4,6 +4,7 @@ import {
 	type CreateMessageArgs,
 	DiscordCallError,
 	type DiscordChannelInfo,
+	type DiscordGatewayFatalError,
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
@@ -182,6 +183,11 @@ export class FakeDiscordTransport implements DiscordTransport {
 	/** A gateway Ready (`resumed: false`, a new session) or Resumed after `start`. */
 	emitReady(info: { resumed: boolean }): void {
 		this.handlers?.ready?.(info);
+	}
+
+	/** A non-retryable gateway close after `start` (the real gateway has stopped itself by then). */
+	emitFatal(error: DiscordGatewayFatalError): void {
+		this.handlers?.fatal?.(error);
 	}
 
 	/** Guild roles as GUILD_CREATE / GUILD_ROLE_CREATE would bring them. */

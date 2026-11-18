@@ -72,6 +72,8 @@ export interface DiscordHandlers {
 	interaction(interaction: DiscordInteraction): Promise<void>;
 	/** Every Ready (`resumed: false`: a new session, the events in between are lost) and Resumed (`resumed: true`). */
 	ready?(info: { resumed: boolean }): void;
+	/** A non-retryable gateway close (4004, 4014 ...): the gateway has stopped and will not reconnect. */
+	fatal?(error: DiscordGatewayFatalError): void;
 	/** Guild roles from `GUILD_CREATE` and `GUILD_ROLE_CREATE`/`GUILD_ROLE_UPDATE`. */
 	roles?(roles: ReadonlyArray<DiscordRole>): void;
 }

@@ -10,7 +10,15 @@ import {
 	tableEndAt,
 	tableSpans,
 } from "../channel/text";
-import { CARD_MAX_BLOCKS, cardFallbackText, cardToBlocks, parseCard, type SlackBlock } from "./card";
+import {
+	CARD_MAX_BLOCKS,
+	cardFallbackText,
+	cardToBlocks,
+	parseCard,
+	type SlackBlock,
+	slackCodeFence,
+	slackLinkUrl,
+} from "./card";
 
 /** Markdown -> Slack mrkdwn. Fenced blocks pass through untouched; GFM tables become fixed-width fenced blocks. */
 export function toMrkdwn(markdown: string): string {
@@ -175,7 +183,7 @@ function convertProse(text: string): string {
 				return placeholder;
 			}),
 		);
-		links.push(`<${url.replace(/\|/g, "%7C").replace(/</g, "%3C").replace(/>/g, "%3E")}|${safeLabel}>`);
+		links.push(`<${slackLinkUrl(url)}|${safeLabel}>`);
 		return `\uE000${links.length - 1}\uE000`;
 	})
 		// Only well-formed user mentions stay live Slack tokens; every other `<...>` is still escaped below.
@@ -248,7 +256,8 @@ function renderTableBlock(block: string, restore: (s: string) => string): string
 	// The delimiter row only sets alignment; widths come from the header and the body rows.
 	const toRow = (line: string): string[] => {
 		// Rows shorter than the header pad with empty cells; a longer one folds its extras into the last cell.
-		const cells = splitRowCells(line).map(restore);
+		// A literal pipe in a cell shows as `\|`, as typed, so it never reads as a column break.
+		const cells = splitRowCells(line).map((cell) => restore(cell).replace(/\|/g, "\\|"));
 		while (cells.length < columns) cells.push("");
 		if (cells.length > columns) {
 			cells.splice(columns - 1, cells.length - columns + 1, cells.slice(columns - 1).join("|"));
@@ -264,7 +273,7 @@ function renderTableBlock(block: string, restore: (s: string) => string): string
 	const separator = `| ${aligns
 		.map((align, c) => padCell("-".repeat(widths[c] ?? 3), widths[c] ?? 3, align))
 		.join(" | ")} |`;
-	return ["```", rowLine(rows[0] ?? []), separator, ...rows.slice(1).map(rowLine), "```"].join("\n");
+	return slackCodeFence([rowLine(rows[0] ?? []), separator, ...rows.slice(1).map(rowLine)].join("\n"));
 }
 
 /**

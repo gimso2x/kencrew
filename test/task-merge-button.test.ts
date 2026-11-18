@@ -99,7 +99,8 @@ describe("TASK merge button", () => {
 		});
 		expect(blocks?.some((b) => typeof b === "object" && b !== null && "fields" in b)).toBe(true);
 		expect(blocks?.some((b) => typeOf(b) === "actions")).toBe(false);
-		expect(contextText(blocks)).toMatch(/"text":"▶ 머지 요청됨 · \d\d:\d\d"/);
+		// The core could not land it (no worktree): the note says so before "머지해" went in.
+		expect(contextText(blocks)).toMatch(/"text":"▶ 머지 요청됨 · \d\d:\d\d — 코어가 넘김: worktree 없음: /);
 		expect(logs.some((l) => l.includes("event=action_ignored"))).toBe(false);
 	});
 

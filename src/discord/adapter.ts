@@ -118,7 +118,14 @@ export interface DiscordAdapterOptions {
 	mediaRoot?: string | undefined;
 	/** The typing indicator's interval timer (tests fire it by hand). Default `setInterval`/`clearInterval`, unref'd. */
 	typingTimers?: TypingTimers | undefined;
+	/** How long `start()` waits for the first Ready before it lets the daemon go on. Default `START_WAIT_MS`. */
+	startWaitMs?: number | undefined;
+	/** A fatal gateway close after `start()` returned: the daemon drops this adapter (see `AdapterDeps.detach`). */
+	onFatal?: ((error: Error) => void) | undefined;
 }
+
+/** The longest `start()` waits for the first Ready; a gateway that is still failing to connect goes on in the background. */
+export const START_WAIT_MS = 30_000;
 
 export interface TypingTimers {
 	set(fn: () => unknown, ms: number): unknown;
@@ -180,6 +187,10 @@ export class DiscordAdapter implements ChannelAdapter {
 	/** Recovered server roots that opened their thread, until their scan's notice picks one (`#recoveryNotice`). */
 	readonly #recoveredThreads = new Set<string>();
 	#ready: Promise<string | undefined> = Promise.resolve(undefined);
+	readonly #startWaitMs: number;
+	readonly #onFatal: ((error: Error) => void) | undefined;
+	/** `start()` has returned (Ready, or the wait ran out): a fatal close from here on is for the daemon to handle. */
+	#startReturned = false;
 	#botUserId: string | undefined;
 	/** Managed bot roles seen on the gateway (`tags.bot_id`): role id → the bot's user id. */
 	readonly #botRoles = new Map<string, string>();
@@ -202,6 +213,8 @@ export class DiscordAdapter implements ChannelAdapter {
 		this.#onInboundFailure = options.onInboundFailure;
 		this.#mediaRoot = options.mediaRoot;
 		this.#typingTimers = options.typingTimers ?? INTERVAL_TIMERS;
+		this.#startWaitMs = options.startWaitMs ?? START_WAIT_MS;
+		this.#onFatal = options.onFatal;
 		this.#gate = new RetryAfterGate({
 			clock: options.clock,
 			park: (route, retryAfterMs) => options.log.warn("discord_rate_limited", { route, retry_after_ms: retryAfterMs }),
@@ -286,8 +299,11 @@ export class DiscordAdapter implements ChannelAdapter {
 	}
 
 	/**
-	 * Connects in the background: the daemon (and Slack) never waits for the gateway. A failed start — a fatal close
-	 * such as 4004/4014 — leaves Discord off and is logged; every other part of the daemon keeps running.
+	 * Waits for the first Ready, but no longer than `startWaitMs`: a gateway that only retries (5xx, no network, no
+	 * Hello) must not hold the daemon and Slack back, so after that wait `discord_start_pending` is logged, `start()`
+	 * resolves and the gateway keeps connecting; its Ready then records the bot id and releases the recovery pass the
+	 * daemon started (a pass waits for the first Ready). A fatal
+	 * close such as 4004/4014 before that rejects, so the daemon runs without Discord; one after it goes to `onFatal`.
 	 */
 	async start(): Promise<void> {
 		const handlers: DiscordHandlers = {
@@ -297,6 +313,9 @@ export class DiscordAdapter implements ChannelAdapter {
 			// has the bot id: that one is the daemon's own startup recover().
 			ready: ({ resumed }) => {
 				if (!resumed && this.#botUserId !== undefined) this.recover();
+			},
+			fatal: (error) => {
+				if (this.#startReturned) this.#onFatal?.(error);
 			},
 			roles: (roles) => {
 				for (const role of roles) {
@@ -318,6 +337,17 @@ export class DiscordAdapter implements ChannelAdapter {
 				return undefined;
 			},
 		);
+		const wait = Promise.withResolvers<"pending">();
+		const timer = setTimeout(() => wait.resolve("pending"), this.#startWaitMs);
+		let first: string | undefined | "pending";
+		try {
+			first = await Promise.race([this.#ready, wait.promise]);
+		} finally {
+			clearTimeout(timer);
+		}
+		if (first === undefined) throw new Error("discord gateway did not come up");
+		if (first === "pending") this.#log.warn("discord_start_pending", { wait_ms: this.#startWaitMs });
+		this.#startReturned = true;
 	}
 
 	async stop(): Promise<void> {

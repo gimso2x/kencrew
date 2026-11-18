@@ -68,7 +68,10 @@ export class DiscordSocketTransport implements DiscordTransport {
 				this.#options.onReady?.(info);
 				handlers.ready?.(info);
 			},
-			onFatal: (error) => this.#options.onFatal?.(error),
+			onFatal: (error) => {
+				this.#options.onFatal?.(error);
+				handlers.fatal?.(error);
+			},
 			onError: (error) => {
 				console.error(redact(`[ompbot] discord gateway: ${error.message}`));
 				lifecycle({ type: "error", detail: error.message });

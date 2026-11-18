@@ -27,10 +27,12 @@ function threadMessage(message: DiscordMessageEvent): SlackThreadMessage {
 export class DiscordBinding implements ChannelBinding {
 	readonly port: DiscordChannel;
 	readonly #backfillMaxPages: number | undefined;
+	readonly #startWaitMs: number | undefined;
 
-	constructor(port: DiscordChannel, options: { backfillMaxPages?: number } = {}) {
+	constructor(port: DiscordChannel, options: { backfillMaxPages?: number; startWaitMs?: number } = {}) {
 		this.port = port;
 		this.#backfillMaxPages = options.backfillMaxPages;
+		this.#startWaitMs = options.startWaitMs;
 	}
 
 	createAdapter(deps: AdapterDeps): ChannelAdapter {
@@ -54,6 +56,8 @@ export class DiscordBinding implements ChannelBinding {
 			peerHopLimit: deps.config.peerHopLimit,
 			isTaskRoot: (threadRef) => store.tasks.isTaskRoot(threadRef),
 			onInboundFailure: () => adapter.recover(),
+			startWaitMs: this.#startWaitMs,
+			onFatal: deps.detach,
 			mediaRoot: join(deps.config.homeDir, "media"),
 			// Every Discord conversation is a channel to read: a DM, a server channel (its roots open threads), and a
 			// server thread, which is a channel of its own. A stored watermark keeps its channel a target after `ompbot

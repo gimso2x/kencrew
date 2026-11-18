@@ -487,7 +487,7 @@
 					"method": "updateMessage",
 					"channel": "C1",
 					"ts": "1800000000.000011",
-					"text": "🔍 머지 대기 · 로그 회전\n▶ 머지 요청됨 · 17:00",
+					"text": "🔍 머지 대기 · 로그 회전\n▶ 머지 요청됨 · 17:00 — 코어 착지 중",
 					"blocks": [
 						{
 							"type": "header",
@@ -526,7 +526,56 @@
 							"elements": [
 								{
 									"type": "mrkdwn",
-									"text": "▶ 머지 요청됨 · 17:00"
+									"text": "▶ 머지 요청됨 · 17:00 — 코어 착지 중"
+								}
+							]
+						}
+					]
+				},
+				{
+					"method": "updateMessage",
+					"channel": "C1",
+					"ts": "1800000000.000011",
+					"text": "🔍 머지 대기 · 로그 회전\n▶ 머지 요청됨 · 17:00 — 코어가 넘김: worktree 없음: /r/repo-t-20270115-01 — 모델 턴이 \"머지해\"로 이어받습니다",
+					"blocks": [
+						{
+							"type": "header",
+							"text": {
+								"type": "plain_text",
+								"text": "🔍 머지 대기 · 로그 회전",
+								"emoji": true
+							}
+						},
+						{
+							"type": "section",
+							"text": {
+								"type": "mrkdwn",
+								"text": "로그 회전"
+							}
+						},
+						{
+							"type": "section",
+							"fields": [
+								{
+									"type": "mrkdwn",
+									"text": "*수락기준*\n2개"
+								},
+								{
+									"type": "mrkdwn",
+									"text": "*브랜치*\n`task/T-20270115-01`"
+								},
+								{
+									"type": "mrkdwn",
+									"text": "*워커*\nlocal/t-20270115-01 · T-20270115-01"
+								}
+							]
+						},
+						{
+							"type": "context",
+							"elements": [
+								{
+									"type": "mrkdwn",
+									"text": "▶ 머지 요청됨 · 17:00 — 코어가 넘김: worktree 없음: /r/repo-t-20270115-01 — 모델 턴이 \"머지해\"로 이어받습니다"
 								}
 							]
 						}

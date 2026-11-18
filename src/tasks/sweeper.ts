@@ -1,34 +1,43 @@
 import { createHash } from "node:crypto";
 import type { ChannelRegistry } from "../channel/registry";
 import { dispatchEnv, HERDR_INTERRUPT_WAIT_MS, type HerdrAgentStatusResult, type ProcessRunner } from "../dispatch/omp";
+import { confidentBand } from "../lanes/land";
 import { type LastAnswer, questionOf } from "../omp/session-tail";
 import type { FreezeState } from "../ops/freeze";
 import type { TaskJudgement } from "./checker";
 import { digest, summarizeJudgement } from "./checker";
 import type { TaskCheckCache, TaskEvaluation } from "./evaluate";
+import type { TaskGateEnd, TaskGateHooks } from "./gate";
+import type { TaskLandOutcome } from "./land";
 import { type TaskLedger, type TaskRow, type TaskTransitionRow, taskPausedAt } from "./ledger";
 import {
 	type AutoLandPolicy,
+	agyLimitLine,
 	autoLandBlockers,
 	buildAgentQuestionCard,
 	buildAgentWaitingCard,
+	buildAgyLimitCard,
 	buildAutoLandCard,
 	buildBlockedCard,
 	buildLostCard,
 	buildNudgeLimitCard,
 	buildReachedCard,
 	buildReviewWaitingCard,
+	editThreadCard,
 	formatReadFailureNotice,
 	formatSpecChangedNotice,
 	formatStaleNotice,
 	NUDGE_MAX,
+	postCardToThread,
 	postToThread,
 	setStatusReaction,
 	type TaskCard,
 	type TaskSlackLog,
+	taskLandNote,
 	unmetLines,
 } from "./notify";
 import { restatedHash } from "./resume-check";
+import { agyModelOf } from "./worker-tier";
 
 /** Sweep cadence of the daemon. */
 export const TASK_SWEEP_MS = 5 * 60_000;
@@ -126,6 +135,12 @@ function lastResumeAt(row: TaskRow, history: readonly TaskTransitionRow[]): numb
 	return resumes.length === 0 ? undefined : Math.max(...resumes);
 }
 
+/** An agy limit block since `nudgeBase` (the latest resume, else the registration): no prompt goes to the worker. */
+function agyLimitHeld(row: TaskRow): boolean {
+	const since = nudgeBase(row);
+	return Object.entries(row.notices).some(([key, at]) => key.startsWith("agylimit:") && at >= since);
+}
+
 /** Unmet-condition nudges recorded since `nudgeBase`. */
 function nudgesSince(row: TaskRow): number {
 	const since = nudgeBase(row);
@@ -194,8 +209,13 @@ export interface TaskSweepDeps {
 	 * `undefined` leaves the task out of this sweep's check. Never asked for a remote task. Absent = no overlap check.
 	 */
 	changedPaths?(row: TaskRow): Promise<string[] | undefined>;
-	/** Puts "머지해" into the task thread as the owner; true = it went in. */
-	autoLand?(row: TaskRow): Promise<boolean>;
+	/**
+	 * Lands the task through the core, or hands it to the thread as "머지해" (`Daemon.autoLand`); what it came to. A task
+	 * in the confident band gets `gate`: the review·QA gate runs first and reports through it (`gating`, `held`).
+	 */
+	autoLand?(row: TaskRow, gate?: TaskGateHooks): Promise<TaskLandOutcome>;
+	/** Whether a review task's gate was cut off (a restart) before its receipts: the sweep starts it again. */
+	gatePending?(row: TaskRow): Promise<boolean>;
 	/** Why auto-merge is held after an apply code rollback (`<home>/autoland.hold`); undefined = not held. */
 	autoLandHold?(): string | undefined;
 	ownerUserId: string;
@@ -290,6 +310,7 @@ export class TaskSweeper {
 	 */
 	async #reviewWaiting(row: TaskRow): Promise<TaskCheckResult> {
 		const { ledger } = this.#deps;
+		await this.#resumeGate(row);
 		const entry = ledger.history(row.taskId).findLast((item) => item.toStatus === "review");
 		const since = entry?.at ?? row.updatedAt;
 		const waited = this.#deps.now() - since;
@@ -408,6 +429,11 @@ export class TaskSweeper {
 			}
 			return this.#result(row, status, judgement, actions);
 		}
+		// An agy limit block holds until a resume: PROGRESS still says working, so it must not undo the block.
+		if (status === "blocked" && !judgement.reached && agyLimitHeld(ledger.require(row.taskId))) {
+			actions.push("agy limit held");
+			return this.#result(row, status, judgement, actions);
+		}
 		if (status === "blocked") {
 			ledger.transition(row.taskId, "working", "bot", "PROGRESS status: working");
 			status = "working";
@@ -416,18 +442,57 @@ export class TaskSweeper {
 		}
 
 		if (judgement.reached) {
-			ledger.transition(row.taskId, "review", "bot", `outcome reached AC ${judgement.acChecked}/${judgement.acTotal}`);
+			// The reviewed row, not the swept one: the core landing behind `autoLand` refuses a task not in review.
+			const reviewed = ledger.transition(
+				row.taskId,
+				"review",
+				"bot",
+				`outcome reached AC ${judgement.acChecked}/${judgement.acTotal}`,
+			);
 			status = "review";
 			await setStatusReaction(this.#deps.channels, log, row.threadRef, "review");
 			actions.push("working → review, 🔍");
 			if (ledger.recordNotice(row.taskId, `reached:${judgement.reachKey}`)) {
-				await this.#reachedNotice(row, judgement, actions);
+				await this.#reachedNotice(reviewed, judgement, actions);
 			}
 			return this.#result(row, status, judgement, actions);
 		}
 
-		await this.#staleness(row, now, actions, judgement);
+		// An agy worker is asked about first, once: a limit on its screen stops every prompt below.
+		const agyAgent = agyModelOf(row.workerModel) === undefined ? undefined : await this.#agentStatus(row);
+		if (agyAgent !== undefined && (await this.#agyLimit(row, agyAgent, actions)))
+			return this.#result(row, "blocked", judgement, actions);
+		await this.#staleness(row, now, actions, judgement, agyAgent);
 		return this.#result(row, status, judgement, actions);
+	}
+
+	/**
+	 * An agy worker's limit (doc/plans/agy-task-worker.md 6): when herdr says it stopped (idle, done, unknown) or cannot
+	 * say (a reminder could go out next), its screen tail is read. A limit line there blocks the task with one owner card
+	 * per line per resume window and stops the prompts (true). An unreadable screen leaves the flow as it is (logged).
+	 */
+	async #agyLimit(row: TaskRow, agent: HerdrAgentStatusResult, actions: string[]): Promise<boolean> {
+		const { ledger, log } = this.#deps;
+		const status = agent.ok ? agent.status : undefined;
+		if (status === "working" || status === "blocked" || status === "gone") return false;
+		const screen = await this.#readAgent(row);
+		if (!screen.ok) {
+			log.info("task_agy_screen_read_failed", { task: row.taskId, error: screen.error ?? "unknown" });
+			return false;
+		}
+		const line = agyLimitLine(screen.output ?? "");
+		if (line === undefined) return false;
+		const fresh = ledger.require(row.taskId);
+		if (fresh.status === "working") {
+			ledger.transition(row.taskId, "blocked", "bot", "agy 한도");
+			await setStatusReaction(this.#deps.channels, log, row.threadRef, "blocked");
+			actions.push("working → blocked (agy 한도), 🚧");
+		}
+		if (ledger.recordNotice(row.taskId, `agylimit:${digest([String(nudgeBase(fresh)), line])}`)) {
+			await this.#post(row, buildAgyLimitCard(row, line, this.#deps.ownerUserId, await this.#boardLink(row)));
+			actions.push("agy limit notice");
+		}
+		return true;
 	}
 
 	/**
@@ -464,8 +529,9 @@ export class TaskSweeper {
 
 	/**
 	 * The one card of a reach (its `reached:<reachKey>` notice key is already recorded, so a repeat sweep never gets
-	 * here). With `taskAutoLand` on and nothing in the way, "머지해" goes into the thread first and the card only
-	 * reports it; a skipped or failed auto-merge leaves today's 머지 question with one line saying why.
+	 * here). With `taskAutoLand` on and nothing in the way, the landing runs first (`autoLand`: the core's landing, or
+	 * "머지해" for the model turn on a handoff) and the card reports what it came to; a skipped, blocked or failed
+	 * auto-merge leaves today's 머지 question with one line saying why.
 	 */
 	async #reachedNotice(row: TaskRow, judgement: TaskJudgement, actions: string[]): Promise<void> {
 		const { log, ownerUserId } = this.#deps;
@@ -483,14 +549,18 @@ export class TaskSweeper {
 		if (hold !== undefined) log.info("task_autoland_held", { task: row.taskId, reason: hold });
 		// A freeze stops every autonomous action, and merging unasked is one: the owner is asked instead. So does an
 		// owner pause of this one task.
-		const blockers = [
+		const held = [
 			...(hold === undefined ? [] : [`autoland.hold: ${hold}`]),
 			...(this.#deps.frozen?.() === undefined ? [] : ["동결 중"]),
 			// Re-read: the owner may have paused it while this sweep judged (the checks can take minutes).
 			...(this.#deps.ledger.isPaused(this.#deps.ledger.require(row.taskId)) ? ["멈춤 중"] : []),
-			...autoLandBlockers(row, judgement, policy, repoMatched),
 		];
-		if (blockers.length > 0) {
+		// A task in the confident band is judged without the gate's receipts first: only one the gate alone holds back
+		// reaches `autoLand`, whose gate then runs review → QA → landing (doc/plans/task-review-qa-gate.md 설계 4).
+		const band = confidentBand(row.risk, policy);
+		const ungated = band === undefined ? policy : { repos: policy.repos, maxRisk: band.maxRisk };
+		if ([...held, ...autoLandBlockers(row, judgement, ungated, repoMatched)].length > 0) {
+			const blockers = [...held, ...autoLandBlockers(row, judgement, policy, repoMatched)];
 			log.info("task_autoland_skipped", { task: row.taskId, reasons: blockers.join(" · ") });
 			await this.#post(
 				row,
@@ -499,20 +569,117 @@ export class TaskSweeper {
 			actions.push("Outcome notice (auto-merge skipped)");
 			return;
 		}
-		let landed = false;
+		let outcome: TaskLandOutcome = { state: "not_accepted" };
+		const gate = band === undefined ? undefined : this.#gateHooks(row, judgement, link, true);
 		try {
-			landed = (await this.#deps.autoLand?.(row)) === true;
-			if (!landed) log.warn("task_autoland_failed", { task: row.taskId, error: "not_accepted" });
+			outcome = await this.#deps.autoLand(row, gate);
+			if (outcome.state === "not_accepted")
+				log.warn("task_autoland_failed", { task: row.taskId, error: "not_accepted" });
 		} catch (error) {
 			log.warn("task_autoland_failed", { task: row.taskId, error: String(error) });
 		}
-		if (landed) {
-			await this.#post(row, buildAutoLandCard(row, judgement, link));
-			actions.push("auto-merge started");
+		// One card per reach, by what the landing came to.
+		if (outcome.state === "not_accepted") {
+			await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link, { kind: "failed" }));
+			actions.push("Outcome notice (auto-merge failed)");
 			return;
 		}
-		await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link, { kind: "failed" }));
-		actions.push("Outcome notice (auto-merge failed)");
+		if (outcome.state === "gating") {
+			actions.push("Outcome notice (gate running)");
+			return;
+		}
+		if (outcome.state === "held") {
+			log.info("task_autoland_skipped", { task: row.taskId, reasons: outcome.reasons.join(" · ") });
+			const card = {
+				kind: "skipped" as const,
+				reasons: outcome.reasons,
+				gate: this.#deps.ledger.require(row.taskId).gate,
+			};
+			await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link, card));
+			actions.push("Outcome notice (gate held)");
+			return;
+		}
+		if (outcome.state === "blocked") {
+			const reasons = [taskLandNote(outcome)];
+			await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link, { kind: "skipped", reasons }));
+			actions.push("Outcome notice (auto-merge blocked)");
+			return;
+		}
+		await this.#post(row, buildAutoLandCard(row, judgement, outcome, link));
+		actions.push(`auto-merge ${outcome.state}`);
+	}
+
+	/**
+	 * The gate's card hooks: the running card (only on the reach; a restarted gate posts none), and its end — a landing
+	 * redraws the running card as the auto-merge card (or posts it), a hold redraws it with the receipts and posts one
+	 * reached card naming the reasons with the owner mention.
+	 */
+	#gateHooks(row: TaskRow, judgement: TaskJudgement, link: string | undefined, onReach: boolean): TaskGateHooks {
+		const { channels, log, ownerUserId } = this.#deps;
+		return {
+			judgement,
+			gating: () =>
+				onReach
+					? postCardToThread(
+							channels,
+							log,
+							row.threadRef,
+							buildReachedCard(row, judgement, ownerUserId, link, { kind: "gating" }),
+						)
+					: Promise.resolve(undefined),
+			ended: async (end: TaskGateEnd, card) => {
+				const landed = end.landed;
+				if (
+					end.blockers.length === 0 &&
+					landed !== undefined &&
+					(landed.state === "landed" ||
+						landed.state === "merged-not-pushed" ||
+						landed.state === "handoff" ||
+						landed.state === "in_flight")
+				) {
+					const done = buildAutoLandCard(row, judgement, landed, link, end.gate);
+					if (card === undefined || !(await editThreadCard(channels, log, card, { ...done, buttons: [] }))) {
+						await this.#post(row, done);
+					}
+					return;
+				}
+				const reasons = end.blockers.length > 0 ? end.blockers : landed === undefined ? [] : [taskLandNote(landed)];
+				log.info("task_autoland_skipped", { task: row.taskId, reasons: reasons.join(" · ") });
+				if (card !== undefined) {
+					const gated = buildReachedCard(row, judgement, ownerUserId, link, { kind: "gated", gate: end.gate });
+					await editThreadCard(channels, log, card, gated);
+				}
+				await this.#post(
+					row,
+					buildReachedCard(row, judgement, ownerUserId, link, { kind: "skipped", reasons, gate: end.gate }),
+				);
+			},
+		};
+	}
+
+	/**
+	 * A review task whose gate a restart cut off before its receipts (`gatePending`) is judged again — the checks run
+	 * again for its subject — and its gate restarted, unless something else holds it now. No running card: the end
+	 * posts its own.
+	 */
+	async #resumeGate(row: TaskRow): Promise<void> {
+		const { autoLand, gatePending, ledger, log } = this.#deps;
+		const policy = this.#deps.autoLandPolicy?.();
+		if (policy === undefined || autoLand === undefined || gatePending === undefined || row.host !== null) return;
+		const band = confidentBand(row.risk, policy);
+		if (band === undefined || this.#deps.autoLandHold?.() !== undefined || this.#deps.frozen?.() !== undefined) return;
+		if (ledger.isPaused(row) || !(await gatePending(row))) return;
+		const evaluation = await this.#deps.evaluate(row, this.#checks);
+		if (!evaluation.ok || !(await this.#repoMatches(row, policy.repos))) return;
+		const { judgement } = evaluation;
+		if (autoLandBlockers(row, judgement, { repos: policy.repos, maxRisk: band.maxRisk }, true).length > 0) return;
+		const link = await this.#boardLink(row);
+		const outcome = await autoLand(row, this.#gateHooks(row, judgement, link, false));
+		log.info("task_gate_resumed", { task: row.taskId, state: outcome.state });
+		if (outcome.state === "held" && outcome.reasons.length > 0) {
+			const card = { kind: "skipped" as const, reasons: outcome.reasons, gate: ledger.require(row.taskId).gate };
+			await this.#post(row, buildReachedCard(row, judgement, this.#deps.ownerUserId, link, card));
+		}
 	}
 
 	/**
@@ -573,7 +740,13 @@ export class TaskSweeper {
 		}
 	}
 
-	async #staleness(row: TaskRow, now: number, actions: string[], judgement: TaskJudgement): Promise<void> {
+	async #staleness(
+		row: TaskRow,
+		now: number,
+		actions: string[],
+		judgement: TaskJudgement,
+		known?: HerdrAgentStatusResult,
+	): Promise<void> {
 		const { ledger } = this.#deps;
 		const fresh = ledger.require(row.taskId);
 		const base = Math.max(fresh.progressAt ?? 0, fresh.createdAt);
@@ -583,7 +756,7 @@ export class TaskSweeper {
 		// An owner pause of this task holds the same prompts plus the stale notice, until the unpause.
 		const pausedAt = taskPausedAt(fresh);
 		// One herdr question per working task per sweep, shared by the LOST check and the reminder below.
-		const agent = await this.#agentStatus(row);
+		const agent = known ?? (await this.#agentStatus(row));
 		this.#sweepAgents.set(row.taskId, agent);
 		const status = agent.ok ? agent.status : undefined;
 		// The LOST notice is for the owner, not the agent, so a freeze does not hold it. A resume moves the base.
@@ -773,7 +946,9 @@ export class TaskSweeper {
 	 */
 	async #overlapPrompt(row: TaskRow, text: string): Promise<string | undefined> {
 		if (this.#deps.frozen?.() !== undefined) return "frozen";
-		if (this.#deps.ledger.isPaused(this.#deps.ledger.require(row.taskId))) return "paused";
+		const fresh = this.#deps.ledger.require(row.taskId);
+		if (this.#deps.ledger.isPaused(fresh)) return "paused";
+		if (agyLimitHeld(fresh)) return "agy_limit";
 		if (this.#prompted.has(row.taskId)) return "prompted";
 		if (this.#sweepQuestions.has(row.taskId)) return "question";
 		const agent = this.#sweepAgents.get(row.taskId) ?? (await this.#agentStatus(row));

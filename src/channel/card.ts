@@ -201,7 +201,7 @@ function reservedIds(spec: Record<string, unknown>): string[] {
 	const elements = isRecord(spec.elements) ? spec.elements : {};
 	const ids = [spec.root, ...Object.keys(elements)];
 	for (const element of Object.values(elements))
-		if (isRecord(element) && Array.isArray(element.children)) ids.push(...element.children);
+		if (isRecord(element) && Array.isArray(element.children)) for (const child of element.children) ids.push(child);
 	return [...new Set(ids.filter((id): id is string => typeof id === "string" && RESERVED_IDS.has(id)))];
 }
 
@@ -237,19 +237,22 @@ function graphIssues(spec: Record<string, unknown>): string[] {
 	return [...new Set(issues)];
 }
 
-/** One issue per image URL (the card's own and every Image) that is not an `http(s)` URL, which no platform may be handed. */
-function imageUrlIssues(card: CardElement): string[] {
+/**
+ * One issue per URL (the card's own image, every Image and every Link, sections searched too) that is not an
+ * `http(s)` URL, which no platform may be handed.
+ */
+export function cardUrlIssues(card: CardElement): string[] {
 	const issues: string[] = [];
-	const check = (url: string): void => {
-		if (!/^https?:\/\//i.test(url)) issues.push(`image url "${url.slice(0, 60)}" must be an http(s) URL`);
+	const check = (kind: "image" | "link", url: string): void => {
+		if (!/^https?:\/\//i.test(url)) issues.push(`${kind} url "${url.slice(0, 60)}" must be an http(s) URL`);
 	};
 	const walk = (children: readonly CardChild[]): void => {
 		for (const child of children) {
-			if (child.type === "image") check(child.url);
+			if (child.type === "image" || child.type === "link") check(child.type, child.url);
 			else if (child.type === "section") walk(child.children);
 		}
 	};
-	if (card.imageUrl) check(card.imageUrl);
+	if (card.imageUrl) check("image", card.imageUrl);
 	walk(card.children);
 	return issues;
 }
@@ -300,7 +303,7 @@ export function validateCard(json: string): ValidatedCard {
 			components: CARD_COMPONENTS,
 			limits: CARD_LIMITS,
 		});
-		const badUrls = imageUrlIssues(card);
+		const badUrls = cardUrlIssues(card);
 		if (badUrls.length > 0) return { ok: false, issues: badUrls };
 		const repeated = repeatedCategories(card.children);
 		if (repeated.length > 0) return { ok: false, issues: repeated };

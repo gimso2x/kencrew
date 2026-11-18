@@ -3,6 +3,8 @@ import { join } from "node:path";
 import { type ProcessRunner, runOmpPrint } from "../dispatch/omp";
 import type { Logger } from "../log";
 import { byteLength, redact, truncateUtf8 } from "../redact";
+import type { TaskCheck } from "../tasks/checker";
+import type { AcceptanceItem } from "../tasks/docs";
 import type { LaneReview, LaneRow } from "./status";
 import { defaultGit, type GitRunner } from "./verify";
 
@@ -110,9 +112,53 @@ export interface LaneReviewInput {
 	signal?: AbortSignal;
 }
 
-/** The diff file of one review: `<reviewsDir>/<laneId>-<sha12>.diff`. */
-export const reviewDiffPath = (reviewsDir: string, lane: LaneRow, sha: string): string =>
-	join(reviewsDir, `${lane.meta.laneId ?? lane.name}-${sha.slice(0, 12)}.diff`);
+/**
+ * What the independent review and the run QA read of the change they judge: a closed lane's claim (`laneSubject`) or
+ * a reached [TASK]'s branch tip (`taskSubject`, src/tasks/gate.ts).
+ */
+export interface GateSubject {
+	/** The key of the review and QA file names: a lane's id (`laneId ?? name`), a task's id. */
+	id: string;
+	title: string;
+	brief: string | undefined;
+	acceptance: readonly AcceptanceItem[];
+	/** The commit judged (`""` when there is none); every receipt is bound to it. */
+	sha: string;
+	baseBranch: string | undefined;
+	repo: string | undefined;
+	/** The worktree at `sha`: the reviewer reads it, the QA links its `node_modules`. */
+	worktree: string | undefined;
+	/** The implementer's own report, shown to the reviewer last and for comparison only. */
+	claim: { commit: string; summary: string } | undefined;
+	/** The `[check: …]` results the core re-ran at `sha`. */
+	checks: readonly TaskCheck[];
+}
+
+/** A lane as the review and QA read it: its claim commit, and the re-run checks only when they ran at that commit. */
+export function laneSubject(lane: LaneRow): GateSubject {
+	const { meta } = lane;
+	return {
+		id: meta.laneId ?? lane.name,
+		title: lane.title,
+		brief: meta.brief,
+		acceptance: meta.acceptance ?? [],
+		sha: meta.sha ?? "",
+		baseBranch: meta.baseBranch,
+		repo: meta.repo,
+		worktree: meta.worktree,
+		claim: meta.claim,
+		checks: meta.checks?.head === meta.sha ? (meta.checks?.results ?? []) : [],
+	};
+}
+
+/** `<dir>/<id>-<sha12>`: the stem of one review's (and QA overlay's) files. */
+export const gateFileStem = (dir: string, id: string, sha: string): string => join(dir, `${id}-${sha.slice(0, 12)}`);
+
+/** `reviewIsolationPaths` by subject id. */
+const isolationPaths = (reviewsDir: string, id: string, sha: string): { configPath: string; cwd: string } => {
+	const stem = gateFileStem(reviewsDir, id, sha);
+	return { configPath: `${stem}.omp.yml`, cwd: `${stem}.cwd` };
+};
 
 /**
  * The isolation files of one review: the `--config` overlay `<reviewsDir>/<laneId>-<sha12>.omp.yml` and the empty
@@ -122,21 +168,28 @@ export const reviewIsolationPaths = (
 	reviewsDir: string,
 	lane: LaneRow,
 	sha: string,
-): { configPath: string; cwd: string } => {
-	const stem = join(reviewsDir, `${lane.meta.laneId ?? lane.name}-${sha.slice(0, 12)}`);
-	return { configPath: `${stem}.omp.yml`, cwd: `${stem}.cwd` };
-};
+): { configPath: string; cwd: string } => isolationPaths(reviewsDir, laneSubject(lane).id, sha);
 
-/** The reviewer's prompt: spec → diff → re-run checks → the lane's own report (for comparison only). */
-export function buildReviewPrompt(input: { lane: LaneRow; diff: string; diffPath: string }): string {
-	const { lane, diff, diffPath } = input;
-	const acceptance = (lane.meta.acceptance ?? []).map((item) => `- ${item.id}: ${item.text}`);
-	const checks = (lane.meta.checks?.head === lane.meta.sha ? (lane.meta.checks?.results ?? []) : []).map(
+/** The `[check:]` result lines of a review or QA prompt. */
+export const checkLines = (checks: readonly TaskCheck[]): string[] =>
+	checks.map(
 		(check) =>
 			`- ${check.id}: ${check.ok ? "통과" : check.inconclusive ? "확인 불가" : "실패"} — ${redact(check.detail).slice(0, CHECK_DETAIL_MAX)}`,
 	);
-	const claim = lane.meta.claim;
-	const worktree = lane.meta.worktree ?? "?";
+
+/** The reviewer's prompt: spec → diff → re-run checks → the lane's own report (for comparison only). */
+export function buildReviewPrompt(input: { lane: LaneRow; diff: string; diffPath: string }): string {
+	return reviewPrompt({ subject: laneSubject(input.lane), diff: input.diff, diffPath: input.diffPath });
+}
+
+/** `buildReviewPrompt` of any subject. */
+function reviewPrompt(input: { subject: GateSubject; diff: string; diffPath: string }): string {
+	const { subject, diff, diffPath } = input;
+	const sha = subject.sha === "" ? "?" : subject.sha;
+	const acceptance = subject.acceptance.map((item) => `- ${item.id}: ${item.text}`);
+	const checks = checkLines(subject.checks);
+	const claim = subject.claim;
+	const worktree = subject.worktree ?? "?";
 	const head = [
 		"너는 이 변경을 처음 보는 독립 리뷰어다. 파일을 고치지 말고 읽기만 한다.",
 		"스펙·수락기준을 먼저 읽고, 이 diff가 그것을 실제로 충족하는지 판정한다. 아래 순서로 본다:",
@@ -150,15 +203,15 @@ export function buildReviewPrompt(input: { lane: LaneRow; diff: string; diffPath
 		"마지막 줄에는 정확히 `VERDICT: CLEAR` 또는 `VERDICT: BLOCK` 하나만 쓴다. 다른 줄에는 VERDICT를 쓰지 않는다.",
 		"",
 		REVIEW_SECTIONS.spec,
-		`제목: ${lane.title}`,
+		`제목: ${subject.title}`,
 		"",
-		lane.meta.brief === undefined ? "(브리프 없음)" : lane.meta.brief,
+		subject.brief === undefined ? "(브리프 없음)" : subject.brief,
 		"",
 		"수락기준:",
 		...(acceptance.length === 0 ? ["(없음)"] : acceptance),
 		"",
 		REVIEW_SECTIONS.diff,
-		`기준: git merge-base ${lane.meta.baseBranch ?? "?"} ${lane.meta.sha ?? "?"} .. ${lane.meta.sha ?? "?"}`,
+		`기준: git merge-base ${subject.baseBranch ?? "?"} ${sha} .. ${sha}`,
 	].join("\n");
 	const tail = [
 		"",
@@ -210,9 +263,22 @@ export function parseReviewVerdict(
 export const formatConfidence = (confidence: number): string => confidence.toFixed(2);
 
 /** Reviews the lane's claim commit once; resolves with its receipt and never throws. */
-export async function reviewLane(input: LaneReviewInput, deps: LaneReviewDeps): Promise<LaneReview> {
-	const { lane, model } = input;
-	const sha = lane.meta.sha ?? "";
+export function reviewLane(input: LaneReviewInput, deps: LaneReviewDeps): Promise<LaneReview> {
+	const { lane, ...rest } = input;
+	return reviewSubject({ subject: laneSubject(lane), ...rest }, deps);
+}
+
+export interface GateReviewInput {
+	subject: GateSubject;
+	model: string;
+	timeoutMs: number;
+	signal?: AbortSignal;
+}
+
+/** Reviews the subject's commit once; resolves with its receipt and never throws. */
+export async function reviewSubject(input: GateReviewInput, deps: LaneReviewDeps): Promise<LaneReview> {
+	const { subject, model } = input;
+	const { sha } = subject;
 	const receipt = (verdict: LaneReview["verdict"], text: string, reason?: string): LaneReview => {
 		// The findings sit right above the VERDICT line: a long output keeps its end.
 		const notes = redact(text.trim());
@@ -226,7 +292,7 @@ export async function reviewLane(input: LaneReviewInput, deps: LaneReviewDeps): 
 		};
 	};
 	const inconclusive = (reason: string, notes = ""): LaneReview => receipt("inconclusive", notes, reason);
-	const { repo, worktree, baseBranch } = lane.meta;
+	const { repo, worktree, baseBranch } = subject;
 	if (sha === "" || repo === undefined || worktree === undefined || baseBranch === undefined) {
 		return inconclusive("레인에 worktree나 클레임 커밋이 없음");
 	}
@@ -244,17 +310,17 @@ export async function reviewLane(input: LaneReviewInput, deps: LaneReviewDeps): 
 		const full = await git([...diffArgs, "--unified=3", range]);
 		if (stat.code !== 0 || full.code !== 0) return inconclusive("diff 수집 실패");
 		const diff = redact(`${stat.stdout.trimEnd()}\n\n${full.stdout}`);
-		const diffPath = reviewDiffPath(deps.reviewsDir, lane, sha);
+		const diffPath = `${gateFileStem(deps.reviewsDir, subject.id, sha)}.diff`;
 		mkdirSync(deps.reviewsDir, { recursive: true, mode: 0o700 });
 		chmodSync(deps.reviewsDir, 0o700);
 		writeFileSync(diffPath, diff, { mode: 0o600 });
 		chmodSync(diffPath, 0o600);
-		const isolation = reviewIsolationPaths(deps.reviewsDir, lane, sha);
+		const isolation = isolationPaths(deps.reviewsDir, subject.id, sha);
 		let result: Awaited<ReturnType<typeof runOmpPrint>>;
 		try {
-			result = await runIsolated(isolation, { lane, diff, diffPath, input, deps });
+			result = await runIsolated(isolation, { subject, diff, diffPath, input, deps });
 		} finally {
-			dropIsolation(isolation, deps.log);
+			dropFiles([diffPath, isolation.configPath, isolation.cwd], deps.log);
 		}
 		if (input.signal?.aborted === true) return inconclusive("중단됨");
 		if (result.timedOut) return inconclusive("시간 초과", result.output);
@@ -271,9 +337,9 @@ export async function reviewLane(input: LaneReviewInput, deps: LaneReviewDeps): 
 /** Writes the overlay (0600) and a fresh empty cwd (0700), then runs the reviewer isolated in them. */
 async function runIsolated(
 	isolation: { configPath: string; cwd: string },
-	ctx: { lane: LaneRow; diff: string; diffPath: string; input: LaneReviewInput; deps: LaneReviewDeps },
+	ctx: { subject: GateSubject; diff: string; diffPath: string; input: GateReviewInput; deps: LaneReviewDeps },
 ): Promise<Awaited<ReturnType<typeof runOmpPrint>>> {
-	const { lane, diff, diffPath, input, deps } = ctx;
+	const { subject, diff, diffPath, input, deps } = ctx;
 	writeFileSync(isolation.configPath, REVIEW_OVERLAY_YAML, { mode: 0o600 });
 	chmodSync(isolation.configPath, 0o600);
 	// A leftover of an earlier run (killed daemon) must not be the reviewer's cwd content.
@@ -281,7 +347,7 @@ async function runIsolated(
 	mkdirSync(isolation.cwd, { mode: 0o700 });
 	chmodSync(isolation.cwd, 0o700);
 	return runOmpPrint({
-		task: buildReviewPrompt({ lane, diff, diffPath }),
+		task: reviewPrompt({ subject, diff, diffPath }),
 		cwd: isolation.cwd,
 		isolation: { configPath: isolation.configPath },
 		systemPromptAppendix: deps.systemPromptAppendix,
@@ -297,9 +363,9 @@ async function runIsolated(
 	});
 }
 
-/** Removes a review's overlay and cwd whatever the run's end; a failure is logged, never thrown. */
-function dropIsolation(isolation: { configPath: string; cwd: string }, log: LaneReviewDeps["log"]): void {
-	for (const path of [isolation.configPath, isolation.cwd]) {
+/** Removes a review's diff file, overlay and cwd whatever the run's end; a failure is logged, never thrown. */
+function dropFiles(paths: readonly string[], log: LaneReviewDeps["log"]): void {
+	for (const path of paths) {
 		try {
 			rmSync(path, { force: true, recursive: true });
 		} catch (error) {
