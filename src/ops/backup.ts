@@ -332,7 +332,8 @@ export function runBackup(options: BackupOptions): BackupResult {
 	const keep = options.keep ?? DEFAULT_KEEP;
 	const homeDir = options.homeDir;
 	const dbPath = join(homeDir, "ompbot.db");
-	if (!existsSync(dbPath)) throw new BackupError("db_missing", dbPath);
+	// A FIFO in the ledger's place would block the read-only open forever: it counts as missing.
+	if (!existsSync(dbPath) || !statSync(dbPath).isFile()) throw new BackupError("db_missing", dbPath);
 
 	const backupsDir = join(homeDir, "backups");
 	mkdirSync(backupsDir, { recursive: true, mode: 0o700 });

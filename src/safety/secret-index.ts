@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import type { OmpbotConfig } from "../config";
-import { readDiscordToken, readSlackTokens, readTeamsClientSecret } from "../config";
+import { readDiscordToken, readTeamsClientSecret } from "../config";
 import type { Logger } from "../log";
 import { indexSecretValue } from "../redact";
 import { readGraphTokenFile } from "../teams/graph";
@@ -56,8 +56,8 @@ function indexFile(path: string, index: (candidate: string) => void): void {
 }
 
 /**
- * Seeds the redaction value index with everything the daemon can legitimately know at startup: the Slack token
- * files, secret-named environment variables, and extra files listed in `OMPBOT_SECRET_GUARD_FILES`
+ * Seeds the redaction value index with everything the daemon can legitimately know at startup: the Discord and
+ * Teams secret files, secret-named environment variables, and extra files listed in `OMPBOT_SECRET_GUARD_FILES`
  * (colon-separated, like upstream's guard-files env). Returns how many values were indexed.
  *
  * Startup-only on purpose: a rotated token invalidates the socket connection anyway, so the daemon restarts and
@@ -73,20 +73,11 @@ export function indexRuntimeSecrets(
 		if (indexSecretValue(candidate)) known += 1;
 	};
 
-	if (config.slack !== undefined) {
-		try {
-			const tokens = readSlackTokens(config);
-			index(tokens.botToken);
-			index(tokens.appToken);
-		} catch {
-			// Token problems are doctor's job; masking simply stays pattern-only until they are fixed.
-		}
-	}
 	if (config.channels.discord !== undefined) {
 		try {
 			index(readDiscordToken(config));
 		} catch {
-			// Same as above: doctor reports it.
+			// Token problems are doctor's job; masking simply stays pattern-only until they are fixed.
 		}
 	}
 	if (config.channels.teams !== undefined) {
@@ -106,7 +97,7 @@ export function indexRuntimeSecrets(
 }
 
 /**
- * The part of {@link indexRuntimeSecrets} that never touches the Slack token files: secret-named environment
+ * The part of {@link indexRuntimeSecrets} that never touches the token files: secret-named environment
  * variables and the files listed in `OMPBOT_SECRET_GUARD_FILES`. The dashboard seeds its index with this alone, so its
  * masking goes past the patterns without the dashboard reading the tokens. Returns how many values were indexed.
  */

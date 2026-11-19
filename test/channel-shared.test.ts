@@ -1,4 +1,4 @@
-// Shared channel pieces the Slack and Discord adapters call (T-20261113-25): addressing, peer records,
+// Shared channel pieces the Discord and Teams adapters call (T-20261113-25): addressing, peer records,
 // thread-link tokens, card runs, table detection, the dead-letter verdict and the single-flight backfill runner.
 import { describe, expect, test } from "bun:test";
 import { countsTowardDeadLetter, SingleFlightBackfill } from "../src/channel/backfill";
@@ -123,7 +123,7 @@ test("cardRuns keeps a refused card as text and numbers its issues", () => {
 	expect(issues).toEqual(["card 1: no"]);
 });
 
-test("tableEndAt: Slack takes one hyphen per delimiter cell, Discord three", () => {
+test("tableEndAt: the default takes one hyphen per delimiter cell, Discord three", () => {
 	const lines = ["| a | b |", "| - | - |", "| 1 | 2 |", "after"];
 	expect(tableEndAt(lines, 0)).toBe(3);
 	expect(tableEndAt(lines, 0, 3)).toBeUndefined();

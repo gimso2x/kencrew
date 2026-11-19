@@ -141,7 +141,7 @@ export class FakeMicrosoft {
 }
 
 /**
- * A daemon with Teams as its only platform (no Slack keys at all), its endpoint on a free loopback port and its
+ * A daemon with Teams as its only platform (no other channel configured), its endpoint on a free loopback port and its
  * Microsoft calls all going to `ms`; the fake omp answers `ECHO <text>`.
  */
 export async function startTeamsDaemon(
@@ -152,6 +152,8 @@ export async function startTeamsDaemon(
 		teams?: Partial<TeamsChannelConfig>;
 		extra?: Partial<OmpbotConfig>;
 		guestRun?: ProcessRunner;
+		/** `Daemon.gateSweepMs`; default 0 (no gate sweep). */
+		gateSweepMs?: number;
 		guestEnv?: Record<string, string | undefined>;
 		teamsGraphEndpoints?: { loginBase: string; graphBase: string };
 		attachmentFetch?: typeof fetch;
@@ -159,9 +161,8 @@ export async function startTeamsDaemon(
 ): Promise<{ daemon: Daemon; binding: TeamsBinding; port: number }> {
 	const clientSecretFile = join(home.dir, "secrets", "teams-client-secret");
 	writeFileSync(clientSecretFile, "fake-client-secret-0\n", { mode: 0o600 });
-	const { slack: _slack, ...rest } = home.config;
 	const config: OmpbotConfig = {
-		...rest,
+		...home.config,
 		channels: {
 			teams: {
 				appId: APP_ID,
@@ -199,7 +200,7 @@ export async function startTeamsDaemon(
 		log: createLogger({ sink: (line) => logs.push(line), clock: { now: () => Date.now() }, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
-		gateSweepMs: 0,
+		gateSweepMs: options.gateSweepMs ?? 0,
 		driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
 		...(options.guestRun === undefined ? {} : { guestRun: options.guestRun }),
 		...(options.guestEnv === undefined ? {} : { guestEnv: options.guestEnv }),

@@ -1,5 +1,5 @@
 // Channel-scoped recall: when the owner points at an earlier conversation ("저번에 말한 거"), the turn prompt gets the
-// most relevant past rows of the same Slack conversation space (one DM, or every thread of one channel). Ranking is
+// most relevant past rows of the same conversation space (one DM, or every thread of one channel). Ranking is
 // in-memory word rarity over the ledger rows the store returns — Korean two-character words ("배포") rule out an
 // SQLite trigram index. Design adapted from rlaope/deepseek-bot (MIT, 0d0c37f) "the recall index".
 import { byteLength, truncateUtf8 } from "../redact";

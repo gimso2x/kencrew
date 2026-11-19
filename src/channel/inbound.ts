@@ -1,10 +1,18 @@
-// Inbound steps the Slack and Discord adapters share: addressing, card replies, the core records and
-// thread-link tokens. Platform work (ids, posting, the status message) comes in as callbacks.
+// Inbound steps of a chat adapter: addressing, card replies, the core records, thread-link tokens and the peer-bot
+// limits. Platform work (ids, posting, the status message) comes in as callbacks.
 import { parseThreadRef, THREAD_LINK_PREFIX } from "../core/normalize";
 import { parseCommand } from "../core/types";
 import type { Logger } from "../log";
 import { errorText } from "./text";
 import type { CoreSink, InboundMessage, IngestOutcome, PeerInboundMessage } from "./types";
+
+/** Posted once in a thread whose peer-input cap was hit; mentions no bot. */
+export const PEER_HOP_NOTICE = "피어 대화 상한에 닿았습니다. 이어 가려면 오너가 말해 주세요.";
+/** Default per-thread cap on peer input (`peerHopLimit` unset). */
+export const DEFAULT_PEER_HOP_LIMIT = { turns: 3, windowMinutes: 30 } as const;
+
+/** Peer bots an adapter accepts (`channels.discord.peerBots`). */
+export type PeerBotList = ReadonlyArray<{ userId: string; name: string }>;
 
 /** Logs a redelivery and reports it. */
 export function duplicate(log: Logger, id: string): IngestOutcome {

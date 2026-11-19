@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { CLAIM_GRACE_MS } from "../src/lanes/manager";
 import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneRow } from "../src/lanes/status";
 import { type CheckRun, createTaskHostOps, type TaskHostOps } from "../src/tasks/host";
-import { makeHome, type TestHome } from "./helpers/bot-home";
+import { CHANNEL, makeHome, type TestHome } from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import {
 	LANE_START,
@@ -68,7 +68,7 @@ function commitIn(worktree: string, ...files: string[]): string {
 
 async function startLane(h: LaneHarness, acceptance: string[]): Promise<LaneRow> {
 	const repo = makeRepo(repos);
-	const lane = await h.manager.start({ title: "checked", cwd: repo, channel: "D1", acceptance, risk: "L2" });
+	const lane = await h.manager.start({ title: "checked", cwd: repo, channel: CHANNEL, acceptance, risk: "L2" });
 	await h.settle();
 	return lane;
 }
@@ -351,7 +351,7 @@ describe("a timed-out check is inconclusive, not a violation", () => {
 			head: sha,
 			results: [
 				{ id: "AC-1", ok: true },
-				{ id: "AC-2", ok: false, inconclusive: true, detail: "300초 안에 끝나지 않았습니다(확인 불가)" },
+				{ id: "AC-2", ok: false, inconclusive: true, detail: "900초 안에 끝나지 않았습니다(확인 불가)" },
 			],
 			inconclusive: { head: sha, runs: 1 },
 		});
@@ -398,7 +398,7 @@ describe("a timed-out check is inconclusive, not a violation", () => {
 		await h.settle();
 		expect(host.slowRuns()).toBe(2);
 		expect(asked.asked).toEqual([
-			`레인 ${lane.name} 재실행 검사 확인 불가(300초 초과 2회) — 승인하면 이 검사 없이 닫습니다.\n- check AC-1: command ["sh","-c","exit 0 # slow"]`,
+			`레인 ${lane.name} 재실행 검사 확인 불가(900초 초과 2회) — 승인하면 이 검사 없이 닫습니다.\n- check AC-1: command ["sh","-c","exit 0 # slow"]`,
 		]);
 		const closed = h.store.getLane(lane.name);
 		expect(closed?.status).toBe("closed");
@@ -433,7 +433,7 @@ describe("a timed-out check is inconclusive, not a violation", () => {
 			expect(asked.asked).toHaveLength(1);
 			expect(h.store.getLane(lane.name)?.status).toBe("not-done");
 			const reason =
-				"check AC-1 300초 초과 2회 — 오너가 닫지 않음. 검사를 빠르게 할 수 있으면 고쳐 새 커밋으로 다시 주장";
+				"check AC-1 900초 초과 2회 — 오너가 닫지 않음. 검사를 빠르게 할 수 있으면 고쳐 새 커밋으로 다시 주장";
 			expect(h.store.getLane(lane.name)?.history.at(-1)?.detail).toBe(reason);
 			expect(h.steers(lane.originKey)).toHaveLength(1);
 			expect(h.steers(lane.originKey)[0]).toContain(reason);
@@ -619,7 +619,7 @@ function pendingClaim(h: LaneHarness, lane: LaneRow, summary = "완료"): void {
 const rootTsOf = (lane: LaneRow): string => lane.threadRef.slice(lane.threadRef.indexOf(":") + 1);
 const rootEdits = (h: LaneHarness, lane: LaneRow): string[] =>
 	h.transport.calls.flatMap((call) =>
-		call.method === "updateMessage" && call.ts === rootTsOf(lane) ? [call.text] : [],
+		call.method === "editMessage" && call.messageId === rootTsOf(lane) ? [call.content ?? ""] : [],
 	);
 
 describe("lane verdicts run off the tick", () => {

@@ -6,7 +6,7 @@ import { type DashboardServerOptions, startDashboardServer } from "../src/dashbo
 import type { OmpEvent } from "../src/omp/driver";
 
 const WAIT_MS = 5_000;
-const ORIGIN = "slack/ch/CS/t/9.0";
+const ORIGIN = "discord/ch/300000000000000001/t/900000000000000009";
 
 const view = (seq: number, text = `글 ${seq}`): LiveView => ({
 	seq,

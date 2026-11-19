@@ -7,16 +7,7 @@ import { openStore, type Store } from "../store/db";
 import type { LiveView } from "./live-turn";
 import { type BoardNotice, type DriverFactory, type MailboxDeps, OriginMailbox } from "./mailbox";
 import { isThreadOrigin } from "./normalize";
-import { chatOriginKey } from "./origin-key";
 import type { InboundRecord, MailboxClock, StatusProvider } from "./types";
-
-/**
- * Origin of a Slack DM message: one conversation per DM channel. Top-level messages and thread replies share
- * the key, so `threadTs` is deliberately ignored. Keys are only built here, never parsed afterwards.
- */
-export function slackDmOrigin(message: { channelId: string; threadTs?: string }): string {
-	return chatOriginKey({ platform: "slack", kind: "dm", conversationId: message.channelId });
-}
 
 /** One session directory per origin epoch (`/new` starts a new one, so old epochs can be garbage collected). */
 export function sessionDirFor(sessionsRoot: string, originKey: string, epoch: number): string {
@@ -47,7 +38,7 @@ export interface OriginRouterDeps {
 	costCap?: MailboxDeps["costCap"];
 	/** Passed to every mailbox: the `!budget` answer; see `MailboxDeps.budgetProvider`. */
 	budgetProvider?: MailboxDeps["budgetProvider"];
-	/** Passed to every mailbox: Slack thread reader for turn context; see `MailboxDeps.threadSource`. */
+	/** Passed to every mailbox: Thread reader for turn context; see `MailboxDeps.threadSource`. */
 	threadSource?: MailboxDeps["threadSource"];
 	log: Logger;
 	sessionsRoot: string;
@@ -73,6 +64,8 @@ export interface OriginRouterDeps {
 	onSessionMismatch?: MailboxDeps["onSessionMismatch"];
 	/** Thread notice for a turn aborted on a tool repeat loop; see `MailboxDeps`. */
 	onStuckLoop?: MailboxDeps["onStuckLoop"];
+	/** Thread warning for a turn that reached `costCap.turnUsd`; see `MailboxDeps`. */
+	onTurnCostCap?: MailboxDeps["onTurnCostCap"];
 	/** Owner dialogs a plain message may answer; see `MailboxDeps.dialogs`. */
 	dialogs?: MailboxDeps["dialogs"];
 	/** Turn snapshots and `!undo`; passed to every mailbox (`MailboxDeps.turnUndo`). */
@@ -134,7 +127,7 @@ export class OriginRouter {
 	route(record: InboundRecord): Promise<void> {
 		const known = this.#mailboxes.has(record.originKey);
 		const mailbox = this.mailbox(record.originKey);
-		// One line per thread-session lifetime: the first routed message opens `slack/ch/<C>/t/<rootTs>`.
+		// One line per thread-session lifetime: the first routed message opens `discord/ch/<C>/t/<rootId>`.
 		if (!known && isThreadOrigin(record.originKey)) {
 			this.#deps.log.info("thread_session_started", {
 				origin: record.originKey,

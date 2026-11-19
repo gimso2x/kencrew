@@ -165,7 +165,7 @@ describe("extractProposals adversarial", () => {
 
 	test("an indexed secret smuggled through the NAME field is rejected", () => {
 		// DEFECT (src/review/skills.ts:90): only description+content go through redact(); `name` (allowed [a-z0-9._-],
-		// 64 chars) is not checked, yet it lands in the pending filename, the Slack approval text and the skills dir.
+		// 64 chars) is not checked, yet it lands in the pending filename, the approval text and the skills dir.
 		const secret = ["9f86d081884c7d65", "9a2feaa0c55ad015"].join(""); // runtime-assembled: keeps gitleaks quiet, same value
 		expect(indexSecretValue(secret)).toBe(true);
 		expect(extractProposals(arr(item({ name: secret })))).toEqual([]);
@@ -398,7 +398,8 @@ describe("classifyLaneCompletion adversarial", () => {
 			'-\tif (!ok) throw new Error("denied");',
 			"-}",
 		);
-		expect(cats("done", del)).toEqual(["guard_deletion_without_adversarial_regression"]);
+		// The deleted file also drops an export the report does not name.
+		expect(cats("done", del)).toEqual(["guard_deletion_without_adversarial_regression", "undeclared_feature_removal"]);
 		const delTest = hunk(
 			[
 				"diff --git a/test/g.test.ts b/test/g.test.ts",

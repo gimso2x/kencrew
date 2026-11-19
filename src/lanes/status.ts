@@ -42,6 +42,8 @@ export type LaneLandState = "pending" | "landed" | "merged-not-pushed" | "blocke
 export const INTEGRITY_APPROVED = "무결성 승인";
 /** `autoLandHeld` of a lane the owner closed past checks that timed out twice: auto-merge skips it, `머지` does not. */
 export const INCONCLUSIVE_APPROVED = "확인 불가 승인";
+/** `autoLandHeld` of a `not-done` lane the owner closed past failed checks (`닫아`): auto-merge skips it, `머지` does not. */
+export const OWNER_ACCEPTED = "오너 수락";
 /** `autoLandHeld` of a closed lane whose auto-merge the owner's pause holds: `머지해`/`머지` still lands it. */
 export const OWNER_PAUSE_HELD = "오너 멈춤";
 
@@ -53,7 +55,7 @@ export interface LaneLand {
 	preSha?: string;
 	/** Why the landing is `blocked` or `merged-not-pushed`. */
 	reason?: string;
-	/** Why auto-merge leaves this lane to the owner: `INTEGRITY_APPROVED`, `INCONCLUSIVE_APPROVED` or `OWNER_PAUSE_HELD`. */
+	/** Why auto-merge leaves this lane to the owner: `INTEGRITY_APPROVED`, `INCONCLUSIVE_APPROVED`, `OWNER_ACCEPTED` or `OWNER_PAUSE_HELD`. */
 	autoLandHeld?: string;
 	/** A landing has begun and not finished: the tick resumes it (each step is idempotent). */
 	requestedBy?: "auto" | "owner";
@@ -152,7 +154,7 @@ export interface LaneMeta {
 	claim?: LaneClaim;
 	/** Full sha recorded when the claim was verified and the lane closed. */
 	sha?: string;
-	/** What the Slack root / status messages currently show (reconciled on every tick). */
+	/** What the root / status messages currently show (reconciled on every tick). */
 	renderedRoot?: string;
 	renderedStatus?: string;
 	/** Counter for synthetic inbound ids of messages the core steers into the lane. */
@@ -167,11 +169,15 @@ export interface LaneMeta {
 	worktree?: string;
 	branch?: string;
 	baseBranch?: string;
+	/** The conversation (origin key) that started the lane; absent on lanes started before it was recorded (no backfill). */
+	parentOrigin?: string;
 	/** The risk the starter named (or a keyword floor raised it to); absent = unrated, compared as `DEFAULT_LANE_RISK`. */
 	risk?: TaskRisk;
 	/** The worker tier the start chose, its reason and the exact `lanes.models` value; absent on a lane started before tiers. */
 	tier?: LaneModelTier;
 	tierReason?: string;
+	/** The judge's confidence in `tier` (0..1) when the starter gave one. */
+	tierConfidence?: number;
 	/** `lanes.models[tier]` at the start; absent = the bot's default model (tier not configured). */
 	workerModel?: string;
 	/** Acceptance criteria as given at the start; a trailing `[check: …]` is re-run by the core before closing. */

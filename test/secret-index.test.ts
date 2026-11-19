@@ -58,12 +58,12 @@ describe("indexSecretValue + redact", () => {
 	});
 
 	test("pattern masking keeps priority and still works with the index loaded", () => {
-		const slack = `xoxb-${TOKEN}`;
+		const patterned = `xoxb-${TOKEN}`;
 		// Pattern-only (nothing indexed): the xoxb form is already masked.
-		expect(redact(`t ${slack}`)).toBe(`t ${REDACTED}`);
+		expect(redact(`t ${patterned}`)).toBe(`t ${REDACTED}`);
 		// With the same value indexed, the result is the same token-free text.
-		indexSecretValue(slack);
-		expect(redact(`t ${slack}`)).toBe(`t ${REDACTED}`);
+		indexSecretValue(patterned);
+		expect(redact(`t ${patterned}`)).toBe(`t ${REDACTED}`);
 	});
 
 	test("secretIndexSize reflects the window count and clears", () => {
@@ -87,11 +87,10 @@ describe("indexRuntimeSecrets", () => {
 		clearSecretIndex();
 	});
 
-	function fakeConfig(botTokenFile: string, appTokenFile: string): OmpbotConfig {
+	function fakeConfig(botTokenFile: string, clientSecretFile: string): OmpbotConfig {
 		return {
 			homeDir: home,
-			slack: { botTokenFile, appTokenFile },
-			channels: { slack: { ownerUserId: "UOWNER" } },
+			channels: { discord: { ownerUserId: "100000000000000001", botTokenFile }, teams: { clientSecretFile } },
 		} as unknown as OmpbotConfig;
 	}
 
@@ -107,8 +106,8 @@ describe("indexRuntimeSecrets", () => {
 	}
 
 	test("indexes token files, secret-named env vars, and extra guard files", () => {
-		const botToken = `xoxb-${TOKEN}`;
-		const appToken = `xapp-1-${TOKEN_REVERSED}`;
+		const botToken = `bot-${TOKEN}`;
+		const appToken = `secret-${TOKEN_REVERSED}`;
 		const guardFile = join(home, "extra.json");
 		writeFileSync(guardFile, JSON.stringify({ anthropic_key: `sk-ant-${TOKEN}`, model: "exampleproxy/glm-5.3-flash" }));
 
@@ -128,16 +127,16 @@ describe("indexRuntimeSecrets", () => {
 	test("secret-named env vars are indexed but pointer-style names are not read", () => {
 		const value = `plain-${TOKEN}`;
 		const indexed = indexRuntimeSecrets(
-			fakeConfig(join(home, "missing-bot"), join(home, "missing-app")),
+			fakeConfig(join(home, "missing-bot"), join(home, "missing-secret")),
 			{ DEPLOY_TOKEN: value, DEPLOY_TOKEN_FILE: "/etc/other-thing" },
 			logger(),
 		);
-		// Missing token files degrade to pattern-only for those two; the env var was still indexed.
+		// Missing token files degrade to pattern-only for those; the env var was still indexed.
 		expect(indexed).toBe(1);
 		expect(redact(`v ${value}`)).toBe(`v ${REDACTED}`);
 	});
 
-	test("the dashboard path indexes env vars and guard files but never reads the Slack token files", () => {
+	test("the dashboard path indexes env vars and guard files but never reads the Discord token file", () => {
 		const envValue = `plain-${TOKEN}`;
 		const guardValue = `guard-${TOKEN_REVERSED}`;
 		// Shares no 16-char window with the two values above.
@@ -149,8 +148,7 @@ describe("indexRuntimeSecrets", () => {
 
 		const indexed = indexEnvSecrets({
 			DEPLOY_TOKEN: envValue,
-			SLACK_BOT_TOKEN_FILE: unreadable,
-			SLACK_APP_TOKEN_FILE: join(home, "missing-app"),
+			DISCORD_BOT_TOKEN_FILE: unreadable,
 			OMPBOT_SECRET_GUARD_FILES: `${guardFile}:${join(home, "missing-guard")}`,
 		});
 

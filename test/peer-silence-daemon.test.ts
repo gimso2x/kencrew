@@ -6,13 +6,11 @@ import type { ChannelBinding } from "../src/channel/adapter";
 import type { OmpbotConfig } from "../src/config";
 import { Daemon } from "../src/daemon/daemon";
 import { snowflakeAt } from "../src/discord/backfill";
-import { DiscordBinding } from "../src/discord/binding";
-import { DiscordChannel } from "../src/discord/channel";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { PEER_SILENCE_OP_PREFIX } from "../src/store/db";
-import { DISCORD_OWNER, makeHome, type TestHome, WaitingDiscordTransport, withDiscord } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
 const PEER = "200000000000000001";
 const GUILD = "300000000000000001";
@@ -47,9 +45,9 @@ function waitForLog(needle: string): Promise<void> {
 }
 
 function withPeer(minutes?: number): OmpbotConfig {
-	const config = withDiscord(home);
+	const config = home.config;
 	const discord = config.channels.discord;
-	if (discord === undefined) throw new Error("withDiscord without channels.discord");
+	if (discord === undefined) throw new Error("makeHome without channels.discord");
 	return {
 		...config,
 		...(minutes === undefined ? {} : { peerSilenceAlert: { minutes } }),
@@ -59,11 +57,7 @@ function withPeer(minutes?: number): OmpbotConfig {
 
 async function boot(config: OmpbotConfig, discord: WaitingDiscordTransport): Promise<Daemon> {
 	const sessions = new FakeSessionStore();
-	const channels: ChannelBinding[] = [
-		new DiscordBinding(
-			new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER, peerBots: config.channels.discord?.peerBots }),
-		),
-	];
+	const channels: ChannelBinding[] = [discordBinding(discord, { peerBots: config.channels.discord?.peerBots })];
 	const clock = { now: () => now };
 	const started = new Daemon({
 		config,
@@ -139,8 +133,8 @@ describe("daemon: peer silence alert", () => {
 		const [alert, ...more] = discord.posts((text) => text.includes(ALERT));
 		expect(more).toEqual([]);
 		expect(alert?.channelId).toBe(THREAD);
-		expect(alert?.content).toContain(`<@${DISCORD_OWNER}> ⚠️ 뮤즈 무응답 10분`);
-		expect(alert?.allowedMentions).toEqual({ parse: [], users: [DISCORD_OWNER] });
+		expect(alert?.content).toContain(`<@${OWNER}> ⚠️ 뮤즈 무응답 10분`);
+		expect(alert?.allowedMentions).toEqual({ parse: [], users: [OWNER] });
 		now += 30 * MINUTE;
 		await made.sweep();
 		expect(alertRows(made)).toHaveLength(1);

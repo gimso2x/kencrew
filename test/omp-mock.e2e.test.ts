@@ -27,7 +27,7 @@ const OMP_VERSION = runnable
 	: "";
 if (runnable) console.log(`[omp-mock] ${OMP_EXECUTABLE} --version: ${OMP_VERSION}`);
 
-const ORIGIN = "slack/dm/DMOCK";
+const ORIGIN = "discord/dm/200000000000000011";
 /** Failure deadline on an awaited signal, never a wait for time to pass. */
 const DEADLINE_MS = 60_000;
 /** Mock model latency for the interrupt scenarios; the steer/abort is sent while this request is held open. */

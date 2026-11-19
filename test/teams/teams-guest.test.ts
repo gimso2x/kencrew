@@ -91,10 +91,15 @@ function waitForCalls(count: number, timeoutMs = 5_000): Promise<void> {
 	return promise;
 }
 
-async function boot(teams: Record<string, unknown> = {}, extra: Record<string, unknown> = {}): Promise<number> {
+async function boot(
+	teams: Record<string, unknown> = {},
+	extra: Record<string, unknown> = {},
+	gateSweepMs?: number,
+): Promise<number> {
 	const started = await startTeamsDaemon(home, ms, logs, {
 		teams: { guestAadObjectIds: [GUEST_AAD], ...teams },
 		extra,
+		...(gateSweepMs === undefined ? {} : { gateSweepMs }),
 		guestRun,
 		guestEnv: { HOME: join(home.dir, "fake-user"), PI_CODING_AGENT_DIR: agentSource, PATH: "/usr/bin" },
 	});
@@ -306,28 +311,28 @@ describe("owner notices stay out of group chats (AC-C4)", () => {
 		await daemon?.sweep();
 	}
 	const unroutable = () => logs.filter((line) => line.includes("event=owner_notice_unroutable"));
-	const capPosts = () => ms.calls.filter((call) => String(call.body.text ?? "").includes("하루 상한"));
+	const capPosts = () => ms.calls.filter((call) => String(call.body.text ?? "").includes("cost_cap"));
 
 	test("group chat only → unroutable; after a Teams 1:1 the notice goes to that 1:1", async () => {
-		const port = await boot({}, { costCap: { dailyUsd: 10 } });
+		const port = await boot({}, { costCap: { dailyUsd: 10 } }, 1);
 		await say(port, { id: "o-1", text: "그룹에서만" });
 		await answerTo("o-1", "답변1");
 		await capNotice();
-		expect(unroutable().some((line) => line.includes("notice=cost_cap_daily"))).toBe(true);
+		expect(unroutable().some((line) => line.includes("notice=gate_sweep"))).toBe(true);
 		expect(capPosts()).toEqual([]);
 		expect(daemon?.store.listDeliveries().filter((row) => row.threadRef.endsWith(":-"))).toEqual([]);
 
 		await say(port, { id: "d-1", text: "개인으로", personal: true });
 		await ms.waitFor((call) => String(call.body.text).includes("ECHO 개인으로"));
 		await capNotice();
-		await ms.waitFor((call) => String(call.body.text ?? "").includes("하루 상한"));
+		await ms.waitFor((call) => String(call.body.text ?? "").includes("cost_cap"));
 		expect(capPosts().map((call) => call.path)).toEqual([
 			`/v3/conversations/${encodeURIComponent(PERSONAL_CHAT)}/activities`,
 		]);
 	});
 
 	test("qa: a Teams 1:1 keeps the home; `!home` is refused in a group chat and taken in the 1:1", async () => {
-		const port = await boot({ ownerMode: "qa" }, { costCap: { dailyUsd: 10 } });
+		const port = await boot({ ownerMode: "qa" }, { costCap: { dailyUsd: 10 } }, 1);
 		await say(port, { id: "o-1", text: "!home" });
 		await answerTo("o-1", TEAMS_GROUP_HOME_REFUSED_TEXT);
 		expect(daemon?.store.ownerHome()).toBeUndefined();
@@ -339,7 +344,7 @@ describe("owner notices stay out of group chats (AC-C4)", () => {
 		await answerTo("d-1", "답변1");
 		expect(daemon?.store.ownerHome()).toEqual({ platform: "teams", conversationId: teamsAlias(PERSONAL_CHAT) });
 		await capNotice();
-		await ms.waitFor((call) => String(call.body.text ?? "").includes("하루 상한"));
+		await ms.waitFor((call) => String(call.body.text ?? "").includes("cost_cap"));
 		expect(capPosts().map((call) => call.path)).toEqual([
 			`/v3/conversations/${encodeURIComponent(PERSONAL_CHAT)}/activities`,
 		]);
@@ -425,7 +430,7 @@ describe("concurrency (AC-C6)", () => {
 });
 
 describe("display and retention", () => {
-	test("the Teams footer is unicode and *italic*, Slack emoji codes become emoji", () => {
+	test("the Teams footer is unicode and *italic*, emoji codes become emoji", () => {
 		const [part] = renderTeamsParts(":white_check_mark: 완료", false, "✅ 00:18");
 		expect(part).toBe("✅ 완료\n\n*✅ 00:18*");
 		expect(part).not.toContain(":white_check_mark:");

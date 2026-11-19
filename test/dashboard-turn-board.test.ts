@@ -74,7 +74,7 @@ function seed(rows: Row[]): void {
 				row.createdAt,
 				row.dispatchedAt ?? null,
 				row.lastEventAt ?? null,
-				`${row.origin.split("/")[2]}:${index}.0`,
+				`${row.origin.split("/")[2]}:1000000000000000${index}`,
 				row.opRef ?? null,
 			],
 		);
@@ -82,10 +82,14 @@ function seed(rows: Row[]): void {
 	db.close();
 }
 
+/** The short names (`CA`…) of the test channels `300000000000000001`… used in the conversations below. */
+const CHANNEL_CODES = ["", "CA", "CB", "CC", "CD", "CE", "CF", "CS", "CX"];
+const codeOf = (originKey: string): string | undefined => CHANNEL_CODES[Number(originKey.split("/")[2]?.slice(-1))];
+
 /** AC-1's six conversations A–F. */
 const SIX: Row[] = [
 	{
-		origin: "slack/ch/CA/t/1.0",
+		origin: "discord/ch/300000000000000001/t/100000000000000001",
 		text: "A 요청",
 		state: "dispatched",
 		createdAt: NOW - 5 * MINUTE,
@@ -93,21 +97,21 @@ const SIX: Row[] = [
 		lastEventAt: NOW - MINUTE,
 	},
 	{
-		origin: "slack/ch/CB/t/1.0",
+		origin: "discord/ch/300000000000000002/t/100000000000000001",
 		text: "B 첫 요청",
 		state: "answered",
 		createdAt: NOW - 3 * HOUR,
 		dispatchedAt: NOW - 3 * HOUR,
 	},
 	{
-		origin: "slack/ch/CB/t/1.0",
+		origin: "discord/ch/300000000000000002/t/100000000000000001",
 		text: "B 실패",
 		state: "failed_notified",
 		createdAt: NOW - HOUR,
 		dispatchedAt: NOW - HOUR,
 	},
 	{
-		origin: "slack/ch/CC/t/1.0",
+		origin: "discord/ch/300000000000000003/t/100000000000000001",
 		text: "C 오래됨",
 		state: "answered",
 		createdAt: NOW - 31 * HOUR,
@@ -115,7 +119,7 @@ const SIX: Row[] = [
 		lastEventAt: NOW - 30 * HOUR,
 	},
 	{
-		origin: "slack/ch/CD/t/1.0",
+		origin: "discord/ch/300000000000000004/t/100000000000000001",
 		text: "D 끝남",
 		state: "answered",
 		createdAt: NOW - 3 * HOUR,
@@ -123,7 +127,7 @@ const SIX: Row[] = [
 		lastEventAt: NOW - 2 * HOUR,
 	},
 	{
-		origin: "slack/ch/CE/t/1.0",
+		origin: "discord/ch/300000000000000005/t/100000000000000001",
 		text: "E 긴 턴",
 		state: "answered",
 		createdAt: NOW - 25 * HOUR,
@@ -131,13 +135,18 @@ const SIX: Row[] = [
 		lastEventAt: NOW - HOUR,
 	},
 	{
-		origin: "slack/ch/CF/t/1.0",
+		origin: "discord/ch/300000000000000006/t/100000000000000001",
 		text: "F 멈춤",
 		state: "dispatched",
 		createdAt: NOW - 21 * MINUTE,
 		dispatchedAt: NOW - 20 * MINUTE,
 	},
-	{ origin: "slack/ch/CF/t/1.0", text: "F 새 요청", state: "pending", createdAt: NOW - MINUTE },
+	{
+		origin: "discord/ch/300000000000000006/t/100000000000000001",
+		text: "F 새 요청",
+		state: "pending",
+		createdAt: NOW - MINUTE,
+	},
 ];
 
 const threadsOf = (snapshot: DashboardSnapshot) => {
@@ -165,9 +174,9 @@ describe("turn board snapshot", () => {
 	test("AC-1: threads sort into attention·working·done by their turns; one past 24 hours is gone", async () => {
 		seed(SIX);
 		const threads = threadsOf(await buildSnapshot(deps()));
-		const column = Object.fromEntries(threads.map((thread) => [thread.originKey.split("/")[2], thread.column]));
+		const column = Object.fromEntries(threads.map((thread) => [codeOf(thread.originKey), thread.column]));
 		expect(column).toEqual({ CA: "working", CB: "attention", CD: "done", CE: "done", CF: "attention" });
-		const f = threads.find((thread) => thread.originKey.includes("/CF/"));
+		const f = threads.find((thread) => codeOf(thread.originKey) === "CF");
 		expect([f?.openCount, f?.stalledCount, f?.turnCount, f?.latest.state, f?.title]).toEqual([
 			2,
 			1,
@@ -178,7 +187,7 @@ describe("turn board snapshot", () => {
 	});
 
 	test("messages steered into one running turn read as one run with merged messages, not a queue", async () => {
-		const origin = "slack/ch/CS/t/1.0";
+		const origin = "discord/ch/300000000000000007/t/100000000000000001";
 		const sent = (text: string, ago: number, opRef: string): Row => ({
 			origin,
 			text,
@@ -208,29 +217,40 @@ describe("turn board snapshot", () => {
 		const body = (n: number): string => `${"가".repeat(80)} BODY-TAIL-${n}-must-not-leak 그 뒤 본문`;
 		seed([
 			{
-				origin: "slack/ch/CX/t/1.0",
+				origin: "discord/ch/300000000000000008/t/100000000000000001",
 				text: body(1),
 				state: "answered",
 				createdAt: NOW - 3 * HOUR,
 				dispatchedAt: NOW - 3 * HOUR,
 			},
 			{
-				origin: "slack/ch/CX/t/1.0",
+				origin: "discord/ch/300000000000000008/t/100000000000000001",
 				text: body(2),
 				state: "failed_notified",
 				createdAt: NOW - 2 * HOUR,
 				dispatchedAt: NOW - 2 * HOUR,
 			},
 			{
-				origin: "slack/ch/CX/t/1.0",
+				origin: "discord/ch/300000000000000008/t/100000000000000001",
 				text: body(3),
 				state: "dispatched",
 				createdAt: NOW - HOUR,
 				dispatchedAt: NOW - HOUR,
 				lastEventAt: NOW - MINUTE,
 			},
-			{ origin: "slack/ch/CX/t/1.0", text: body(4), state: "pending", createdAt: NOW - MINUTE },
-			{ origin: "slack/dm/UY", text: body(5), state: "answered", createdAt: NOW - HOUR, dispatchedAt: NOW - HOUR },
+			{
+				origin: "discord/ch/300000000000000008/t/100000000000000001",
+				text: body(4),
+				state: "pending",
+				createdAt: NOW - MINUTE,
+			},
+			{
+				origin: "discord/dm/200000000000000001",
+				text: body(5),
+				state: "answered",
+				createdAt: NOW - HOUR,
+				dispatchedAt: NOW - HOUR,
+			},
 		]);
 		const snapshot = await buildSnapshot(deps());
 		expect(threadsOf(snapshot)).toHaveLength(2);
@@ -276,9 +296,24 @@ describe("turn board snapshot", () => {
 describe("turn board model chip", () => {
 	test("threads carry the session model; the card and the detail draw its chip, a fallback with 폴백, none without", async () => {
 		seed([
-			{ origin: "slack/ch/CA/t/1.0", text: "A", state: "answered", createdAt: NOW - MINUTE },
-			{ origin: "slack/ch/CB/t/1.0", text: "B", state: "answered", createdAt: NOW - MINUTE },
-			{ origin: "slack/ch/CC/t/1.0", text: "C", state: "answered", createdAt: NOW - MINUTE },
+			{
+				origin: "discord/ch/300000000000000001/t/100000000000000001",
+				text: "A",
+				state: "answered",
+				createdAt: NOW - MINUTE,
+			},
+			{
+				origin: "discord/ch/300000000000000002/t/100000000000000001",
+				text: "B",
+				state: "answered",
+				createdAt: NOW - MINUTE,
+			},
+			{
+				origin: "discord/ch/300000000000000003/t/100000000000000001",
+				text: "C",
+				state: "answered",
+				createdAt: NOW - MINUTE,
+			},
 		]);
 		const write = (origin: string, lines: unknown[]): void => {
 			const dir = join(home, "sessions", encodeURIComponent(origin));
@@ -290,32 +325,34 @@ describe("turn board model chip", () => {
 			{ type: "thinking_level_change", thinkingLevel: "high", configured: null },
 			{ type: "message", message: { role: "assistant", provider: "anthropic", model: "claude-opus-5-5" } },
 		];
-		write("slack/ch/CA/t/1.0", opus);
-		write("slack/ch/CB/t/1.0", [
+		write("discord/ch/300000000000000001/t/100000000000000001", opus);
+		write("discord/ch/300000000000000002/t/100000000000000001", [
 			...opus,
 			{ type: "model_change", role: "fallback", model: "zai/glm-5.3", resolvedModelIsFallback: true },
 		]);
 		const snapshot = await buildSnapshot(deps());
-		const model = Object.fromEntries(
-			threadsOf(snapshot).map((thread) => [thread.originKey.split("/")[2], thread.model]),
-		);
+		const model = Object.fromEntries(threadsOf(snapshot).map((thread) => [codeOf(thread.originKey), thread.model]));
 		expect(model).toEqual({
 			CA: { model: "anthropic/claude-opus-5-5", thinking: "high", fallback: false },
 			CB: { model: "anthropic/claude-opus-5-5", thinking: "high", fallback: true },
 			CC: undefined,
 		});
 		const cardOf = (html: string, key: string): string =>
-			new RegExp(`<a class="card[^"]*"[^>]*data-row="${key}"[\\s\\S]*?</a>`).exec(html)?.[0] ?? "";
+			new RegExp(`<article class="card[^"]*"[^>]*data-row="${key}"[\\s\\S]*?</article>`).exec(html)?.[0] ?? "";
 		const board = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
-		expect(cardOf(board, "slack/ch/CA/t/1.0")).toContain(
+		expect(cardOf(board, "discord/ch/300000000000000001/t/100000000000000001")).toContain(
 			'<span class="badge model-chip" title="anthropic/claude-opus-5-5">claude-opus-5-5 · high</span>',
 		);
-		expect(cardOf(board, "slack/ch/CB/t/1.0")).toContain(
+		expect(cardOf(board, "discord/ch/300000000000000002/t/100000000000000001")).toContain(
 			'<span class="badge model-chip is-warning" title="anthropic/claude-opus-5-5">폴백 · claude-opus-5-5 · high</span>',
 		);
-		expect(cardOf(board, "slack/ch/CC/t/1.0")).not.toContain("model-chip");
-		expect(renderItemDetail(snapshot, "turns", "slack/ch/CB/t/1.0")).toContain("폴백 · claude-opus-5-5 · high");
-		expect(renderItemDetail(snapshot, "turns", "slack/ch/CC/t/1.0")).not.toContain("model-chip");
+		expect(cardOf(board, "discord/ch/300000000000000003/t/100000000000000001")).not.toContain("model-chip");
+		expect(renderItemDetail(snapshot, "turns", "discord/ch/300000000000000002/t/100000000000000001")).toContain(
+			"폴백 · claude-opus-5-5 · high",
+		);
+		expect(renderItemDetail(snapshot, "turns", "discord/ch/300000000000000003/t/100000000000000001")).not.toContain(
+			"model-chip",
+		);
 	});
 });
 
@@ -336,9 +373,13 @@ describe("turn board page", () => {
 		for (const label of ["확인 필요", "진행 중", "완료"]) {
 			expect(board).toMatch(new RegExp(`<section class="col" [^>]*><h2 class="col-head"><span>${label}</span>`));
 		}
-		expect(board).toMatch(/<a class="card[^"]*"[^>]*data-row="slack\/ch\/CA\/t\/1.0"/);
+		expect(board).toMatch(
+			/<article class="card[^"]*"[^>]*data-row="discord\/ch\/300000000000000001\/t\/100000000000000001"/,
+		);
 
-		const thread = await page(`?view=turns&item=${encodeURIComponent("slack/ch/CA/t/1.0")}`);
+		const thread = await page(
+			`?view=turns&item=${encodeURIComponent("discord/ch/300000000000000001/t/100000000000000001")}`,
+		);
 		expect(thread).toContain('<aside id="detail" class="detail is-open"');
 		expect(tabsOf(thread)).toEqual({ hidden: false, words: ["개요", "대화", "트레이스"], selected: ["대화"] });
 		expect(thread).not.toMatch(/<body class="[^"]*detail-trace/);
@@ -349,7 +390,7 @@ describe("turn board page", () => {
 		// The old address of one turn: that turn's conversation, on the trace tab, with the wide panel.
 		const old = await page("?view=turns&item=1");
 		expect(old).toContain('<aside id="detail" class="detail is-open"');
-		expect(old).toContain("slack/ch/CA/t/1.0");
+		expect(old).toContain("discord/ch/300000000000000001/t/100000000000000001");
 		expect(tabsOf(old)).toEqual({ hidden: false, words: ["개요", "대화", "트레이스"], selected: ["트레이스"] });
 		expect(old).toMatch(/<body class="[^"]*detail-trace/);
 	});
@@ -417,7 +458,7 @@ const toolResult = (callId: string, at: number, text: string, isError = false) =
 	timestamp: iso(at),
 	message: { role: "toolResult", toolCallId: callId, toolName: "x", isError, content: [{ type: "text", text }] },
 });
-const ORIGIN = "slack/ch/CS/t/9.0";
+const ORIGIN = "discord/ch/300000000000000007/t/100000000000000009";
 
 /** A conversation whose session file (in its `session_dir`) is returned, empty. */
 function session(): string {
@@ -535,7 +576,7 @@ describe("api/thread/conversation", () => {
 	test("AC-6: unknown origin, no session file and no reader answer 404 with their error", async () => {
 		seed([{ origin: ORIGIN, text: "요청", state: "answered", createdAt: NOW - HOUR }]);
 		const base = serve();
-		expect(await ask(base, "origin=slack%2Fch%2FNOPE")).toEqual([404, { error: "unknown_origin" }]);
+		expect(await ask(base, "origin=discord%2Fch%2F300000000000000099")).toEqual([404, { error: "unknown_origin" }]);
 		expect(await ask(base, `origin=${encodeURIComponent(ORIGIN)}`)).toEqual([404, { error: "no_session" }]);
 		stop?.();
 		expect(await ask(serve(false), `origin=${encodeURIComponent(ORIGIN)}`)).toEqual([
@@ -609,13 +650,18 @@ describe("터미널에서 보기: watch / attach commands to paste (lane-attach 
 
 	function seedLane(): void {
 		seed([
-			{ origin: "slack/ch/CA/t/1.0", text: "대화 요청", state: "answered", createdAt: NOW - 5 * MINUTE },
+			{
+				origin: "discord/ch/300000000000000001/t/100000000000000001",
+				text: "대화 요청",
+				state: "answered",
+				createdAt: NOW - 5 * MINUTE,
+			},
 			{ origin: LANE_ORIGIN, text: "레인 작업", state: "dispatched", createdAt: NOW - 4 * MINUTE },
 		]);
 		const db = new Database(join(home, "ompbot.db"), { strict: true });
 		db.run(
 			`INSERT INTO lanes (name, title, thread_ref, origin_key, cwd, session_dir, status, history, meta, created_at, updated_at)
-			 VALUES ('fix-login', '로그인 고치기', 'CA:9.0', ?, '/srv/repo-l-1', '/srv/s', 'working', '[]', '{}', ?, ?)`,
+			 VALUES ('fix-login', '로그인 고치기', '300000000000000001:100000000000000009', ?, '/srv/repo-l-1', '/srv/s', 'working', '[]', '{}', ?, ?)`,
 			[LANE_ORIGIN, NOW, NOW],
 		);
 		db.close();
@@ -645,8 +691,8 @@ describe("터미널에서 보기: watch / attach commands to paste (lane-attach 
 			`${cli} lanes watch fix-login`,
 			`${cli} lanes attach fix-login`,
 		]);
-		const chat = renderItemDetail(snapshot, "turns", "slack/ch/CA/t/1.0");
-		expect(commandsIn(chat)).toEqual([`${cli} lanes watch slack/ch/CA/t/1.0`]);
+		const chat = renderItemDetail(snapshot, "turns", "discord/ch/300000000000000001/t/100000000000000001");
+		expect(commandsIn(chat)).toEqual([`${cli} lanes watch discord/ch/300000000000000001/t/100000000000000001`]);
 		for (const command of [...commandsIn(lane), ...commandsIn(chat)]) {
 			expect(command).not.toMatch(/["'`]/);
 		}
@@ -666,6 +712,6 @@ describe("터미널에서 보기: watch / attach commands to paste (lane-attach 
 			() => 0,
 		) as { renderItemDetail: typeof renderItemDetail };
 		expect(client.renderItemDetail(snapshot, "lanes", "fix-login")).toBe(lane);
-		expect(client.renderItemDetail(snapshot, "turns", "slack/ch/CA/t/1.0")).toBe(chat);
+		expect(client.renderItemDetail(snapshot, "turns", "discord/ch/300000000000000001/t/100000000000000001")).toBe(chat);
 	});
 });

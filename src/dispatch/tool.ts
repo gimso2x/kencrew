@@ -159,7 +159,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				taskSpec: {
 					type: "object",
 					description:
-						"여러 단계·하루 넘는 작업의 [TASK] 상태 문서 등록. 신규: title·risk·goal·acceptance·repo 필수(+scope·exclusions·background·tier·tierReason·worker). 재개: {id}만(tier·worker 불가, 처음 모델로 뜬다). host가 있으면 그 호스트에, 없으면 로컬에 워크트리를 만든다",
+						"여러 단계·하루 넘는 작업의 [TASK] 상태 문서 등록. 신규: title·risk·goal·acceptance·repo 필수(+scope·exclusions·background·tier·tierReason·tierConfidence·worker). 재개: {id}만(tier·worker 불가, 처음 모델로 뜬다). host가 있으면 그 호스트에, 없으면 로컬에 워크트리를 만든다",
 					properties: {
 						id: { type: "string", description: "재개할 TASKID(T-YYYYMMDD-NN). 이것만 준다" },
 						title: { type: "string" },
@@ -185,6 +185,12 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 								"워커 모델 등급(config lanes.models). 생략하면 위험 등급으로 정한다(L0·L1 low, L2 middle, L3 이상 high) — 이유가 있을 때만 준다. high: 설계·디버깅·넓은 변경, middle: 일반 구현, low: 기계적 수선 묶음. L3 이상은 항상 high. 신규 등록에서만",
 						},
 						tierReason: { type: "string", description: "그 등급을 고른 이유 한 줄(카드에 보임). 신규 등록에서만" },
+						tierConfidence: {
+							type: "number",
+							minimum: 0,
+							maximum: 1,
+							description: "그 등급 판정의 확신도 0~1(judge conf가 있을 때). 신규 등록에서만",
+						},
 						worker: {
 							type: "string",
 							enum: ["agy"],
@@ -324,6 +330,7 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 				spec.goal,
 				...spec.scope,
 				...(spec.background === undefined ? [] : [spec.background]),
+				...(spec.assumptions === undefined ? [] : [spec.assumptions]),
 			];
 			const gate = await gateWork(briefed ? [task, ...topics].join("\n") : undefined, signal);
 			const approvedRisk = gate.approved && ["L0", "L1", "L2"].includes(spec.risk) ? "L3" : spec.risk;

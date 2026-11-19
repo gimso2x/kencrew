@@ -3,15 +3,15 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DiscordChannel } from "../src/discord/channel";
+import type { DiscordTransport, EditMessageArgs } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { ApprovalBroker, type ApprovalStore, type ApprovalTimers } from "../src/safety/approval";
-import { SlackChannel } from "../src/slack/channel";
-import type { SlackTransport } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
-import { hasButtons } from "./helpers/bot-home";
+import { CHANNEL, GUILD, hasButtons, OWNER, OWNER_DM } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
+import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 let dir: string;
 let store: Store;
@@ -26,22 +26,27 @@ afterEach(() => {
 });
 
 const quietLog = () => createLogger({ sink: () => undefined, clock: { now: () => 0 }, redact });
-const OWNER = "UOWNER";
 
-/** Resolves `shown` when the buttons go up and `finalized` when a card update removes them. */
-class CardTransport extends FakeSlackTransport {
-	readonly shown = Promise.withResolvers<{ ts: string; blocks: readonly unknown[] }>();
-	readonly finalized = Promise.withResolvers<{ text: string; blocks: readonly unknown[] | undefined }>();
-
-	override async updateMessage(args: {
-		channel: string;
+/** Resolves `shown` when the buttons go up and `finalized` when a card edit removes them. */
+class CardTransport extends FakeDiscordTransport {
+	readonly shown = Promise.withResolvers<{
 		ts: string;
+		blocks: readonly unknown[];
+		embeds: readonly unknown[] | undefined;
+	}>();
+	readonly finalized = Promise.withResolvers<{
 		text: string;
-		blocks?: readonly unknown[] | undefined;
-	}): Promise<void> {
-		await super.updateMessage(args);
-		if (args.blocks !== undefined && hasButtons(args.blocks)) this.shown.resolve({ ts: args.ts, blocks: args.blocks });
-		else this.finalized.resolve({ text: args.text, blocks: args.blocks });
+		blocks: readonly unknown[] | undefined;
+		embeds: readonly unknown[] | undefined;
+	}>();
+
+	override async editMessage(args: EditMessageArgs): Promise<void> {
+		await super.editMessage(args);
+		if (args.components !== undefined && hasButtons(args.components)) {
+			this.shown.resolve({ ts: args.messageId, blocks: args.components, embeds: args.embeds });
+		} else {
+			this.finalized.resolve({ text: args.content ?? "", blocks: args.components, embeds: args.embeds });
+		}
 	}
 }
 
@@ -61,10 +66,10 @@ class ManualTimers implements ApprovalTimers {
 	}
 }
 
-function makeBroker(transport: SlackTransport, timers: ApprovalTimers, now: () => number): ApprovalBroker {
+function makeBroker(transport: DiscordTransport, timers: ApprovalTimers, now: () => number): ApprovalBroker {
 	return new ApprovalBroker({
 		timezone: "Asia/Seoul",
-		channels: registryOf(new SlackChannel(transport)),
+		channels: registryOf(new DiscordChannel(transport, { ownerUserId: OWNER })),
 		ownerUserId: OWNER,
 		log: quietLog(),
 		store: store as unknown as ApprovalStore,
@@ -95,12 +100,12 @@ describe("durable approvals", () => {
 			summary: "s",
 			createdAt: 1_000,
 			expiresAt: 61_000,
-			originKey: "slack/dm/D1",
-			originThreadRef: "D1:9.9",
+			originKey: "discord/dm/200000000000000001",
+			originThreadRef: "200000000000000001:700000000000000009",
 		});
 		expect(store.getApproval("C1:1.1")).toMatchObject({
-			originKey: "slack/dm/D1",
-			originThreadRef: "D1:9.9",
+			originKey: "discord/dm/200000000000000001",
+			originThreadRef: "200000000000000001:700000000000000009",
 			status: "pending",
 		});
 		expect(store.replyApproval("C1:1.1", "2.2", "go", 2_000)).toBe(true);
@@ -168,7 +173,7 @@ describe("durable approvals", () => {
 		const transport = new CardTransport();
 		const timers = new ManualTimers();
 		const broker1 = makeBroker(transport, timers, () => 1_000);
-		void broker1.request("D1", "git push --force");
+		void broker1.request(OWNER_DM, "git push --force");
 		const { ts } = await transport.shown.promise;
 
 		// New broker over the same ledger (the old process is gone): the boot sweep expires and relabels the card.
@@ -178,35 +183,35 @@ describe("durable approvals", () => {
 		expect(final.text).toContain("재시작으로 만료됨");
 		expect(final.blocks).toEqual([]);
 		// The stale waiter cannot be granted anything anymore.
-		expect(store.decideApproval(`D1:${ts}`, "approved", 3_000)).toBe(false);
+		expect(store.decideApproval(`${OWNER_DM}:${ts}`, "approved", 3_000)).toBe(false);
 	});
 
 	test("a timed-out request lands as expired in the ledger", async () => {
 		const transport = new CardTransport();
 		const timers = new ManualTimers();
 		const broker = makeBroker(transport, timers, () => 1_000);
-		const done = broker.request("D1", "s");
+		const done = broker.request(OWNER_DM, "s");
 		const { ts } = await transport.shown.promise;
 		timers.fireAll();
 		expect(await done).toBe("timeout");
 		await transport.finalized.promise;
-		expect(store.decideApproval(`D1:${ts}`, "approved", 2_000)).toBe(false);
+		expect(store.decideApproval(`${OWNER_DM}:${ts}`, "approved", 2_000)).toBe(false);
 	});
 
 	test("an aborted wait (daemon restart, stopped turn) lands as expired and its card does not read as a denial", async () => {
 		const transport = new CardTransport();
 		const timers = new ManualTimers();
 		const abort = new AbortController();
-		const done = makeBroker(transport, timers, () => 1_000).ask("D1", "git push", { signal: abort.signal });
+		const done = makeBroker(transport, timers, () => 1_000).ask(OWNER_DM, "git push", { signal: abort.signal });
 		const { ts } = await transport.shown.promise;
 		abort.abort();
 		expect(await done).toBe("denied");
-		expect(store.getApproval(`D1:${ts}`)?.status).toBe("expired");
+		expect(store.getApproval(`${OWNER_DM}:${ts}`)?.status).toBe("expired");
 		const final = await transport.finalized.promise;
 		expect(final.text).not.toContain("⛔ 거부됨");
 		// The buttons are gone; the card keeps its title and shows the abort as its result line.
 		expect(hasButtons(final.blocks)).toBe(false);
-		expect(JSON.stringify(final.blocks)).toContain("기다리던 작업이 중단돼 만료됨");
+		expect(JSON.stringify(final.embeds)).toContain("기다리던 작업이 중단돼 만료됨");
 	});
 
 	test("a ledger without the detail and link columns gains them; old rows stay and a second open is a no-op", () => {
@@ -219,12 +224,15 @@ describe("durable approvals", () => {
 				origin_thread_ref TEXT, reply_ts TEXT, reply_text TEXT)`,
 		);
 		old.run(
-			"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key) VALUES ('C1:1.1','C1','1.1','old card','pending',1000,90000,'slack/dm/D1')",
+			"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key) VALUES ('C1:1.1','C1','1.1','old card','pending',1000,90000,'discord/dm/200000000000000001')",
 		);
 		old.close();
 		for (let open = 0; open < 2; open++) {
 			const migrated = openStore({ timezone: "Asia/Seoul", path, clock: { now: () => 1_000 }, redact });
-			expect(migrated.getApproval("C1:1.1")).toMatchObject({ status: "pending", originKey: "slack/dm/D1" });
+			expect(migrated.getApproval("C1:1.1")).toMatchObject({
+				status: "pending",
+				originKey: "discord/dm/200000000000000001",
+			});
 			migrated.close();
 		}
 		const check = new Database(path, { readonly: true });
@@ -254,7 +262,7 @@ describe("durable approvals", () => {
 		const transport = new CardTransport();
 		const timers = new ManualTimers();
 		const long = `rm -rf /srv/build ${"x".repeat(500)}`;
-		const done = makeBroker(transport, timers, () => 1_000).ask("D1", "clean build", {
+		const done = makeBroker(transport, timers, () => 1_000).ask(OWNER_DM, "clean build", {
 			detail: {
 				action: long,
 				why: "token xoxb-TEST-0 leaked",
@@ -263,20 +271,20 @@ describe("durable approvals", () => {
 			},
 		});
 		const { ts } = await transport.shown.promise;
-		const stored = JSON.parse(rawRow(`D1:${ts}`).detail_json ?? "null") as Record<string, string>;
+		const stored = JSON.parse(rawRow(`${OWNER_DM}:${ts}`).detail_json ?? "null") as Record<string, string>;
 		expect(Object.keys(stored)).toEqual(["action", "why", "impact", "rollback"]);
 		expect(stored.action).toBe(long.slice(0, 400));
 		expect(stored.why).toBe("token [REDACTED] leaked");
 		expect(stored.impact).toBe("key [REDACTED] rotates");
-		const card = transport.calls.find((call) => call.method === "postMessage");
-		const cardText = card?.method === "postMessage" ? card.text : "";
+		const card = transport.calls.find((call) => call.method === "createMessage");
+		const cardText = card?.method === "createMessage" ? JSON.stringify(card.embeds) : "";
 		for (const [label, key] of [
 			["할 일", "action"],
 			["이유", "why"],
 			["영향", "impact"],
 			["되돌릴 수 없는 이유", "rollback"],
 		] as const) {
-			expect(cardText).toContain(`• ${label}: ${stored[key]}`);
+			expect(cardText).toContain(JSON.stringify({ name: label, value: stored[key] }).slice(1, -1));
 		}
 		timers.fireAll();
 		expect(await done).toBe("timeout");
@@ -287,8 +295,11 @@ describe("durable approvals", () => {
 		expect(dump).not.toContain("sk-");
 
 		for (const [channel, start] of [
-			["D2", (broker: ApprovalBroker) => broker.ask("D2", "plain ask", { detail: { action: "  " } })],
-			["D3", (broker: ApprovalBroker) => broker.request("D3", "plain request")],
+			[
+				"200000000000000002",
+				(broker: ApprovalBroker) => broker.ask("200000000000000002", "plain ask", { detail: { action: "  " } }),
+			],
+			["200000000000000003", (broker: ApprovalBroker) => broker.request("200000000000000003", "plain request")],
 		] as const) {
 			const next = new CardTransport();
 			const nextTimers = new ManualTimers();
@@ -301,34 +312,36 @@ describe("durable approvals", () => {
 	});
 
 	test("ask stores the card and asking-thread permalinks; a throwing permalink leaves NULLs and the decision intact", async () => {
+		const THREAD_ROOT = "700000000000000077";
 		const transport = new CardTransport();
+		transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
 		const timers = new ManualTimers();
 		const broker = makeBroker(transport, timers, () => 1_000);
-		const done = broker.ask("C9", "deploy", {
-			origin: { originKey: "slack/ch/C9/t/7.7", channel: "C9", threadTs: "7.7" },
+		const done = broker.ask(CHANNEL, "deploy", {
+			origin: { originKey: `discord/ch/${CHANNEL}/t/${THREAD_ROOT}`, channel: CHANNEL, threadTs: THREAD_ROOT },
 		});
 		const { ts } = await transport.shown.promise;
-		expect(rawRow(`C9:${ts}`)).toEqual({
+		expect(rawRow(`${CHANNEL}:${ts}`)).toEqual({
 			detail_json: null,
-			card_url: `https://slack.test/archives/C9/p${ts.replace(".", "")}`,
-			origin_url: "https://slack.test/archives/C9/p77",
+			card_url: `https://discord.com/channels/${GUILD}/${CHANNEL}/${ts}`,
+			origin_url: `https://discord.com/channels/${GUILD}/${CHANNEL}/${THREAD_ROOT}`,
 		});
-		expect(broker.handleAction({ actionId: `ompbot:approval:approve:C9:${ts}`, userId: OWNER })).toBe(true);
+		expect(broker.handleAction({ actionId: `ompbot:approval:approve:${CHANNEL}:${ts}`, userId: OWNER })).toBe(true);
 		expect(await done).toBe("approved");
 
-		// A fresh fake transport restarts its ts sequence, so each round asks in its own channel.
+		// A fresh fake transport restarts its id sequence, so each round asks in its own channel.
 		for (const [channel, decision, outcome] of [
-			["C7", "approve", "approved"],
-			["C8", "deny", "denied"],
+			["300000000000000007", "approve", "approved"],
+			["300000000000000008", "deny", "denied"],
 		] as const) {
 			const failing = new CardTransport();
-			failing.failNext.getPermalink = [new Error("slack down"), new Error("slack down")];
+			failing.failNext.getChannel = [new Error("discord down"), new Error("discord down")];
 			const failingBroker = makeBroker(failing, new ManualTimers(), () => 1_000);
 			const pending = failingBroker.ask(channel, "deploy", {
-				origin: { originKey: `slack/ch/${channel}/t/7.7`, channel, threadTs: "7.7" },
+				origin: { originKey: `discord/ch/${channel}/t/${THREAD_ROOT}`, channel, threadTs: THREAD_ROOT },
 			});
 			const shown = await failing.shown.promise;
-			expect(failing.count("getPermalink")).toBe(2);
+			expect(failing.count("getChannel")).toBe(2);
 			expect(rawRow(`${channel}:${shown.ts}`)).toEqual({ detail_json: null, card_url: null, origin_url: null });
 			expect(
 				failingBroker.handleAction({ actionId: `ompbot:approval:${decision}:${channel}:${shown.ts}`, userId: OWNER }),
@@ -341,13 +354,13 @@ describe("durable approvals", () => {
 	test("a ledger that throws on the click fails closed: approve is refused, deny still settles", async () => {
 		const transport = new CardTransport();
 		const broker = makeBroker(transport, new ManualTimers(), () => 1_000);
-		const done = broker.request("D1", "git push --force");
+		const done = broker.request(OWNER_DM, "git push --force");
 		const { ts } = await transport.shown.promise;
 		store.decideApproval = () => {
 			throw new Error("database is locked");
 		};
-		expect(broker.handleAction({ actionId: `ompbot:approval:approve:D1:${ts}`, userId: OWNER })).toBe(false);
-		expect(broker.handleAction({ actionId: `ompbot:approval:deny:D1:${ts}`, userId: OWNER })).toBe(true);
+		expect(broker.handleAction({ actionId: `ompbot:approval:approve:${OWNER_DM}:${ts}`, userId: OWNER })).toBe(false);
+		expect(broker.handleAction({ actionId: `ompbot:approval:deny:${OWNER_DM}:${ts}`, userId: OWNER })).toBe(true);
 		expect(await done).toBe("denied");
 	});
 
@@ -355,9 +368,9 @@ describe("durable approvals", () => {
 		const transport = new CardTransport();
 		const timers = new ManualTimers();
 		const askedAt = Date.parse("2026-10-27T00:03:00+09:00");
-		const done = makeBroker(transport, timers, () => askedAt).request("D1", "git push");
-		const { blocks } = await transport.shown.promise;
-		expect(JSON.stringify(blocks)).toContain("00:33");
+		const done = makeBroker(transport, timers, () => askedAt).request(OWNER_DM, "git push");
+		const { embeds } = await transport.shown.promise;
+		expect(JSON.stringify(embeds)).toContain("00:33");
 		timers.fireAll();
 		expect(await done).toBe("timeout");
 	});

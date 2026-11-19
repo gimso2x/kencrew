@@ -13,7 +13,7 @@ import {
 } from "./spec";
 
 export const NO_REPORT = "NO_REPORT";
-/** Entire-response / first-line / last-line answer that skips the Slack delivery (hermes monitor mode). */
+/** Entire-response / first-line / last-line answer that skips the chat delivery (hermes monitor mode). */
 export const SILENT = "[SILENT]";
 export const MONITOR_ORIGIN_PREFIX = "monitor/";
 /** The same monitor failing with the same normalized error re-alerts after this long, not on every fire. */
@@ -21,7 +21,7 @@ export const MONITOR_INCIDENT_REPEAT_MS = 24 * 60 * 60_000;
 
 export const monitorOrigin = (monitorId: string): string => `${MONITOR_ORIGIN_PREFIX}${monitorId}`;
 
-/** The whole-response / first-line / last-line markers that keep a monitor answer off the Slack delivery. */
+/** The whole-response / first-line / last-line markers that keep a monitor answer off the chat delivery. */
 const SILENT_MARKERS: ReadonlySet<string> = new Set([NO_REPORT, SILENT]);
 
 const isMarkerLine = (line: string | undefined): boolean => SILENT_MARKERS.has(line?.trim() ?? "");
@@ -66,9 +66,9 @@ export interface MonitorRow {
 	instruction: string;
 	overlap: MonitorOverlap;
 	enabled: boolean;
-	/** Slack or Discord channel the answer goes to (top level); null = the Slack owner DM. */
+	/** Discord channel the answer goes to (top level); null = the owner DM. */
 	channel: string | null;
-	/** Slack or Discord channel that also gets a top-level copy of every settled event; null = no copy. */
+	/** Discord channel that also gets a top-level copy of every settled event; null = no copy. */
 	copyChannel: string | null;
 	/** omp model id pinned to this monitor's session; null = no pin. */
 	model: string | null;

@@ -1,5 +1,8 @@
 // Discord Gateway v10 client on Bun's global WebSocket (JSON encoding, one shard, no compression).
+// The reconnect skeleton is shared (src/channel/socket-base.ts); what stays here is Discord's protocol: op codes,
+// heartbeat with ACK tracking, session resume and the fatal close codes.
 
+import { SocketBase, type SocketTimers } from "../channel/socket-base";
 import {
 	DISCORD_INTENTS,
 	DiscordCallError,
@@ -12,15 +15,7 @@ import {
 } from "./transport";
 
 /** Timer seam: the gateway's heartbeat, reconnect and backoff waits all go through it, so tests drive time by hand. */
-export interface GatewayTimers {
-	set(fn: () => void, ms: number): unknown;
-	clear(handle: unknown): void;
-}
-
-const REAL_TIMERS: GatewayTimers = {
-	set: (fn, ms) => setTimeout(fn, ms),
-	clear: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
-};
+export type GatewayTimers = SocketTimers;
 
 export interface DiscordGatewayOptions {
 	token: string;
@@ -95,110 +90,59 @@ function record(value: unknown): Record<string, unknown> {
  * predecessor got no ACK marks a zombie connection: it is closed and resumed. Reconnect (op 7) resumes at once; Invalid
  * Session (op 9) resumes when `d` is true, otherwise identifies anew after 1–5 s. Fatal close codes stop the client.
  */
-export class DiscordGateway {
+export class DiscordGateway extends SocketBase<{ botUserId: string; applicationId: string }> {
 	readonly #opts: DiscordGatewayOptions;
-	readonly #timers: GatewayTimers;
 	readonly #random: () => number;
-	readonly #now: () => number;
 	readonly #intents: number;
-	readonly #backoffBaseMs: number;
-	readonly #backoffMaxMs: number;
-	#ws: WebSocket | undefined;
-	/** Bumped whenever a socket is replaced; callbacks of older sockets compare against it and bail. */
-	#generation = 0;
-	#stopped = true;
-	#attempt = 0;
 	#baseUrl: string | undefined;
 	#sessionId: string | undefined;
 	#resumeUrl: string | undefined;
 	#seq: number | undefined;
 	#heartbeatTimer: unknown;
-	#reconnectTimer: unknown;
 	#helloTimer: unknown;
 	#awaitingAck = false;
-	#state: "up" | "down" = "down";
-	#since: number;
-	#first:
-		| {
-				resolve: (ids: { botUserId: string; applicationId: string }) => void;
-				reject: (error: Error) => void;
-		  }
-		| undefined;
 
 	constructor(options: DiscordGatewayOptions) {
+		super({
+			backoffBaseMs: options.backoffBaseMs ?? 1_000,
+			backoffMaxMs: options.backoffMaxMs ?? 60_000,
+			...(options.now === undefined ? {} : { now: options.now }),
+			...(options.timers === undefined ? {} : { timers: options.timers }),
+			onError: options.onError,
+			onReconnect: options.onReconnect,
+		});
 		this.#opts = options;
-		this.#timers = options.timers ?? REAL_TIMERS;
 		this.#random = options.random ?? Math.random;
-		this.#now = options.now ?? Date.now;
 		this.#intents = options.intents ?? DISCORD_INTENTS;
-		this.#backoffBaseMs = options.backoffBaseMs ?? 1_000;
-		this.#backoffMaxMs = options.backoffMaxMs ?? 60_000;
-		this.#since = this.#now();
 	}
 
 	/** Resolves on the first Ready. Rejects on a fatal close or a refused gateway URL lookup; other failures retry. */
 	start(): Promise<{ botUserId: string; applicationId: string }> {
-		if (!this.#stopped) return Promise.reject(new Error("discord gateway already started"));
-		this.#stopped = false;
-		this.#attempt = 0;
-		const { promise, resolve, reject } = Promise.withResolvers<{ botUserId: string; applicationId: string }>();
-		this.#first = { resolve, reject };
-		void this.#connect();
-		return promise;
+		if (!this.stopped) return Promise.reject(new Error("discord gateway already started"));
+		const ready = this.beginStart();
+		void this.connect();
+		return ready;
 	}
 
 	stop(): void {
-		this.#stopped = true;
-		this.#generation++;
-		this.#timers.clear(this.#heartbeatTimer);
-		this.#timers.clear(this.#reconnectTimer);
-		this.#timers.clear(this.#helloTimer);
-		this.#heartbeatTimer = undefined;
-		this.#reconnectTimer = undefined;
-		this.#helloTimer = undefined;
-		this.#closeSocket(1000);
-		this.#setDown();
-		this.#first?.reject(new Error("discord gateway stopped before ready"));
-		this.#first = undefined;
+		this.#clearHeartbeat();
+		this.#clearHello();
+		this.halt(new Error("discord gateway stopped before ready"), 1000);
 	}
 
-	/** Up from Ready/Resumed until the connection is lost; `since` keeps the start of a long outage. */
-	connectionState(): { state: "up" | "down"; since: number } {
-		return { state: this.#state, since: this.#since };
+	#clearHeartbeat(): void {
+		this.timers.clear(this.#heartbeatTimer);
+		this.#heartbeatTimer = undefined;
+	}
+
+	#clearHello(): void {
+		this.timers.clear(this.#helloTimer);
+		this.#helloTimer = undefined;
 	}
 
 	/** What a resume needs: the session, its resume URL and the last Dispatch sequence. */
 	session(): { sessionId: string | undefined; resumeUrl: string | undefined; seq: number | undefined } {
 		return { sessionId: this.#sessionId, resumeUrl: this.#resumeUrl, seq: this.#seq };
-	}
-
-	#report(err: unknown): void {
-		this.#opts.onError?.(err instanceof Error ? err : new Error(String(err)));
-	}
-
-	#setDown(): void {
-		if (this.#state === "up") {
-			this.#state = "down";
-			this.#since = this.#now();
-		}
-	}
-
-	#setUp(): void {
-		if (this.#state !== "up") {
-			this.#state = "up";
-			this.#since = this.#now();
-		}
-	}
-
-	#closeSocket(code: number): void {
-		const ws = this.#ws;
-		this.#ws = undefined;
-		if (!ws) return;
-		try {
-			ws.close(code);
-		} catch {
-			// already closed
-		}
 	}
 
 	async #resolveBaseUrl(): Promise<string> {
@@ -209,52 +153,53 @@ export class DiscordGateway {
 		return this.#baseUrl;
 	}
 
-	async #connect(): Promise<void> {
-		if (this.#stopped) return;
-		const gen = ++this.#generation;
+	protected override async connect(): Promise<void> {
+		if (this.stopped) return;
+		const gen = this.bumpGeneration();
 		const resumeUrl = this.#sessionId === undefined ? undefined : this.#resumeUrl;
 		let url: string;
 		try {
 			url = resumeUrl ?? (await this.#resolveBaseUrl());
 		} catch (err) {
-			if (gen !== this.#generation) return;
-			this.#report(err);
-			if (err instanceof DiscordCallError && err.kind === "definitive" && this.#first) {
+			if (gen !== this.generation) return;
+			this.report(err);
+			if (err instanceof DiscordCallError && err.kind === "definitive") {
 				// The gateway URL lookup was refused (bad token): retrying will not help.
-				const first = this.#first;
-				this.#first = undefined;
-				this.stop();
-				first.reject(err);
-				return;
+				const first = this.takeFirst();
+				if (first !== undefined) {
+					this.stop();
+					first.reject(err);
+					return;
+				}
 			}
-			this.#scheduleConnect(this.#nextBackoff());
+			this.scheduleConnect(this.nextBackoff());
 			return;
 		}
-		if (gen !== this.#generation) return;
+		if (gen !== this.generation) return;
 
 		let ws: WebSocket;
 		try {
 			ws = new WebSocket(withQuery(url));
 		} catch (err) {
 			// A gateway URL that is no URL: forget it (the lookup runs again), and a bad resume URL drops the session.
-			this.#report(new Error(`discord gateway url unusable: ${err instanceof Error ? err.message : String(err)}`));
+			this.report(new Error(`discord gateway url unusable: ${err instanceof Error ? err.message : String(err)}`));
 			if (resumeUrl === undefined) this.#baseUrl = undefined;
 			else this.#dropSession();
-			this.#scheduleConnect(this.#nextBackoff());
+			this.scheduleConnect(this.nextBackoff());
 			return;
 		}
-		this.#ws = ws;
-		this.#timers.clear(this.#helloTimer);
-		this.#helloTimer = this.#timers.set(() => {
-			if (gen === this.#generation) this.#reconnect("hello timeout", { newSession: false, delay: "backoff" });
+		this.ws = ws;
+		this.#clearHello();
+		this.#helloTimer = this.timers.set(() => {
+			if (gen === this.generation) this.#reconnect("hello timeout", { newSession: false, delay: "backoff" });
 		}, HELLO_TIMEOUT_MS);
 		const resuming = resumeUrl !== undefined;
-		const current = (): boolean => gen === this.#generation && this.#ws === ws;
+		const current = (): boolean => this.isCurrent(gen, ws);
 		ws.addEventListener("message", (ev) => {
 			if (current()) this.#onFrame(gen, ev.data, resuming);
 		});
 		ws.addEventListener("error", () => {
-			if (current()) this.#report(new Error("discord gateway websocket error"));
+			if (current()) this.report(new Error("discord gateway websocket error"));
 		});
 		ws.addEventListener("close", (ev) => {
 			if (current()) this.#onClose(ev.code, ev.reason);
@@ -262,7 +207,7 @@ export class DiscordGateway {
 	}
 
 	#send(payload: { op: number; d: unknown }): void {
-		const ws = this.#ws;
+		const ws = this.ws;
 		if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(payload));
 	}
 
@@ -271,27 +216,26 @@ export class DiscordGateway {
 		try {
 			frame = JSON.parse(typeof data === "string" ? data : String(data)) as Frame;
 		} catch {
-			this.#report(new Error("unparseable discord gateway frame"));
+			this.report(new Error("unparseable discord gateway frame"));
 			return;
 		}
 		if (typeof frame !== "object" || frame === null || Array.isArray(frame)) {
-			this.#report(new Error("non-object discord gateway frame"));
+			this.report(new Error("non-object discord gateway frame"));
 			return;
 		}
 		if (typeof frame.s === "number") this.#seq = frame.s;
 		switch (frame.op) {
 			case OP.HELLO: {
-				this.#timers.clear(this.#helloTimer);
-				this.#helloTimer = undefined;
+				this.#clearHello();
 				const interval = record(frame.d).heartbeat_interval;
 				if (typeof interval !== "number" || !(interval > 0)) {
-					this.#report(new Error("discord hello without heartbeat_interval"));
+					this.report(new Error("discord hello without heartbeat_interval"));
 					this.#reconnect("bad hello", { newSession: false, delay: "backoff" });
 					return;
 				}
 				this.#awaitingAck = false;
-				this.#timers.clear(this.#heartbeatTimer);
-				this.#heartbeatTimer = this.#timers.set(() => this.#beat(gen, interval), interval * this.#random());
+				this.#clearHeartbeat();
+				this.#heartbeatTimer = this.timers.set(() => this.#beat(gen, interval), interval * this.#random());
 				if (resuming && this.#sessionId !== undefined) {
 					this.#send({
 						op: OP.RESUME,
@@ -336,14 +280,14 @@ export class DiscordGateway {
 	}
 
 	#beat(gen: number, interval: number): void {
-		if (gen !== this.#generation) return;
+		if (gen !== this.generation) return;
 		if (this.#awaitingAck) {
 			this.#reconnect("heartbeat ack missing", { newSession: false, delay: 0 });
 			return;
 		}
 		this.#awaitingAck = true;
 		this.#send({ op: OP.HEARTBEAT, d: this.#seq ?? null });
-		this.#heartbeatTimer = this.#timers.set(() => this.#beat(gen, interval), interval);
+		this.#heartbeatTimer = this.timers.set(() => this.#beat(gen, interval), interval);
 	}
 
 	#dispatch(type: string, data: unknown): void {
@@ -359,22 +303,21 @@ export class DiscordGateway {
 					typeof user.id !== "string" ||
 					typeof application.id !== "string"
 				) {
-					this.#report(new Error("discord ready without session or ids"));
+					this.report(new Error("discord ready without session or ids"));
 					this.#reconnect("bad ready", { newSession: true, delay: "backoff" });
 					return;
 				}
 				this.#sessionId = d.session_id;
 				this.#resumeUrl = d.resume_gateway_url;
-				this.#attempt = 0;
-				this.#setUp();
+				this.resetBackoff();
+				this.setUp();
 				this.#opts.onReady?.({ resumed: false });
-				this.#first?.resolve({ botUserId: user.id, applicationId: application.id });
-				this.#first = undefined;
+				this.resolveFirst({ botUserId: user.id, applicationId: application.id });
 				return;
 			}
 			case "RESUMED":
-				this.#attempt = 0;
-				this.#setUp();
+				this.resetBackoff();
+				this.setUp();
 				this.#opts.onReady?.({ resumed: true });
 				return;
 			// Handlers start in arrival order; each runs on its own so a slow one does not hold the socket.
@@ -395,17 +338,16 @@ export class DiscordGateway {
 
 	#run(handler: () => Promise<void> | void): void {
 		try {
-			Promise.resolve(handler()).catch((err: unknown) => this.#report(err));
+			Promise.resolve(handler()).catch((err: unknown) => this.report(err));
 		} catch (err) {
-			this.#report(err);
+			this.report(err);
 		}
 	}
 
 	#onClose(code: number, reason: string): void {
 		if (FATAL_CLOSE_CODES.has(code)) {
 			const error = new DiscordGatewayFatalError(code, reason);
-			const first = this.#first;
-			this.#first = undefined;
+			const first = this.takeFirst();
 			this.stop();
 			first?.reject(error);
 			this.#opts.onFatal?.(error);
@@ -415,37 +357,19 @@ export class DiscordGateway {
 	}
 
 	#reconnect(reason: string, plan: ReconnectPlan): void {
-		if (this.#stopped) return;
-		this.#generation++; // detaches the old socket's callbacks and heartbeat
-		this.#timers.clear(this.#heartbeatTimer);
-		this.#timers.clear(this.#helloTimer);
-		this.#heartbeatTimer = undefined;
-		this.#helloTimer = undefined;
-		this.#closeSocket(plan.newSession ? 1000 : RESUMABLE_CLOSE);
-		this.#setDown();
+		if (this.stopped) return;
+		this.#clearHeartbeat();
+		this.#clearHello();
 		if (plan.newSession) this.#dropSession();
-		this.#opts.onReconnect?.(reason);
-		const delay = plan.delay === "backoff" ? this.#nextBackoff() : plan.delay;
-		if (delay === 0) void this.#connect();
-		else this.#scheduleConnect(delay);
+		this.replaceConnection(reason, plan.newSession ? 1000 : RESUMABLE_CLOSE);
+		const delay = plan.delay === "backoff" ? this.nextBackoff() : plan.delay;
+		if (delay === 0) void this.connect();
+		else this.scheduleConnect(delay);
 	}
 
 	#dropSession(): void {
 		this.#sessionId = undefined;
 		this.#resumeUrl = undefined;
 		this.#seq = undefined;
-	}
-
-	#nextBackoff(): number {
-		return Math.min(this.#backoffMaxMs, this.#backoffBaseMs * 2 ** this.#attempt++);
-	}
-
-	#scheduleConnect(delayMs: number): void {
-		if (this.#stopped) return;
-		this.#timers.clear(this.#reconnectTimer);
-		this.#reconnectTimer = this.#timers.set(() => {
-			this.#reconnectTimer = undefined;
-			void this.#connect();
-		}, delayMs);
 	}
 }

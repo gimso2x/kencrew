@@ -253,7 +253,7 @@ describe("simple mode risk gate", () => {
 		const runs: string[][] = [];
 		const approvals: string[] = [];
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: "/h",
 			workspaceDir: "/h/workspace",
@@ -824,7 +824,7 @@ describe("herdr optional (config herdr)", () => {
 	function dispatchTool(over: Partial<DispatchToolDeps> = {}) {
 		const calls: string[][] = [];
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: "/h",
 			workspaceDir: "/h/workspace",
@@ -1031,7 +1031,7 @@ describe("qa50b lane H: local herdr start and pipe-holding children", () => {
 			return { code: 0, stdout: "{}", timedOut: false };
 		};
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: "/h",
 			workspaceDir: "/h/workspace",
@@ -1151,7 +1151,7 @@ describe("herdr prompts kept for the dashboard (herdr_prompts)", () => {
 			};
 		};
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: dir,
 			workspaceDir: dir,
@@ -1183,7 +1183,13 @@ describe("herdr prompts kept for the dashboard (herdr_prompts)", () => {
 		await ok.built.execute({ mode: "herdr", name: "worker-1", task: `토큰 ${TOKEN} 로 다음 단계 진행` }, { signal });
 		const [row] = ok.rows() as Array<{ preview: string }>;
 		expect(ok.rows()).toEqual([
-			{ host: "", agent: "worker-1", kind: "followup", preview: row?.preview ?? "", originKey: "slack/dm/D0123456789" },
+			{
+				host: "",
+				agent: "worker-1",
+				kind: "followup",
+				preview: row?.preview ?? "",
+				originKey: "discord/dm/200000000000000001",
+			},
 		]);
 		expect(row?.preview).toContain("다음 단계 진행");
 		expect(row?.preview).not.toContain(TOKEN);
@@ -1199,7 +1205,13 @@ describe("herdr prompts kept for the dashboard (herdr_prompts)", () => {
 		const fresh = recorded([]);
 		await fresh.built.execute({ mode: "herdr", name: "brand-new", task: "새 일 시작" }, { signal });
 		expect(fresh.rows()).toEqual([
-			{ host: "", agent: "brand-new", kind: "start", preview: "새 일 시작", originKey: "slack/dm/D0123456789" },
+			{
+				host: "",
+				agent: "brand-new",
+				kind: "start",
+				preview: "새 일 시작",
+				originKey: "discord/dm/200000000000000001",
+			},
 		]);
 		fresh.done();
 	});
@@ -1210,14 +1222,26 @@ describe("herdr prompts kept for the dashboard (herdr_prompts)", () => {
 			String(await start.built.execute({ host: "wsl", name: "remote-1", task: "원격 시작" }, { signal })),
 		).toContain("에이전트를 시작했습니다");
 		expect(start.rows()).toEqual([
-			{ host: "wsl", agent: "remote-1", kind: "start", preview: "원격 시작", originKey: "slack/dm/D0123456789" },
+			{
+				host: "wsl",
+				agent: "remote-1",
+				kind: "start",
+				preview: "원격 시작",
+				originKey: "discord/dm/200000000000000001",
+			},
 		]);
 		start.done();
 
 		const follow = recorded(["remote-1"]);
 		await follow.built.execute({ host: "wsl", name: "remote-1", task: "원격 후속" }, { signal });
 		expect(follow.rows()).toEqual([
-			{ host: "wsl", agent: "remote-1", kind: "followup", preview: "원격 후속", originKey: "slack/dm/D0123456789" },
+			{
+				host: "wsl",
+				agent: "remote-1",
+				kind: "followup",
+				preview: "원격 후속",
+				originKey: "discord/dm/200000000000000001",
+			},
 		]);
 		follow.done();
 	});
@@ -1254,7 +1278,7 @@ describe("herdr prompts kept for the dashboard (herdr_prompts)", () => {
 
 		const warned: string[] = [];
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: "/h",
 			workspaceDir: "/h/workspace",
@@ -1315,7 +1339,7 @@ describe("herdr start guards and agent list shape (qa-l low B)", () => {
 	test("the ad hoc remote dispatch closes what it created when the prompt fails", async () => {
 		const { words, run } = remoteChain(true);
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: "/h",
 			workspaceDir: "/h/workspace",
@@ -1359,7 +1383,7 @@ describe("herdr start guards and agent list shape (qa-l low B)", () => {
 		const controller = new AbortController();
 		const seen: string[][] = [];
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: "/h",
 			workspaceDir: "/h/workspace",

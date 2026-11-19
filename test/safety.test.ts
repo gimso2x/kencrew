@@ -13,6 +13,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
+import { DiscordChannel } from "../src/discord/channel";
+import type { DiscordInteraction } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
 import { buildChildEnv } from "../src/omp/env";
@@ -44,29 +46,35 @@ import {
 	ompbotCli,
 	WAIT_INTERIM_LINE,
 } from "../src/safety/prompt";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	discordBinding,
+	hasButtons,
+	makeHome,
+	OWNER,
+	OWNER_DM,
+	ownerMessage,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
-const CHANNEL = "D1";
-const ORIGIN = `slack/dm/${CHANNEL}`;
+const CHANNEL = OWNER_DM;
+const ORIGIN = `discord/dm/${CHANNEL}`;
+const SERVER_CHANNEL = "300000000000000001";
+const CHANNEL_ORIGIN = `discord/ch/${SERVER_CHANNEL}`;
+const THREAD_ORIGIN = `${CHANNEL_ORIGIN}/t/700000000000000001`;
+const port = (transport: WaitingDiscordTransport) => new DiscordChannel(transport, { ownerUserId: OWNER });
 const clock = { now: () => Date.now() };
 
-/** Resolves `shown` once the approval buttons (non-empty blocks) have been attached to a message. */
-class ButtonTransport extends FakeSlackTransport {
-	shown = Promise.withResolvers<{ ts: string; blocks: readonly unknown[] }>();
+/** Resolves `shown` once the approval buttons (non-empty components) have been attached to a message. */
+class ButtonTransport extends WaitingDiscordTransport {
+	shown = Promise.withResolvers<{ ts: string; components: readonly unknown[] }>();
 	#armed = Promise.withResolvers<void>();
 
-	override async updateMessage(args: {
-		channel: string;
-		ts: string;
-		text: string;
-		blocks?: readonly unknown[] | undefined;
-	}): Promise<void> {
-		await super.updateMessage(args);
-		if (args.blocks !== undefined && hasButtons(args.blocks)) this.shown.resolve({ ts: args.ts, blocks: args.blocks });
+	override async editMessage(args: Parameters<WaitingDiscordTransport["editMessage"]>[0]): Promise<void> {
+		await super.editMessage(args);
+		if (args.components === undefined) return;
+		if (hasButtons(args.components)) this.shown.resolve({ ts: args.messageId, components: args.components });
 		else this.#armed.resolve();
 	}
 
@@ -164,17 +172,20 @@ function memoryApprovalStore(): ApprovalStore {
 	};
 }
 
-function click(ts: string, decision: "approve" | "deny", user = OWNER) {
+let clicks = 0;
+function click(ts: string, decision: "approve" | "deny", user = OWNER): DiscordInteraction {
+	clicks += 1;
 	return {
+		id: String(800_000_000_000_000_000n + BigInt(clicks)),
+		application_id: "600000000000000000",
+		type: 3,
+		token: `token-${ts}`,
+		channel_id: CHANNEL,
 		user: { id: user },
-		channel: { id: CHANNEL },
-		message: { ts },
-		actions: [{ action_id: approvalActionId(decision, CHANNEL, ts), value: decision }],
+		data: { custom_id: approvalActionId(decision, CHANNEL, ts), component_type: 2 },
+		message: { id: ts, channel_id: CHANNEL },
 	};
 }
-
-/** The owner's zone: the base-commit prompt fixtures were taken with it. */
-const SEOUL = { timezone: { name: "Asia/Seoul", offset: "+09:00" } };
 
 describe("prompt and child environment", () => {
 	test("the appended system prompt carries the floors and names this bot home's secrets directory", () => {
@@ -182,7 +193,7 @@ describe("prompt and child environment", () => {
 		expect(prompt).toBe(buildFloorsPrompt("/bot/home/secrets"));
 		expect(prompt).toContain("/bot/home/secrets");
 		expect(prompt).toContain("ompbot_request_approval");
-		expect(prompt).toContain("slack_send_file");
+		expect(prompt).toContain("discord_send_file");
 	});
 
 	test("buildWorkerFloorsPrompt includes Korean prose and command-with-claim rules without changing buildFloorsPrompt", () => {
@@ -196,7 +207,7 @@ describe("prompt and child environment", () => {
 			"- outcome 요약이나 답에서 '통과·검증됨·확인함'을 주장할 때는 같은 문장에 실제로 돌린 명령과 결과 숫자를 함께 쓴다(예: `bun test x.test.ts` → 12 pass 0 fail).";
 		expect(worker).toContain(koreanRule);
 		expect(worker).toContain(claimRule);
-		const chat = buildFloorsPrompt("/bot/home/secrets", "slack/dm/D1");
+		const chat = buildFloorsPrompt("/bot/home/secrets", ORIGIN);
 		expect(chat).not.toContain(koreanRule);
 		expect(chat).not.toContain(claimRule);
 	});
@@ -212,11 +223,11 @@ describe("prompt and child environment", () => {
 });
 
 describe("floors prompt answer format", () => {
-	test("Slack chat origins get the answer-format section; only the owner DM gets the monitor tools; others get neither", () => {
-		for (const originKey of ["slack/dm/D1", "slack/ch/C1", "slack/ch/C1/t/100.1"] as const) {
+	test("Discord chat origins get the answer-format section; only the owner DM gets the monitor tools; others get neither", () => {
+		for (const originKey of [ORIGIN, CHANNEL_ORIGIN, THREAD_ORIGIN] as const) {
 			const prompt = buildFloorsPrompt("/bot/home/secrets", originKey);
 			expect(prompt).toContain("## 답변 형식 / Answer format");
-			expect(prompt.includes("ompbot_monitor_add")).toBe(originKey === "slack/dm/D1");
+			expect(prompt.includes("ompbot_monitor_add")).toBe(originKey === ORIGIN);
 		}
 		for (const originKey of ["monitor/3", "ompbot/work/lane1", "review/skills", undefined] as const) {
 			const prompt = buildFloorsPrompt("/bot/home/secrets", originKey);
@@ -226,15 +237,13 @@ describe("floors prompt answer format", () => {
 	});
 
 	test("the thread lookup line names this home's ledger, not ~/.ompbot/ompbot.db", () => {
-		for (const originKey of ["slack/dm/D1", "discord/dm/123456789012345678"]) {
-			const prompt = buildFloorsPrompt("/home/u/.ompbot-songbak/secrets", originKey);
-			expect(prompt).toContain("`/home/u/.ompbot-songbak/ompbot.db`");
-			expect(prompt).not.toContain("~/.ompbot/ompbot.db");
-		}
+		const prompt = buildFloorsPrompt("/home/u/.ompbot-songbak/secrets", ORIGIN);
+		expect(prompt).toContain("`/home/u/.ompbot-songbak/ompbot.db`");
+		expect(prompt).not.toContain("~/.ompbot/ompbot.db");
 	});
 
 	test("chat sessions are told a note next to `wait` reaches the owner right away; monitor sessions are not", () => {
-		for (const originKey of ["slack/dm/D1", "slack/ch/C1", "slack/ch/C1/t/100.1"]) {
+		for (const originKey of [ORIGIN, CHANNEL_ORIGIN, THREAD_ORIGIN]) {
 			expect(buildFloorsPrompt("/s", originKey)).toContain(WAIT_INTERIM_LINE);
 		}
 		for (const originKey of ["monitor/3", monitorOrigin("mabc12345")]) {
@@ -243,13 +252,11 @@ describe("floors prompt answer format", () => {
 		}
 	});
 
-	test("Slack and Discord chat sessions are told to run long jobs detached and resume through an inject into this conversation", () => {
+	test("Discord chat sessions are told to run long jobs detached and resume through an inject into this conversation", () => {
 		const cases = [
-			["slack/ch/C1/t/100.1", "--origin slack/ch/C1 --thread 100.1 --as-owner"],
-			["slack/dm/D1", "--origin slack/dm/D1 --as-owner"],
-			["slack/dm/D1/t/200.2", "--origin slack/dm/D1 --thread 200.2 --as-owner"],
 			["discord/ch/1/t/2", "--origin discord/ch/1 --thread 2 --as-owner"],
 			["discord/dm/3", "--origin discord/dm/3 --as-owner"],
+			["discord/dm/3/t/4", "--origin discord/dm/3 --thread 4 --as-owner"],
 		] as const;
 		for (const [originKey, target] of cases) {
 			const line = backgroundResumeLine(originKey, {});
@@ -266,30 +273,32 @@ describe("floors prompt answer format", () => {
 		// A detached systemd unit has no ~/.bun/bin on PATH: the line names this bun by absolute path (11-11 exit 127).
 		expect(OMPBOT_BUN).toBe(process.execPath);
 		expect(isAbsolute(OMPBOT_BUN)).toBe(true);
-		// `inject` addresses Slack and Discord conversations only: no line where it could not reach (monitors, lanes).
-		for (const originKey of ["telegram/dm/1", "monitor/3", "ompbot/work/lane1", "slack/thread/C1:1.2"]) {
+		// `inject` addresses Discord conversations only: no line where it could not reach (monitors, lanes, the removed Slack).
+		for (const originKey of ["telegram/dm/1", "monitor/3", "ompbot/work/lane1", "slack/dm/D1"]) {
 			expect(backgroundResumeLine(originKey)).toBeUndefined();
 			expect(buildFloorsPrompt("/s", originKey)).not.toContain("[자동 후속]");
 		}
 	});
 
-	test("herdr off: no chat prompt mentions herdr; herdr on: byte-identical to base 1ad1bbc", () => {
+	test("herdr off: no chat prompt mentions herdr; herdr on matches the frozen prompts", () => {
+		for (const originKey of [ORIGIN, CHANNEL_ORIGIN, THREAD_ORIGIN]) {
+			expect(buildFloorsPrompt("/h/secrets", originKey)).not.toContain("herdr");
+			expect(floorsSystemPrompt("/h/secrets", originKey)).not.toContain("herdr");
+		}
 		const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "herdr-on-base.json"), "utf8")) as {
 			prompts: Record<string, string>;
 		};
 		// The fixture keeps the checkout-dependent CLI path and the home-dependent ledger path as placeholders.
 		const fixed = (prompt: string): string =>
 			prompt.replaceAll(ompbotCli(), "<bun> <ompbot>/src/main.ts").replaceAll("`/h/ompbot.db`", "`<home>/ompbot.db`");
+		const seoul = { timezone: { name: "Asia/Seoul", offset: "+09:00" } };
 		const origins = Object.keys(base.prompts);
 		expect(origins.length).toBe(3);
 		for (const originKey of origins) {
-			expect(buildFloorsPrompt("/h/secrets", originKey)).not.toContain("herdr");
-			expect(floorsSystemPrompt("/h/secrets", originKey)).not.toContain("herdr");
-			// The owner's `timezone: "Asia/Seoul"` gives the base commit's text byte for byte.
-			expect(fixed(buildFloorsPrompt("/h/secrets", originKey, true, false, false, SEOUL))).toBe(
+			expect(fixed(buildFloorsPrompt("/h/secrets", originKey, true, false, false, seoul))).toBe(
 				base.prompts[originKey] as string,
 			);
-			expect(fixed(floorsSystemPrompt("/h/secrets", originKey, undefined, undefined, true, false, false, SEOUL))).toBe(
+			expect(fixed(floorsSystemPrompt("/h/secrets", originKey, undefined, undefined, true, false, false, seoul))).toBe(
 				base.prompts[originKey] as string,
 			);
 		}
@@ -298,7 +307,7 @@ describe("floors prompt answer format", () => {
 	test("`ask` is allowed only for chat and lane sessions whose dialogs the owner answers; forbidden elsewhere", () => {
 		const ALLOWED = "may use the `ask` tool";
 		const FORBIDDEN = "never use the `ask` tool";
-		for (const originKey of ["slack/dm/D1", "slack/ch/C1", "slack/ch/C1/t/100.1", "ompbot/work/lane1"]) {
+		for (const originKey of [ORIGIN, CHANNEL_ORIGIN, THREAD_ORIGIN, "ompbot/work/lane1"]) {
 			const prompt = buildFloorsPrompt("/s", originKey, false, true);
 			expect(prompt).toContain(ALLOWED);
 			expect(prompt).toContain("추천 선택지(없으면 첫 선택지)가 자동 선택");
@@ -312,13 +321,13 @@ describe("floors prompt answer format", () => {
 			expect(prompt).not.toContain(ALLOWED);
 		}
 		// The claude driver (run.ts: `floorsSystemPrompt` without an answerer) gets the ban even for a chat origin.
-		const claude = floorsSystemPrompt("/s", "slack/dm/D1", undefined, () => undefined, true);
+		const claude = floorsSystemPrompt("/s", ORIGIN, undefined, () => undefined, true);
 		expect(claude).toContain(FORBIDDEN);
 		expect(claude).not.toContain(ALLOWED);
 	});
 
 	test("the send-file guidance names the conversation thread and the mermaid/SVG/HTML push for every origin with a conversation", () => {
-		for (const originKey of [undefined, "slack/dm/D1"] as const) {
+		for (const originKey of [undefined, ORIGIN] as const) {
 			const prompt = buildFloorsPrompt("/s", originKey);
 			expect(prompt).toContain("지금 대화 스레드로 업로드");
 			expect(prompt).toContain("mermaid·SVG·HTML");
@@ -330,16 +339,20 @@ describe("floors prompt answer format", () => {
 
 describe("approval action ids", () => {
 	test("round trip, and malformed ids are rejected", () => {
-		const id = approvalActionId("approve", "D0ABC123", "1800000000.000007");
-		expect(id).toBe("ompbot:approval:approve:D0ABC123:1800000000.000007");
-		expect(parseApprovalActionId(id)).toEqual({ decision: "approve", channel: "D0ABC123", ts: "1800000000.000007" });
-		expect(parseApprovalActionId(approvalActionId("deny", "C1", "1.2"))?.decision).toBe("deny");
+		const id = approvalActionId("approve", "200000000000000001", "700000000000000007");
+		expect(id).toBe("ompbot:approval:approve:200000000000000001:700000000000000007");
+		expect(parseApprovalActionId(id)).toEqual({
+			decision: "approve",
+			channel: "200000000000000001",
+			ts: "700000000000000007",
+		});
+		expect(parseApprovalActionId(approvalActionId("deny", SERVER_CHANNEL, "12"))?.decision).toBe("deny");
 		for (const bad of [
-			"ompbot:approval:maybe:D1:1.2",
+			"ompbot:approval:maybe:D1:12",
 			"ompbot:approval:approve:D1",
-			"ompbot:approval:approve:D1:1.2:extra",
-			"other:approval:approve:D1:1.2",
-			"ompbot:approval:approve::1.2",
+			"ompbot:approval:approve:D1:12:extra",
+			"other:approval:approve:D1:12",
+			"ompbot:approval:approve::12",
 			"",
 		]) {
 			expect(parseApprovalActionId(bad)).toBeUndefined();
@@ -352,10 +365,16 @@ describe("ApprovalBroker", () => {
 	let timers: ManualTimers;
 	let broker: ApprovalBroker;
 
+	/** Content of the first message the transport created (the approval card's text). */
+	const createdContent = (): string => {
+		const call = transport.calls.find((c) => c.method === "createMessage");
+		return call?.method === "createMessage" ? (call.content ?? "") : "";
+	};
+
 	const make = (extra: Partial<ApprovalBrokerOptions> = {}) =>
 		new ApprovalBroker({
 			timezone: "Asia/Seoul",
-			channels: registryOf(new SlackChannel(transport)),
+			channels: registryOf(port(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -371,68 +390,64 @@ describe("ApprovalBroker", () => {
 
 	test("buttons carry the ompbot action ids of the request message; the owner's approve resolves it", async () => {
 		const result = broker.request(CHANNEL, "git push --force");
-		const { ts, blocks } = await transport.shown.promise;
-		const ids = JSON.stringify(blocks);
+		const { ts, components } = await transport.shown.promise;
+		const ids = JSON.stringify(components);
 		expect(ids).toContain(approvalActionId("approve", CHANNEL, ts));
 		expect(ids).toContain(approvalActionId("deny", CHANNEL, ts));
 		expect(broker.handleAction({ actionId: approvalActionId("approve", CHANNEL, ts), userId: OWNER })).toBe(true);
 		expect(await result).toBe("approved");
 		// The decision removes the buttons.
-		const last = transport.calls.filter((c) => c.method === "updateMessage").at(-1);
-		expect(last).toMatchObject({ ts });
-		expect(last?.method === "updateMessage" && last.blocks !== undefined && !hasButtons(last.blocks)).toBe(true);
+		const last = transport.calls.filter((c) => c.method === "editMessage").at(-1);
+		expect(last).toMatchObject({ messageId: ts });
+		expect(last?.method === "editMessage" && last.components !== undefined && !hasButtons(last.components)).toBe(true);
 		expect(broker.pendingCount).toBe(0);
 	});
 
-	test("the card: header, summary, sections as fields and the buttons; after approval header and fields stay with a result line", async () => {
+	test("the card: title, summary, sections as fields and the buttons; after approval title and fields stay with a result line", async () => {
 		const result = broker.ask(CHANNEL, "배포를 진행할까요?", {
 			detail: { action: "git push origin main", why: "릴리스", impact: "운영 반영" },
 		});
-		const { ts, blocks } = await transport.shown.promise;
-		const header = { type: "header", text: { type: "plain_text", text: "🔐 승인 요청", emoji: true } };
-		const summary = { type: "section", text: { type: "mrkdwn", text: "배포를 진행할까요?" } };
-		const fields = {
-			type: "section",
-			fields: [
-				{ type: "mrkdwn", text: "*할 일*\ngit push origin main" },
-				{ type: "mrkdwn", text: "*이유*\n릴리스" },
-				{ type: "mrkdwn", text: "*영향*\n운영 반영" },
-			],
-		};
-		expect(blocks).toEqual([
-			header,
-			summary,
-			fields,
-			{
-				type: "actions",
-				elements: [
-					expect.objectContaining({
-						text: { type: "plain_text", text: "승인" },
-						action_id: approvalActionId("approve", CHANNEL, ts),
-					}),
-					expect.objectContaining({
-						text: { type: "plain_text", text: "거부" },
-						action_id: approvalActionId("deny", CHANNEL, ts),
-					}),
-				],
-			},
-			{ type: "context", elements: [{ type: "mrkdwn", text: expect.stringContaining("거부로 처리됩니다") }] },
-		]);
-		// The notification text is the full card as before; the summary section above carries no `• 라벨:` lines.
+		const { ts, components } = await transport.shown.promise;
+		const fields = [
+			{ name: "할 일", value: "git push origin main" },
+			{ name: "이유", value: "릴리스" },
+			{ name: "영향", value: "운영 반영" },
+		];
+		// The notification text is the full card as before; the embed description carries no `• 라벨:` lines.
 		const cardText =
 			"🔐 승인 요청\n배포를 진행할까요?\n• 할 일: git push origin main\n• 이유: 릴리스\n• 영향: 운영 반영";
-		expect(transport.calls.find((c) => c.method === "updateMessage")).toMatchObject({ ts, text: cardText });
+		expect(transport.calls.find((c) => c.method === "createMessage")).toMatchObject({
+			content: cardText,
+			embeds: [{ title: "🔐 승인 요청", description: "배포를 진행할까요?", fields }],
+		});
+		const shown = transport.calls.find((c) => c.method === "editMessage");
+		expect(shown).toMatchObject({
+			messageId: ts,
+			content: cardText,
+			embeds: [{ title: "🔐 승인 요청", fields }],
+		});
+		expect(JSON.stringify(shown?.method === "editMessage" ? shown.embeds : [])).toContain("거부로 처리됩니다");
+		expect(components).toEqual([
+			{
+				type: 1,
+				components: [
+					expect.objectContaining({ label: "승인", custom_id: approvalActionId("approve", CHANNEL, ts) }),
+					expect.objectContaining({ label: "거부", custom_id: approvalActionId("deny", CHANNEL, ts) }),
+				],
+			},
+		]);
 
 		broker.handleAction({ actionId: approvalActionId("approve", CHANNEL, ts), userId: OWNER });
 		expect(await result).toBe("approved");
-		const last = transport.calls.filter((c) => c.method === "updateMessage").at(-1);
-		const text = last?.method === "updateMessage" ? last.text : "";
+		const last = transport.calls.filter((c) => c.method === "editMessage").at(-1);
+		const text = last?.method === "editMessage" ? (last.content ?? "") : "";
 		expect(text.startsWith(`${cardText}\n`)).toBe(true);
 		const resultLine = text.slice(cardText.length + 1);
 		expect(resultLine).toMatch(/^✅ 승인됨 · \d{2}:\d{2}$/);
 		expect(last).toMatchObject({
-			ts,
-			blocks: [header, summary, fields, { type: "context", elements: [{ type: "mrkdwn", text: resultLine }] }],
+			messageId: ts,
+			components: [],
+			embeds: [{ title: "🔐 승인 요청", description: `배포를 진행할까요?\n-# ${resultLine}`, fields }],
 		});
 	});
 
@@ -446,7 +461,9 @@ describe("ApprovalBroker", () => {
 	test("a click by a non-owner is ignored and the request stays pending until the owner clicks", async () => {
 		const result = broker.request(CHANNEL, "deploy");
 		const { ts } = await transport.shown.promise;
-		expect(broker.handleAction({ actionId: approvalActionId("approve", CHANNEL, ts), userId: "UOTHER" })).toBe(false);
+		expect(
+			broker.handleAction({ actionId: approvalActionId("approve", CHANNEL, ts), userId: "100000000000000009" }),
+		).toBe(false);
 		expect(broker.pendingCount).toBe(1);
 		broker.handleAction({ actionId: approvalActionId("deny", CHANNEL, ts), userId: OWNER });
 		expect(await result).toBe("denied");
@@ -455,7 +472,7 @@ describe("ApprovalBroker", () => {
 	test("clicks for another message, a repeated click and foreign action ids do nothing", async () => {
 		const result = broker.request(CHANNEL, "x");
 		const { ts } = await transport.shown.promise;
-		expect(broker.handleAction({ actionId: approvalActionId("approve", CHANNEL, "9.9"), userId: OWNER })).toBe(false);
+		expect(broker.handleAction({ actionId: approvalActionId("approve", CHANNEL, "99"), userId: OWNER })).toBe(false);
 		expect(broker.handleAction({ actionId: "something:else", userId: OWNER })).toBe(false);
 		expect(broker.pendingCount).toBe(1);
 		expect(broker.handleAction({ actionId: approvalActionId("approve", CHANNEL, ts), userId: OWNER })).toBe(true);
@@ -469,9 +486,11 @@ describe("ApprovalBroker", () => {
 		timers.fireAll();
 
 		expect(await result).toBe("timeout");
-		const last = transport.calls.filter((c) => c.method === "updateMessage").at(-1);
-		expect(last?.method === "updateMessage" && last.blocks !== undefined && !hasButtons(last.blocks)).toBe(true);
-		expect(last?.method === "updateMessage" ? last.text : "").toMatch(/\n⌛ 시간 초과: 거부로 처리됨 · \d{2}:\d{2}$/);
+		const last = transport.calls.filter((c) => c.method === "editMessage").at(-1);
+		expect(last?.method === "editMessage" && last.components !== undefined && !hasButtons(last.components)).toBe(true);
+		expect(last?.method === "editMessage" ? (last.content ?? "") : "").toMatch(
+			/\n⌛ 시간 초과: 거부로 처리됨 · \d{2}:\d{2}$/,
+		);
 		expect(timers.callbacks.size).toBe(0);
 	});
 
@@ -484,7 +503,7 @@ describe("ApprovalBroker", () => {
 	});
 
 	test("a failure to attach the buttons is denied, never approved", async () => {
-		transport.failNext.updateMessage = [new Error("boom")];
+		transport.failNext.editMessage = [new Error("boom")];
 		expect(await broker.request(CHANNEL, "x")).toBe("denied");
 	});
 
@@ -499,8 +518,8 @@ describe("ApprovalBroker", () => {
 	test("a summary-only request (the skill-review path) renders exactly the header and the summary", async () => {
 		const result = broker.request(CHANNEL, "📝 스킬 제안 1건 — 승인하면 lint-fix를 설치합니다.");
 		await transport.shown.promise;
-		expect(transport.calls.find((c) => c.method === "postMessage")).toMatchObject({
-			text: "🔐 승인 요청\n📝 스킬 제안 1건 — 승인하면 lint-fix를 설치합니다.",
+		expect(transport.calls.find((c) => c.method === "createMessage")).toMatchObject({
+			content: "🔐 승인 요청\n📝 스킬 제안 1건 — 승인하면 lint-fix를 설치합니다.",
 		});
 		timers.fireAll();
 		await result;
@@ -514,7 +533,7 @@ describe("ApprovalBroker", () => {
 			rollback: "force push는 원격 히스토리를 덮어써 되돌릴 수 없음",
 		});
 		await transport.shown.promise;
-		expect(transport.calls.find((c) => c.method === "postMessage")?.text).toBe(
+		expect(createdContent()).toBe(
 			[
 				"🔐 승인 요청",
 				"main 브랜치 강제 푸시",
@@ -532,9 +551,7 @@ describe("ApprovalBroker", () => {
 	test("blank detail sections are omitted, so an all-empty detail equals a summary-only card", async () => {
 		const result = broker.request(CHANNEL, "요약만 있는 요청", undefined, { action: "   ", impact: "" });
 		await transport.shown.promise;
-		expect(transport.calls.filter((c) => c.method === "postMessage").at(-1)?.text).toBe(
-			"🔐 승인 요청\n요약만 있는 요청",
-		);
+		expect(createdContent()).toBe("🔐 승인 요청\n요약만 있는 요청");
 		timers.fireAll();
 		await result;
 	});
@@ -544,8 +561,8 @@ describe("ApprovalBroker", () => {
 			action: "gh issue create --repo can1357/oh-my-pi --title 'x' --body-file /tmp/b.md",
 		});
 		await transport.shown.promise;
-		const post = transport.calls.find((c) => c.method === "postMessage");
-		expect(post?.text).toBe(
+		const post = transport.calls.find((c) => c.method === "createMessage");
+		expect(createdContent()).toBe(
 			[
 				"🌐 외부 공개 승인 요청",
 				"업스트림에 버그 이슈 등록",
@@ -553,7 +570,9 @@ describe("ApprovalBroker", () => {
 				"• 할 일: gh issue create --repo can1357/oh-my-pi --title 'x' --body-file /tmp/b.md",
 			].join("\n"),
 		);
-		expect(post?.blocks?.[0]).toMatchObject({ type: "header", text: { text: "🌐 외부 공개 승인 요청" } });
+		expect(post?.method === "createMessage" ? post.embeds?.[0] : undefined).toMatchObject({
+			title: "🌐 외부 공개 승인 요청",
+		});
 		timers.fireAll();
 		await result;
 	});
@@ -564,9 +583,7 @@ describe("ApprovalBroker", () => {
 			action: "gh pr comment 1 --body hi",
 		});
 		await transport.shown.promise;
-		expect(transport.calls.find((c) => c.method === "postMessage")?.text).toContain(
-			"• 🌐 외부 공개: 외부 메일 a@example.com\n",
-		);
+		expect(createdContent()).toContain("• 🌐 외부 공개: 외부 메일 a@example.com\n");
 		timers.fireAll();
 		await explicit;
 		for (const action of ["gh issue view 18559", "gh api repos/a/b/issues", "git push --force origin main"]) {
@@ -574,8 +591,8 @@ describe("ApprovalBroker", () => {
 			broker = make();
 			const plain = broker.request(CHANNEL, "확인", undefined, { action });
 			await transport.shown.promise;
-			const text = transport.calls.find((c) => c.method === "postMessage")?.text;
-			expect(text?.startsWith("🔐 승인 요청\n"), action).toBe(true);
+			const text = createdContent();
+			expect(text.startsWith("🔐 승인 요청\n"), action).toBe(true);
 			timers.fireAll();
 			await plain;
 		}
@@ -591,6 +608,12 @@ describe("host tools", () => {
 	let timers: ManualTimers;
 	let tools: HostToolDef[];
 
+	/** Content of the first message the transport created (the approval card's text). */
+	const createdContent = (): string => {
+		const call = transport.calls.find((c) => c.method === "createMessage");
+		return call?.method === "createMessage" ? (call.content ?? "") : "";
+	};
+
 	const tool = (name: string): HostToolDef => {
 		const found = tools.find((t) => t.name === name);
 		if (!found) throw new Error(`no tool ${name}`);
@@ -601,10 +624,10 @@ describe("host tools", () => {
 	function build(originKey = ORIGIN, extra: Partial<Parameters<typeof buildHostTools>[0]> = {}): HostToolDef[] {
 		return buildHostTools({
 			originKey,
-			channels: registryOf(new SlackChannel(transport)),
+			channels: registryOf(port(transport)),
 			broker: new ApprovalBroker({
 				timezone: "Asia/Seoul",
-				channels: registryOf(new SlackChannel(transport)),
+				channels: registryOf(port(transport)),
 				ownerUserId: OWNER,
 				log: quietLog(),
 				timers,
@@ -626,7 +649,7 @@ describe("host tools", () => {
 		workspaceDir = join(homeDir, "workspace");
 		mkdirSync(join(homeDir, "secrets"), { recursive: true });
 		mkdirSync(workspaceDir, { recursive: true });
-		writeFileSync(join(homeDir, "secrets", "slack-bot-token"), "xoxb-TEST-SECRET-0\n");
+		writeFileSync(join(homeDir, "secrets", "discord-bot-token"), "xoxb-TEST-SECRET-0\n");
 		transport = new ButtonTransport();
 		timers = new ManualTimers();
 		tools = build();
@@ -635,37 +658,35 @@ describe("host tools", () => {
 
 	test("qa-j #47: a monitor session has no conversation, so neither its tools nor its prompt offer upload or approval", () => {
 		const names = build("monitor/m1").map((t) => t.name);
-		expect(names).not.toContain("slack_send_file");
+		expect(names).not.toContain("discord_send_file");
 		expect(names).not.toContain("ompbot_request_approval");
 		const prompt = buildFloorsPrompt(join(homeDir, "secrets"), "monitor/m1");
-		expect(prompt).not.toContain("slack_send_file");
+		expect(prompt).not.toContain("discord_send_file");
 		expect(prompt).not.toContain("`ompbot_request_approval(");
 		expect(prompt).not.toContain("승인 카드(`ompbot_request_approval`)");
 		// A chat origin keeps both.
-		expect(build().map((t) => t.name)).toEqual(expect.arrayContaining(["slack_send_file", "ompbot_request_approval"]));
+		expect(build().map((t) => t.name)).toEqual(
+			expect.arrayContaining(["discord_send_file", "ompbot_request_approval"]),
+		);
 		expect(buildFloorsPrompt(join(homeDir, "secrets"), ORIGIN)).toContain("`ompbot_request_approval(");
 	});
 
-	test("a Slack origin's upload and approval tools are the base commit's definitions byte for byte", () => {
-		const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "slack-prompt-base.json"), "utf8")) as {
+	test("a Discord origin's upload and approval tools are the base commit's definitions byte for byte", () => {
+		const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "prompt-base.json"), "utf8")) as {
 			tools: Array<{ name: string; label: string; description: string; parameters: unknown }>;
 		};
 		const shown = (name: string) => {
 			const found = tool(name);
 			return { name: found.name, label: found.label, description: found.description, parameters: found.parameters };
 		};
-		expect(base.tools.map((t) => t.name)).toEqual(["slack_send_file", "ompbot_request_approval"]);
+		expect(base.tools.map((t) => t.name)).toEqual(["discord_send_file", "ompbot_request_approval"]);
 		for (const expected of base.tools) expect(JSON.stringify(shown(expected.name))).toBe(JSON.stringify(expected));
 	});
 
 	test("a Discord origin's upload tool is discord_send_file with the platform named in its description", () => {
-		tools = build("discord/dm/123456789012345678");
 		const names = tools.map((t) => t.name);
 		expect(names).toContain("discord_send_file");
-		expect(names).not.toContain("slack_send_file");
 		expect(tool("discord_send_file").description).toContain("owner's Discord");
-		const slackUpload = build().find((t) => t.name === "slack_send_file");
-		expect(tool("discord_send_file").parameters).toEqual(slackUpload?.parameters ?? {});
 	});
 
 	test("a Teams origin gets no upload tool: the Teams port cannot send files (qa-i #110)", () => {
@@ -675,42 +696,43 @@ describe("host tools", () => {
 	});
 
 	test("host tools are registered with object schemas (dispatch, upload, approval)", () => {
-		expect(tools.map((t) => t.name)).toEqual(["ompbot_dispatch", "slack_send_file", "ompbot_request_approval"]);
+		expect(tools.map((t) => t.name)).toEqual(["ompbot_dispatch", "discord_send_file", "ompbot_request_approval"]);
 		for (const t of tools) expect(t.parameters.type).toBe("object");
 	});
 
-	test("slack_send_file uploads to the origin DM channel (main view, no thread)", async () => {
+	test("discord_send_file uploads to the origin DM channel (main view, no thread)", async () => {
 		const report = join(workspaceDir, "report.txt");
 		writeFileSync(report, "all green\n");
-		const text = await tool("slack_send_file").execute({ path: report, title: "Report" }, ctx);
+		const text = await tool("discord_send_file").execute({ path: report, title: "Report" }, ctx);
 		expect(text).toContain("report.txt");
 		const uploads = transport.calls.filter((c) => c.method === "uploadFile");
-		expect(uploads).toMatchObject([{ channel: CHANNEL, filePath: report, title: "Report" }]);
-		expect("threadTs" in (uploads[0] ?? {})).toBe(false);
+		expect(uploads).toMatchObject([{ channelId: CHANNEL, filePath: report }]);
+		expect(uploads[0]?.method === "uploadFile" ? uploads[0].messageReference : "missing").toBeUndefined();
 	});
 
-	test("slack_send_file lands in the thread the host resolves, per execute call", async () => {
+	test("discord_send_file lands in the thread the host resolves, per execute call", async () => {
 		const report = join(workspaceDir, "flow.html");
 		writeFileSync(report, "<html>flow</html>\n");
-		let current: string | undefined = "1700.000001";
+		let current: string | undefined = "700000000000000001";
 		tools = build(ORIGIN, { threadTs: () => current });
-		const text = await tool("slack_send_file").execute({ path: report }, ctx);
+		const text = await tool("discord_send_file").execute({ path: report }, ctx);
 		expect(text).toContain("conversation thread");
 		expect(transport.calls.find((c) => c.method === "uploadFile")).toMatchObject({
-			channel: CHANNEL,
-			threadTs: "1700.000001",
+			channelId: CHANNEL,
+			messageReference: { messageId: "700000000000000001" },
 			filePath: report,
 		});
 		// The thread follows the origin's current conversation, resolved when the tool runs.
-		current = "1700.000002";
-		await tool("slack_send_file").execute({ path: report }, ctx);
+		current = "700000000000000002";
+		await tool("discord_send_file").execute({ path: report }, ctx);
 		expect(transport.calls.filter((c) => c.method === "uploadFile").at(-1)).toMatchObject({
-			threadTs: "1700.000002",
+			messageReference: { messageId: "700000000000000002" },
 		});
 		// An unresolvable thread falls back to the main view.
 		current = undefined;
-		await tool("slack_send_file").execute({ path: report }, ctx);
-		expect("threadTs" in (transport.calls.filter((c) => c.method === "uploadFile").at(-1) ?? {})).toBe(false);
+		await tool("discord_send_file").execute({ path: report }, ctx);
+		const last = transport.calls.filter((c) => c.method === "uploadFile").at(-1);
+		expect(last?.method === "uploadFile" ? last.messageReference : "missing").toBeUndefined();
 	});
 
 	test("ompbot_dispatch is registered for chat origins only (lanes and monitors never get it)", () => {
@@ -725,20 +747,20 @@ describe("host tools", () => {
 		const withoutOmp = build(ORIGIN, { ompExecutable: undefined });
 		expect(withoutOmp.find((tool) => tool.name === "ompbot_dispatch")).toBeUndefined();
 		// A thread session is a chat surface too: dispatch registers and the parent channel resolves.
-		const thread = build("slack/ch/C123/t/1800000000.000100").find((tool) => tool.name === "ompbot_dispatch");
+		const thread = build(THREAD_ORIGIN).find((tool) => tool.name === "ompbot_dispatch");
 		expect(thread).toBeDefined();
 	});
 
 	test("a relative path resolves against the workspace", async () => {
 		writeFileSync(join(workspaceDir, "rel.txt"), "x");
-		await tool("slack_send_file").execute({ path: "rel.txt" }, ctx);
+		await tool("discord_send_file").execute({ path: "rel.txt" }, ctx);
 		expect(transport.calls.find((c) => c.method === "uploadFile")).toMatchObject({
 			filePath: join(workspaceDir, "rel.txt"),
 		});
 	});
 
 	test("secrets, links into secrets, token-bearing files, directories and missing files are refused with no upload", async () => {
-		const secret = join(homeDir, "secrets", "slack-bot-token");
+		const secret = join(homeDir, "secrets", "discord-bot-token");
 		symlinkSync(secret, join(workspaceDir, "innocent.txt"));
 		writeFileSync(join(workspaceDir, "notes.txt"), "token is xoxb-TEST-SECRET-0\n");
 		for (const path of [
@@ -748,9 +770,9 @@ describe("host tools", () => {
 			workspaceDir,
 			join(workspaceDir, "missing.txt"),
 		]) {
-			await expect(tool("slack_send_file").execute({ path }, ctx)).rejects.toThrow();
+			await expect(tool("discord_send_file").execute({ path }, ctx)).rejects.toThrow();
 		}
-		await expect(tool("slack_send_file").execute({}, ctx)).rejects.toThrow();
+		await expect(tool("discord_send_file").execute({}, ctx)).rejects.toThrow();
 		expect(transport.count("uploadFile")).toBe(0);
 	});
 
@@ -897,15 +919,15 @@ describe("host tools", () => {
 
 	test("upload tools need an owner DM origin", () => {
 		// No conversation to post into: the tools are not offered at all (qa-j #47).
-		const names = build("slack/channel/C1").map((t) => t.name);
-		expect(names).not.toContain("slack_send_file");
+		const names = build(`discord/channel/${SERVER_CHANNEL}`).map((t) => t.name);
+		expect(names).not.toContain("discord_send_file");
 		expect(names).not.toContain("ompbot_request_approval");
 	});
 
 	test("ompbot_request_approval returns approved / denied / denied (timeout) from the buttons", async () => {
 		const broker = new ApprovalBroker({
 			timezone: "Asia/Seoul",
-			channels: registryOf(new SlackChannel(transport)),
+			channels: registryOf(port(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -913,7 +935,7 @@ describe("host tools", () => {
 		});
 		tools = buildHostTools({
 			originKey: ORIGIN,
-			channels: registryOf(new SlackChannel(transport)),
+			channels: registryOf(port(transport)),
 			broker,
 			log: quietLog(),
 			homeDir,
@@ -935,7 +957,7 @@ describe("host tools", () => {
 	test("ompbot_request_approval forwards the optional sections; unfilled ones never appear", async () => {
 		const broker = new ApprovalBroker({
 			timezone: "Asia/Seoul",
-			channels: registryOf(new SlackChannel(transport)),
+			channels: registryOf(port(transport)),
 			ownerUserId: OWNER,
 			log: quietLog(),
 			timers,
@@ -943,7 +965,7 @@ describe("host tools", () => {
 		});
 		tools = buildHostTools({
 			originKey: ORIGIN,
-			channels: registryOf(new SlackChannel(transport)),
+			channels: registryOf(port(transport)),
 			broker,
 			log: quietLog(),
 			homeDir,
@@ -960,7 +982,7 @@ describe("host tools", () => {
 			ctx,
 		);
 		await transport.shown.promise;
-		const text = transport.calls.find((c) => c.method === "postMessage")?.text ?? "";
+		const text = createdContent();
 		expect(text).toContain("🔐 승인 요청\n배포 스크립트 실행");
 		expect(text).toContain("• 할 일: bash deploy.sh --prod");
 		expect(text).toContain("• 이유: 버전 1.2.3 출시");
@@ -991,7 +1013,7 @@ describe("approval through the daemon (adapter owner gate, logs)", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -1005,11 +1027,11 @@ describe("approval through the daemon (adapter owner gate, logs)", () => {
 		if (!approval) throw new Error("tool missing");
 		const { ts } = await transport.shown.promise;
 
-		await transport.emitBlockAction(click(ts, "approve", "UOTHER"));
+		await transport.emitInteraction(click(ts, "approve", "100000000000000009"));
 		expect(await Promise.race([approval, Promise.resolve("still pending")])).toBe("still pending");
 		expect(logs.some((line) => line.includes("event=approval_click "))).toBe(false);
 
-		await transport.emitBlockAction(click(ts, "approve"));
+		await transport.emitInteraction(click(ts, "approve"));
 		expect(await approval).toBe("approved");
 		expect(
 			logs.some(
@@ -1035,63 +1057,56 @@ describe("file upload thread routing (daemon)", () => {
 	});
 
 	test("a DM upload lands in the origin's newest inbound thread; a lane's upload in the lane thread", async () => {
-		const transport = new FakeSlackTransport();
+		const transport = new WaitingDiscordTransport();
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: quietLog(),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
 			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
 		});
 		await daemon.start();
-		await transport.emitMessage({
-			type: "message",
-			channel: CHANNEL,
-			channel_type: "im",
-			user: OWNER,
-			text: "흐름 다이어그램 그려줘",
-			ts: "1700.000001",
-		});
+		await transport.emitMessage(ownerMessage("700000000000000001", "흐름 다이어그램 그려줘"));
 		const file = join(home.config.workspaceDir, "flow.html");
 		writeFileSync(file, "<html>flow</html>\n");
 		const ctx = { signal: new AbortController().signal };
-		const send = daemon.hostToolsFor(ORIGIN).find((t) => t.name === "slack_send_file");
+		const send = daemon.hostToolsFor(ORIGIN).find((t) => t.name === "discord_send_file");
 		if (!send) throw new Error("tool missing");
 		await send.execute({ path: file }, ctx);
 		expect(transport.calls.filter((c) => c.method === "uploadFile").at(-1)).toMatchObject({
-			channel: CHANNEL,
-			threadTs: "1700.000001",
+			channelId: CHANNEL,
+			messageReference: { messageId: "700000000000000001" },
 			filePath: file,
 		});
 
 		daemon.store.insertLane({
 			name: "l1",
 			title: "레인",
-			threadRef: `${CHANNEL}:1700.000009`,
+			threadRef: `${CHANNEL}:700000000000000009`,
 			originKey: "ompbot/work/l1",
 			cwd: home.config.workspaceDir,
 			sessionDir: join(home.config.homeDir, "sessions", "l1"),
 			meta: { startedAt: 0, lastProgressAt: 0, steerSeq: 0 },
 		});
-		const laneSend = daemon.hostToolsFor("ompbot/work/l1").find((t) => t.name === "slack_send_file");
+		const laneSend = daemon.hostToolsFor("ompbot/work/l1").find((t) => t.name === "discord_send_file");
 		if (!laneSend) throw new Error("lane tool missing");
 		await laneSend.execute({ path: file }, ctx);
 		expect(transport.calls.filter((c) => c.method === "uploadFile").at(-1)).toMatchObject({
-			channel: CHANNEL,
-			threadTs: "1700.000009",
+			channelId: CHANNEL,
+			messageReference: { messageId: "700000000000000009" },
 		});
 	});
 
 	test("while a turn runs, an upload lands in the turn's thread even after a newer inbound in another thread", async () => {
-		const transport = new WaitingTransport();
+		const transport = new WaitingDiscordTransport();
 		const sessions = new FakeSessionStore();
 		const drivers: FakeOmpDriver[] = [];
 		const steerDelivered = Promise.withResolvers<void>();
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: createLogger({
 				sink: (line) => {
 					if (line.includes("event=steer_delivered")) steerDelivered.resolve();
@@ -1120,12 +1135,12 @@ describe("file upload thread routing (daemon)", () => {
 
 		const file = join(home.config.workspaceDir, "diagram.svg");
 		writeFileSync(file, "<svg>flow</svg>\n");
-		const send = daemon.hostToolsFor(ORIGIN).find((t) => t.name === "slack_send_file");
+		const send = daemon.hostToolsFor(ORIGIN).find((t) => t.name === "discord_send_file");
 		if (!send) throw new Error("tool missing");
 		await send.execute({ path: file }, { signal: new AbortController().signal });
 		expect(transport.calls.filter((c) => c.method === "uploadFile").at(-1)).toMatchObject({
-			channel: CHANNEL,
-			threadTs: running.threadRef.split(":")[1],
+			channelId: CHANNEL,
+			messageReference: { messageId: running.threadRef.split(":")[1] },
 		});
 
 		drivers[0]?.release();

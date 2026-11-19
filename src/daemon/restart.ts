@@ -3,7 +3,7 @@
 // reports back with `--report-plain` (IPC `notify`), so neither the request nor the report needs a working model.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { conversationKind, parseThreadRef, TOP_LEVEL_TS } from "../core/normalize";
+import { parseThreadRef, TOP_LEVEL_TS } from "../core/normalize";
 import { parseChatOrigin, platformOfConversationId } from "../core/origin-key";
 import { isLaneOrigin } from "../lanes/status";
 import type { Logger } from "../log";
@@ -39,7 +39,7 @@ export interface ReportTarget {
 
 /**
  * The report target of a `!restart` row: its platform, conversation and thread root in the only shape apply takes
- * (`slack|discord/(dm|ch)/<id>` plus a root ts or message id). A thread origin (`…/t/<root>`) and a work lane's origin
+ * (`discord/(dm|ch)/<id>` plus a root message id). A thread origin (`…/t/<root>`) and a work lane's origin
  * resolve through the row's thread ref; anything else — or a ref that disagrees with the origin — has none.
  */
 export function reportTargetOf(originKey: string, threadRef: string): ReportTarget | undefined {
@@ -53,11 +53,11 @@ export function reportTargetOf(originKey: string, threadRef: string): ReportTarg
 	} else if (isLaneOrigin(originKey)) {
 		const platform = platformOfConversationId(thread.channel);
 		if (platform === undefined) return undefined;
-		origin = `${platform}/${conversationKind(thread.channel)}/${thread.channel}`;
+		origin = `${platform}/ch/${thread.channel}`;
 	} else return undefined;
 	if (!isReportOrigin(origin)) return undefined;
 	if (thread.threadTs === TOP_LEVEL_TS) return { origin };
-	return reportThreadPattern(origin).test(thread.threadTs) ? { origin, thread: thread.threadTs } : undefined;
+	return reportThreadPattern().test(thread.threadTs) ? { origin, thread: thread.threadTs } : undefined;
 }
 
 /**

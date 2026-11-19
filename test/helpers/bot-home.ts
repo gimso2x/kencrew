@@ -1,26 +1,38 @@
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ChannelBinding } from "../../src/channel/adapter";
 import type { OmpbotConfig } from "../../src/config";
-import type { CreateMessageArgs, DiscordHandlers, EditMessageArgs } from "../../src/discord/transport";
+import { DiscordBinding } from "../../src/discord/binding";
+import { DiscordChannel } from "../../src/discord/channel";
+import type {
+	CreateMessageArgs,
+	DiscordHandlers,
+	DiscordMessageEvent,
+	EditMessageArgs,
+} from "../../src/discord/transport";
 import { type FakeDiscordCall, FakeDiscordTransport } from "./discord-fake-transport";
-import { type FakeCall, FakeSlackTransport } from "./slack-fake-transport";
 
-export const OWNER = "UOWNER";
+/** The Discord owner of a test home (a fake snowflake). */
+export const OWNER = "100000000000000001";
+/** The bot user of `FakeDiscordTransport` (its default `botUserId`). */
+export const BOT = "500000000000000000";
+/** The owner's DM channel with the bot in the tests (a fake snowflake; DMs carry no `guild_id`). */
+export const OWNER_DM = "200000000000000001";
+/** A server text channel the bot is in, and its server. */
+export const CHANNEL = "300000000000000001";
+export const GUILD = "400000000000000001";
 
 export interface TestHome {
 	dir: string;
-	/**
-	 * Same shape `loadConfig` returns for this home, plus the Slack owner id under its pre-`channels` name for the
-	 * tests that read it from there.
-	 */
-	config: OmpbotConfig & { ownerSlackUserId: string };
+	/** Same shape `loadConfig` returns for this home: `channels.discord` with owner `OWNER` and a 0600 fake token. */
+	config: OmpbotConfig;
 	remove(): void;
 }
 
 /**
- * A 0700 bot home with a config.json, 0600 fake token files (`xoxb-TEST-0`, `xapp-TEST-0`) and a stub `omp` that
- * only answers `--version`. Nothing here can talk to Slack or start a real omp.
+ * A 0700 bot home with a config.json (`channels.discord`, owner `OWNER`), a 0600 fake bot token file and a stub
+ * `omp` that only answers `--version`. Nothing here can talk to Discord or start a real omp.
  */
 export function makeHome(
 	prefix = "ompbot-home-",
@@ -30,21 +42,19 @@ export function makeHome(
 	chmodSync(dir, 0o700);
 	const secrets = join(dir, "secrets");
 	mkdirSync(secrets, { mode: 0o700 });
-	const botTokenFile = join(secrets, "slack-bot-token");
-	const appTokenFile = join(secrets, "slack-app-token");
-	writeFileSync(botTokenFile, "xoxb-TEST-0\n", { mode: 0o600 });
-	writeFileSync(appTokenFile, "xapp-TEST-0\n", { mode: 0o600 });
+	const botTokenFile = join(secrets, "discord-bot-token");
+	writeFileSync(botTokenFile, `${["TEST", "discord", "0"].join("-")}\n`, { mode: 0o600 });
 	const ompExecutable = real?.ompExecutable ?? join(dir, "fake-omp");
 	if (!real) writeFileSync(ompExecutable, '#!/bin/sh\necho "omp-stub 0.0.0"\n', { mode: 0o755 });
 	const workspaceDir = join(dir, "workspace");
 	mkdirSync(workspaceDir, { mode: 0o700 });
 	const configPath = join(dir, "config.json");
+	const discord = { ownerUserId: OWNER, applicationId: "600000000000000000" };
 	writeFileSync(
 		configPath,
 		JSON.stringify({
 			schemaVersion: 1,
-			channels: { slack: { ownerUserId: OWNER } },
-			slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+			channels: { discord: { ...discord, botTokenFile: "secrets/discord-bot-token" } },
 			ompExecutable,
 			workspaceDir: "workspace",
 			timezone: "Asia/Seoul",
@@ -58,9 +68,8 @@ export function makeHome(
 			schemaVersion: 1,
 			homeDir: dir,
 			configPath,
-			channels: { slack: { ownerUserId: OWNER } },
-			ownerSlackUserId: OWNER,
-			slack: { botTokenFile, appTokenFile },
+			// Key order as `loadConfig` builds it: reload compares configs by their JSON text.
+			channels: { discord: { ownerUserId: OWNER, botTokenFile, applicationId: discord.applicationId } },
 			ompExecutable,
 			workspaceDir,
 			timezone: "Asia/Seoul",
@@ -69,31 +78,36 @@ export function makeHome(
 	};
 }
 
-/** Whether a message's blocks still carry buttons: an approval card keeps its other blocks after the decision. */
-export function hasButtons(blocks: readonly unknown[] | undefined): boolean {
-	return (
-		blocks?.some(
-			(block) => typeof block === "object" && block !== null && "type" in block && block.type === "actions",
-		) ?? false
+/** Whether a Discord message still carries buttons: an approval card keeps its embed after the decision. */
+export function hasButtons(components: readonly unknown[] | undefined): boolean {
+	return (components?.length ?? 0) > 0;
+}
+
+/** The Discord binding the daemon gets for `transport`, owner `OWNER` (the shape `runDaemon` builds). */
+export function discordBinding(
+	transport: FakeDiscordTransport,
+	options: { peerBots?: ReadonlyArray<{ userId: string; name: string }>; startWaitMs?: number } = {},
+): ChannelBinding {
+	const { startWaitMs, peerBots } = options;
+	return new DiscordBinding(
+		new DiscordChannel(transport, { ownerUserId: OWNER, ...(peerBots === undefined ? {} : { peerBots }) }),
+		startWaitMs === undefined ? {} : { startWaitMs },
 	);
 }
 
-/** The Discord owner of a test home (`withDiscord`). */
-export const DISCORD_OWNER = "100000000000000001";
-
-/**
- * `config` with `channels.discord` on (owner `DISCORD_OWNER`) and its 0600 token file in the home. The token is a
- * fake; nothing in the tests talks to Discord.
- */
-export function withDiscord(home: TestHome): OmpbotConfig {
-	const botTokenFile = join(home.dir, "secrets", "discord-bot-token");
-	writeFileSync(botTokenFile, `${["TEST", "discord", "0"].join("-")}\n`, { mode: 0o600 });
+/** An owner message in the DM `OWNER_DM` (or another channel through `overrides`). */
+export function ownerMessage(
+	id: string,
+	content: string,
+	overrides: Partial<DiscordMessageEvent> = {},
+): DiscordMessageEvent {
 	return {
-		...home.config,
-		channels: {
-			...home.config.channels,
-			discord: { ownerUserId: DISCORD_OWNER, botTokenFile, applicationId: "600000000000000000" },
-		},
+		id,
+		channel_id: OWNER_DM,
+		author: { id: OWNER, username: "owner" },
+		content,
+		type: 0,
+		...overrides,
 	};
 }
 
@@ -168,45 +182,5 @@ export class PendingDiscordTransport extends WaitingDiscordTransport {
 	/** The first Ready arrives. */
 	release(): void {
 		this.#gate.resolve();
-	}
-}
-
-/** FakeSlackTransport whose `waitForPosts` resolves on the post that satisfies it (no polling, bounded timeout). */
-export class WaitingTransport extends FakeSlackTransport {
-	readonly #waiters = new Set<() => void>();
-
-	override async postMessage(args: {
-		channel: string;
-		text: string;
-		threadTs?: string | undefined;
-		blocks?: readonly unknown[] | undefined;
-	}): Promise<{ ts: string }> {
-		const result = await super.postMessage(args);
-		for (const waiter of [...this.#waiters]) waiter();
-		return result;
-	}
-
-	posts(match?: (text: string) => boolean): Extract<FakeCall, { method: "postMessage" }>[] {
-		return this.calls.filter(
-			(call): call is Extract<FakeCall, { method: "postMessage" }> =>
-				call.method === "postMessage" && (match === undefined || match(call.text)),
-		);
-	}
-
-	waitForPosts(match: (text: string) => boolean, count = 1, timeoutMs = 10_000): Promise<void> {
-		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		const check = () => {
-			if (this.posts(match).length < count) return;
-			clearTimeout(timer);
-			this.#waiters.delete(check);
-			resolve();
-		};
-		const timer = setTimeout(() => {
-			this.#waiters.delete(check);
-			reject(new Error(`timed out waiting for ${count} matching post(s); saw ${this.posts().length} posts`));
-		}, timeoutMs);
-		this.#waiters.add(check);
-		check();
-		return promise;
 	}
 }

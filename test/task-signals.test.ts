@@ -114,8 +114,8 @@ describe("signal grammar", () => {
 		});
 	});
 
-	test("a timed-out command is inconclusive with the 300 s limit, not its output", async () => {
-		expect(CHECK_TIMEOUT_MS).toBe(300_000);
+	test("a timed-out command is inconclusive with the 900 s limit, not its output", async () => {
+		expect(CHECK_TIMEOUT_MS).toBe(900_000);
 		const io = {
 			runCheck: async () => ({ code: null, output: "partial", timedOut: true }),
 			readBytes: async () => undefined,
@@ -123,7 +123,7 @@ describe("signal grammar", () => {
 		expect(await runSignal('command ["sleep","999"]', io)).toEqual({
 			signal: 'command ["sleep","999"]',
 			ok: false,
-			detail: "300초 안에 끝나지 않았습니다(확인 불가)",
+			detail: "900초 안에 끝나지 않았습니다(확인 불가)",
 			inconclusive: true,
 		});
 	});

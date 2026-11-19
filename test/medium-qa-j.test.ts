@@ -22,7 +22,7 @@ function layout(): { root: string; home: string } {
 	const home = join(root, "home");
 	mkdirSync(join(home, "secrets"), { recursive: true });
 	mkdirSync(join(home, "scripts"));
-	writeFileSync(join(home, "secrets", "slack-bot-token"), "xoxb-TEST-0\n");
+	writeFileSync(join(home, "secrets", "discord-bot-token"), "TEST-discord-0\n");
 	return { root, home };
 }
 
@@ -54,7 +54,9 @@ describe("qa-j #6/#1 workspace overlap", () => {
 
 	test("a procedure file under secrets/ is refused even when the workspace contains it", () => {
 		const { root, home } = layout();
-		expect(() => resolveProcedureFile("home/secrets/slack-bot-token", root, join(home, "scripts"))).toThrow(/secrets/);
+		expect(() => resolveProcedureFile("home/secrets/discord-bot-token", root, join(home, "scripts"))).toThrow(
+			/secrets/,
+		);
 		writeFileSync(join(root, "notes.md"), "ok\n");
 		expect(resolveProcedureFile("notes.md", root, join(home, "scripts"))).toBe(join(root, "notes.md"));
 	});

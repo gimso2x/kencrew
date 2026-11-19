@@ -53,7 +53,7 @@ const GIT_GLOBAL_OPTION_RUN = new RegExp(
  * as `git reset --hard` at the same indices. One left-to-right pass: the git rules need no option group of their
  * own, which re-walked a long option run from every `git` in it.
  */
-export function blankGitGlobalOptions(text: string): string {
+function blankGitGlobalOptions(text: string): string {
 	return text.replace(
 		GIT_GLOBAL_OPTION_RUN,
 		(match: string, options: string) => `${match.slice(0, 3)}${options.replace(/[^\n]/g, " ")}`,
@@ -594,7 +594,7 @@ function secretsFromHome(text: string): Hit[] {
 
 /**
  * `secret_path` in a stretch that runs in a directory below the bot home: a file command with a relative, non-option
- * argument that lands in `secrets` (`cat slack.json` inside `secrets`, `cat ../secrets/x` inside `logs`).
+ * argument that lands in `secrets` (`cat token.json` inside `secrets`, `cat ../secrets/x` inside `logs`).
  */
 function secretsFromSubdir(text: string, cwd: string): Hit[] {
 	const hits: Hit[] = [];
@@ -1042,11 +1042,6 @@ function gitAliasEdits(text: string): Edit[] {
 	return edits;
 }
 
-/** `text` with every git alias defined on its own command line replaced by what it runs (`gitAliasEdits`). */
-export function expandGitAliases(text: string): string {
-	return edited({ text }, gitAliasEdits(text)).text;
-}
-
 /**
  * The findings of one line of a brief (`line` is its 1-based number for the report) in three spellings: as written,
  * as the shell reads its words (`shellSpelling`), and with its git aliases expanded, invisible characters dropped and
@@ -1154,31 +1149,6 @@ function scanSpelling(
 	});
 }
 
-/** The rules naming a shell command by its own words; the rest (`sql_destructive`, `service_control`, `secret_path`) read prose. */
-const COMMAND_RULES = HIGH_RISK_COMPILED.filter(({ rule }) => /^(?:git_|gh_|crontab_|disk_)/.test(rule));
-
-/**
- * Backticks and redirections (`2>&1`, `&>`, `>&`): `SEGMENT` ends a command at them, which suits an inline code span in
- * a brief, but in a command about to run the words after them still belong to the same command.
- */
-const SEGMENT_BREAKS = /`|[0-9]*>&[0-9-]*|&>/g;
-
-/**
- * The first command rule a single shell command matches, for a caller judging a command about to run (the Claude
- * permission gate): the brief scan's own table, tried on the command as written, with git global options blanked and
- * with command-line git aliases expanded, each also with backticks and redirections blanked. No clause or
- * forbidding-marker reading: a command is not prose.
- */
-export function highRiskCommandRule(command: string): string | undefined {
-	const shapes = [command, blankGitGlobalOptions(command), expandGitAliases(command)];
-	for (const text of new Set([...shapes, ...shapes.map((shape) => shape.replace(SEGMENT_BREAKS, " "))])) {
-		for (const compiled of COMMAND_RULES) {
-			if (ruleMatches(text, compiled).length > 0) return compiled.rule;
-		}
-	}
-	return undefined;
-}
-
 /** A line ending in a backslash (trailing blanks allowed) is continued on the next one, as in a shell script. */
 const CONTINUED = /\\[ \t\r]*$/;
 
@@ -1195,7 +1165,7 @@ export function scanHandoffBrief(brief: string, options: { protectedBranches?: r
 	const branches = options.protectedBranches ?? DEFAULT_PROTECTED_BRANCHES;
 	const { head, truncated } = headBytes(brief);
 	const findings: HandoffFinding[] = [];
-	// Every character Slack, editors and browsers break a line at, numbered in order (CRLF is one break).
+	// Every character chat clients, editors and browsers break a line at, numbered in order (CRLF is one break).
 	const lines = head.split(/\r\n|[\n\r\v\f\u0085\u2028\u2029]/);
 	const inBotHome = botHomeStates(lines);
 	for (let first = 0; first < lines.length; ) {

@@ -9,11 +9,9 @@ import { readStatusFromDb } from "../src/daemon/status";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import { acceptanceItems } from "../src/tasks/docs";
 import { openTaskLedger, TaskLedger } from "../src/tasks/ledger";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 import { runCliCapture } from "./helpers/daemon-process";
 
 let home: TestHome;
@@ -46,8 +44,8 @@ function registerTask(dbPath: string): string {
 	const row = ledger.register({
 		title: "t",
 		risk: "L2",
-		originKey: "slack/dm/D1/t/1.1",
-		threadRef: "D1:1.1",
+		originKey: "discord/dm/200000000000000001/t/700000000000000001",
+		threadRef: "200000000000000001:700000000000000001",
 		host: null,
 		repo: "/r/repo",
 		acceptance: acceptanceItems(["a"]),
@@ -59,7 +57,14 @@ function registerTask(dbPath: string): string {
 describe("inject and tasks against a silent daemon (qa-j n24, n59)", () => {
 	test("inject says the request may have been delivered, not that the daemon is unreachable", async () => {
 		silentDaemon();
-		const result = await runCliCapture(home.dir, ["inject", "--origin", "slack/dm/D1", "--as-owner", "--text", "hi"]);
+		const result = await runCliCapture(home.dir, [
+			"inject",
+			"--origin",
+			"discord/dm/200000000000000001",
+			"--as-owner",
+			"--text",
+			"hi",
+		]);
 		expect(result.code).toBe(1);
 		expect(result.stderr).toContain("no daemon answer");
 		expect(result.stderr).not.toContain("not reachable");
@@ -76,8 +81,8 @@ describe("inject and tasks against a silent daemon (qa-j n24, n59)", () => {
 		const second = ledger.register({
 			title: "t2",
 			risk: "L2",
-			originKey: "slack/dm/D1/t/1.2",
-			threadRef: "D1:1.2",
+			originKey: "discord/dm/200000000000000001/t/700000000000000002",
+			threadRef: "200000000000000001:700000000000000002",
 			host: null,
 			repo: "/r/repo",
 			acceptance: acceptanceItems(["a"]),
@@ -136,8 +141,8 @@ function registerPlainLedgerTask(dbPath: string): string {
 	const row = ledger.register({
 		title: "t",
 		risk: "L2",
-		originKey: "slack/dm/D1/t/1.1",
-		threadRef: "D1:1.1",
+		originKey: "discord/dm/200000000000000001/t/700000000000000001",
+		threadRef: "200000000000000001:700000000000000001",
 		host: null,
 		repo: "/r/repo",
 		acceptance: acceptanceItems(["a"]),
@@ -178,13 +183,13 @@ describe("status (qa-j n15, n16)", () => {
 
 describe("inject origin ids (qa-j n26)", () => {
 	let daemon: Daemon;
-	let slackHome: TestHome;
+	let ownerHome: TestHome;
 	beforeEach(async () => {
-		slackHome = makeHome("ompbot-inject-ids-");
+		ownerHome = makeHome("ompbot-inject-ids-");
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
-			config: slackHome.config,
-			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			config: ownerHome.config,
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			clock: { now: () => Date.now() },
 			log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact: (text) => text }),
 			ompVersion: "omp-test 0",
@@ -192,20 +197,22 @@ describe("inject origin ids (qa-j n26)", () => {
 			sweepMs: 3_600_000,
 			gateSweepMs: 0,
 			taskSweepMs: 0,
-			driverFactory: () => new FakeOmpDriver({ sessionDir: join(slackHome.dir, "s"), store: sessions }),
+			driverFactory: () => new FakeOmpDriver({ sessionDir: join(ownerHome.dir, "s"), store: sessions }),
 		});
 		await daemon.start();
 	});
 	afterEach(async () => {
 		await daemon.stop();
-		slackHome.remove();
+		ownerHome.remove();
 	});
 
-	test("a Slack member id as a DM, or a DM id as a channel, is refused", async () => {
-		for (const origin of ["slack/dm/U0123456789", "slack/ch/D0123456789", "slack/dm/C0123456789"]) {
-			await expect(daemon.inject({ origin, asOwner: true, text: "hi" })).rejects.toThrow("starts with");
+	test("an origin whose id is not a snowflake, or whose platform is removed, is refused", async () => {
+		for (const origin of ["discord/dm/U0123456789", "discord/ch/D0123456789", "slack/dm/D0123456789"]) {
+			await expect(daemon.inject({ origin, asOwner: true, text: "hi" })).rejects.toThrow(
+				"inject origin must be discord/dm/<id> or discord/ch/<id>",
+			);
 		}
-		const ok = await daemon.inject({ origin: "slack/dm/D0123456789", asOwner: true, text: "hi" });
+		const ok = await daemon.inject({ origin: "discord/dm/200000000000000001", asOwner: true, text: "hi" });
 		expect(ok.nonce).not.toBe("");
 	});
 });

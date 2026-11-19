@@ -37,7 +37,7 @@ describe("CLI argument errors are usage errors (exit 2, one line)", () => {
 			runMain(home.dir, ["drain", "--timeout"]),
 			runMain(home.dir, ["backup", "--keep", "-1"]),
 			runMain(home.dir, ["inject", "--bogus"]),
-			runMain(home.dir, ["inject", "--origin", "slack/dm/D1", "--as-owner", "--text"]),
+			runMain(home.dir, ["inject", "--origin", "discord/dm/200000000000000001", "--as-owner", "--text"]),
 		]);
 		const commands = ["drain", "drain", "drain", "backup", "inject", "inject"];
 		for (const [i, run] of runs.entries()) expectUsageLine(run, commands[i] ?? "");
@@ -73,7 +73,14 @@ describe("CLI argument errors are usage errors (exit 2, one line)", () => {
 
 	test("inject --text '' or blanks is refused before the daemon is asked", async () => {
 		for (const text of ["", "   \n"]) {
-			const run = await runMain(home.dir, ["inject", "--origin", "slack/dm/D1", "--as-owner", "--text", text]);
+			const run = await runMain(home.dir, [
+				"inject",
+				"--origin",
+				"discord/dm/200000000000000001",
+				"--as-owner",
+				"--text",
+				text,
+			]);
 			expect(run.code).toBe(2);
 			expect(run.stderr).toContain("--text is empty");
 			expect(run.stderr).not.toContain("daemon not reachable");
@@ -122,9 +129,9 @@ describe("CLI commands without a daemon", () => {
 		}
 	});
 
-	test("status falls back to the database without reading the Slack tokens, and works on a db-only home", async () => {
+	test("status falls back to the database without reading the bot token, and works on a db-only home", async () => {
 		openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul").close();
-		chmodSync(join(home.dir, "secrets", "slack-app-token"), 0o644);
+		chmodSync(join(home.dir, "secrets", "discord-bot-token"), 0o644);
 		const loose = await runMain(home.dir, ["status", "--json"]);
 		expect(loose.code, loose.stderr).toBe(0);
 		expect(JSON.parse(loose.stdout).ompVersion).toBe("omp-stub 0.0.0");
@@ -183,8 +190,8 @@ describe("tasks CLI reads (qa-l low B)", () => {
 		const row = ledger.register({
 			title,
 			risk: "L2",
-			originKey: "slack/dm/D1/t/1.1",
-			threadRef: "D1:1.1",
+			originKey: "discord/dm/200000000000000001/t/700000000000000001",
+			threadRef: "200000000000000001:700000000000000001",
 			host: null,
 			repo: "/r/repo",
 			acceptance: acceptanceItems(["a"]),

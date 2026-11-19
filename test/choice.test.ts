@@ -13,13 +13,12 @@ import {
 	parseApprovalActionId,
 	parseChoiceActionId,
 } from "../src/safety/approval";
-import { answerDialogOnSlack } from "../src/safety/choice";
-import { SlackChannel } from "../src/slack/channel";
+import { answerDialog } from "../src/safety/choice";
+import { OWNER, OWNER_DM } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
-const OWNER = "U_OWNER";
-const ORIGIN = { originKey: "slack/dm/D1", channel: "D1", threadTs: "100.1" };
+const DM = OWNER_DM;
+const ORIGIN = { originKey: `discord/dm/${DM}`, channel: DM, threadTs: "700000000000000001" };
 const START = 1_800_000_000_000;
 const clock = { t: START, now: () => clock.t };
 
@@ -61,14 +60,14 @@ interface CardWrite {
 }
 
 class RecordingPort implements ChannelPort {
-	readonly platform = "slack" as const;
+	readonly platform = "discord" as const;
 	readonly writes = new Seen<CardWrite>();
 	#next = 1;
 
 	async post(target: PostTarget, msg: OutboundMessage): Promise<MessageRef> {
-		const ts = `${200 + this.#next++}.0`;
+		const ts = String(900_000_000_000_000_000n + BigInt(this.#next++));
 		this.writes.push({ kind: "post", target, ts, msg });
-		return { platform: "slack", conversationId: target.conversationId, messageId: ts };
+		return { platform: "discord", conversationId: target.conversationId, messageId: ts };
 	}
 	async edit(ref: MessageRef, msg: OutboundMessage): Promise<void> {
 		this.writes.push({ kind: "edit", target: { conversationId: ref.conversationId }, ts: ref.messageId, msg });
@@ -190,7 +189,7 @@ function harness(timezone = "Asia/Seoul") {
 	const replies = new Seen<Record<string, unknown>>();
 	const answered: Array<Promise<OmpDialogResponse | undefined>> = [];
 	const answerer: OmpDialogAnswerer = (request, signal) => {
-		const response = answerDialogOnSlack(broker, ORIGIN, request, signal);
+		const response = answerDialog(broker, ORIGIN, request, signal);
 		answered.push(response);
 		return response;
 	};
@@ -231,36 +230,52 @@ const reply = (id: string, body: Record<string, unknown>) => ({ type: "extension
 
 describe("choice action ids", () => {
 	test("round trip; approval ids and malformed ids are not choice ids, choice ids are not approval ids", () => {
-		const id = choiceActionId(3, "D0ABC", "1800000000.000007");
-		expect(id).toBe("ompbot:choice:3:D0ABC:1800000000.000007");
-		expect(parseChoiceActionId(id)).toEqual({ index: 3, channel: "D0ABC", ts: "1800000000.000007" });
+		const id = choiceActionId(3, DM, "700000000000000007");
+		expect(id).toBe(`ompbot:choice:3:${DM}:700000000000000007`);
+		expect(parseChoiceActionId(id)).toEqual({ index: 3, channel: DM, ts: "700000000000000007" });
 		expect(parseApprovalActionId(id)).toBeUndefined();
-		expect(parseChoiceActionId("ompbot:approval:approve:D1:1.2")).toBeUndefined();
-		expect(parseChoiceActionId("ompbot:choice:x:D1:1.2")).toBeUndefined();
-		expect(parseChoiceActionId("ompbot:choice:1:D1")).toBeUndefined();
+		expect(parseChoiceActionId(`ompbot:approval:approve:${DM}:700000000000000002`)).toBeUndefined();
+		expect(parseChoiceActionId(`ompbot:choice:x:${DM}:700000000000000002`)).toBeUndefined();
+		expect(parseChoiceActionId(`ompbot:choice:1:${DM}`)).toBeUndefined();
 	});
 });
 
-describe("omp dialogs answered on Slack choice cards", () => {
+describe("omp dialogs answered on choice cards", () => {
 	test("select: a button card in the asking thread; the n-th click answers omp with options[n]", async () => {
 		const h = harness();
 		h.send({ method: "select", id: "u1", title: "배포 방식", options: ["blue-green", "canary", "rolling"] });
 		const posted = await h.card(false);
-		expect(posted.target).toEqual({ conversationId: "D1", threadId: "100.1" });
+		expect(posted.target).toEqual({ conversationId: DM, threadId: ORIGIN.threadTs });
 		const shown = await h.card(true);
 		expect(shown.msg.buttons?.map((b) => b.label)).toEqual(["blue-green", "canary", "rolling"]);
-		expect(shown.msg.buttons?.map((b) => b.actionId)).toEqual([0, 1, 2].map((n) => choiceActionId(n, "D1", shown.ts)));
+		expect(shown.msg.buttons?.map((b) => b.actionId)).toEqual([0, 1, 2].map((n) => choiceActionId(n, DM, shown.ts)));
 		expect(shown.msg.buttonsNote).toContain("까지 답이 없으면 취소로 처리됩니다");
 		// Only the owner's click counts.
 		expect(h.broker.handleAction({ actionId: shown.msg.buttons?.[1]?.actionId ?? "", userId: "U_OTHER" })).toBe(false);
 		expect(h.click(shown.msg.buttons?.[1])).toBe(true);
 		expect(await h.replies.waitFor((r) => r.id === "u1")).toEqual(reply("u1", { value: "canary" }));
 		expect((await h.finalEdit(shown.ts)).msg.text).toContain("✅ 선택: canary");
-		expect(h.store.rows.get(`D1:${shown.ts}`)).toMatchObject({ status: "replied", replyText: "canary" });
+		expect(h.store.rows.get(`${DM}:${shown.ts}`)).toMatchObject({ status: "replied", replyText: "canary" });
 		// A second click on the closed card does nothing.
 		expect(h.click(shown.msg.buttons?.[0])).toBe(false);
 		await h.close();
 		expect(h.replies.items).toHaveLength(1);
+	});
+
+	test("select rows `label — description`: buttons show the label, the card lists each row whole, omp gets the whole row", async () => {
+		const options = ["로컬만 — OCI 카드만 먼저", "전부 — 원격 호스트까지"];
+		const h = harness();
+		h.send({ method: "select", id: "d1", title: "범위", options });
+		const shown = await h.card(true);
+		expect(shown.msg.buttons?.map((b) => b.label)).toEqual(["로컬만", "전부"]);
+		expect(shown.msg.text).toContain("1. 로컬만 — OCI 카드만 먼저\n2. 전부 — 원격 호스트까지");
+		expect(h.click(shown.msg.buttons?.[1])).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "d1")).toEqual(reply("d1", { value: options[1] }));
+		h.send({ method: "select", id: "d2", title: "범위", options });
+		await h.requested(2);
+		expect(await h.broker.answerDialog(ORIGIN.originKey, "로컬만")).toBe(true);
+		expect(await h.replies.waitFor((r) => r.id === "d2")).toEqual(reply("d2", { value: options[0] }));
+		await h.close();
 	});
 
 	test("select with more than 5 options: a numbered list, answered by number, label or free text", async () => {
@@ -311,13 +326,17 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		h.send({ method: "select", id: "s2", title: "고르기", options: [...FOUR, OTHER] });
 		await h.requested(2);
 		const second = h.port.writes.items.filter((w) => w.kind === "post").at(-1);
-		const id = `D1:${second?.ts}`;
-		expect(h.broker.handleCardReply({ approvalId: id, ts: "9.1", text: "d" })).toEqual({ kind: "settled" });
+		const id = `${DM}:${second?.ts}`;
+		expect(h.broker.handleCardReply({ approvalId: id, ts: "700000000000000091", text: "d" })).toEqual({
+			kind: "settled",
+		});
 		expect(await h.replies.waitFor((r) => r.id === "s2")).toEqual(reply("s2", { value: "d" }));
 		h.send({ method: "select", id: "s3", title: "고르기", options: [...FOUR, OTHER] });
 		await h.requested(3);
 		const third = h.port.writes.items.filter((w) => w.kind === "post").at(-1);
-		expect(h.broker.handleCardReply({ approvalId: `D1:${third?.ts}`, ts: "9.2", text: "다른 얘기" })).toEqual({
+		expect(
+			h.broker.handleCardReply({ approvalId: `${DM}:${third?.ts}`, ts: "700000000000000092", text: "다른 얘기" }),
+		).toEqual({
 			kind: "settled",
 		});
 		expect(await h.replies.waitFor((r) => r.id === "s3")).toEqual(reply("s3", { value: OTHER }));
@@ -332,14 +351,16 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		expect(await h.broker.answerDialog(ORIGIN.originKey, "음 잠깐만")).toBe(false);
 		expect(await h.broker.answerDialog(ORIGIN.originKey, "아니 그게 아니라")).toBe(false);
 		// A card-thread reply is ignored, not settled as the card's answer.
-		expect(h.broker.handleCardReply({ approvalId: `D1:${shown.ts}`, ts: "9.1", text: "음" })).toEqual({
-			kind: "duplicate",
-		});
+		expect(h.broker.handleCardReply({ approvalId: `${DM}:${shown.ts}`, ts: "700000000000000091", text: "음" })).toEqual(
+			{
+				kind: "duplicate",
+			},
+		);
 		const hint = await h.port.writes.waitFor((w) => w.kind === "edit" && w.msg.text.includes("번호나 선택지 이름으로"));
 		expect(h.port.writes.items.filter((w) => w.msg.text.includes("번호나 선택지 이름으로"))).toHaveLength(1);
 		expect(hint.msg.buttons?.map((b) => b.label)).toEqual(["허용", "거부"]);
 		expect(h.replies.items).toHaveLength(0);
-		expect(h.store.rows.get(`D1:${shown.ts}`)?.status).toBe("pending");
+		expect(h.store.rows.get(`${DM}:${shown.ts}`)?.status).toBe("pending");
 		expect(await h.broker.answerDialog(ORIGIN.originKey, "2")).toBe(true);
 		expect(await h.replies.waitFor((r) => r.id === "s1")).toEqual(reply("s1", { value: "거부" }));
 		await h.close();
@@ -420,8 +441,8 @@ describe("omp dialogs answered on Slack choice cards", () => {
 
 	test("a held text is only used by an input of the same turn (opRef)", async () => {
 		const h = harness();
-		const ask = (opRef: string, request: Parameters<typeof answerDialogOnSlack>[2]) =>
-			answerDialogOnSlack(h.broker, { ...ORIGIN, opRef }, request, new AbortController().signal);
+		const ask = (opRef: string, request: Parameters<typeof answerDialog>[2]) =>
+			answerDialog(h.broker, { ...ORIGIN, opRef }, request, new AbortController().signal);
 		const select = ask("op-1", { method: "select", id: "s1", title: "t", options: [...FOUR, OTHER] });
 		await h.requested(1);
 		expect(await h.broker.answerDialog(ORIGIN.originKey, "글")).toBe(true);
@@ -466,11 +487,17 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		expect(posted.msg.text).toContain("이 스레드에 답장해 주세요");
 		expect(posted.msg.text).toContain("까지 답이 없으면 취소로 처리됩니다");
 		await h.requested(1);
-		const settled = h.broker.handleCardReply({ approvalId: `D1:${posted.ts}`, ts: "300.1", text: "feature/ask" });
+		const settled = h.broker.handleCardReply({
+			approvalId: `${DM}:${posted.ts}`,
+			ts: "700000000000000301",
+			text: "feature/ask",
+		});
 		expect(settled).toEqual({ kind: "settled" });
 		expect(await h.replies.waitFor((r) => r.id === "i1")).toEqual(reply("i1", { value: "feature/ask" }));
 		// A later reply in the closed card's thread goes back to the asking conversation.
-		expect(h.broker.handleCardReply({ approvalId: `D1:${posted.ts}`, ts: "300.2", text: "late" })).toEqual({
+		expect(
+			h.broker.handleCardReply({ approvalId: `${DM}:${posted.ts}`, ts: "700000000000000302", text: "late" }),
+		).toEqual({
 			kind: "route",
 			originKey: ORIGIN.originKey,
 		});
@@ -485,7 +512,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		const h = harness();
 		h.send({ method: "input", id: "s1", title: "API 키", secret: true });
 		const posted = await h.card(false);
-		expect(posted.msg.text).toContain("비밀값은 슬랙에 쓰지 마세요");
+		expect(posted.msg.text).toContain("비밀값은 채팅에 쓰지 마세요");
 		expect(await h.replies.waitFor((r) => r.id === "s1")).toEqual(reply("s1", { cancelled: true }));
 		expect((await h.finalEdit(posted.ts)).msg.text).toContain("🚫 취소됨");
 		expect(h.broker.openDialogs(ORIGIN.originKey)).toBe(0);
@@ -600,7 +627,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		await h.close();
 	});
 
-	test("ask: each question's recommended button is primary (Slack primary, Discord PRIMARY=1), the rest default, kept on redraw", async () => {
+	test("ask: each question's recommended button is primary (Discord PRIMARY=1), the rest default, kept on redraw", async () => {
 		const h = harness();
 		h.send({
 			method: "ask",
@@ -622,19 +649,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 			"3. long",
 		]);
 		expect(styles(ask.msg.buttons)).toEqual([undefined, "primary", "primary", undefined, undefined, undefined]);
-		// The platforms draw that style: Slack Block Kit `style: "primary"`, Discord button style 1; the rest unstyled / 2.
-		const slack = new FakeSlackTransport();
-		await new SlackChannel(slack).post({ conversationId: "D1" }, ask.msg);
-		const posted = slack.calls.find((c) => c.method === "postMessage");
-		const blocks = posted?.method === "postMessage" ? (posted.blocks ?? []) : [];
-		const actions = blocks.find((b) => typeof b === "object" && b !== null && "type" in b && b.type === "actions");
-		const elements =
-			typeof actions === "object" && actions !== null && "elements" in actions && Array.isArray(actions.elements)
-				? actions.elements
-				: [];
-		expect(elements.map((e) => (typeof e === "object" && e !== null && "style" in e ? e.style : undefined))).toEqual(
-			styles(ask.msg.buttons),
-		);
+		// Discord draws that style as button style 1 (primary) and 2 (the rest).
 		// buttonRows returns the wire shape as unknown[]: Action Rows of buttons with a numeric style.
 		const rows = buttonRows(ask.msg.buttons ?? []) as Array<{ components: Array<{ style: number }> }>;
 		expect(rows.flatMap((row) => row.components.map((c) => c.style))).toEqual([2, 1, 1, 2, 2, 2]);
@@ -709,7 +724,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 				{
 					id: "q2",
 					question: "무엇을 알릴까?",
-					options: [{ label: "slack" }, { label: "mail" }, { label: "sms" }],
+					options: [{ label: "discord" }, { label: "mail" }, { label: "sms" }],
 					multi: true,
 				},
 			],
@@ -729,7 +744,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 			reply("a1", {
 				answers: [
 					{ id: "q1", selectedOptions: ["prod"] },
-					{ id: "q2", selectedOptions: ["slack", "sms"] },
+					{ id: "q2", selectedOptions: ["discord", "sms"] },
 				],
 			}),
 		);
@@ -774,7 +789,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		await h.close();
 	});
 
-	test("ask: buttons stop at Slack's 25 per card; the overflowing question is answered by number", async () => {
+	test("ask: buttons stop at 25 per card; the overflowing question is answered by number", async () => {
 		const h = harness();
 		const options = ["a", "b", "c", "d", "e"].map((label) => ({ label }));
 		const questions = [1, 2, 3, 4, 5, 6].map((n) => ({ id: `q${n}`, question: `질문${n}`, options }));
@@ -807,12 +822,16 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		h.send({ method: "input", id: "i1", title: "브랜치 이름" });
 		const posted = await h.card(false);
 		await h.requested(1);
-		const id = `D1:${posted.ts}`;
-		expect(h.broker.handleCardReply({ approvalId: id, ts: "300.7", text: "feature/x" })).toEqual({ kind: "settled" });
+		const id = `${DM}:${posted.ts}`;
+		expect(h.broker.handleCardReply({ approvalId: id, ts: "700000000000000307", text: "feature/x" })).toEqual({
+			kind: "settled",
+		});
 		await h.replies.waitFor((r) => r.id === "i1");
 		await h.finalEdit(posted.ts);
-		expect(h.store.rows.get(id)).toMatchObject({ status: "replied", replyTs: "300.7" });
-		expect(h.broker.handleCardReply({ approvalId: id, ts: "300.7", text: "feature/x" })).toEqual({ kind: "duplicate" });
+		expect(h.store.rows.get(id)).toMatchObject({ status: "replied", replyTs: "700000000000000307" });
+		expect(h.broker.handleCardReply({ approvalId: id, ts: "700000000000000307", text: "feature/x" })).toEqual({
+			kind: "duplicate",
+		});
 		await h.close();
 	});
 
@@ -821,7 +840,7 @@ describe("omp dialogs answered on Slack choice cards", () => {
 		h.send({ method: "select", id: "r1", title: "고르기", options: ["A", "B"] });
 		const choice = await h.card(true);
 		const abort = new AbortController();
-		const approval = h.broker.ask("D1", "main에 push", { signal: abort.signal });
+		const approval = h.broker.ask(DM, "main에 push", { signal: abort.signal });
 		const approvalCard = await h.port.writes.waitFor(
 			(w) => w.kind === "edit" && w.ts !== choice.ts && (w.msg.buttons?.length ?? 0) > 0,
 		);

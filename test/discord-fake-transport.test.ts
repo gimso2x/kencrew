@@ -113,7 +113,7 @@ describe("FakeDiscordTransport contract", () => {
 		fake.failNext.createMessage = [new DiscordCallError("ambiguous", "boom")];
 		await expect(fake.createMessage({ channelId: CHANNEL, content: "x" })).rejects.toThrow("boom");
 		expect((await fake.createMessage({ channelId: CHANNEL, content: "y" })).id).toMatch(/^[0-9]+$/);
-		// Like FakeSlackTransport, a failed call is still in the log.
+		// A failed call is still in the log.
 		expect(fake.count("createMessage")).toBe(2);
 	});
 
@@ -184,8 +184,8 @@ describe("FileFakeDiscordTransport", () => {
 	});
 });
 
-/** Every Slack reaction name the code outside src/discord/ sends: literal reaction names, final marks, task statuses. */
-async function slackEmojiNamesInSrc(): Promise<Set<string>> {
+/** Every reaction name the code outside src/discord/ sends: literal reaction names, final marks, task statuses. */
+async function reactionNamesInSrc(): Promise<Set<string>> {
 	const names = new Set<string>(Object.values(STATUS_REACTIONS));
 	const patterns = [/(?:addReaction|removeReaction)\(\{[^)]*?name: "([^"]+)"/g, /\bmark: "([^"]+)"/g];
 	for await (const file of new Glob("src/**/*.ts").scan(".")) {
@@ -197,9 +197,9 @@ async function slackEmojiNamesInSrc(): Promise<Set<string>> {
 }
 
 describe("emoji table", () => {
-	test("every Slack emoji name used in src maps to a unicode emoji", async () => {
-		const names = await slackEmojiNamesInSrc();
-		for (const known of ["eyes", "white_check_mark", "x", "warning", "hourglass_flowing_sand", "mag", "construction"]) {
+	test("every reaction name used in src maps to a unicode emoji", async () => {
+		const names = await reactionNamesInSrc();
+		for (const known of ["white_check_mark", "x", "warning", "hourglass_flowing_sand", "mag", "construction"]) {
 			expect(names.has(known)).toBe(true);
 		}
 		for (const name of names) {

@@ -14,8 +14,8 @@ import { killSpawned, runMain } from "./helpers/daemon-process";
 const base = {
 	title: "로그 정리",
 	risk: "L2" as const,
-	originKey: "slack/ch/C1",
-	threadRef: "C1:100.1",
+	originKey: "discord/ch/111111111111111111",
+	threadRef: "111111111111111111:700000000000000001",
 	host: null,
 	repo: "/r/repo",
 	acceptance: acceptanceItems(["하나", "둘"]),
@@ -47,8 +47,8 @@ describe("TaskLedger", () => {
 		expect(ledger.register(base).taskId).toBe("T-20261027-01");
 		expect(ledger.getByAgent("t-20261026-02", "wsl")?.taskId).toBe("T-20261026-02");
 		expect(ledger.getByAgent("t-20261026-02", null)).toBeUndefined();
-		expect(ledger.isTaskRoot("C1:100.1")).toBe(true);
-		expect(ledger.isTaskRoot("C1:999.9")).toBe(false);
+		expect(ledger.isTaskRoot("111111111111111111:700000000000000001")).toBe(true);
+		expect(ledger.isTaskRoot("111111111111111111:700000000000000009")).toBe(false);
 	});
 
 	test("bot paths can never reach done or cancelled; a human close can, from any open state, once", () => {
@@ -132,12 +132,39 @@ describe("TaskLedger", () => {
 		expect(db.query("SELECT COUNT(*) AS n FROM task_transitions").get()).toEqual({ n: 0 });
 	});
 
+	test("tier_confidence round-trips and unreadable stored values read null", () => {
+		const ledger = ledgerAt({ ms: Date.parse("2026-11-19T00:00:00Z") });
+		const worker = { tier: "middle" as const, tierReason: "r", model: null };
+		const withConf = ledger.register({ ...base, worker: { ...worker, tierConfidence: 0.88 } });
+		expect(withConf.tierConfidence).toBe(0.88);
+		expect(ledger.register({ ...base, worker }).tierConfidence).toBeNull();
+		expect(ledger.register(base).tierConfidence).toBeNull();
+	});
+
+	test("migration adds the tier_confidence column to a database without it, leaving task rows alone", () => {
+		const db = new Database(":memory:", { strict: true });
+		db.run(TASK_SCHEMA);
+		db.run("ALTER TABLE tasks DROP COLUMN tier_confidence");
+		db.run(
+			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
+				acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', '111111111111111111:700000000000000001', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`,
+		);
+		const columns = () => (db.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((c) => c.name);
+		expect(columns()).not.toContain("tier_confidence");
+		const before = db.query("SELECT * FROM tasks").all();
+		migrateTaskSchema(db);
+		expect(columns()).toContain("tier_confidence");
+		expect(db.query("SELECT * FROM tasks").all()).toEqual(
+			before.map((row) => ({ ...(row as object), tier_confidence: null })),
+		);
+	});
+
 	test("migration adds the history table to a database that predates it, leaving task rows alone", () => {
 		const db = new Database(":memory:", { strict: true });
 		db.run(TASK_SCHEMA.slice(0, TASK_SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS task_transitions")));
 		db.run(
 			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
-				acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', 'C1:1.1', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`,
+				acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', '111111111111111111:700000000000000001', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`,
 		);
 		const before = db.query("SELECT * FROM tasks").all();
 		migrateTaskSchema(db);
@@ -175,7 +202,7 @@ describe("TaskLedger", () => {
 		db.run(TASK_SCHEMA.replace("'bot','human','core-land'", "'bot','human'"));
 		db.run(
 			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
-				acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', 'C1:1.1', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`,
+				acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', '111111111111111111:700000000000000001', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`,
 		);
 		db.run(
 			`INSERT INTO task_transitions (task_id, from_status, to_status, actor, reason, at) VALUES
@@ -241,7 +268,7 @@ const PRE_TIER_TASKS = `CREATE TABLE tasks (
 	reminded_at INTEGER, notices_json TEXT NOT NULL DEFAULT '{}', closed_at INTEGER
 )`;
 const OLD_ROW = `INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
-	acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', 'C1:1.1', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`;
+	acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', '111111111111111111:700000000000000001', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`;
 
 describe("host ops (fake runner)", () => {
 	function recorder(respond: (cmd: string[]) => { code: number | null; stdout?: string; timedOut?: boolean }) {

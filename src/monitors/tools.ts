@@ -31,8 +31,6 @@ export interface MonitorToolDeps {
 	webhook?: { port: number; bind?: string } | undefined;
 	/** `config.timezone`: the default zone of `at`/cron triggers and of every time the tools show. */
 	timezone: string;
-	/** `config.channels.slack` absent: Slack channel ids are refused as monitor channels. */
-	slackOff?: boolean | undefined;
 	/** Test seam: the clock that picks the zone offset the tool descriptions quote (default `Date.now`). */
 	now?: () => number;
 	log: Logger;
@@ -61,12 +59,11 @@ function spec(params: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * A monitor without `channel` posts to the owner DM it was registered from: a Slack registration keeps no channel (the
- * Slack owner DM is the stored default), another platform's stores its DM id, since the default would be Slack's.
+ * A monitor without `channel` posts to the owner DM it was registered from: the registration stores that DM's id.
  */
 function withDefaultChannel(params: Record<string, unknown>, originKey: string): Record<string, unknown> {
 	const ref = parseChatOrigin(originKey);
-	if (ref === undefined || ref.platform === "slack" || (params.channel !== undefined && params.channel !== null)) {
+	if (ref === undefined || (params.channel !== undefined && params.channel !== null)) {
 		return params;
 	}
 	return { ...params, channel: ref.conversationId };
@@ -144,12 +141,12 @@ export function buildMonitorTools(deps: MonitorToolDeps): HostToolDef[] {
 					channel: {
 						type: "string",
 						description:
-							"Slack channel id (C…/G…) or Discord channel id (digits) to post the result into as one top-level thread instead of the owner DM this session runs in; the answer may mention the owner as <@U…>",
+							"Discord channel id (digits) to post the result into as one top-level thread instead of the owner DM this session runs in; the answer may mention the owner as <@id>",
 					},
 					copyChannel: {
 						type: "string",
 						description:
-							"Slack channel id (C…/G…) or Discord channel id (digits) that also gets a top-level copy of every run's result, including runs that stayed silent; the primary delivery is unchanged",
+							"Discord channel id (digits) that also gets a top-level copy of every run's result, including runs that stayed silent; the primary delivery is unchanged",
 					},
 					model: {
 						type: "string",
@@ -184,7 +181,6 @@ export function buildMonitorTools(deps: MonitorToolDeps): HostToolDef[] {
 					workspaceDir,
 					webhook,
 					defaultTimezone: timezone,
-					slackOff: deps.slackOff,
 				});
 				let row: MonitorRow;
 				try {

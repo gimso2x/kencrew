@@ -25,7 +25,7 @@
  * SOFTWARE.
  */
 
-// Instruction-like text inside material the owner did not write (forwarded / quoted Slack posts, text attachments,
+// Instruction-like text inside material the owner did not write (forwarded / quoted posts, text attachments,
 // earlier bot answers re-injected as context). A mitigation that makes an attempt visible to the model and the
 // operator, not a boundary: the approval gate and secret redaction are the fences. Findings never carry the matched
 // text — a warning that quotes the attack delivers it a second time.

@@ -1,12 +1,13 @@
 import { Database } from "bun:sqlite";
-import { closeSync, existsSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig, timezoneOfHome } from "../config";
 import { sessionToResume } from "../core/mailbox";
 import { callDaemon } from "../daemon/ipc";
 import { withOmpProfile } from "../omp/env";
+import { ompSessionDirFor } from "../omp/session-dir";
 import { newestSessionFile } from "../omp/session-heal";
 import { isRecord } from "../omp/type-guards";
 import { redact } from "../redact";
@@ -109,39 +110,6 @@ async function pickOriginFile(homeDir: string, target: string, deps: LanesDeps):
 				: `no answer from the daemon (${answer.reason}); the file the next child resumes`;
 	const label = found.lane === undefined ? origin.originKey : `lane ${found.lane} (${origin.originKey})`;
 	return { file, label, source };
-}
-
-/**
- * The folder omp keeps the sessions of a cwd in, under `sessionsRoot`: omp's default-session-dir naming (omp
- * `session-paths.ts`, read 2026-11-13): a cwd inside the temp root is `-tmp-<rest>`, one inside the user's home
- * `-<rest>` (path separators and `:` as `-`), any other `--<path>--`. The cwd and both roots are compared by real path.
- */
-export function ompSessionDirFor(cwd: string, userHome: string, sessionsRoot: string, tempRoot = tmpdir()): string {
-	const real = (path: string): string => {
-		try {
-			return realpathSync(resolve(path));
-		} catch {
-			return resolve(path);
-		}
-	};
-	const canonical = real(cwd);
-	const within = (root: string): string | undefined => {
-		const rel = relative(real(root), canonical);
-		return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel)) ? rel : undefined;
-	};
-	const encode = (prefix: string, rel: string): string => {
-		const encoded = rel.replace(/[/\\:]/g, "-");
-		return encoded === "" ? prefix : prefix.endsWith("-") ? `${prefix}${encoded}` : `${prefix}-${encoded}`;
-	};
-	const inTemp = within(tempRoot);
-	const inHome = within(userHome);
-	const name =
-		inTemp !== undefined
-			? encode("-tmp", inTemp)
-			: inHome !== undefined
-				? encode("-", inHome)
-				: `--${canonical.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
-	return join(sessionsRoot, name);
 }
 
 /**

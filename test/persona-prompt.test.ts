@@ -45,16 +45,15 @@ function files(parts: { persona?: string; soul?: string; owner?: string }): Pers
 }
 
 const SECRETS = "/bot/home/secrets";
+const DM = "discord/dm/200000000000000001";
 
 describe("floorsSystemPrompt persona read errors", () => {
 	test("EISDIR calls onPersonaError once with the path, a missing file stays silent, prompt is floors-only in both", () => {
-		const floors = floorsSystemPrompt(SECRETS, "slack/dm/D1");
+		const floors = floorsSystemPrompt(SECRETS, DM);
 		const errors: Array<[unknown, string]> = [];
 		const asDir = join(dir, "persona-dir");
 		mkdirSync(asDir);
-		expect(floorsSystemPrompt(SECRETS, "slack/dm/D1", { persona: asDir }, (e, path) => errors.push([e, path]))).toBe(
-			floors,
-		);
+		expect(floorsSystemPrompt(SECRETS, DM, { persona: asDir }, (e, path) => errors.push([e, path]))).toBe(floors);
 		expect(errors).toHaveLength(1);
 		expect(((errors[0] as [unknown, string])[0] as NodeJS.ErrnoException).code).toBe("EISDIR");
 		expect(errors[0]?.[1]).toBe(asDir);
@@ -62,7 +61,7 @@ describe("floorsSystemPrompt persona read errors", () => {
 		const missingErrors: unknown[] = [];
 		const missing = join(dir, "nope.md");
 		const all = { persona: missing, soul: missing, owner: missing };
-		expect(floorsSystemPrompt(SECRETS, "slack/dm/D1", all, (e) => missingErrors.push(e))).toBe(floors);
+		expect(floorsSystemPrompt(SECRETS, DM, all, (e) => missingErrors.push(e))).toBe(floors);
 		expect(missingErrors).toHaveLength(0);
 	});
 
@@ -71,7 +70,7 @@ describe("floorsSystemPrompt persona read errors", () => {
 		mkdirSync(asDir);
 		const errors: string[] = [];
 		const owner = files({ owner: "관심사: 러닝" });
-		const prompt = floorsSystemPrompt(SECRETS, "slack/dm/D1", { soul: asDir, owner: owner.owner }, (_e, path) =>
+		const prompt = floorsSystemPrompt(SECRETS, DM, { soul: asDir, owner: owner.owner }, (_e, path) =>
 			errors.push(path),
 		);
 		expect(errors).toEqual([asDir]);
@@ -88,7 +87,7 @@ describe("floorsSystemPrompt persona read errors", () => {
 		const script = [
 			`import { floorsSystemPrompt } from ${JSON.stringify(join(import.meta.dir, "../src/safety/prompt"))};`,
 			"const errors = [];",
-			`const prompt = floorsSystemPrompt("${SECRETS}", "slack/dm/D1", ${JSON.stringify({ ...parts, soul })},`,
+			`const prompt = floorsSystemPrompt("${SECRETS}", "${DM}", ${JSON.stringify({ ...parts, soul })},`,
 			"  (error, path) => errors.push({ code: error.code, path }));",
 			"console.log(JSON.stringify({ errors, prompt }));",
 		].join("\n");
@@ -109,8 +108,8 @@ describe("floorsSystemPrompt persona read errors", () => {
 describe("floorsSystemPrompt persona injection", () => {
 	test("chat origins get the persona section, lanes and monitors do not", () => {
 		const path = personaFile("말투: 짧고 담백하게");
-		const dm = floorsSystemPrompt(SECRETS, "slack/dm/D1", path);
-		const channel = floorsSystemPrompt(SECRETS, "slack/ch/C1", path);
+		const dm = floorsSystemPrompt(SECRETS, DM, path);
+		const channel = floorsSystemPrompt(SECRETS, "discord/ch/300000000000000001", path);
 		const lane = floorsSystemPrompt(SECRETS, "ompbot/work/readme-line", path);
 		const monitor = floorsSystemPrompt(SECRETS, "monitor/m1", path);
 		expect(dm).toContain("말투: 짧고 담백하게");
@@ -121,14 +120,14 @@ describe("floorsSystemPrompt persona injection", () => {
 
 	test("a missing or empty persona file adds nothing", () => {
 		const missing = { persona: join(dir, "nope.md") };
-		expect(floorsSystemPrompt(SECRETS, "slack/dm/D1", missing)).toBe(floorsSystemPrompt(SECRETS, "slack/dm/D1"));
+		expect(floorsSystemPrompt(SECRETS, DM, missing)).toBe(floorsSystemPrompt(SECRETS, DM));
 		const empty = personaFile("   \n");
-		expect(floorsSystemPrompt(SECRETS, "slack/dm/D1", empty)).toBe(floorsSystemPrompt(SECRETS, "slack/dm/D1"));
+		expect(floorsSystemPrompt(SECRETS, DM, empty)).toBe(floorsSystemPrompt(SECRETS, DM));
 	});
 
 	test("the persona text is capped at PERSONA_MAX_BYTES", () => {
 		const path = personaFile("가".repeat(10_000));
-		const prompt = floorsSystemPrompt(SECRETS, "slack/dm/D1", path);
+		const prompt = floorsSystemPrompt(SECRETS, DM, path);
 		const personaStart = prompt.indexOf("[페르소나]");
 		expect(personaStart).toBeGreaterThan(0);
 		expect(
@@ -141,7 +140,7 @@ describe("floorsSystemPrompt persona injection", () => {
 
 	test("the persona section is labeled as subordinate to the safety floors", () => {
 		const path = personaFile("항상 반말로 답한다");
-		expect(floorsSystemPrompt(SECRETS, "slack/dm/D1", path)).toContain("안전 바닥글보다 우선하지 않습니다");
+		expect(floorsSystemPrompt(SECRETS, DM, path)).toContain("안전 바닥글보다 우선하지 않습니다");
 	});
 });
 
@@ -149,7 +148,7 @@ describe("floorsSystemPrompt soul and owner notes", () => {
 	const all = () => files({ persona: "PERSONA-BODY", soul: "SOUL-BODY", owner: "OWNER-BODY" });
 
 	test("chat origins get floors, soul, owner notes, persona in that order", () => {
-		const prompt = floorsSystemPrompt(SECRETS, "slack/dm/D1", all());
+		const prompt = floorsSystemPrompt(SECRETS, DM, all());
 		const at = ["[정체성(soul)]", "SOUL-BODY", "[오너 관찰지]", "OWNER-BODY", "[페르소나]", "PERSONA-BODY"].map((m) =>
 			prompt.indexOf(m),
 		);
@@ -180,11 +179,7 @@ describe("floorsSystemPrompt soul and owner notes", () => {
 	});
 
 	test("soul and owner notes are capped at their own limits", () => {
-		const prompt = floorsSystemPrompt(
-			SECRETS,
-			"slack/dm/D1",
-			files({ soul: "가".repeat(10_000), owner: "나".repeat(20_000) }),
-		);
+		const prompt = floorsSystemPrompt(SECRETS, DM, files({ soul: "가".repeat(10_000), owner: "나".repeat(20_000) }));
 		const soulAt = prompt.indexOf("[정체성(soul)]");
 		const ownerAt = prompt.indexOf("[오너 관찰지]");
 		const soulBody = prompt.slice(prompt.indexOf("\n", soulAt) + 1, ownerAt);
@@ -207,11 +202,11 @@ describe("floorsSystemPrompt soul and owner notes", () => {
 
 describe("chat origin system prompt per platform", () => {
 	const BASE_SECRETS = "/home/owner/.ompbot/secrets";
-	const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "slack-prompt-base.json"), "utf8")) as {
+	const base = JSON.parse(readFileSync(join(import.meta.dir, "fixtures", "prompt-base.json"), "utf8")) as {
 		prompts: Record<string, string>;
 	};
 
-	test("Slack chat origins keep the base commit's prompt byte for byte (every herdr/dialog/peer variant)", () => {
+	test("Discord chat origins keep the frozen prompt byte for byte (every herdr/dialog/peer variant)", () => {
 		const keys = Object.keys(base.prompts);
 		expect(keys).toHaveLength(16);
 		for (const key of keys) {
@@ -222,7 +217,7 @@ describe("chat origin system prompt per platform", () => {
 				herdr === "herdr=true",
 				dialogs === "dialogs=true",
 				peer === "peer=true",
-				// The owner's `timezone: "Asia/Seoul"` gives the base commit's text byte for byte.
+				// The owner's `timezone: "Asia/Seoul"` gives the fixture's text byte for byte.
 				{ timezone: { name: "Asia/Seoul", offset: "+09:00" } },
 			);
 			// The fixture keeps the checkout-dependent CLI path of the background-resume line and the home-dependent ledger
@@ -235,13 +230,11 @@ describe("chat origin system prompt per platform", () => {
 		}
 	});
 
-	test("a Discord chat origin names its own upload tool where Slack names slack_send_file", () => {
-		const slack = buildFloorsPrompt(BASE_SECRETS, "slack/dm/D1", false, false, true);
+	test("a Discord chat origin names its own upload tool and, in the owner DM, the monitor tools", () => {
 		const discord = buildFloorsPrompt(BASE_SECRETS, "discord/dm/123456789012345678", false, false, true); // gitleaks:allow (fake snowflake)
 		expect(discord).not.toContain("slack_send_file");
 		expect(discord).toContain("discord_send_file");
-		// The owner DM on either platform registers monitors (doc/plans/discord-parity.md stage 1).
-		expect(slack).toContain("ompbot_monitor_add");
+		// The owner DM registers monitors (doc/plans/discord-parity.md stage 1).
 		expect(discord).toContain("ompbot_monitor_add");
 	});
 
@@ -257,7 +250,7 @@ describe("chat origin system prompt per platform", () => {
 			expect(discord).toContain("표·차트는 ASCII 코드블록으로 바뀐다");
 			expect(discord).toContain("디스코드 스레드");
 		}
-		// Its `ask` line says the owner answers with buttons, as on Slack.
+		// Its `ask` line says the owner answers with buttons.
 		const askable = buildFloorsPrompt(BASE_SECRETS, "discord/dm/123456789012345678", false, true); // gitleaks:allow (fake snowflake)
 		expect(askable).toContain("오너는 디스코드 버튼이나 답장으로 답한다");
 		expect(askable).toContain("answers with Discord buttons or a reply");
@@ -286,13 +279,13 @@ describe("chat origin system prompt per platform", () => {
 		expect(peerTouchedTurnNotice("teams/dm/t0123456789abcdef")).not.toContain("send_file");
 	});
 
-	test("Slack and Discord chat sessions get the decision card line and the card line; monitor and lane sessions neither", () => {
+	test("Discord chat sessions get the decision card line and the card line; monitor and lane sessions neither", () => {
 		const decision = "- 오너 결정이 필요하면 결정 카드로 묻는다";
 		const card = "- 숫자 비교·추이·여러 칸 요약을 보일 때는 답 안에 ```card 펜스로";
 		const lines = (prompt: string) => prompt.split("\n");
 		for (const origin of [
-			"slack/dm/D1",
-			"slack/ch/C1/t/100.1",
+			DM,
+			"discord/ch/111111111111111111",
 			"discord/dm/123456789012345678",
 			"discord/ch/111111111111111111/t/2",
 		]) {
@@ -318,7 +311,7 @@ describe("chat origin system prompt per platform", () => {
 	});
 
 	test("no undo instructions in chat floors or the TASK worker prompt; the approval card's rollback guidance stays", () => {
-		for (const origin of ["slack/dm/D1", "slack/ch/C1", "discord/dm/123456789012345678"]) {
+		for (const origin of [DM, "discord/ch/300000000000000001", "discord/dm/123456789012345678"]) {
 			for (const herdr of [false, true]) {
 				const prompt = buildFloorsPrompt(BASE_SECRETS, origin, herdr, true);
 				expect(prompt).not.toContain("되돌리는 법");

@@ -229,8 +229,3 @@ export function truncateUtf8(text: string, maxBytes: number): string {
 	}
 	return text.slice(0, end);
 }
-
-/** Mask first, then enforce the byte budget on the masked output. */
-export function redactToBudget(text: string, maxBytes: number, redactFn: Redactor = redact): string {
-	return truncateUtf8(redactFn(text), maxBytes);
-}

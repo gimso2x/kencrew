@@ -11,12 +11,14 @@ import {
 	NO_BACKUP_YET_HINT,
 } from "../src/daemon/notices";
 import type { Gate } from "../src/ops/gates";
+import { OWNER_DM } from "./helpers/bot-home";
 
 const HOUR = 3_600_000;
+const DM_ORIGIN = `discord/dm/${OWNER_DM}`;
 
 const escalation = (overrides: Partial<TurnFailureEscalation> = {}): TurnFailureEscalation => ({
-	originKey: "slack/dm/D1",
-	threadRef: "D1:1700.1",
+	originKey: DM_ORIGIN,
+	threadRef: `${OWNER_DM}:1700`,
 	failures: 3,
 	reason: "Could not restore model: fake/alpha",
 	modelHealed: false,
@@ -30,7 +32,7 @@ describe("formatTurnEscalationNotice", () => {
 		const text = formatTurnEscalationNotice(escalation(), 1);
 		expect(text).toBe(
 			[
-				"🚨 [자가보고] slack/dm/D1 작업이 3번 연속 실패했습니다",
+				`🚨 [자가보고] ${DM_ORIGIN} 작업이 3번 연속 실패했습니다`,
 				"마지막 사인: Could not restore model: fake/alpha",
 			].join("\n"),
 		);
@@ -50,16 +52,16 @@ describe("formatTurnEscalationNotice", () => {
 
 describe("formatPendingDispatchNotice", () => {
 	test("names the origin, the waiting minutes and a one-line sign; a repeat occurrence names its round", () => {
-		const text = formatPendingDispatchNotice("slack/dm/D1", 90_500, "OmpDriverError: abort wedged\nline2", 1);
+		const text = formatPendingDispatchNotice(DM_ORIGIN, 90_500, "OmpDriverError: abort wedged\nline2", 1);
 		expect(text).toBe(
 			[
-				"🚨 [자가보고] slack/dm/D1의 메시지를 2분째 보내지 못하고 있습니다",
+				`🚨 [자가보고] ${DM_ORIGIN}의 메시지를 2분째 보내지 못하고 있습니다`,
 				"마지막 사인: OmpDriverError: abort wedged line2",
 				"스위프가 계속 재시도합니다 — 원인이 해소되면 자동으로 전송됩니다.",
 				"대기 중인 일반 메시지는 `/queue-ompbot`에서 취소할 수 있습니다.",
 			].join("\n"),
 		);
-		expect(formatPendingDispatchNotice("slack/dm/D1", 90_500, "boom", 2)).toContain("같은 사안 반복 2회차");
+		expect(formatPendingDispatchNotice(DM_ORIGIN, 90_500, "boom", 2)).toContain("같은 사안 반복 2회차");
 	});
 });
 
@@ -104,8 +106,8 @@ describe("formatGateClosedNotice", () => {
 
 describe("formatStallNotice", () => {
 	const stall = (overrides: Partial<StallEscalation> = {}): StallEscalation => ({
-		originKey: "slack/dm/D1",
-		threadRef: "D1:1700.1",
+		originKey: DM_ORIGIN,
+		threadRef: `${OWNER_DM}:1700`,
 		opRef: "op:1",
 		kind: "notify",
 		count: 3,
@@ -115,7 +117,7 @@ describe("formatStallNotice", () => {
 
 	test("conversation: names the origin and minutes, says the turn was not cut, points at the real new-session command", () => {
 		const text = formatStallNotice(stall());
-		expect(text).toContain("slack/dm/D1");
+		expect(text).toContain(DM_ORIGIN);
 		expect(text).toContain("33분째");
 		expect(text).toContain("자동으로 끊지 않았습니다");
 		expect(text).toContain(COMMAND_TEXT.new);

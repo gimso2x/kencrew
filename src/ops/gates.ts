@@ -62,7 +62,7 @@ export const TURNS_FAILING_WINDOW_MS = 60 * 60_000;
 export const TURNS_FAILING_THRESHOLD = 3;
 
 /**
- * The Slack socket (or the Discord gateway) stays down this long before `slack_disconnected` (`discord_disconnected`)
+ * The Discord gateway stays down this long before `discord_disconnected`
  * opens; shorter blips reconnect by themselves.
  */
 export const SOCKET_DOWN_MS = 10 * 60_000;
@@ -101,7 +101,7 @@ export interface GatesOptions {
 	hostLoad?: Partial<HostLoadReader>;
 	/**
 	 * `costCap.dailyUsd` and the bot's zone (`config.timezone`, where "today" is). With a ceiling the `cost_cap` gate
-	 * exists and opens while today's ledger total has reached it (the day `!budget off` lifted it stays closed); without
+	 * exists and opens while today's ledger total has reached it (a warning only); without
 	 * one there is nothing to judge and no gate.
 	 */
 	dailyCap?: { usd: number; timezone: string };
@@ -162,7 +162,6 @@ export const GATE_NAMES = [
 	"backup_age",
 	"offsite_age",
 	"sweep_stalled",
-	"slack_disconnected",
 	"discord_disconnected",
 	"omp_runtime",
 	"frozen",
@@ -197,11 +196,6 @@ function dailySpend(db: Database, day: string): number {
 		cost: number;
 	} | null;
 	return row?.cost ?? 0;
-}
-
-/** Whether one of the ledger's stored flags (`slack_cursors`) exists: the day-scoped `!budget off` lives there. */
-function cursorExists(db: Database, cursorKey: string): boolean {
-	return db.query("SELECT 1 FROM slack_cursors WHERE cursor_key = ?").get(cursorKey) != null;
 }
 
 /**
@@ -349,26 +343,7 @@ export function collectGates(options: GatesOptions): Gate[] {
 		}
 	}
 
-	if (heartbeat === undefined) {
-		gates.push(unknownGate("slack_disconnected", "stamp=missing"));
-	} else if (heartbeat.socket?.state === "down") {
-		const downMs = now - heartbeat.socket.since.getTime();
-		// A since in the future (clock stepped back) cannot be aged: open, like the other stamps, rather than hide it.
-		gates.push(
-			downMs < -BACKUP_FUTURE_TOLERANCE_MS
-				? gate("slack_disconnected", true, "socket=down ts_in_future")
-				: gate(
-						"slack_disconnected",
-						downMs >= SOCKET_DOWN_MS,
-						`socket=down minutes=${Math.max(0, Math.floor(downMs / 60_000))}`,
-					),
-		);
-	} else {
-		// A stamp without the socket field comes from a daemon older than this gate: closed, as before.
-		gates.push(gate("slack_disconnected", false, heartbeat.socket === undefined ? "socket=unknown" : "socket=up"));
-	}
-
-	// Discord only when configured. Unlike the Slack socket, a stamp without the discord field cannot be read as health:
+	// Discord only when configured. A stamp without the discord field cannot be read as health:
 	// a daemon that runs Discord always reports its gateway, so a missing field means nothing to judge.
 	if (options.discordConfigured === true) {
 		if (heartbeat === undefined) gates.push(unknownGate("discord_disconnected", "stamp=missing"));
@@ -542,19 +517,16 @@ export function collectGates(options: GatesOptions): Gate[] {
 				: 0;
 		ledger.push(gate("turns_failing", failedTurns >= TURNS_FAILING_THRESHOLD, `recent=${failedTurns}`));
 
-		// The daily cost ceiling (`costCap.dailyUsd`): open while today's spend has reached it and monitors are stopped.
-		// A day the owner switched off with `!budget off` is closed (the brake is lifted, so nothing is wrong), and a
-		// ledger without the table (a daemon that never finished a turn) reads as zero spend.
+		// The daily cost ceiling (`costCap.dailyUsd`): open while today's spend has reached it (a warning only, nothing is
+		// stopped). A ledger without the table (a daemon that never finished a turn) reads as zero spend.
 		if (options.dailyCap !== undefined) {
 			const day = localDay(now, options.dailyCap.timezone);
 			const spend = tableExists(db, "usage_daily") ? dailySpend(db, day) : 0;
-			const off = tableExists(db, "slack_cursors") && cursorExists(db, `cost-cap-off:${day}`);
-			const over = spend >= options.dailyCap.usd && !off;
 			ledger.push(
 				gate(
 					"cost_cap",
-					over,
-					`today=${spend.toFixed(2)} cap=${options.dailyCap.usd.toFixed(2)}${off ? " off=today" : ""}`,
+					spend >= options.dailyCap.usd,
+					`today=${spend.toFixed(2)} cap=${options.dailyCap.usd.toFixed(2)}`,
 				),
 			);
 		}

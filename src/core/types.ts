@@ -1,10 +1,10 @@
-/** Already-normalized inbound message handed to the core (Slack adapter and `ompbot inject` produce the same shape). */
+/** Already-normalized inbound message handed to the core (the channel adapters and `ompbot inject` produce the same shape). */
 export interface InboundRecord {
 	platformMessageId: string;
 	originKey: string;
 	ownerVerified: true;
 	text: string;
-	/** Where replies go (Slack `thread_ts`). */
+	/** Where replies go (the platform's thread id). */
 	threadRef: string;
 }
 
@@ -28,7 +28,7 @@ export type CommandKind =
 
 /**
  * Slash command name of each kind (`-ompbot` suffix: several bots share the workspace). `distill` and `btw` are typed
- * as `!distill` / `!btw` only: their slash names are not in the Slack app manifests. `undo` restores the newest
+ * as `!distill` / `!btw` only: their slash names are not in the Discord command set. `undo` restores the newest
  * conversation turn's files (doc/plans/turn-undo.md), so its slash name is registered. `stop` (doc/plans/owner-stop-and-context.md)
  * is typed as `!stop` only too, so it works without re-applying the manifests. `restart`
  * (doc/plans/owner-restart-command.md) is typed as `!restart` only as well: the daemon restarts without a model turn.
@@ -71,7 +71,7 @@ export const COMMAND_OP_REF = new RegExp(
 
 /**
  * `!home`: makes the conversation it is typed in the owner's notice home (`Store.ownerHome()`). Typed text only: it has
- * no slash name, so the Slack manifests and the Discord command set stay as they are. Only the bare word counts.
+ * no slash name, so the Discord command set stays as it is. Only the bare word counts.
  */
 export const HOME_COMMAND = "!home";
 
@@ -92,7 +92,6 @@ export const TAKES_ARG: ReadonlySet<CommandKind> = new Set([
 	"queue",
 	"followup",
 	"btw",
-	"budget",
 ]);
 
 export interface ParsedCommand {
@@ -102,8 +101,8 @@ export interface ParsedCommand {
 }
 
 /**
- * A message is a command when it starts with `/<name>-ompbot` or `!<name>` (the Slack client refuses unregistered
- * `/` commands typed as text, so `!model` works in a DM or channel before the app manifest has the slash command).
+ * A message is a command when it starts with `/<name>-ompbot` or `!<name>` (`!model` works typed
+ * as text in a DM or channel without a registered slash command).
  */
 export function parseCommand(text: string): ParsedCommand | undefined {
 	const trimmed = text.trim();

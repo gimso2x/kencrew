@@ -8,18 +8,24 @@ import {
 	parseThreadRef,
 	QUOTED_HEADER,
 	stripFenceLookalikes,
-	unescapeSlackText,
 	wrapQuoted,
 } from "../src/core/normalize";
+import { BOT, OWNER } from "./helpers/bot-home";
+
+const DM = "200000000000000001";
+const CH = "300000000000000001";
+const TS = "1800000000000100";
+const ROOT = "1799999999000001";
 
 const base: NormalizeInput = {
-	userId: "UOWNER",
-	botUserId: "UBOT",
-	ownerUserId: "UOWNER",
+	userId: OWNER,
+	botUserId: BOT,
+	ownerUserId: OWNER,
 	text: "요약해 줘",
 	quoted: [],
-	channel: "D1",
-	ts: "1800000000.000100",
+	channel: DM,
+	ts: TS,
+	platform: "discord",
 };
 
 describe("normalizeInbound gating", () => {
@@ -28,23 +34,23 @@ describe("normalizeInbound gating", () => {
 		expect(r).toEqual({
 			accept: true,
 			inbound: {
-				platformMessageId: "D1:1800000000.000100",
-				originKey: "slack/dm/D1",
+				platformMessageId: `${DM}:${TS}`,
+				originKey: `discord/dm/${DM}`,
 				ownerVerified: true,
 				text: "요약해 줘",
-				threadRef: "D1:1800000000.000100",
+				threadRef: `${DM}:${TS}`,
 			},
 		});
 	});
 
 	test("reply inside a thread keeps the thread root", () => {
-		const r = normalizeInbound({ ...base, threadTs: "1799999999.000001" });
-		expect(r.accept && r.inbound.threadRef).toBe("D1:1799999999.000001");
+		const r = normalizeInbound({ ...base, threadTs: ROOT });
+		expect(r.accept && r.inbound.threadRef).toBe(`${DM}:${ROOT}`);
 	});
 
 	test("non-owner, bot, subtype and empty messages are rejected with a reason", () => {
-		expect(normalizeInbound({ ...base, userId: "UOTHER" })).toEqual({ accept: false, reason: "not_owner" });
-		expect(normalizeInbound({ ...base, userId: "UBOT", ownerUserId: "UBOT" })).toEqual({
+		expect(normalizeInbound({ ...base, userId: "100000000000000099" })).toEqual({ accept: false, reason: "not_owner" });
+		expect(normalizeInbound({ ...base, userId: BOT, ownerUserId: BOT })).toEqual({
 			accept: false,
 			reason: "bot_message",
 		});
@@ -56,58 +62,62 @@ describe("normalizeInbound gating", () => {
 	test("isOwner is false for missing or empty ids even when the owner id is empty", () => {
 		expect(isOwner(undefined, "")).toBe(false);
 		expect(isOwner("", "")).toBe(false);
-		expect(isOwner("U1", "U1")).toBe(true);
+		expect(isOwner(OWNER, OWNER)).toBe(true);
 	});
 });
 
 describe("originKeyForMessage (thread-scoped sessions)", () => {
 	test("a channel thread reply gets its own origin under the root ts", () => {
-		expect(originKeyForMessage("C1", "channel", "200.2", "100.1", "질문")).toBe("slack/ch/C1/t/100.1");
+		expect(originKeyForMessage(CH, "channel", "2002", "1001", "질문", "discord")).toBe(`discord/ch/${CH}/t/1001`);
 	});
 
 	test("a channel root and a pseudo-thread parent open their own thread origin under their own ts", () => {
-		expect(originKeyForMessage("C1", "channel", "100.1", undefined, "질문")).toBe("slack/ch/C1/t/100.1");
-		expect(originKeyForMessage("C1", "channel", "100.1", "", "질문")).toBe("slack/ch/C1/t/100.1");
-		// Slack history shape: a root with replies carries thread_ts equal to its own ts.
-		expect(originKeyForMessage("C1", "channel", "100.1", "100.1", "질문")).toBe("slack/ch/C1/t/100.1");
+		expect(originKeyForMessage(CH, "channel", "1001", undefined, "질문", "discord")).toBe(`discord/ch/${CH}/t/1001`);
+		expect(originKeyForMessage(CH, "channel", "1001", "", "질문", "discord")).toBe(`discord/ch/${CH}/t/1001`);
+		// A root with replies can carry a thread id equal to its own id.
+		expect(originKeyForMessage(CH, "channel", "1001", "1001", "질문", "discord")).toBe(`discord/ch/${CH}/t/1001`);
 	});
 
 	test("a channel root that is a chat command stays on the channel origin; a command reply stays in its thread", () => {
 		for (const text of ["!model fake/beta", "!followup 이어서", "!new", "/thinking-ompbot high"]) {
-			expect(originKeyForMessage("C1", "channel", "100.1", undefined, text)).toBe("slack/ch/C1");
+			expect(originKeyForMessage(CH, "channel", "1001", undefined, text, "discord")).toBe(`discord/ch/${CH}`);
 		}
 		// `!new` takes no argument, so with one it is a plain message — and a plain root opens its own thread origin.
-		expect(originKeyForMessage("C1", "channel", "100.1", undefined, "!new 작업")).toBe("slack/ch/C1/t/100.1");
-		expect(originKeyForMessage("C1", "channel", "200.2", "100.1", "!model fake/beta")).toBe("slack/ch/C1/t/100.1");
+		expect(originKeyForMessage(CH, "channel", "1001", undefined, "!new 작업", "discord")).toBe(
+			`discord/ch/${CH}/t/1001`,
+		);
+		expect(originKeyForMessage(CH, "channel", "2002", "1001", "!model fake/beta", "discord")).toBe(
+			`discord/ch/${CH}/t/1001`,
+		);
 	});
 
 	test("DMs ignore threads entirely (the owner DM is one continuous conversation)", () => {
-		expect(originKeyForMessage("D1", "im", "200.2", "100.1", "질문")).toBe("slack/dm/D1");
-		expect(originKeyForMessage("D1", undefined, "200.2", "100.1", "질문")).toBe("slack/dm/D1");
-		expect(originKeyForMessage("D1", "im", "100.1", undefined, "질문")).toBe("slack/dm/D1");
+		expect(originKeyForMessage(DM, "im", "2002", "1001", "질문", "discord")).toBe(`discord/dm/${DM}`);
+		expect(originKeyForMessage(DM, undefined, "2002", "1001", "질문", "discord")).toBe(`discord/dm/${DM}`);
+		expect(originKeyForMessage(DM, "im", "1001", undefined, "질문", "discord")).toBe(`discord/dm/${DM}`);
 	});
 
 	test("normalizeInbound routes a channel root to its own thread origin, a root command to the channel", () => {
-		const root = normalizeInbound({ ...base, channel: "C1", channelType: "channel" });
+		const root = normalizeInbound({ ...base, channel: CH, channelType: "channel" });
 		expect(root.accept && root.inbound).toMatchObject({
-			originKey: "slack/ch/C1/t/1800000000.000100",
-			threadRef: "C1:1800000000.000100",
+			originKey: `discord/ch/${CH}/t/${TS}`,
+			threadRef: `${CH}:${TS}`,
 		});
-		const command = normalizeInbound({ ...base, channel: "C1", channelType: "channel", text: "!model fake/beta" });
-		expect(command.accept && command.inbound.originKey).toBe("slack/ch/C1");
-		expect(normalizeInbound(base)).toMatchObject({ inbound: { originKey: "slack/dm/D1" } });
+		const command = normalizeInbound({ ...base, channel: CH, channelType: "channel", text: "!model fake/beta" });
+		expect(command.accept && command.inbound.originKey).toBe(`discord/ch/${CH}`);
+		expect(normalizeInbound(base)).toMatchObject({ inbound: { originKey: `discord/dm/${DM}` } });
 	});
 
 	test("normalizeInbound routes a channel thread reply to the thread origin with the root threadRef", () => {
-		const r = normalizeInbound({ ...base, channel: "C1", channelType: "channel", threadTs: "1799999999.000001" });
-		expect(r.accept && r.inbound.originKey).toBe("slack/ch/C1/t/1799999999.000001");
-		expect(r.accept && r.inbound.threadRef).toBe("C1:1799999999.000001");
+		const r = normalizeInbound({ ...base, channel: CH, channelType: "channel", threadTs: ROOT });
+		expect(r.accept && r.inbound.originKey).toBe(`discord/ch/${CH}/t/${ROOT}`);
+		expect(r.accept && r.inbound.threadRef).toBe(`${CH}:${ROOT}`);
 	});
 
 	test("isThreadOrigin classifies origins", () => {
-		expect(isThreadOrigin("slack/ch/C1/t/100.1")).toBe(true);
-		expect(isThreadOrigin("slack/ch/C1")).toBe(false);
-		expect(isThreadOrigin("slack/dm/D1")).toBe(false);
+		expect(isThreadOrigin(`discord/ch/${CH}/t/1001`)).toBe(true);
+		expect(isThreadOrigin(`discord/ch/${CH}`)).toBe(false);
+		expect(isThreadOrigin(`discord/dm/${DM}`)).toBe(false);
 		expect(isThreadOrigin("ompbot/work/lane")).toBe(false);
 		expect(isThreadOrigin("monitor/m1")).toBe(false);
 	});
@@ -155,7 +165,7 @@ describe("quoted fencing", () => {
 		const header = lines.indexOf(QUOTED_HEADER);
 		const warning = lines[header - 1] ?? "";
 		expect(warning.startsWith("⚠️ ")).toBe(true);
-		expect(warning).toContain("출처: 전달·인용된 Slack 글");
+		expect(warning).toContain("출처: 전달·인용된 Discord 글");
 		expect(warning).not.toContain("Ignore");
 		expect(warning).not.toContain("secrets");
 		expect(lines.filter((line) => line.startsWith("⚠️"))).toHaveLength(1);
@@ -192,12 +202,8 @@ describe("quoted fencing", () => {
 
 describe("helpers", () => {
 	test("parseThreadRef round trips and rejects malformed refs", () => {
-		expect(parseThreadRef("D1:1.2")).toEqual({ channel: "D1", threadTs: "1.2" });
-		expect(parseThreadRef("D1")).toBeUndefined();
-		expect(parseThreadRef(":1.2")).toBeUndefined();
-	});
-
-	test("unescapeSlackText decodes only the three Slack entities", () => {
-		expect(unescapeSlackText("a &lt; b &amp;&amp; c &gt; d &amp;lt;")).toBe("a < b && c > d &lt;");
+		expect(parseThreadRef(`${DM}:1002`)).toEqual({ channel: DM, threadTs: "1002" });
+		expect(parseThreadRef(DM)).toBeUndefined();
+		expect(parseThreadRef(":1002")).toBeUndefined();
 	});
 });

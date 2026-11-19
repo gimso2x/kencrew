@@ -10,16 +10,18 @@ export async function repoMatchesCommonDir(
 	repos: readonly string[],
 	run: ProcessRunner = realProcessRunner,
 ): Promise<boolean> {
-	const commonDir = async (dir: string): Promise<string | undefined> => {
-		const result = await run(["git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
-			timeoutMs: 10_000,
-			env: dispatchEnv(process.env),
-		});
-		const found = result.stdout.trim();
-		return result.code === 0 && found !== "" ? found : undefined;
-	};
-	const own = await commonDir(path);
+	const own = await gitCommonDir(path, run);
 	if (own === undefined) return false;
-	for (const repo of repos) if ((await commonDir(repo)) === own) return true;
+	for (const repo of repos) if ((await gitCommonDir(repo, run)) === own) return true;
 	return false;
+}
+
+/** The absolute git common directory of the work tree at `dir`; `undefined` when git cannot read it. */
+export async function gitCommonDir(dir: string, run: ProcessRunner = realProcessRunner): Promise<string | undefined> {
+	const result = await run(["git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir"], {
+		timeoutMs: 10_000,
+		env: dispatchEnv(process.env),
+	});
+	const found = result.stdout.trim();
+	return result.code === 0 && found !== "" ? found : undefined;
 }

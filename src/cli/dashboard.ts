@@ -1,31 +1,36 @@
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import type { Server } from "bun";
 import { loadConfig } from "../config";
 import type { LiveView } from "../core/live-turn";
 import { callDaemon } from "../daemon/ipc";
+import { readDiff } from "../dashboard/diff";
 import { readMonitorDetail } from "../dashboard/monitor-detail";
 import { resolvePeers } from "../dashboard/peers";
 import { startDashboardServer } from "../dashboard/server";
 import { readBoardPrompts, readBoardTasks } from "../dashboard/snapshot";
 import { boardSourceFor, hasConfig, snapshotReader } from "../dashboard/snapshot-assembly";
 import { readThreadConversation } from "../dashboard/thread-conversation";
-import { readTurnTrace } from "../dashboard/trace";
+import { readCardTrace, readJobTraceByName, readTurnTrace } from "../dashboard/trace";
 import { realProcessRunner } from "../dispatch/omp";
 import { redact } from "../redact";
 import { indexEnvSecrets } from "../safety/secret-index";
 import { hostTimezone } from "../time";
+import { sourceAgentDir } from "./omp";
 
 export const DASHBOARD_USAGE = `  dashboard [--port <n>] [--bind 127.0.0.1|::1]
                                  read-only status page on a loopback port until SIGTERM: HTML at /, JSON at
-                                 /api/snapshot, a turn's waterfall at /api/turn/<id>/trace, a monitor's masked
-                                 instruction and runs at /api/monitor/detail?id=<id>, a conversation's
-                                 masked omp session at /api/thread/conversation?origin=<key>, what its running turn
+                                 /api/snapshot, a turn's waterfall at /api/turn/<id>/trace, a background job's
+                                 waterfall at /api/job/trace?name=<name>, a monitor's masked instruction and runs at
+                                 /api/monitor/detail?id=<id>, a conversation's masked omp session at
+                                 /api/thread/conversation?origin=<key>, a lane's or [TASK]'s change at /api/diff?lane=<name>|task=<id>, what its running turn
                                  is writing at /api/thread/live?origin=<key> (stream: /api/thread/live/events) (also
                                  under a prefix like /task/); --port/--bind override config
                                  dashboard {port, bind?, herdrWebUrl?, opsStatus?, usageLimits?, peerHomes?}; no port in either → exit 2. With config
                                  herdrBoard it also shows the herdr agent board (api/board, api/board/events,
-                                 ?card=<key> detail with the pane's conversation and plan)
+                                 ?card=<key> detail with the pane's conversation, plan and, for a local omp worker, its last turn's waterfall at
+                                 /api/pane/trace?card=<key>)
 `;
 
 const LOOPBACK = ["127.0.0.1", "::1"] as const;
@@ -61,10 +66,14 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 	const port = flagPort ?? config?.dashboard?.port;
 	if (port === undefined) return usage("no port: pass --port or set config dashboard.port");
 	const hostname = flagBind ?? config?.dashboard?.bind ?? "127.0.0.1";
-	// Value masking like the daemon's, minus the Slack token files this process does not read.
+	// Value masking like the daemon's, minus the token files this process does not read.
 	indexEnvSecrets(process.env);
 
 	const now = () => Date.now();
+	const sessionWhere = () => ({
+		userHome: process.env.HOME ?? homedir(),
+		sessionsRoot: join(sourceAgentDir(process.env), "sessions"),
+	});
 	const board = boardSourceFor(config, homeDir);
 	const snapshot = snapshotReader({
 		homeDir,
@@ -82,7 +91,14 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 			port,
 			hostname,
 			snapshot,
-			trace: (inboundId) => readTurnTrace(homeDir, inboundId, now()),
+			trace: (inboundId) => readTurnTrace(homeDir, inboundId, now(), sessionWhere()),
+			cardTrace: (card) => readCardTrace(card, { ...sessionWhere(), now: now() }),
+			jobTrace: (name) =>
+				readJobTraceByName(homeDir, name, {
+					...sessionWhere(),
+					now: now(),
+					timezone: config?.timezone ?? hostTimezone(),
+				}),
 			conversation: (origin, before) => readThreadConversation(homeDir, origin, before),
 			// The daemon's procedure file roots (MonitorScheduler in daemon.ts).
 			monitorDetail: (id) =>
@@ -96,6 +112,7 @@ export async function dashboardCommand(args: string[], homeDir: string): Promise
 					id,
 					resolvePeers(config?.dashboard, config?.timezone ?? hostTimezone()),
 				),
+			diff: (subject) => readDiff(homeDir, subject),
 			// 800 ms bound: a wedged daemon must not hold a read past the next tick (callDaemon defaults to 120 s).
 			live: async (origin) => {
 				const answer = await callDaemon(join(homeDir, "ompbot.sock"), { op: "live", origin }, 800);

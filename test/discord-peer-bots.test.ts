@@ -14,34 +14,24 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { writeFreeze } from "../src/ops/freeze";
 import { redact } from "../src/redact";
 import { type FloorsSurface, spawnSystemPrompt } from "../src/safety/prompt";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import {
-	DISCORD_OWNER,
-	makeHome,
-	type TestHome,
-	WaitingDiscordTransport,
-	WaitingTransport,
-	withDiscord,
-} from "./helpers/bot-home";
+import { makeHome, OWNER, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
 const PEER = "200000000000000001";
 const STRANGER = "200000000000000009";
 const BOT = "500000000000000000";
 const GUILD = "300000000000000001";
 const CH = "111111111111111111";
-const SLACK_PEER = "UPEER00001";
 const WAIT_MS = 4_000;
 
 describe("allowedMentions (C)", () => {
 	test("only the owner and peer bots named in the content are notified; parse stays empty", () => {
 		const channel = new DiscordChannel(new WaitingDiscordTransport(), {
-			ownerUserId: DISCORD_OWNER,
+			ownerUserId: OWNER,
 			peerBots: [{ userId: PEER }],
 		});
-		expect(channel.allowedMentions(`<@${PEER}> <@!${DISCORD_OWNER}> <@${STRANGER}> @everyone 검토`)).toEqual({
+		expect(channel.allowedMentions(`<@${PEER}> <@!${OWNER}> <@${STRANGER}> @everyone 검토`)).toEqual({
 			parse: [],
-			users: [DISCORD_OWNER, PEER],
+			users: [OWNER, PEER],
 		});
 		expect(channel.allowedMentions(`<@${STRANGER}> 만`)).toEqual({ parse: [] });
 	});
@@ -74,8 +64,7 @@ async function boot(config: OmpbotConfig, discord: WaitingDiscordTransport, hold
 	const sessions = new FakeSessionStore();
 	const discordConfig = config.channels.discord;
 	const channels: ChannelBinding[] = [
-		new SlackBinding(new SlackChannel(new WaitingTransport())),
-		new DiscordBinding(new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER, peerBots: discordConfig?.peerBots })),
+		new DiscordBinding(new DiscordChannel(discord, { ownerUserId: OWNER, peerBots: discordConfig?.peerBots })),
 	];
 	const clock = { now: () => Date.now() };
 	const started = new Daemon({
@@ -107,12 +96,11 @@ async function boot(config: OmpbotConfig, discord: WaitingDiscordTransport, hold
 }
 
 function withPeers(): OmpbotConfig {
-	const config = withDiscord(home);
+	const config = home.config;
 	const discord = config.channels.discord;
-	if (discord === undefined) throw new Error("withDiscord without channels.discord");
+	if (discord === undefined) throw new Error("home without channels.discord");
 	return {
 		...config,
-		peerBots: [{ userId: SLACK_PEER, name: "떡" }],
 		channels: { ...config.channels, discord: { ...discord, peerBots: [{ userId: PEER, name: "떡" }] } },
 	};
 }
@@ -151,7 +139,7 @@ describe("floors peer line (D)", () => {
 		return { text, dynamic: (dynamic ?? "").split(",").filter((name) => name !== "") };
 	}
 
-	test("Discord origins name channels.discord.peerBots as <@snowflake>, Slack origins the top-level peerBots", async () => {
+	test("Discord origins name channels.discord.peerBots as <@snowflake>", async () => {
 		const made = await boot(withPeers(), new WaitingDiscordTransport());
 		const discord = floors(
 			`discord/ch/${CH}/t/700000000000000001`,
@@ -159,14 +147,10 @@ describe("floors peer line (D)", () => {
 		);
 		expect(discord.text).toContain(`- 이 대화의 피어 봇: 떡 = <@${PEER}>`);
 		expect(discord.dynamic).toContain("peers");
-		const slack = floors("slack/ch/C0PEER0001/t/1.1", made.floorsSurfaceFor("slack/ch/C0PEER0001/t/1.1"));
-		expect(slack.text).toContain(`- 이 대화의 피어 봇: 떡 = <@${SLACK_PEER}>`);
-		expect(slack.text).not.toContain(PEER);
-		expect(slack.dynamic).toContain("peers");
 	});
 
 	test("a platform without peers gets no line and no tag", async () => {
-		const made = await boot(withDiscord(home), new WaitingDiscordTransport());
+		const made = await boot(home.config, new WaitingDiscordTransport());
 		const origin = `discord/ch/${CH}/t/700000000000000001`;
 		expect(made.floorsSurfaceFor(origin).peers).toBeUndefined();
 		const out = floors(origin, made.floorsSurfaceFor(origin));
@@ -245,7 +229,7 @@ describe("daemon: a Discord peer request (AC-5)", () => {
 			id: root,
 			channel_id: CH,
 			guild_id: GUILD,
-			author: { id: DISCORD_OWNER },
+			author: { id: OWNER },
 			content: `<@${BOT}> 오너 질문`,
 			type: 0,
 		});

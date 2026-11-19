@@ -6,6 +6,8 @@
  */
 export const TRACE_CLIENT = `function traceController(host) {
 	let id = null;
+	let url = "";
+	let notes = null;
 	let title = "";
 	let answer = null;
 	let receivedAt = 0;
@@ -14,7 +16,31 @@ export const TRACE_CLIENT = `function traceController(host) {
 	let openSpan = null;
 	let generation = 0;
 	let ticks = 0;
+	// 폭포 (default) or 흐름도: the choice survives a reload; storage may be blocked, then it stays 폭포.
+	let mode = "waterfall";
+	try {
+		if (localStorage.getItem("trace-mode") === "flow") mode = "flow";
+	} catch (error) {
+		mode = "waterfall";
+	}
 	const known = new Set();
+	const bar = document.createElement("div");
+	bar.className = "fl-mode";
+	bar.setAttribute("role", "group");
+	bar.setAttribute("aria-label", "보기 방식");
+	bar.hidden = true;
+	bar.innerHTML = '<button type="button" class="button is-ghost is-sm" data-trace-mode="waterfall">폭포</button><button type="button" class="button is-ghost is-sm" data-trace-mode="flow">흐름도</button>';
+	const view = document.createElement("div");
+	host.replaceChildren(bar, view);
+	function setMode(next) {
+		mode = next;
+		try {
+			localStorage.setItem("trace-mode", next);
+		} catch (error) {
+			// Storage blocked: the choice lasts until the page is left.
+		}
+		draw();
+	}
 	const clock = () => (answer && answer.ok ? answer.now + (Date.now() - receivedAt) : Date.now());
 	const rowEl = (spanId) => {
 		for (const row of host.querySelectorAll("[data-span]")) if (row.getAttribute("data-span") === spanId) return row;
@@ -47,18 +73,53 @@ export const TRACE_CLIENT = `function traceController(host) {
 		}
 		return true;
 	}
+	/** Same cards: only a card whose data-sig changed is replaced (keeping focus when it had it). */
+	function patchFlow(prev, next) {
+		const from = Array.from(next.querySelectorAll("[data-flow-card]"));
+		const to = Array.from(prev.querySelectorAll("[data-flow-card]"));
+		if (from.length !== to.length) return false;
+		for (let i = 0; i < from.length; i++) if (from[i].getAttribute("data-flow-card") !== to[i].getAttribute("data-flow-card")) return false;
+		for (let i = 0; i < from.length; i++) {
+			if (from[i].getAttribute("data-sig") === to[i].getAttribute("data-sig")) continue;
+			const focused = document.activeElement === to[i];
+			to[i].replaceWith(from[i]);
+			if (focused) from[i].focus({ preventScroll: true });
+		}
+		return true;
+	}
 	function draw() {
 		if (!answer) return;
+		if (!answer.ok && notes && notes[answer.error]) {
+			const line = document.createElement("p");
+			line.className = "note";
+			line.textContent = notes[answer.error];
+			bar.hidden = true;
+			view.replaceChildren(line);
+			return;
+		}
+		bar.hidden = !answer.ok;
+		for (const button of bar.querySelectorAll("[data-trace-mode]")) {
+			button.setAttribute("aria-pressed", String(button.getAttribute("data-trace-mode") === mode));
+		}
+		const state = { now: clock(), fold: fold, focus: focus, open: openSpan, title: title };
 		const template = document.createElement("template");
-		template.innerHTML = renderTrace(answer, { now: clock(), fold: fold, focus: focus, open: openSpan, title: title });
+		if (answer.ok && mode === "flow") {
+			template.innerHTML = renderFlow(answer, state);
+			const nextFlow = template.content.firstElementChild;
+			const prevFlow = view.firstElementChild;
+			if (prevFlow && nextFlow && prevFlow.matches("[data-flow]") && patchFlow(prevFlow, nextFlow)) return;
+			view.replaceChildren(template.content);
+			return;
+		}
+		template.innerHTML = renderTrace(answer, state);
 		const next = template.content.firstElementChild;
-		const prev = host.firstElementChild;
+		const prev = view.firstElementChild;
 		if (prev && next && prev.matches("[data-trace]") && patch(prev, next)) return;
 		const active = document.activeElement;
 		const hadFocus = !!active && host.contains(active);
 		const tree = host.querySelector(".tw-tree");
 		const scroll = tree ? tree.scrollTop : 0;
-		host.replaceChildren(template.content);
+		view.replaceChildren(template.content);
 		const again = host.querySelector(".tw-tree");
 		if (again) again.scrollTop = scroll;
 		if (hadFocus && focus) {
@@ -74,7 +135,7 @@ export const TRACE_CLIENT = `function traceController(host) {
 	async function load() {
 		const mine = generation;
 		try {
-			const response = await fetch("api/turn/" + encodeURIComponent(id) + "/trace", { cache: "no-store" });
+			const response = await fetch(url, { cache: "no-store" });
 			if (!response.ok && response.status !== 404) throw new Error("HTTP " + response.status);
 			const body = await response.json();
 			if (mine !== generation) return;
@@ -96,7 +157,8 @@ export const TRACE_CLIENT = `function traceController(host) {
 			const line = document.createElement("p");
 			line.className = "note";
 			line.textContent = "트레이스를 읽지 못했어요 (" + (error && error.message ? error.message : String(error)) + ")";
-			host.replaceChildren(line);
+			bar.hidden = true;
+			view.replaceChildren(line);
 		}
 	}
 	function moveTo(row) {
@@ -126,11 +188,14 @@ export const TRACE_CLIENT = `function traceController(host) {
 		return out;
 	}
 	return {
-		open(turnId, turnTitle) {
+		/** \`source\` = { url, notes } reads another address (a worker card's) and words its 404 codes; default: the turn's. */
+		open(turnId, turnTitle, source) {
 			if (turnTitle) title = turnTitle;
 			host.hidden = false;
 			if (turnId === id) return draw();
 			id = turnId;
+			url = source ? source.url : "api/turn/" + encodeURIComponent(turnId) + "/trace";
+			notes = source ? source.notes : null;
 			answer = null;
 			fold = {};
 			focus = null;
@@ -142,8 +207,13 @@ export const TRACE_CLIENT = `function traceController(host) {
 			wrap.className = "skeleton";
 			wrap.setAttribute("role", "status");
 			wrap.innerHTML = '<p class="note-sub">트레이스를 불러오는 중…</p><div class="skeleton-bar is-w90"></div><div class="skeleton-bar is-w70"></div><div class="skeleton-bar is-w50"></div>';
-			host.replaceChildren(wrap);
+			bar.hidden = true;
+			view.replaceChildren(wrap);
 			load();
+		},
+		/** Read the open trace once more (a card's status moved: its live flag and running spans change). */
+		reload() {
+			if (id !== null) load();
 		},
 		close() {
 			if (id === null) return;
@@ -151,7 +221,8 @@ export const TRACE_CLIENT = `function traceController(host) {
 			answer = null;
 			generation += 1;
 			host.hidden = true;
-			host.replaceChildren();
+			bar.hidden = true;
+			view.replaceChildren();
 		},
 		/** Every second: running bars and the "now" line move; every fifth, the trace is read again. */
 		tick() {
@@ -226,6 +297,23 @@ export const TRACE_CLIENT = `function traceController(host) {
 		/** A click inside the waterfall; true = handled. */
 		click(target) {
 			if (!answer || !answer.ok) return false;
+			const modeButton = target.closest("[data-trace-mode]");
+			if (modeButton) {
+				setMode(modeButton.getAttribute("data-trace-mode") === "flow" ? "flow" : "waterfall");
+				return true;
+			}
+			// A flow card hands over to the waterfall with that worker unfolded and focused.
+			const worker = target.closest("[data-flow-worker]");
+			if (worker) {
+				const spanId = worker.getAttribute("data-flow-worker");
+				fold[spanId] = false;
+				focus = spanId;
+				setMode("waterfall");
+				refocus();
+				const row = rowEl(spanId);
+				if (row) row.scrollIntoView({ block: "nearest" });
+				return true;
+			}
 			if (target.closest("[data-trace-close]")) {
 				openSpan = null;
 				draw();

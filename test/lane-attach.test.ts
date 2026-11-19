@@ -12,9 +12,16 @@ import type { OmpState } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { newestSessionFile } from "../src/omp/session-heal";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	CHANNEL,
+	discordBinding,
+	GUILD,
+	makeHome,
+	OWNER,
+	OWNER_DM,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { makeRepo } from "./helpers/git-fixtures";
 import { removeRepoAndWorktrees } from "./helpers/lane-harness";
 
@@ -89,7 +96,7 @@ describe("lane attach / detach through the daemon", () => {
 	let repos: string[];
 	let daemon: Daemon | undefined;
 	let drivers: FileSessionDriver[];
-	let transport: WaitingTransport;
+	let transport: WaitingDiscordTransport;
 	let logs: string[];
 	let alivePids: Set<number>;
 
@@ -97,7 +104,8 @@ describe("lane attach / detach through the daemon", () => {
 		home = makeHome("ompbot-lane-attach-");
 		repos = [];
 		drivers = [];
-		transport = new WaitingTransport();
+		transport = new WaitingDiscordTransport();
+		transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
 		logs = [];
 		alivePids = new Set([4242]);
 	});
@@ -112,8 +120,16 @@ describe("lane attach / detach through the daemon", () => {
 	async function startDaemon(): Promise<Daemon> {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
-			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			config: {
+				...home.config,
+				channels: {
+					discord: {
+						...(home.config.channels.discord as NonNullable<typeof home.config.channels.discord>),
+						laneChannelId: CHANNEL,
+					},
+				},
+			},
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: (line) => logs.push(line), clock: { now: () => Date.now() }, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -129,15 +145,15 @@ describe("lane attach / detach through the daemon", () => {
 		return daemon;
 	}
 
-	const ownerMessage = (text: string, ts: string, threadTs: string) =>
+	/** An owner message in the lane's thread (the thread's id is its root message's id). */
+	const ownerMessage = (text: string, id: string, thread: string) =>
 		transport.emitMessage({
-			type: "message",
-			channel: "D1",
-			channel_type: "im",
-			user: OWNER,
-			text,
-			ts,
-			thread_ts: threadTs,
+			id,
+			channel_id: thread,
+			guild_id: GUILD,
+			author: { id: OWNER },
+			content: text,
+			type: 0,
 		});
 
 	/** A lane whose first turn is running (held by the fake omp until aborted). */
@@ -146,13 +162,13 @@ describe("lane attach / detach through the daemon", () => {
 		title: string,
 	): Promise<{ lane: LaneRow; rootTs: string; child: FileSessionDriver }> {
 		const repo = makeRepo(repos);
-		await d.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: ${title} @${repo}` });
+		await d.inject({ origin: `discord/dm/${OWNER_DM}`, asOwner: true, text: `작업: ${title} @${repo}` });
 		await transport.waitForPosts((text) => text.includes(`작업 레인 \`${title}\`을 시작했습니다`));
 		const root = transport.posts((text) => text === `🔄 ${title}`)[0];
 		await until(() => drivers.some((driver) => driver.calls.some((call) => call.startsWith("prompt:"))));
 		const lane = d.store.getLane(title) as LaneRow;
 		expect(lane.status).toBe("working");
-		return { lane, rootTs: root?.ts ?? "", child: drivers.at(-1) as FileSessionDriver };
+		return { lane, rootTs: root?.id ?? "", child: drivers.at(-1) as FileSessionDriver };
 	}
 
 	const attach = (d: Daemon, lane: string, extra: Record<string, unknown> = {}) =>
@@ -234,11 +250,11 @@ describe("lane attach / detach through the daemon", () => {
 		utimesSync(file, new Date(1_000_000), new Date(1_000_000));
 		expect(newestSessionFile(lane.sessionDir)).toBe(newer);
 
-		await ownerMessage("터미널 중에 보낸 지시", "1900000000.000100", rootTs);
-		await ownerMessage("!model fake/beta", "1900000000.000200", rootTs);
+		await ownerMessage("터미널 중에 보낸 지시", "1900000000000000100", rootTs);
+		await ownerMessage("!model fake/beta", "1900000000000000200", rootTs);
 		await transport.waitForPosts((text) => text.includes("터미널에서 작업 중이라 전달하지 않았습니다"));
-		expect(d.store.getInbound("D1:1900000000.000100")?.state).toBe("pending");
-		expect(d.store.getInbound("D1:1900000000.000200")?.state).toBe("pending");
+		expect(d.store.getInbound(`${CHANNEL}:1900000000000000100`)?.state).toBe("pending");
+		expect(d.store.getInbound(`${CHANNEL}:1900000000000000200`)?.state).toBe("pending");
 		expect(drivers).toHaveLength(1); // not even the command started a child
 
 		expect(await detach(d, lane.name, file)).toMatchObject({ ok: true });
@@ -253,7 +269,7 @@ describe("lane attach / detach through the daemon", () => {
 		expect(d.store.getOrigin(lane.originKey)?.epoch).toBe(1);
 		expect(d.store.getLane(lane.name)?.status).toBe("working");
 		expect(d.store.getLane(lane.name)?.meta.attach).toBeUndefined();
-		expect(d.store.getInbound("D1:1900000000.000100")?.state).toBe("dispatched");
+		expect(d.store.getInbound(`${CHANNEL}:1900000000000000100`)?.state).toBe("dispatched");
 		// The hand-back summary: one terminal turn, its cost, no resume steer into the lane.
 		expect(transport.posts((text) => text.includes("TUI에서 1턴") && text.includes("$0.25"))).toHaveLength(1);
 		expect(next.calls.some((call) => call.includes("오너가 재개했습니다"))).toBe(false);
@@ -274,7 +290,7 @@ describe("lane attach / detach through the daemon", () => {
 		expect(after?.meta.sessionChoices).toEqual({ files: [file, created], resume: true });
 		expect(d.store.getOrigin(lane.originKey)?.sessionFile).toBe(file);
 		const card = transport.posts((text) => text.includes("이어 쓸 파일을 고르세요"))[0];
-		const actions = JSON.stringify(card?.blocks ?? []);
+		const actions = JSON.stringify(card?.components ?? []);
 		expect(actions).toContain(`ompbot:lane:session:${lane.name}:0`);
 		expect(actions).toContain(`ompbot:lane:session:${lane.name}:1`);
 		expect(parseLaneActionId(`ompbot:lane:session:${lane.name}:1`)).toEqual({
@@ -283,17 +299,22 @@ describe("lane attach / detach through the daemon", () => {
 			index: 1,
 		});
 
-		await transport.emitBlockAction({
-			user: { id: OWNER },
-			channel: { id: "D1" },
-			message: { ts: card?.ts ?? "" },
-			actions: [{ action_id: `ompbot:lane:session:${lane.name}:1`, value: lane.name }],
+		await transport.emitInteraction({
+			id: "800000000000000001",
+			application_id: "600000000000000000",
+			type: 3,
+			token: "token-1",
+			channel_id: card?.channelId ?? "",
+			guild_id: GUILD,
+			member: { user: { id: OWNER } },
+			data: { custom_id: `ompbot:lane:session:${lane.name}:1`, component_type: 2 },
+			message: { id: card?.id ?? "", channel_id: card?.channelId ?? "" },
 		});
 		await transport.waitForPosts((text) => text.includes("이어 쓸 파일을"));
 		expect(d.store.getOrigin(lane.originKey)?.sessionFile).toBe(created);
 		expect(d.store.getLane(lane.name)?.status).toBe("working");
 		expect(d.store.getLane(lane.name)?.meta.sessionChoices).toBeUndefined();
-		await ownerMessage("이어서", "1900000000.000300", rootTs);
+		await ownerMessage("이어서", "1900000000000000300", rootTs);
 		await until(() => drivers.length === 2);
 		await until(() => (drivers[1]?.calls ?? []).includes(`switchSession:${created}`));
 	});
@@ -303,7 +324,7 @@ describe("lane attach / detach through the daemon", () => {
 		const d = await startDaemon();
 		const { lane, rootTs } = await runningLane(d, "orphan");
 		const file = (await attach(d, lane.name)).sessionFile as string;
-		await ownerMessage("고아 중에 온 글", "1900000000.000400", rootTs);
+		await ownerMessage("고아 중에 온 글", "1900000000000000400", rootTs);
 		await transport.waitForPosts((text) => text.includes("터미널에서 작업 중이라 전달하지 않았습니다"));
 
 		await d.sweep();

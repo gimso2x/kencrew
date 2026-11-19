@@ -69,6 +69,8 @@ export interface TaskLandDeps {
 	git?: GitRunner;
 	/** The daemon's one lander (`createLaneLander`), shared with the work lanes. */
 	land: LandLane;
+	/** `button`: the owner clicked `머지` — an unproven claim word the card already showed does not hand the landing back. */
+	mode: "auto" | "button";
 	/** Judges the task at its worktree's HEAD with the `[check:]` re-runs and the integrity read (`evaluateTask`). */
 	judge(row: TaskRow): Promise<TaskEvaluation>;
 	/** Read right before the landing (`taskLandHold`): why it must not happen now; `undefined` = go on. */
@@ -309,7 +311,13 @@ async function refreshEvidence(
 }
 
 /** Why the fixed tip may not land after the re-judgement (설계 4); `undefined` = it may. */
-async function rejudge(git: GitRunner, row: TaskRow, sha: string, judge: TaskLandDeps["judge"]) {
+async function rejudge(
+	git: GitRunner,
+	row: TaskRow,
+	sha: string,
+	judge: TaskLandDeps["judge"],
+	mode: TaskLandDeps["mode"],
+) {
 	let evaluation: TaskEvaluation;
 	try {
 		evaluation = await judge(row);
@@ -319,7 +327,8 @@ async function rejudge(git: GitRunner, row: TaskRow, sha: string, judge: TaskLan
 	if (!evaluation.ok) return `판정 오류: ${evaluation.error}`;
 	const { problems, integrityWarnings } = evaluation.judgement;
 	if (problems.length > 0) return `재판정 문제: ${problems[0]}`;
-	const holding = holdingIntegrityWarnings(row.risk, integrityWarnings);
+	// Risk L0 is only the lowest rung that exempts claim words: a button click exempts them at any risk.
+	const holding = holdingIntegrityWarnings(mode === "button" ? "L0" : row.risk, integrityWarnings);
 	if (holding.length > 0) return `무결성 경고: ${holding[0]}`;
 	const tip = await git(["-C", row.repo, "rev-parse", "--verify", "-q", `refs/heads/${row.branch}^{commit}`]);
 	if (tip.code !== 0 || tip.stdout.trim() !== sha) {
@@ -346,7 +355,7 @@ export async function landTask(row: TaskRow, deps: TaskLandDeps): Promise<TaskLa
 			if ("handoff" in fit) return handoff(fit.handoff, rebase);
 			if (fit.rebase !== undefined) rebase = { oldSha: rebase?.oldSha ?? fit.rebase.oldSha, newSha: fit.sha };
 			const { sha } = fit;
-			const judged = await rejudge(git, row, sha, deps.judge);
+			const judged = await rejudge(git, row, sha, deps.judge, deps.mode);
 			if (judged !== undefined) return handoff(judged, rebase);
 			const hold = deps.holdReason();
 			if (hold !== undefined) return { state: "blocked", reason: clip(hold) };

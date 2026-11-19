@@ -53,6 +53,19 @@ describe("ids and time", () => {
 });
 
 describe("taskSpec input", () => {
+	const NEW = { title: "t", risk: "L2", goal: "g", acceptance: ["a"], repo: "/r" };
+
+	test("tierConfidence is a 0..1 number on a new spec; anything else, or on a resume, is refused", () => {
+		for (const bad of [1.5, -0.1, "x", "0.5", Number.NaN, null]) {
+			expect(() => parseTaskSpecInput({ ...NEW, tierConfidence: bad })).toThrow(TaskSpecError);
+		}
+		expect(() => parseTaskSpecInput({ id: "T-20261026-01", tierConfidence: 0.5 })).toThrow(TaskSpecError);
+		const ok = parseTaskSpecInput({ ...NEW, tierConfidence: 0.88 });
+		expect(ok.kind === "new" && ok.spec.tierConfidence).toBe(0.88);
+		const none = parseTaskSpecInput(NEW);
+		expect(none.kind === "new" && "tierConfidence" in none.spec).toBe(false);
+	});
+
 	test("resume takes only an id", () => {
 		expect(parseTaskSpecInput({ id: "T-20261026-01" })).toEqual({ kind: "resume", id: "T-20261026-01" });
 		expect(() => parseTaskSpecInput({ id: "T-20261026-01", title: "x" })).toThrow(TaskSpecError);
@@ -95,7 +108,7 @@ describe("taskSpec input", () => {
 
 describe("secret masking at the document boundaries", () => {
 	// Fake token shapes only, built at run time.
-	const SLACK = ["xoxb", "TEST", "0", "docs"].join("-");
+	const XOX = ["xoxb", "TEST", "0", "docs"].join("-");
 	const GH = `ghp_${"T".repeat(36)}`;
 
 	test("AC-5: a spec without secrets parses exactly as written (check block included)", () => {
@@ -126,13 +139,13 @@ describe("secret masking at the document boundaries", () => {
 				"task: T-20261026-01",
 				"status: blocked",
 				"updated: 2026-10-26T15:04:05+09:00",
-				`current: S2 ${SLACK}`,
+				`current: S2 ${XOX}`,
 				`next: ${GH} 기다린다`,
-				`restated: 과제 ${SLACK} / S2 / 테스트`,
+				`restated: 과제 ${XOX} / S2 / 테스트`,
 				`blocked_reason: 토큰 ${GH} 만료`,
-				`question: ${SLACK}를 바꿀까요?`,
+				`question: ${XOX}를 바꿀까요?`,
 				`recommend: ${GH} 회전`,
-				`impact: ${SLACK} 무효`,
+				`impact: ${XOX} 무효`,
 				"---",
 				"# 단계",
 				"- [ ] S2: 구현 | 완료 조건: 테스트 | 증거:",

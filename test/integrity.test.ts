@@ -44,6 +44,27 @@ describe("classifyLaneCompletion", () => {
 		]);
 	});
 
+	test("deleted comment text naming a guard word is not a guard deletion, code is", () => {
+		const GUARD = "guard_deletion_without_adversarial_regression";
+		const hunk = (...lines: string[]): string =>
+			["diff --git a/src/a.ts b/src/a.ts", "--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1,5 +1,2 @@", ...lines].join("\n");
+		for (const text of [
+			"-\t// never reject here: the caller validates",
+			"-/* the check refuses empty input */",
+			"-/**\n-\t * never blocked */",
+		]) {
+			expect({ text, refused: categories("done", hunk(text)) }).toEqual({ text, refused: [] });
+		}
+		// The opening `/**` is a context line; the deleted ` * ` line is inside that comment.
+		expect(
+			categories("done", hunk(" /**", "-\t * early. Owner turns are never blocked by the ceiling.", " \t */")),
+		).toEqual([]);
+		expect(categories("done", hunk("-/* note */ if (!ok) reject();"))).toEqual([GUARD]);
+		expect(categories("done", hunk("-\tif (!ok) throw new Error('no'); // never reject"))).toEqual([GUARD]);
+		// No opening `/*` in the hunk: a `* !ok` line is not assumed to be a comment.
+		expect(categories("done", hunk(" const a = b", "-\t* !ok && deny()"))).toEqual([GUARD]);
+	});
+
 	test("guard deletions need an adversarial regression test", () => {
 		const removed = DIFF("src/auth.ts", "-if (!allowlist.has(host)) throw new Error('denied');");
 		expect(categories("done", removed)).toEqual(["guard_deletion_without_adversarial_regression"]);
@@ -155,8 +176,11 @@ describe("classifyLaneCompletion", () => {
 		expect(edit("-if (!ok) throw new Error('x'); // old", "+if (!ok) throw new Error('y'); // new")).toEqual([]);
 		// A guard deleted with nothing in its place.
 		expect(edit('-\tthrow new Error("bad input");', "+\treturn;")).toEqual([GUARD]);
-		// The condition changed.
-		expect(edit('-if (!auth) throw new Error("no");', '+if (!auth && false) throw new Error("no");')).toEqual([GUARD]);
+		// The condition changed (and switched off by a constant, which the feature-removal category also names).
+		expect(edit('-if (!auth) throw new Error("no");', '+if (!auth && false) throw new Error("no");')).toEqual([
+			GUARD,
+			"undeclared_feature_removal",
+		]);
 		// Two guards deleted, one similar line added: one stays deleted.
 		expect(edit('-throw new Error("a");', '-throw new Error("b");', '+throw new Error("c");')).toEqual([GUARD]);
 		// Code inside an interpolating template is code.
@@ -364,5 +388,69 @@ describe("qa-l low A: adversarial test lines", () => {
 			expect({ lines, refused: categories("done", withTest(...lines)) }).toEqual({ lines, refused: [GUARD] });
 		expect(categories("done", withTest('+test("rejects invalid hosts", () => {});'))).toEqual([]);
 		expect(categories("done", withTest('+\texpect(check("bad")).toBe("invalid"); // was dropped'))).toEqual([]);
+	});
+});
+
+describe("undeclared_feature_removal", () => {
+	const CAT = "undeclared_feature_removal";
+	const diffOf = (file: string, ...lines: string[]): string =>
+		[`diff --git a/${file} b/${file}`, `--- a/${file}`, `+++ b/${file}`, "@@ -1,1 +1,1 @@", ...lines].join("\n");
+
+	test("an exported function deleted without a word in the report is refused, with file and line as excerpt", () => {
+		const refused = classifyLaneCompletion({ summary: "done", diff: diffOf("src/a.ts", "-export function foo() {") });
+		expect(refused.map((r) => r.category)).toEqual([CAT]);
+		expect(refused[0]?.excerpt).toBe("src/a.ts: export function foo() {");
+	});
+
+	test("a deletion the report names is declared; a signature edit or a move keeps the name", () => {
+		const removed = diffOf("src/a.ts", "-export function foo() {");
+		expect(categories("foo 제거", removed)).toEqual([]);
+		expect(categories("done", diffOf("src/a.ts", "-export function foo(a) {", "+export function foo(a, b) {"))).toEqual(
+			[],
+		);
+		expect(categories("done", `${removed}\n${diffOf("src/b.ts", "+export function foo() {")}`)).toEqual([]);
+	});
+
+	test("every export declaration form counts; a longer name in the report does not declare it", () => {
+		for (const line of [
+			"-export default async function* foo() {",
+			"-export abstract class foo {",
+			"-export const foo = 1;",
+			"-export interface foo {",
+			"-export type foo = string;",
+			"-export enum foo {",
+		])
+			expect({ line, refused: categories("done", diffOf("src/a.ts", line)) }).toEqual({ line, refused: [CAT] });
+		expect(categories("foobar removed", diffOf("src/a.ts", "-export const foo = 1;"))).toEqual([CAT]);
+	});
+
+	test("exports deleted from test files are not judged", () => {
+		expect(categories("done", diffOf("test/a.test.ts", "-export function foo() {"))).toEqual([]);
+	});
+
+	test("conditions that switch a feature off are refused", () => {
+		for (const line of ["+{false && <Feature />}", "+if (false) {", "+if (0) {", "+if (ok && false) {"])
+			expect({ line, refused: categories("done", diffOf("src/a.tsx", line)) }).toEqual({ line, refused: [CAT] });
+	});
+
+	test("comparisons against false are not a switch-off", () => {
+		for (const line of [
+			"+if (x === false && y) {",
+			"+if (a !== false && b) {",
+			"+if (a == false && b) {",
+			"+if (a && false == b) {",
+			"+\t\t\tdelivery.finishUntracked === false && finisher.tracks?.(threadRef) === false",
+		])
+			expect({ line, refused: categories("done", diffOf("src/channel/pump.ts", line)) }).toEqual({ line, refused: [] });
+	});
+
+	test("an issue link, a comment and a string literal are not a switch-off", () => {
+		for (const line of ["+if (false) { // #123", "+// if (false) {", '+const s = "false && x";'])
+			expect({ line, refused: categories("done", diffOf("src/a.ts", line)) }).toEqual({ line, refused: [] });
+	});
+
+	test("only the first candidate of the category is reported", () => {
+		const diff = diffOf("src/a.ts", "-export const a = 1;", "-export const b = 2;", "+if (false) {");
+		expect(categories("done", diff)).toEqual([CAT]);
 	});
 });

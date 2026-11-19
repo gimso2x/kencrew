@@ -20,7 +20,7 @@ import { runBounded } from "./helpers/bounded-child";
 
 const NOW = Date.parse("2026-11-11T08:00:00.000Z");
 const MINUTE = 60_000;
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = "discord/dm/200000000000000001";
 const SOUL = "SOUL-MARKER-이름은떡";
 const OWNER_V1 = "OWNER-MARKER-v1 오너는 결론부터 원한다";
 const OWNER_V2 = "OWNER-MARKER-v2 오너는 표를 좋아한다";
@@ -528,7 +528,7 @@ describe("qa50b-low lane L", () => {
 
 	test("L-이관1 hostTools:false leaves out every host tool line (agy and claude children have none)", () => {
 		const hostToolNames = [
-			"slack_send_file",
+			"discord_send_file",
 			"ompbot_request_approval",
 			"ompbot_monitor_add",
 			"ompbot_dispatch",
@@ -597,9 +597,8 @@ describe("a FIFO in the session dir (qa-l #78)", () => {
 
 describe("floors tool lines match the session (qa-l low B)", () => {
 	// qa-l #75: Teams owner 1:1 sessions register no monitor tools, so the prompt must not tell them to use them.
-	test("the monitor tools line is for Slack and Discord owner DMs only", () => {
+	test("the monitor tools line is for Discord owner DMs only", () => {
 		const secrets = join(dir, "secrets");
-		expect(buildFloorsPrompt(secrets, "slack/dm/D1")).toContain("ompbot_monitor_add");
 		expect(buildFloorsPrompt(secrets, "discord/dm/1234567890")).toContain("ompbot_monitor_add"); // gitleaks:allow (fake channel id)
 		expect(buildFloorsPrompt(secrets, "teams/dm/t0123456789abcdef")).not.toContain("ompbot_monitor_add");
 	});
@@ -608,12 +607,12 @@ describe("floors tool lines match the session (qa-l low B)", () => {
 	test("a lane session's cwd line names the lane directory", () => {
 		const secrets = join(dir, "secrets");
 		const lane = buildFloorsPrompt(secrets, "ompbot/work/lane1", false, false, false, {
-			lanePlatform: "slack",
+			lanePlatform: "discord",
 			laneCwd: "/wt/lane1",
 		});
 		expect(lane).toContain("/wt/lane1");
 		expect(lane).not.toContain("Your cwd is the ompbot workspace");
-		expect(buildFloorsPrompt(secrets, "slack/dm/D1")).toContain("Your cwd is the ompbot workspace");
+		expect(buildFloorsPrompt(secrets, ORIGIN)).toContain("Your cwd is the ompbot workspace");
 	});
 });
 

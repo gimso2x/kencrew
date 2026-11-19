@@ -69,7 +69,7 @@ export interface CoreSink {
 	 * muted thread, hop cap): it answers this bot's earlier calls to that peer there (peer silence alert).
 	 */
 	onPeerSeen?(seen: { threadRef: string; peerUserId: string; at: number }): void;
-	/** `duplicate: true` (Slack redelivery of a message already recorded) suppresses the 👀 and the status message. */
+	/** `duplicate: true` (redelivery of a message already recorded) suppresses the 👀 and the status message. */
 	onInbound(
 		message: InboundMessage,
 	): Promise<{ duplicate?: boolean } | undefined> | { duplicate?: boolean } | undefined;

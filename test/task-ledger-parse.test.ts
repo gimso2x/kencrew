@@ -12,8 +12,8 @@ beforeEach(() => {
 		db.run(
 			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
 				acceptance_json, created_at, updated_at, notices_json)
-			 VALUES (?, 't', 'L1', 'slack/dm/U1', ?, NULL, '/r', '/w', 'b', ?, 'working', ?, 1, 1, ?)`,
-			[id, `C1:${id}`, id.toLowerCase(), acceptance, notices],
+			 VALUES (?, 't', 'L1', 'discord/dm/200000000000000001', ?, NULL, '/r', '/w', 'b', ?, 'working', ?, 1, 1, ?)`,
+			[id, `200000000000000001:70000000000000${id.slice(-2)}00`, id.toLowerCase(), acceptance, notices],
 		);
 	insert("T-20261104-01", JSON.stringify([{ id: "AC-1", text: "one" }]), JSON.stringify({ remind: 5 }));
 	insert("T-20261104-02", "{not json", "{}");

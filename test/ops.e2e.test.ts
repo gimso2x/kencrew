@@ -14,7 +14,7 @@ import {
 } from "./helpers/daemon-process";
 
 /**
- * Operations E2E: a REAL omp behind the real daemon process, file-backed fake Slack, temp OMPBOT_HOME with FAKE tokens.
+ * Operations E2E: a REAL omp behind the real daemon process, file-backed fake Discord, temp OMPBOT_HOME with FAKE tokens.
  * The omp child is killed with SIGKILL right after the tool_start log line (omp's tool_execution_start event).
  * Costs tokens, so it only runs with OMPBOT_E2E_OMP=1 (model: OMPBOT_E2E_OMP_PROVIDER/OMPBOT_E2E_OMP_MODEL).
  */
@@ -24,7 +24,7 @@ if (!enabled) console.log("[skip] ops.e2e.test.ts: set OMPBOT_E2E_OMP=1 to run a
 const PROVIDER = process.env.OMPBOT_E2E_OMP_PROVIDER ?? "zai";
 const MODEL = process.env.OMPBOT_E2E_OMP_MODEL ?? "glm-5.3-flash";
 const OMP_EXECUTABLE = process.env.OMPBOT_OMP_EXECUTABLE ?? Bun.which("omp") ?? "omp";
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = "discord/dm/200000000000000001";
 const SCENARIO_TIMEOUT_MS = 420_000;
 // Failure deadline on awaited events (log lines, file changes), never a wait for time to pass.
 const EVENT_TIMEOUT_MS = 180_000;
@@ -73,7 +73,7 @@ describe.skipIf(!enabled)("operations surface with a real omp", () => {
 				home.dir,
 				`Remember this nonce: ${nonce}. Then use the bash tool to run exactly \`sleep 20\` and do not answer before the tool has run.`,
 			);
-			await daemon.waitLog(/event=tool_start origin=slack\/dm\/D1/, EVENT_TIMEOUT_MS);
+			await daemon.waitLog(/event=tool_start origin=discord\/dm\/200000000000000001/, EVENT_TIMEOUT_MS);
 
 			const status = await runMain(home.dir, ["status", "--json"]);
 			expect(status.code, status.stderr).toBe(0);
@@ -82,7 +82,9 @@ describe.skipIf(!enabled)("operations surface with a real omp", () => {
 			expect(readFileSync(`/proc/${ompPid}/cmdline`, "utf8")).toContain("rpc");
 			process.kill(ompPid, "SIGKILL");
 
-			const exitLine = await daemon.waitLog(/event=omp_exit origin=slack\/dm\/D1 code=\S+ expected=false/);
+			const exitLine = await daemon.waitLog(
+				/event=omp_exit origin=discord\/dm\/200000000000000001 code=\S+ expected=false/,
+			);
 			await log.waitFor(
 				(posts) => inThread(posts, a.threadTs).some((post) => post.text.includes(FAILED_NOTICE)),
 				"the [turn failed] omp_exited reply",

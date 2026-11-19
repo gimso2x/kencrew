@@ -2,8 +2,8 @@
  * Boundary between ompbot and one `omp --mode rpc` child process.
  *
  * One driver instance owns at most one child process and one conversation
- * (`sessionDir`). Implementations: `RpcOmpDriver` (real omp), `ClaudeOmpDriver`
- * (Claude Code CLI as the child) and `FakeOmpDriver` (tests; mirrors the real
+ * (`sessionDir`). Implementations: `RpcOmpDriver` (real omp), `AgyOmpDriver`
+ * (Antigravity CLI as the child) and `FakeOmpDriver` (tests; mirrors the real
  * semantics listed below).
  *
  * Semantics every implementation MUST keep:
@@ -24,8 +24,6 @@ export type OmpDriverErrorCode =
 	| "omp_launcher_standalone"
 	| "omp_launcher_unreadable"
 	| "bun_too_old"
-	| "claude_executable_missing"
-	| "claude_not_authenticated"
 	| "agy_executable_missing"
 	| "invalid_env"
 	| "already_started"
@@ -240,7 +238,7 @@ export interface OmpSessionDriver {
 	thinkingLevels(): Promise<string[]>;
 	setThinking(level: string): Promise<void>;
 	/**
-	 * Replaces the session's task list (omp RPC `set_todos`). Drivers without omp todos (Claude, agy) resolve without
+	 * Replaces the session's task list (omp RPC `set_todos`). Drivers without omp todos (agy) resolve without
 	 * doing anything and log `set_todos_unsupported`; the caller never treats that as a failure.
 	 */
 	setTodos(phases: TodoPhase[]): Promise<void>;

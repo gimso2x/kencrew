@@ -21,7 +21,7 @@ export function killSpawned(): void {
 }
 
 /**
- * `bun src/main.ts daemon` with the test-only transport (a JSONL file) so nothing reaches Slack.
+ * `bun src/main.ts daemon` with the test-only Discord transport (a JSONL file) so nothing reaches Discord.
  * Extra env (e.g. OMPBOT_TEST_CRASH_AT) is passed through.
  */
 export function spawnDaemon(homeDir: string, transportFile: string, env: Record<string, string> = {}): SpawnedDaemon {
@@ -30,7 +30,7 @@ export function spawnDaemon(homeDir: string, transportFile: string, env: Record<
 			...process.env,
 			OMPBOT_HOME: homeDir,
 			OMPBOT_TEST_HOOKS: "1",
-			OMPBOT_TEST_TRANSPORT: transportFile,
+			OMPBOT_TEST_DISCORD_TRANSPORT: transportFile,
 			OMPBOT_TEST_HOST_LOAD: "idle", // gates judge an idle host, not this machine's load
 			...env,
 		},
@@ -160,19 +160,19 @@ export async function runCliCapture(
 	}
 }
 
+/** One `createMessage` of the log: its channel, text, the message it replies to (`threadTs`) and its own id (`ts`). */
 export interface LoggedPost {
-	method: "postMessage";
 	channel: string;
 	text: string;
 	threadTs?: string;
 	ts: string;
 }
 
-/** Reader of the JSONL file written by `FileFakeTransport` (what the daemon "sent to Slack"). */
+/** Reader of the JSONL file written by `FileFakeDiscordTransport` (what the daemon "sent to Discord"). */
 export class TransportLog {
 	constructor(readonly path: string) {}
 
-	/** Every logged Slack call of one method (postMessage, updateMessage, uploadFile, ...). */
+	/** Every logged Discord call of one method (createMessage, editMessage, uploadFile, ...). */
 	calls(method: string): Array<Record<string, unknown>> {
 		if (!existsSync(this.path)) return [];
 		return readFileSync(this.path, "utf8")
@@ -182,12 +182,15 @@ export class TransportLog {
 			.filter((entry) => entry.method === method);
 	}
 	posts(): LoggedPost[] {
-		if (!existsSync(this.path)) return [];
-		return readFileSync(this.path, "utf8")
-			.split("\n")
-			.filter((line) => line.startsWith("{"))
-			.map((line) => JSON.parse(line) as { method: string })
-			.filter((entry): entry is LoggedPost => entry.method === "postMessage");
+		return this.calls("createMessage").map((entry) => {
+			const reply = (entry.messageReference as { messageId?: string } | undefined)?.messageId;
+			return {
+				channel: String(entry.channelId),
+				text: typeof entry.content === "string" ? entry.content : "",
+				...(reply === undefined ? {} : { threadTs: reply }),
+				ts: String(entry.id),
+			};
+		});
 	}
 
 	/** Resolves when `predicate(posts)` holds; re-evaluated on every change of the file (no polling). */

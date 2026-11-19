@@ -4,8 +4,6 @@ import { join } from "node:path";
 import { openBotStore } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
 import { readStatusFromDb, renderStatusText, summarizeMonitors } from "../src/daemon/status";
-import { DiscordBinding } from "../src/discord/binding";
-import { DiscordChannel } from "../src/discord/channel";
 import { laneOriginKey } from "../src/lanes/status";
 import { createLogger } from "../src/log";
 import { type MonitorLedger, monitorOrigin, openMonitorLedger } from "../src/monitors/ledger";
@@ -13,18 +11,17 @@ import { buildMonitorTools } from "../src/monitors/tools";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { buildFloorsPrompt } from "../src/safety/prompt";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import {
-	DISCORD_OWNER,
+	CHANNEL,
+	discordBinding,
 	makeHome,
+	OWNER_DM,
 	type TestHome,
 	WaitingDiscordTransport,
-	WaitingTransport,
-	withDiscord,
 } from "./helpers/bot-home";
 
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = `discord/dm/${OWNER_DM}`;
+const CHANNEL_ORIGIN = `discord/ch/${CHANNEL}`;
 /** 2026-10-19 06:00:00 UTC = 15:00 in Asia/Seoul. */
 const NOW = Date.parse("2026-10-19T06:00:00Z");
 const log = createLogger({ sink: () => undefined, clock: { now: () => NOW }, redact });
@@ -191,7 +188,7 @@ describe("ompbot_monitor_add / list / remove", () => {
 			name: "watch",
 			trigger: { kind: "script", command: [script], intervalMs: 60_000 },
 			instruction: "x",
-			channel: "C0123456789",
+			channel: CHANNEL,
 			model: "provider/model",
 			thinking: "off",
 		});
@@ -202,7 +199,7 @@ describe("ompbot_monitor_add / list / remove", () => {
 		// Shared rendering rule (monitors/ledger describeMonitorTrigger): a script trigger shows its last check state,
 		// and pinned options join with the tool's single-space separator.
 		expect(text).toContain(`[script ${script} every 60s fire=edge state=-]`);
-		expect(text).toContain("channel=C0123456789 model=provider/model thinking=off");
+		expect(text).toContain(`channel=${CHANNEL} model=provider/model thinking=off`);
 		expect(text).toContain("next=2026-10-19 15:05:00 Asia/Seoul");
 		expect(text).toContain("next=2026-10-20 09:00:00 Asia/Seoul");
 
@@ -222,7 +219,7 @@ describe("who gets the tools", () => {
 			"ompbot_monitor_list",
 			"ompbot_monitor_remove",
 		]);
-		for (const origin of [monitorOrigin("mabc12345"), laneOriginKey("work"), "slack/channel/C1"]) {
+		for (const origin of [monitorOrigin("mabc12345"), laneOriginKey("work"), CHANNEL_ORIGIN]) {
 			expect(
 				buildMonitorTools({ timezone: "Asia/Seoul", originKey: origin, ledger, scriptsRoot: home.dir, log }),
 			).toEqual([]);
@@ -233,7 +230,7 @@ describe("who gets the tools", () => {
 		const sessions = new FakeSessionStore();
 		const daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			log,
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -250,16 +247,13 @@ describe("who gets the tools", () => {
 		}
 	});
 
-	test("a Discord owner DM gets the monitor tools, a Discord thread does not; Slack origins keep their tool lists", async () => {
+	test("a Discord owner DM gets the monitor tools, a Discord thread and channel do not", async () => {
 		const sessions = new FakeSessionStore();
-		const discordDm = "discord/dm/123456789012345678"; // gitleaks:allow (fake snowflake)
-		const discordThread = "discord/ch/111111111111111111/t/222222222222222222"; // gitleaks:allow (fake snowflake)
+		const discordDm = ORIGIN;
+		const discordThread = `${CHANNEL_ORIGIN}/t/222222222222222222`;
 		const daemon = new Daemon({
-			config: withDiscord(home),
-			channels: [
-				new SlackBinding(new SlackChannel(new WaitingTransport())),
-				new DiscordBinding(new DiscordChannel(new WaitingDiscordTransport(), { ownerUserId: DISCORD_OWNER })),
-			],
+			config: home.config,
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			log,
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -269,15 +263,12 @@ describe("who gets the tools", () => {
 		try {
 			const names = (origin: string) => daemon.hostToolsFor(origin).map((tool) => tool.name);
 			const monitorNames = ["ompbot_monitor_add", "ompbot_monitor_list", "ompbot_monitor_remove"];
-			for (const name of monitorNames) expect(names(discordDm)).toContain(name);
-			for (const name of monitorNames) expect(names(discordThread)).not.toContain(name);
-			// The Slack lists as main 627d14a built them.
-			const withLaneStart = ["ompbot_dispatch", "slack_send_file", "ompbot_request_approval", "ompbot_work_start"];
-			// Every Slack and Discord conversation also gets the lane board (doc/plans/lane-board.md).
+			const base = ["ompbot_dispatch", "discord_send_file", "ompbot_request_approval"];
+			// A server channel or thread can open a lane; the owner DM cannot without channels.discord.laneChannelId. Every Discord conversation also gets the lane board (doc/plans/lane-board.md).
 			const boardNames = ["ompbot_board_post", "ompbot_board_read"];
-			expect(names(ORIGIN)).toEqual([...withLaneStart, ...monitorNames, ...boardNames]);
-			for (const origin of ["slack/ch/C1", "slack/ch/C1/t/1.2", "slack/dm/D1/t/1.2"]) {
-				expect(names(origin)).toEqual([...withLaneStart, ...boardNames]);
+			expect(names(discordDm)).toEqual([...base, ...monitorNames, ...boardNames]);
+			for (const origin of [discordThread, CHANNEL_ORIGIN]) {
+				expect(names(origin)).toEqual([...base, "ompbot_work_start", ...boardNames]);
 			}
 		} finally {
 			await daemon.stop();
@@ -286,8 +277,7 @@ describe("who gets the tools", () => {
 
 	test("the system prompt mentions the monitor tools for persona sessions only", () => {
 		expect(buildFloorsPrompt("/s", ORIGIN)).toContain("ompbot_monitor_add");
-		expect(buildFloorsPrompt("/s", "discord/dm/123456789012345678")).toContain("ompbot_monitor_add"); // gitleaks:allow (fake snowflake)
-		expect(buildFloorsPrompt("/s", "discord/ch/111111111111111111/t/2")).not.toContain("ompbot_monitor_add"); // gitleaks:allow (fake snowflake)
+		expect(buildFloorsPrompt("/s", `${CHANNEL_ORIGIN}/t/222222222222222222`)).not.toContain("ompbot_monitor_add");
 		expect(buildFloorsPrompt("/s", monitorOrigin("mabc12345"))).not.toContain("ompbot_monitor_add");
 		expect(buildFloorsPrompt("/s")).not.toContain("ompbot_monitor_add");
 	});
@@ -298,20 +288,20 @@ describe("status groups thread sessions", () => {
 		const dbPath = join(home.dir, "threads.db");
 		const store = openBotStore(dbPath, { now: () => NOW }, "Asia/Seoul");
 		try {
-			store.ensureOrigin("slack/dm/D1", "/s/dm");
-			store.ensureOrigin("slack/ch/C1", "/s/ch");
-			store.ensureOrigin("slack/ch/C1/t/100.1", "/s/t1");
-			store.ensureOrigin("slack/ch/C1/t/200.2", "/s/t2");
+			store.ensureOrigin(ORIGIN, "/s/dm");
+			store.ensureOrigin(CHANNEL_ORIGIN, "/s/ch");
+			store.ensureOrigin(`${CHANNEL_ORIGIN}/t/1001`, "/s/t1");
+			store.ensureOrigin(`${CHANNEL_ORIGIN}/t/2002`, "/s/t2");
 		} finally {
 			store.close();
 		}
 		const text = renderStatusText(readStatusFromDb(dbPath, "omp-test 0", "Asia/Seoul"));
 		expect(text).toContain("origin 4개");
-		expect(text).toContain("• slack/dm/D1 epoch=1");
-		expect(text).toContain("• slack/ch/C1 epoch=1");
-		expect(text).toContain("• slack/ch/C1 × 2스레드");
+		expect(text).toContain(`• ${ORIGIN} epoch=1`);
+		expect(text).toContain(`• ${CHANNEL_ORIGIN} epoch=1`);
+		expect(text).toContain(`• ${CHANNEL_ORIGIN} × 2스레드`);
 		// No per-thread line leaks into the human-readable list.
-		expect(text).not.toContain("slack/ch/C1/t/");
+		expect(text).not.toContain(`${CHANNEL_ORIGIN}/t/`);
 	});
 });
 

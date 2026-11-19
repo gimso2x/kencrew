@@ -91,7 +91,19 @@ describe("init --workspace overlapping the home", () => {
 		const omp = join(root, "omp");
 		writeFileSync(omp, "#!/bin/sh\n", { mode: 0o755 });
 		const run = Bun.spawnSync(
-			[process.execPath, MAIN, "init", "--owner", "U0123456789", "--omp", omp, "--workspace", workspace(home)],
+			[
+				process.execPath,
+				MAIN,
+				"init",
+				"--owner",
+				"100000000000000001",
+				"--app-id",
+				"600000000000000000",
+				"--omp",
+				omp,
+				"--workspace",
+				workspace(home),
+			],
 			{ env: { HOME: root, OMPBOT_HOME: home, PATH: "" }, stdout: "pipe", stderr: "pipe" },
 		);
 		return { code: run.exitCode, err: run.stderr.toString(), home, root };

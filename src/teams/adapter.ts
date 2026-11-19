@@ -4,13 +4,14 @@
 // result at the end. Answers reply to the original Activity id through the shared delivery pump.
 import { join } from "node:path";
 import type { ChannelAdapter, ChannelPolicy, OwnerIngest } from "../channel/adapter";
-import { MAX_INBOUND_FILES, saveInboundAttachment } from "../channel/attachments";
+import { collectInboundNotes, saveInboundAttachment } from "../channel/attachments";
 import { renderMentions } from "../channel/port";
 import {
 	answerFooter,
 	DeliveryPump,
 	type DeliverySendResult,
 	deliverySender,
+	failedDelivery,
 	finishDeliveryStatus,
 } from "../channel/pump";
 import { RetryAfterGate } from "../channel/retry";
@@ -202,7 +203,7 @@ export class TeamsAdapter implements ChannelAdapter {
 	/** Teams does not resend what the daemon missed: there is nothing to recover. */
 	recover(): void {}
 
-	/** Teams' policy lives under `channels.teams` (restart); the top-level Slack keys do not apply. */
+	/** Teams' policy lives under `channels.teams` (restart). */
 	setChannelPolicy(_policy: ChannelPolicy): void {}
 
 	// ---- inbound ----
@@ -359,18 +360,18 @@ export class TeamsAdapter implements ChannelAdapter {
 	 * Downloads a 1:1 owner message's files (at most `MAX_INBOUND_FILES`) into `<mediaRoot>/inbound/<alias>-<id>/` and
 	 * returns their prompt notes; a refused or failed file is a `[첨부 실패: …]` line and the turn goes on.
 	 */
-	async #collectAttachments(
+	#collectAttachments(
 		conversation: TeamsConversation,
 		messageId: string,
 		files: readonly TeamsAttachment[],
 	): Promise<string[]> {
-		const mediaRoot = this.#mediaRoot;
-		if (mediaRoot === undefined) return [`[첨부 실패: ${files.length}개 — 미디어 저장이 구성되지 않았습니다]`];
-		const dir = join(mediaRoot, "inbound", activityDirName(conversation.alias, messageId));
-		const where = { alias: conversation.alias, id: messageId };
 		const fetchImpl = this.#attachmentFetch;
-		const notes = await Promise.all(
-			files.slice(0, MAX_INBOUND_FILES).map(async (file) => {
+		return collectInboundNotes({
+			mediaRoot: this.#mediaRoot,
+			dir: (root) => join(root, "inbound", activityDirName(conversation.alias, messageId)),
+			files,
+			saveOne: (file, dir) => {
+				const where = { alias: conversation.alias, id: messageId };
 				if (file.contentType === TEAMS_FILE_DOWNLOAD_INFO) {
 					const info = fileDownloadInfo(file.content);
 					if (info === undefined) {
@@ -409,12 +410,8 @@ export class TeamsAdapter implements ChannelAdapter {
 						});
 					},
 				});
-			}),
-		);
-		if (files.length > MAX_INBOUND_FILES) {
-			notes.push(`[첨부 생략: ${files.length - MAX_INBOUND_FILES}개 — 메시지당 최대 ${MAX_INBOUND_FILES}개]`);
-		}
-		return notes;
+			},
+		});
 	}
 
 	/** An owner message the daemon puts in (a button path, `inject`): taken like a live one in a known conversation. */
@@ -580,13 +577,7 @@ export class TeamsAdapter implements ChannelAdapter {
 					retry: { at: this.#gate.untilOf("post") ?? this.#clock.now(), sentParts: sent },
 				};
 			}
-			const definitive = sent === 0 && err instanceof TeamsCallError && err.kind === "definitive";
-			return {
-				kind: "failed",
-				error: errorText(err),
-				outcome: definitive ? "definitive" : "ambiguous",
-				sentParts: sent,
-			};
+			return failedDelivery(err, sent, (e) => e instanceof TeamsCallError && e.kind === "definitive");
 		}
 	}
 

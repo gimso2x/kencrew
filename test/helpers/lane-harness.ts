@@ -3,15 +3,15 @@ import { basename, dirname, join } from "node:path";
 import type { TurnSettledInfo } from "../../src/core/mailbox";
 import { OriginRouter, openBotStore, sessionDirFor } from "../../src/core/origin";
 import type { InboundRecord } from "../../src/core/types";
+import { DiscordChannel } from "../../src/discord/channel";
 import { LaneManager, type LaneManagerDeps } from "../../src/lanes/manager";
 import { defaultGit } from "../../src/lanes/verify";
 import { createLogger } from "../../src/log";
 import type { OmpSessionDriver } from "../../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../../src/omp/fake-driver";
 import { redact } from "../../src/redact";
-import { SlackChannel } from "../../src/slack/channel";
 import type { Store } from "../../src/store/db";
-import { WaitingTransport } from "./bot-home";
+import { OWNER, WaitingDiscordTransport } from "./bot-home";
 import { registryOf } from "./channels";
 
 /** 2027-01-15 KST: lane ids of a harness lane read `L-20270115-NN`. */
@@ -29,7 +29,7 @@ export function removeRepoAndWorktrees(repo: string): void {
 export interface LaneHarness {
 	manager: LaneManager;
 	store: Store;
-	transport: WaitingTransport;
+	transport: WaitingDiscordTransport;
 	drivers: Map<string, FakeOmpDriver>;
 	logs: string[];
 	advance(ms: number): void;
@@ -72,6 +72,7 @@ export type LaneHarnessExtra = Partial<
 		| "rebaseGit"
 		| "completionNudges"
 		| "pidAlive"
+		| "wikiNotes"
 	>
 > & {
 	driver?: LaneDriverFactory;
@@ -79,13 +80,13 @@ export type LaneHarnessExtra = Partial<
 	routeFails?: (record: InboundRecord) => boolean;
 };
 
-/** A `LaneManager` over a real store and router with held fake omp turns, a fake clock and a fake Slack. */
+/** A `LaneManager` over a real store and router with held fake omp turns, a fake clock and a fake Discord. */
 export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): LaneHarness {
 	const { driver: laneDriver, routeFails, ...managerExtra } = extra;
 	let now = LANE_START;
 	const clock = { now: () => now };
 	const store = openBotStore(join(homeDir, "ompbot.db"), clock, "Asia/Seoul");
-	const transport = new WaitingTransport();
+	const transport = new WaitingDiscordTransport();
 	const sessions = new FakeSessionStore();
 	const drivers = new Map<string, FakeOmpDriver>();
 	const sessionsRoot = join(homeDir, "sessions");
@@ -124,7 +125,7 @@ export function laneHarness(homeDir: string, extra: LaneHarnessExtra = {}): Lane
 	manager = new LaneManager({
 		timezone: "Asia/Seoul",
 		store,
-		channels: registryOf(new SlackChannel(transport)),
+		channels: registryOf(new DiscordChannel(transport, { ownerUserId: OWNER })),
 		clock,
 		log,
 		sessionsRoot,

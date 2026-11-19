@@ -2,17 +2,16 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { appendFileSync, mkdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type DaemonAnswer, LANES_USAGE, lanesCommand, ompSessionDirFor, summarizeEntry } from "../src/cli/lanes";
+import { type DaemonAnswer, LANES_USAGE, lanesCommand, summarizeEntry } from "../src/cli/lanes";
 import { openBotStore, sessionDirFor } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
 import { callDaemon } from "../src/daemon/ipc";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
+import { ompSessionDirFor } from "../src/omp/session-dir";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import { TASK_SCHEMA } from "../src/tasks/ledger";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
 const LANE = "watch-lane";
 const LANE_ORIGIN = `ompbot/work/${LANE}`;
@@ -199,7 +198,7 @@ describe("ompbot lanes watch", () => {
 });
 
 describe("daemon session_file op", () => {
-	const ORIGIN = "slack/dm/D1";
+	const ORIGIN = `discord/dm/${OWNER_DM}`;
 	let home: TestHome;
 	let daemon: Daemon | undefined;
 
@@ -220,7 +219,7 @@ describe("daemon session_file op", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			log: createLogger({
 				sink: (line) => {
 					if (line.includes("event=turn_start")) started.resolve();

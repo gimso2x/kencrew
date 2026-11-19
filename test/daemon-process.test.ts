@@ -47,7 +47,7 @@ test("real daemon process: status --json schema, second instance refused, SIGTER
 	const badInject = await runMain(home.dir, ["inject", "--origin", "ompbot/work/x", "--as-owner", "--text", "hi"]);
 	expect(badInject.code).toBe(1);
 	expect(badInject.stderr).toContain("inject failed");
-	const noOwner = await runMain(home.dir, ["inject", "--origin", "slack/dm/D1", "--text", "hi"]);
+	const noOwner = await runMain(home.dir, ["inject", "--origin", "discord/dm/200000000000000001", "--text", "hi"]);
 	expect(noOwner.code).toBe(2);
 
 	daemon.signal("SIGTERM");

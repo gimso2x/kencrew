@@ -10,8 +10,10 @@ import { parseMonitorSpec } from "../src/monitors/spec";
 import { MAX_WATCH_PATHS, WatcherSet } from "../src/monitors/watcher";
 import { redact } from "../src/redact";
 import { openStore } from "../src/store/db";
-import { makeHome, type TestHome } from "./helpers/bot-home";
+import { makeHome, OWNER_DM, type TestHome } from "./helpers/bot-home";
 import { killSpawned, runCliCapture } from "./helpers/daemon-process";
+
+const DM_ORIGIN = `discord/dm/${OWNER_DM}`;
 
 let dir: string;
 let ctx: PortableContext;
@@ -218,8 +220,13 @@ describe("owner notice incidents (qa-j)", () => {
 		};
 		expect(store.ownerHome()).toBeUndefined();
 		expect(failOnce()).toBeUndefined();
-		store.ensureOrigin("slack/dm/D1", "sess/e1");
-		store.recordInbound({ originKey: "slack/dm/D1", platformMessageId: "D1:1", textRef: "hi", threadRef: "D1:1" });
+		store.ensureOrigin(DM_ORIGIN, "sess/e1");
+		store.recordInbound({
+			originKey: DM_ORIGIN,
+			platformMessageId: `${OWNER_DM}:1`,
+			textRef: "hi",
+			threadRef: `${OWNER_DM}:1`,
+		});
 		expect(store.ownerHome()).toBeDefined();
 		expect(failOnce()?.body).toContain("failed_no_retry");
 	});
@@ -233,8 +240,13 @@ describe("owner notice incidents (qa-j)", () => {
 			store.monitors.recordCheckError(mon.id, "spawn EACCES");
 		};
 		for (let i = 0; i < 3; i++) fail();
-		store.ensureOrigin("slack/dm/D1", "sess/e1");
-		store.recordInbound({ originKey: "slack/dm/D1", platformMessageId: "D1:1", textRef: "hi", threadRef: "D1:1" });
+		store.ensureOrigin(DM_ORIGIN, "sess/e1");
+		store.recordInbound({
+			originKey: DM_ORIGIN,
+			platformMessageId: `${OWNER_DM}:1`,
+			textRef: "hi",
+			threadRef: `${OWNER_DM}:1`,
+		});
 		for (let i = 0; i < 3; i++) fail();
 		const raw = new Database(join(dir, "store2.db"), { readonly: true });
 		const rows = raw.query("SELECT body FROM deliveries").all() as Array<{ body: string }>;

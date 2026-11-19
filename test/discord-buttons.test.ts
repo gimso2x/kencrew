@@ -80,7 +80,7 @@ describe("buttons as components", () => {
 		]);
 	});
 
-	test("like Slack's blocks: a card redrawn without buttons drops them, a plain text edit leaves components alone", async () => {
+	test("a card redrawn without buttons drops them, a plain text edit leaves components alone", async () => {
 		const ref = await port.post({ conversationId: DM }, { text: "카드", title: "제목", buttons: [button(1)] });
 		await port.edit(ref, { text: "카드", title: "제목", body: "결정됨" });
 		await port.edit(ref, { text: "글만 수정" });

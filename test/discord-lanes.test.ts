@@ -1,6 +1,6 @@
 // Work lanes on Discord (doc/plans/discord-parity.md stage 2): a lane lives in a Discord thread of a server text
 // channel — root in the parent, a thread started from it, status and cards inside — and the owner drives it with the
-// same words and buttons as on Slack. Everything git-related stays on this machine; Discord is a fake transport.
+// same words and buttons as everywhere else. Everything git-related stays on this machine; Discord is a fake transport.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { readdirSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -16,16 +16,7 @@ import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { floorsSystemPrompt } from "../src/safety/prompt";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import {
-	DISCORD_OWNER,
-	makeHome,
-	type TestHome,
-	WaitingDiscordTransport,
-	WaitingTransport,
-	withDiscord,
-} from "./helpers/bot-home";
+import { makeHome, OWNER, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import { removeRepoAndWorktrees } from "./helpers/lane-harness";
@@ -46,7 +37,6 @@ type Edit = Extract<FakeDiscordCall, { method: "editMessage" }>;
 let home: TestHome;
 let repos: string[];
 let daemons: Daemon[];
-let slack: WaitingTransport;
 let now: number;
 let seq: bigint;
 
@@ -74,8 +64,7 @@ function discordTransport(threads: Array<{ id: string; parentId: string }> = [])
 }
 
 async function boot(discord: WaitingDiscordTransport, laneChannelId?: string): Promise<Daemon> {
-	slack = new WaitingTransport();
-	const config = withDiscord(home);
+	const config = home.config;
 	const discordConfig = config.channels.discord as NonNullable<OmpbotConfig["channels"]["discord"]>;
 	const sessions = new FakeSessionStore();
 	const daemon = new Daemon({
@@ -86,10 +75,7 @@ async function boot(discord: WaitingDiscordTransport, laneChannelId?: string): P
 				discord: { ...discordConfig, ...(laneChannelId === undefined ? {} : { laneChannelId }) },
 			},
 		},
-		channels: [
-			new SlackBinding(new SlackChannel(slack)),
-			new DiscordBinding(new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER })),
-		],
+		channels: [new DiscordBinding(new DiscordChannel(discord, { ownerUserId: OWNER }))],
 		log: createLogger({ sink: () => undefined, clock: { now: () => now }, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
@@ -145,7 +131,7 @@ function ownerInThread(discord: WaitingDiscordTransport, thread: string, content
 		id: nextId(),
 		channel_id: thread,
 		guild_id: GUILD,
-		author: { id: DISCORD_OWNER },
+		author: { id: OWNER },
 		content,
 		type: 0,
 	});
@@ -160,7 +146,7 @@ function click(discord: WaitingDiscordTransport, customId: string, message: { id
 		token: `token-${id}`,
 		channel_id: message.channelId,
 		guild_id: GUILD,
-		member: { user: { id: DISCORD_OWNER } },
+		member: { user: { id: OWNER } },
 		data: { custom_id: customId, component_type: 2 },
 		message: { id: message.id, channel_id: message.channelId },
 	});
@@ -205,13 +191,11 @@ describe("a lane started from a Discord server thread", () => {
 		expect(lane.meta.statusTs).toBe(status?.id);
 		// The tool's answer carries the lane thread's link, which the session passes on to the owner.
 		expect(String(result)).toContain(`https://discord.com/channels/${GUILD}/${root.id}`);
-		// The first turn's answer is in the lane thread; Slack saw nothing.
+		// The first turn's answer is in the lane thread.
 		expect(creates(discord, (call) => (call.content ?? "").includes("ECHO ulw explore"))[0]?.channelId).toBe(root.id);
-		expect(slack.posts()).toHaveLength(0);
 		// The lane session uploads and is told to upload with the Discord tool.
 		const names = daemon.hostToolsFor(lane.originKey).map((tool) => tool.name);
 		expect(names).toContain("discord_send_file");
-		expect(names).not.toContain("slack_send_file");
 		const prompt = floorsSystemPrompt(
 			"/s",
 			lane.originKey,
@@ -223,10 +207,9 @@ describe("a lane started from a Discord server thread", () => {
 			daemon.floorsSurfaceFor(lane.originKey),
 		);
 		expect(prompt).toContain("discord_send_file");
-		expect(prompt).not.toContain("slack_send_file");
 	});
 
-	test("unmentioned owner messages in the lane thread reach the lane; 멈춰·계속·!reopen·폐기해 act as on Slack", async () => {
+	test("unmentioned owner messages in the lane thread reach the lane; 멈춰·계속·!reopen·폐기해 act on the lane", async () => {
 		const discord = discordTransport();
 		const daemon = await boot(discord);
 		const { lane, root } = await startLane(daemon, discord, "t-lane");
@@ -345,7 +328,7 @@ describe("lanes asked for from a Discord DM", () => {
 		await discord.emitMessage({
 			id: ask,
 			channel_id: DM,
-			author: { id: DISCORD_OWNER },
+			author: { id: OWNER },
 			content: `작업: dm-lane @${repo}`,
 			type: 0,
 		});
@@ -383,13 +366,13 @@ describe("lanes asked for from a Discord DM", () => {
 		expect(
 			floorsSystemPrompt(
 				"/s",
-				"slack/dm/D1",
+				"teams/dm/t0123456789abcdef",
 				undefined,
 				undefined,
 				false,
 				false,
 				false,
-				daemon.floorsSurfaceFor("slack/dm/D1"),
+				daemon.floorsSurfaceFor("teams/dm/t0123456789abcdef"),
 			),
 		).not.toContain("laneChannelId");
 
@@ -397,7 +380,7 @@ describe("lanes asked for from a Discord DM", () => {
 		await discord.emitMessage({
 			id: nextId(),
 			channel_id: DM,
-			author: { id: DISCORD_OWNER },
+			author: { id: OWNER },
 			content: `작업: no-lane @${repo}`,
 			type: 0,
 		});

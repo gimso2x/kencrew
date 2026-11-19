@@ -8,16 +8,7 @@ import { DiscordChannel } from "../src/discord/channel";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import {
-	DISCORD_OWNER,
-	makeHome,
-	type TestHome,
-	WaitingDiscordTransport,
-	WaitingTransport,
-	withDiscord,
-} from "./helpers/bot-home";
+import { makeHome, OWNER, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
 const DISCORD_DM = "123456789012345678"; // gitleaks:allow (fake snowflake)
 const DISCORD_CH = "111111111111111111"; // gitleaks:allow (fake snowflake)
@@ -25,20 +16,15 @@ const DM_ORIGIN = `discord/dm/${DISCORD_DM}`;
 
 let home: TestHome;
 let daemon: Daemon;
-let slack: WaitingTransport;
 let discord: WaitingDiscordTransport;
 
 beforeEach(async () => {
 	home = makeHome("ompbot-discord-monitors-");
-	slack = new WaitingTransport();
 	discord = new WaitingDiscordTransport();
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
-		config: withDiscord(home),
-		channels: [
-			new SlackBinding(new SlackChannel(slack)),
-			new DiscordBinding(new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER })),
-		],
+		config: home.config,
+		channels: [new DiscordBinding(new DiscordChannel(discord, { ownerUserId: OWNER }))],
 		log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
@@ -73,7 +59,6 @@ describe("monitors from a Discord owner DM", () => {
 		const post = discord.posts((text) => text.includes("물 마시라고 알려줘"))[0];
 		expect(post?.channelId).toBe(DISCORD_DM);
 		expect(post?.messageReference).toBeUndefined();
-		expect(slack.posts((text) => text.includes("물 마시라고 알려줘"))).toHaveLength(0);
 		expect(daemon.store.listDeliveries().map((delivery) => delivery.threadRef)).toContain(`${DISCORD_DM}:-`);
 	});
 
@@ -94,26 +79,18 @@ describe("monitors from a Discord owner DM", () => {
 		const channels = discord.posts((text) => text.includes("채널 보고")).map((post) => post.channelId);
 		expect(channels).toContain(DISCORD_CH);
 		expect(channels).toContain(copy);
-		expect(slack.posts((text) => text.includes("채널 보고"))).toHaveLength(0);
 	});
 
-	test("malformed channel ids are refused and nothing is stored; Slack ids still pass", async () => {
+	test("malformed channel ids are refused and nothing is stored; a Slack id is refused too", async () => {
 		const add = addTool();
-		for (const bad of ["12345", "C1", "c0123456789", "1234567890123456789012", "D0123456789"]) {
+		for (const bad of ["12345", "C1", "c0123456789", "1234567890123456789012", "D0123456789", "C0123456789"]) {
 			await expect(add({ name: `bad-${bad}`, trigger: due(), instruction: "x", channel: bad })).rejects.toThrow(
-				"channel must be a Slack channel id like C0123456789 or a Discord channel id",
+				"channel must be a Discord channel id (17-20 digits)",
 			);
 			await expect(add({ name: `bad-${bad}`, trigger: due(), instruction: "x", copyChannel: bad })).rejects.toThrow(
-				"copyChannel must be a Slack channel id like C0123456789 or a Discord channel id",
+				"copyChannel must be a Discord channel id (17-20 digits)",
 			);
 		}
 		expect(daemon.store.monitors.listMonitors()).toEqual([]);
-		await add({ name: "slack-ch", trigger: due(), instruction: "x", channel: "C0123456789" });
-		expect(daemon.store.monitors.getMonitor("slack-ch")?.channel).toBe("C0123456789");
-	});
-
-	test("a Slack DM registration still stores no channel (the owner DM default)", async () => {
-		await addTool("slack/dm/D1")({ name: "slack", trigger: due(), instruction: "x" });
-		expect(daemon.store.monitors.getMonitor("slack")?.channel).toBeNull();
 	});
 });

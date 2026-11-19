@@ -6,7 +6,7 @@ import { redact } from "../redact";
 
 /** Owner-DM texts of the unattended reliability loop (turn-failure escalation, gate self-report). Korean, one glance. */
 
-/** One line, always: Slack collapses whitespace and error text is attacker-influenced. */
+/** One line, always: chat clients collapse whitespace and error text is attacker-influenced. */
 const oneLine = (text: string, max = 160): string => text.replace(/\s+/g, " ").trim().slice(0, max);
 
 /**
@@ -55,7 +55,7 @@ export function formatStallNotice(info: StallEscalation): string {
 /**
  * `🚨 [자가보고] … 메시지를 N분째 보내지 못하고 있습니다`: the sweep keeps failing to re-dispatch an origin's
  * stranded pending row. `count` is the incident's occurrence count (24h-repeat suppression), `reason` the last
- * raw drain error — redacted by the caller before it reaches Slack.
+ * raw drain error — redacted by the caller before it reaches the chat.
  */
 export function formatPendingDispatchNotice(
 	originKey: string,

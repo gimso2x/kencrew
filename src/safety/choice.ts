@@ -4,7 +4,7 @@ import type { ApprovalBroker, ApprovalOrigin, ChoiceCardHandle, ChoiceEvent } fr
 
 /** More options than this: a numbered list and "번호로 답장" instead of buttons. */
 export const MAX_CHOICE_BUTTONS = 5;
-/** Slack allows at most 25 elements in one actions block; an `ask` question past it is answered by number. */
+/** A card allows at most 25 elements in one actions block; an `ask` question past it is answered by number. */
 export const MAX_CARD_BUTTONS = 25;
 /**
  * omp times a dialog out by itself at its `timeout`; the card's own deadline comes this much earlier so a partly
@@ -15,6 +15,8 @@ const REPLY_HINT = "버튼을 누르거나 이 스레드에 답장해 주세요"
 const OPTION_ONLY_HINT = "↪ 번호나 선택지 이름으로 답해 주세요";
 /** omp's free-text row of a select (`askChoice`: "Other (type your own)"); picking it makes omp open an `input` next. */
 const OTHER_ROW_SUFFIX = " (type your own)";
+/** Splits a select row `label — description`: the button shows the label, the card text lists the whole row. */
+const DESCRIPTION_SEP = " — ";
 const YES = /^(예|네|응|ㅇㅇ|ㅇ|좋아|yes|y|ok|확인)$/i;
 
 const TIMEOUT_LINE = (fallback: string) => `⌛ 시간 초과: ${fallback}로 처리됨`;
@@ -63,8 +65,14 @@ async function answerSelect(
 ): Promise<OmpDialogResponse> {
 	const { options } = request;
 	const asButtons = options.length <= MAX_CHOICE_BUTTONS;
+	// omp's select rows carry no description field; a row written with DESCRIPTION_SEP brings its own.
+	const heads = options.map((option) => {
+		const at = option.indexOf(DESCRIPTION_SEP);
+		return at > 0 ? option.slice(0, at) : option;
+	});
+	const described = heads.some((head, index) => head !== options[index]);
 	const text = asButtons
-		? `❓ ${request.title}\n${REPLY_HINT}`
+		? `❓ ${request.title}\n${described ? `${numbered(options)}\n` : ""}${REPLY_HINT}`
 		: `❓ ${request.title}\n${numbered(options)}\n번호로 이 스레드에 답장해 주세요`;
 	// omp's own "other" row is its last row. Without one (a tool approval) or in a multi-select (omp marks its rows
 	// "checkbox"; a required one has no "Done" row to tell it by) a text naming no option is not an answer: the card
@@ -75,11 +83,11 @@ async function answerSelect(
 		origin,
 		{
 			text,
-			buttons: asButtons ? options : [],
+			buttons: asButtons ? heads : [],
 			fallback: "취소",
 			timeoutMs: deadlineOf(request),
 			acceptsText: (reply: string) =>
-				other === undefined ? optionOf(options, reply) !== undefined : reply.trim() !== "",
+				other === undefined ? (optionOf(options, reply) ?? optionOf(heads, reply)) !== undefined : reply.trim() !== "",
 			rejectHint: OPTION_ONLY_HINT,
 		},
 		{ signal },
@@ -87,7 +95,7 @@ async function answerSelect(
 	const result = await card.next();
 	if (result.kind === "timeout" || result.kind === "cancelled") return endUnanswered(card, result.kind, "취소");
 	const reply = result.kind === "text" ? result.text.trim() : "";
-	const index = result.kind === "choice" ? result.index : optionOf(options, reply);
+	const index = result.kind === "choice" ? result.index : (optionOf(options, reply) ?? optionOf(heads, reply));
 	const picked = index === undefined ? undefined : options[index];
 	if (picked === undefined && other !== undefined) {
 		// Text outside the options: pick the "other" row, and answer the `input` omp opens next with the text itself.
@@ -136,7 +144,7 @@ async function answerText(
 		const card = await broker.choose(
 			origin,
 			{
-				text: `🔒 ${request.title}\n비밀값은 슬랙에 쓰지 마세요 — 이 입력은 취소합니다`,
+				text: `🔒 ${request.title}\n비밀값은 채팅에 쓰지 마세요 — 이 입력은 취소합니다`,
 				buttons: [],
 				fallback: "취소",
 			},
@@ -329,9 +337,9 @@ function applyAskEvent(
 /**
  * Puts one omp dialog to the owner as a choice card in `origin`'s conversation and returns the omp response.
  * select/confirm get buttons (a numbered list past `MAX_CHOICE_BUTTONS`), input/editor take a reply, ask gets one
- * block per question; a secret input is cancelled at once, since a secret must never be typed into Slack.
+ * block per question; a secret input is cancelled at once, since a secret must never be typed into chat.
  */
-export function answerDialogOnSlack(
+export function answerDialog(
 	broker: ApprovalBroker,
 	origin: ApprovalOrigin,
 	request: OmpDialogRequest,

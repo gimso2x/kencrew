@@ -3,7 +3,6 @@ import { validateCard } from "../src/channel/card";
 import { tableSpans } from "../src/channel/text";
 import { cardToEmbed, fitEmbed } from "../src/discord/card";
 import { renderDiscordParts } from "../src/discord/format";
-import { renderMarkdownParts, toMrkdwn } from "../src/slack/format";
 
 const el = (type: string, props: Record<string, unknown> = {}, children: string[] = []) => ({ type, props, children });
 const spec = (elements: Record<string, unknown>, root = "c"): string => JSON.stringify({ root, elements });
@@ -44,26 +43,6 @@ describe("discord qa-j", () => {
 		const fences = lines.filter((line) => /^`{4,}$/.test(line));
 		expect(fences).toHaveLength(2);
 		expect(lines.at(-1)).toBe("````");
-	});
-});
-
-describe("slack format qa-j", () => {
-	test("28: a token-bearing message's text stays under Slack's 40,000 characters", () => {
-		const body = `<@U0123456> ${"&".repeat(10_000)}`;
-		const parts = renderMarkdownParts(body, false);
-		expect(parts).toBeDefined();
-		for (const part of parts ?? []) expect(part.text.length).toBeLessThanOrEqual(40_000);
-	});
-
-	test("72: a closing # needs a space before it, so C# keeps its sharp", () => {
-		expect(toMrkdwn("## C#")).toBe("*C#*");
-		expect(toMrkdwn("### 2. C#과 F#")).toBe("*2. C#과 F#*");
-		expect(toMrkdwn("## 제목 ##")).toBe("*제목*");
-	});
-
-	test("73: angle brackets in a link label are escaped alike in plain and code span labels", () => {
-		expect(toMrkdwn("[a > b](https://x.test/p)")).toBe("<https://x.test/p|a &gt; b>");
-		expect(toMrkdwn("[`a > b`](https://x.test/p)")).toBe("<https://x.test/p|`a &gt; b`>");
 	});
 });
 

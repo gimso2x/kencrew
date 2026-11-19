@@ -13,17 +13,8 @@ import { DiscordCallError, type DiscordMessageEvent, DiscordRateLimitedError } f
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import { openStore, type Store } from "../src/store/db";
-import {
-	DISCORD_OWNER,
-	makeHome,
-	type TestHome,
-	WaitingDiscordTransport,
-	WaitingTransport,
-	withDiscord,
-} from "./helpers/bot-home";
+import { makeHome, OWNER, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const STRANGER = "100000000000000002";
@@ -65,7 +56,7 @@ function core(): CoreSink {
 /** The adapter the binding builds (store-backed targets and watermarks), started. */
 async function boot(options: { maxPages?: number } = {}): Promise<DiscordAdapter> {
 	const binding = new DiscordBinding(
-		new DiscordChannel(transport, { ownerUserId: DISCORD_OWNER }),
+		new DiscordChannel(transport, { ownerUserId: OWNER }),
 		options.maxPages === undefined ? {} : { backfillMaxPages: options.maxPages },
 	);
 	const adapter = binding.createAdapter({
@@ -86,7 +77,7 @@ async function recover(adapter: DiscordAdapter): Promise<void> {
 	await adapter.recoveryIdle();
 }
 
-function dm(id: string, author = DISCORD_OWNER, content = `메시지 ${id}`): DiscordMessageEvent {
+function dm(id: string, author = OWNER, content = `메시지 ${id}`): DiscordMessageEvent {
 	return { id, channel_id: DM, author: { id: author }, content, type: 0 };
 }
 
@@ -96,7 +87,7 @@ const eyes = () => calls("addReaction").filter((c) => c.emoji === "👀");
 
 beforeEach(() => {
 	home = makeHome("ompbot-discord-backfill-");
-	config = withDiscord(home);
+	config = home.config;
 	store = openStore({
 		timezone: "Asia/Seoul",
 		path: join(home.dir, "test.db"),
@@ -208,6 +199,32 @@ describe("recover()", () => {
 		expect(calls("listMessages").filter((c) => c.channelId === LOCKED)).toHaveLength(0);
 	});
 
+	test("the quarantine survives a restart for a day, then the channel is read again and the mark is cleared", async () => {
+		store.ensureOrigin(`discord/ch/${LOCKED}`, join(home.dir, "s1"));
+		store.setCursor(`dc:${LOCKED}`, WATERMARK);
+		const first = await boot();
+		transport.failNext.getChannel = [
+			new DiscordCallError("definitive", "discord_http_404:10003 Unknown Channel", 404, 10003),
+		];
+		await recover(first);
+		expect(Number(store.getCursor(`bfq:dc:${LOCKED}`))).toBeGreaterThan(0);
+
+		// A restart within the day: a new adapter skips the channel without a Discord call or a warning.
+		logs = [];
+		const restarted = await boot();
+		await recover(restarted);
+		expect(calls("getChannel").filter((c) => c.channelId === LOCKED)).toHaveLength(1);
+		expect(logs.some((line) => line.includes("event=backfill_quarantined"))).toBe(false);
+
+		// A day later the channel is back: it is read and the quarantine row is gone.
+		store.setCursor(`bfq:dc:${LOCKED}`, String(Date.now() - 24 * 60 * 60 * 1000));
+		transport.setChannel({ id: LOCKED, type: 0, guildId: GUILD });
+		const later = await boot();
+		await recover(later);
+		expect(calls("listMessages").filter((c) => c.channelId === LOCKED)).toHaveLength(1);
+		expect(store.getCursor(`bfq:dc:${LOCKED}`)).toBeUndefined();
+	});
+
 	test("transient ingest failures (rate limit, 5xx, busy ledger) never count toward the dead letter", async () => {
 		store.ensureOrigin(`discord/dm/${DM}`, join(home.dir, "s1"));
 		store.setCursor(`dc:${DM}`, WATERMARK);
@@ -228,9 +245,7 @@ describe("recover()", () => {
 		expect(store.getCursor(`dc:${DM}`)).toBe("100000000000000001");
 	});
 
-	test("Slack's ch:/thr: watermarks are neither Discord targets nor touched; Discord keeps dc:<id> only", async () => {
-		store.setCursor("ch:C0SLACK001", "1700000000.000100");
-		store.setCursor("thr:C0SLACK001:1700000000.000100", "1700000000.000200");
+	test("a leftover slack/ origin row (the removed channel) is no Discord target; Discord keeps dc:<id> only", async () => {
 		store.ensureOrigin("slack/dm/D0SLACK001", join(home.dir, "s0"));
 		store.ensureOrigin(`discord/dm/${DM}`, join(home.dir, "s1"));
 		store.setCursor(`dc:${DM}`, WATERMARK);
@@ -238,10 +253,7 @@ describe("recover()", () => {
 		const adapter = await boot();
 		await recover(adapter);
 		expect(calls("listMessages").map((c) => c.channelId)).toEqual([DM]);
-		expect(store.getCursor("ch:C0SLACK001")).toBe("1700000000.000100");
-		expect(store.getCursor("thr:C0SLACK001:1700000000.000100")).toBe("1700000000.000200");
 		expect(store.listCursorKeys("dc:")).toEqual([`dc:${DM}`]);
-		expect(store.listCursorKeys("ch:")).toEqual(["ch:C0SLACK001"]);
 	});
 
 	test("a server thread origin scans the parent channel and the thread channel", async () => {
@@ -253,7 +265,7 @@ describe("recover()", () => {
 			{
 				id: "100000000000000001",
 				channel_id: thread,
-				author: { id: DISCORD_OWNER },
+				author: { id: OWNER },
 				content: `<@${BOT}> 스레드 답`,
 				type: 0,
 			},
@@ -269,13 +281,13 @@ describe("recover()", () => {
 	});
 });
 
-// T-20261112-36 AC-3: Slack's `⏬ … N건을 처리합니다` recovery notice, placed where the answers show up.
+// T-20261112-36 AC-3: the `⏬ … N건을 처리합니다` recovery notice, placed where the answers show up.
 describe("recovery notice", () => {
 	const notices = () => calls("createMessage").filter((c) => c.content?.startsWith("⏬") === true);
 	const root = (id: string, content = `<@${BOT}> 질문 ${id}`): DiscordMessageEvent => ({
 		id,
 		channel_id: CH,
-		author: { id: DISCORD_OWNER },
+		author: { id: OWNER },
 		content,
 		type: 0,
 	});
@@ -389,7 +401,7 @@ describe("recovery triggers", () => {
 			id: "100000000000000009",
 			channel_id: "111111111111111112",
 			guild_id: GUILD,
-			author: { id: DISCORD_OWNER },
+			author: { id: OWNER },
 			content: `<@${BOT}> 질문`,
 			type: 0,
 		});
@@ -426,15 +438,12 @@ describe("daemon start", () => {
 		});
 
 		const discord = new WaitingDiscordTransport();
-		discord.history.set(DM, [dm("100000000000000001", DISCORD_OWNER, "자는 동안 보낸 질문")]);
+		discord.history.set(DM, [dm("100000000000000001", OWNER, "자는 동안 보낸 질문")]);
 		const sessions = new FakeSessionStore();
 		const clock = { now: () => Date.now() };
 		daemon = new Daemon({
 			config,
-			channels: [
-				new SlackBinding(new SlackChannel(new WaitingTransport())),
-				new DiscordBinding(new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER })),
-			],
+			channels: [new DiscordBinding(new DiscordChannel(discord, { ownerUserId: OWNER }))],
 			clock,
 			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 			ompVersion: "omp-test 0",

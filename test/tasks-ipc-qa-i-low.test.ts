@@ -39,8 +39,8 @@ describe("tasks CLI (qa-i low)", () => {
 		const row = ledger.register({
 			title: "t",
 			risk: "L2",
-			originKey: "slack/dm/D1/t/1.1",
-			threadRef: "D1:1.1",
+			originKey: "discord/dm/200000000000000001/t/400000000000000001",
+			threadRef: "200000000000000001:400000000000000001",
 			host: null,
 			repo: "/r/repo",
 			acceptance: acceptanceItems(["a"]),

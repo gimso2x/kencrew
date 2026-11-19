@@ -13,12 +13,12 @@ import { parseMonitorSpec } from "../src/monitors/spec";
 import { parseTaskSpecInput, TaskSpecError } from "../src/tasks/docs";
 import { resolveTaskHost } from "../src/tasks/host";
 import { runSignal } from "../src/tasks/signals";
-import { makeHome, type TestHome } from "./helpers/bot-home";
+import { makeHome, OWNER_DM, type TestHome } from "./helpers/bot-home";
 import { makeRepo } from "./helpers/git-fixtures";
 import { laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
 
 // 2차 딥시크 QA low 레인 M(doc/plans/qa50b-low-fixes.md) 회귀 테스트. 토큰은 가짜 모양만 쓴다.
-const FAKE_SLACK = ["xoxb", "TEST", "0", "lanem"].join("-");
+const FAKE_BOT_TOKEN = ["xoxb", "TEST", "0", "lanem"].join("-");
 const FAKE_GH = `ghp_${"T".repeat(36)}`;
 
 const cleanups: Array<() => void> = [];
@@ -49,23 +49,31 @@ describe("M-1: dispatchHosts lookups take only the config's own keys", () => {
 });
 
 describe("M-3·M-5: lane root and status messages", () => {
-	test("M-3: a title with Slack mention syntax is escaped in the root and the status", async () => {
+	test("M-3: a title with mention syntax stays text in the root and the status and pings no one", async () => {
 		const h = laneHarness(home().dir);
 		const repos: string[] = [];
 		cleanups.push(() => {
 			h.close();
 			for (const repo of repos) removeRepoAndWorktrees(repo);
 		});
-		const lane = await h.manager.start({ title: "<!channel> <@U1> 알림", cwd: makeRepo(repos), channel: "D1" });
+		const lane = await h.manager.start({
+			title: "<!channel> <@700000000000000001> 알림",
+			cwd: makeRepo(repos),
+			channel: OWNER_DM,
+		});
 		await h.settle();
-		const texts = [
-			...h.transport.posts().map((post) => post.text),
-			...h.transport.calls.flatMap((call) => (call.method === "updateMessage" ? [call.text] : [])),
-		];
-		expect(texts.some((text) => text.includes("&lt;!channel&gt;"))).toBe(true);
-		expect(texts.some((text) => text.includes("<!channel>") || text.includes("<@U1>"))).toBe(false);
+		const sent = h.transport.calls.flatMap((call) =>
+			call.method === "createMessage" || call.method === "editMessage" ? [call] : [],
+		);
+		const titled = sent.filter((call) => call.content?.includes("알림") === true);
+		expect(titled.length).toBeGreaterThan(0);
+		// The special mention stays as typed (never the bare `channel` word Discord would turn into a ping) and no
+		// user or role is allowed to be pinged by it.
+		expect(titled.every((call) => call.content?.includes("<!channel>") === true)).toBe(true);
+		expect(titled.every((call) => call.allowedMentions?.users === undefined)).toBe(true);
+		expect(titled.every((call) => call.allowedMentions?.parse?.length === 0)).toBe(true);
 		// The stored title stays as the model wrote it (the lane prompt and the dashboard read it).
-		expect(lane.title).toBe("<!channel> <@U1> 알림");
+		expect(lane.title).toBe("<!channel> <@700000000000000001> 알림");
 	});
 
 	test("M-5: a failed status post leaves the root reading ❌, not 🔄", async () => {
@@ -75,20 +83,20 @@ describe("M-3·M-5: lane root and status messages", () => {
 			h.close();
 			for (const repo of repos) removeRepoAndWorktrees(repo);
 		});
-		const original = h.transport.postMessage.bind(h.transport);
+		const original = h.transport.createMessage.bind(h.transport);
 		let posted = 0;
-		h.transport.postMessage = async (args) => {
+		h.transport.createMessage = async (args) => {
 			posted += 1;
 			if (posted === 2) throw new Error("status post failed");
 			return original(args);
 		};
-		await expect(h.manager.start({ title: "root-left", cwd: makeRepo(repos), channel: "D1" })).rejects.toThrow(
+		await expect(h.manager.start({ title: "root-left", cwd: makeRepo(repos), channel: OWNER_DM })).rejects.toThrow(
 			"status post failed",
 		);
-		const rootTs = h.transport.posts()[0]?.ts;
-		expect(h.transport.posts()[0]?.text).toBe("🔄 root-left");
+		const rootId = h.transport.posts()[0]?.id;
+		expect(h.transport.posts()[0]?.content).toBe("🔄 root-left");
 		const edits = h.transport.calls.flatMap((call) =>
-			call.method === "updateMessage" && call.ts === rootTs ? [call.text] : [],
+			call.method === "editMessage" && call.messageId === rootId ? [call.content] : [],
 		);
 		expect(edits.at(-1)).toBe("❌ root-left");
 		expect(h.store.listLanes()).toHaveLength(0);
@@ -155,8 +163,8 @@ describe("M-7: a check block's secret is refused also when JSON-escaped", () => 
 		background: "b",
 	};
 	test("\\u escapes decoding to a token are refused like the literal token", () => {
-		const literal = `확인 [check: command ["echo","${FAKE_SLACK}"]]`;
-		const escaped = `확인 [check: command ["echo","\\u0078${FAKE_SLACK.slice(1)}"]]`;
+		const literal = `확인 [check: command ["echo","${FAKE_BOT_TOKEN}"]]`;
+		const escaped = `확인 [check: command ["echo","\\u0078${FAKE_BOT_TOKEN.slice(1)}"]]`;
 		expect(() => parseTaskSpecInput({ ...spec, acceptance: [literal] })).toThrow(TaskSpecError);
 		expect(() => parseTaskSpecInput({ ...spec, acceptance: [escaped] })).toThrow(TaskSpecError);
 		expect(() =>

@@ -126,7 +126,12 @@ describe("graph + ownerMode full (AC-2)", () => {
 		await ms.waitFor((call) => String(call.body.text).includes("ECHO 질문 dm-1"));
 
 		expect(names(ownerDm)).toEqual([...TEAMS_DM_TOOLS.slice(0, 1), ...GRAPH_TOOLS, ...TEAMS_DM_TOOLS.slice(1)]);
-		for (const origin of [group, "slack/dm/D0OWNER", "slack/ch/C0CHAN", "discord/dm/123456"]) {
+		for (const origin of [
+			group,
+			"discord/dm/200000000000000001",
+			"discord/ch/300000000000000001",
+			"discord/dm/123456",
+		]) {
 			expect(names(origin).filter((name) => GRAPH_TOOLS.includes(name))).toEqual([]);
 		}
 		// 피어 봇 글이 들어온 1:1은 도구를 잃는다.
@@ -220,7 +225,7 @@ describe("그룹 origin 기억 끄기 (AC-5b)", () => {
 		const withoutGraph: OmpbotConfig = { ...base, channels: { teams } };
 		expect(rpcOverlayFor(withGraph, group)).toBe(teamsGroupOverlayPath(home.dir));
 		expect(rpcOverlayFor(withGraph, `${group}/t/1794445875395`)).toBe(teamsGroupOverlayPath(home.dir));
-		for (const origin of [ownerDm, "slack/ch/C0CHAN", "discord/ch/123456", "lane/x"]) {
+		for (const origin of [ownerDm, "discord/ch/300000000000000001", "discord/ch/123456", "lane/x"]) {
 			expect(rpcOverlayFor(withGraph, origin)).toBeUndefined();
 		}
 		expect(rpcOverlayFor(withoutGraph, group)).toBeUndefined();

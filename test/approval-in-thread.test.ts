@@ -1,12 +1,19 @@
-// Approval cards in the asking thread (doc/plans/slack-approval-in-thread.md F1): the escalation card stays the
+// Approval cards in the asking thread (doc/plans/slack-approval-in-thread.md F1, here on Discord): the escalation card stays the
 // canonical one, a mirror card with the same buttons lands in the asking thread, one decision settles both, and a
 // timed-out card offers `다시 요청`. Broker tests drive timeouts with manual timers; daemon tests click through the
-// Slack adapter. Waits are on transport calls and log lines (bounded), never sleeps.
+// Discord adapter. Waits are on transport calls and log lines (bounded), never sleeps.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
+import { DiscordChannel } from "../src/discord/channel";
+import {
+	type CreateMessageArgs,
+	DiscordCallError,
+	type DiscordInteraction,
+	type EditMessageArgs,
+} from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
@@ -18,65 +25,70 @@ import {
 	approvalActionId,
 	parseApprovalActionId,
 } from "../src/safety/approval";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { SlackCallError } from "../src/slack/transport";
 import { openStore, type Store } from "../src/store/db";
-import { hasButtons, makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	CHANNEL,
+	discordBinding,
+	GUILD,
+	hasButtons,
+	makeHome,
+	OWNER,
+	OWNER_DM,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
-import { type FakeCall, FakeSlackTransport } from "./helpers/slack-fake-transport";
+import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 
-const ESC = "C0ESCALATE1";
-const REQ = "C0REQUEST01";
-const THREAD = "7.7";
+const ESC = "300000000000000010";
+const REQ = CHANNEL;
+const THREAD = "700000000000000077";
 const WAIT_MS = 4_000;
+const ROW_1 = "900000000000000101";
+const ROW_2 = "900000000000000102";
+const ROW_3 = "900000000000000103";
+const ROW_4 = "900000000000000104";
+const MIRROR_ID = "900000000000000108";
 
-type Post = Extract<FakeCall, { method: "postMessage" }>;
-type Update = Extract<FakeCall, { method: "updateMessage" }>;
+type Post = Extract<FakeDiscordCall, { method: "createMessage" }>;
+type Update = Extract<FakeDiscordCall, { method: "editMessage" }>;
 
-const typeOf = (block: unknown): unknown =>
-	typeof block === "object" && block !== null && "type" in block ? block.type : undefined;
+/** The id a post is answered under: the message it replies to (a thread in a server channel), if any. */
+const threadOf = (post: Post): string | undefined => post.messageReference?.messageId;
+const textOf = (post: Post | Update | undefined): string => post?.content ?? "";
 
-/** Action ids of the buttons in a message's blocks (`[]` without an actions block). */
-function actionIds(blocks: readonly unknown[] | undefined): string[] {
-	const actions = blocks?.find((block) => typeOf(block) === "actions");
-	if (typeof actions !== "object" || actions === null || !("elements" in actions)) return [];
-	return (actions.elements as Array<{ action_id: string }>).map((element) => element.action_id);
+/** Custom ids of the buttons in a message's component rows (`[]` without buttons). */
+function actionIds(components: readonly unknown[] | undefined): string[] {
+	return (
+		(components as ReadonlyArray<{ components: Array<{ custom_id: string }> }> | undefined)?.flatMap((row) =>
+			row.components.map((button) => button.custom_id),
+		) ?? []
+	);
 }
 
-/** The grey note line (last `context` block) of a card, as JSON text; `""` when there is none. */
-function contextText(blocks: readonly unknown[] | undefined): string {
-	const last = blocks?.at(-1);
-	if (typeOf(last) !== "context" || typeof last !== "object" || last === null || !("elements" in last)) return "";
-	return JSON.stringify(last.elements);
+/** The grey note line (the `-# ` last line of the embed text) of a card; `""` when there is none. */
+function contextText(embeds: readonly unknown[] | undefined): string {
+	const description = (embeds?.[0] as { description?: string } | undefined)?.description ?? "";
+	const last = description.split("\n").at(-1) ?? "";
+	return last.startsWith("-# ") ? last : "";
 }
 
 /** Fake transport whose calls wake bounded waiters; `failMirror` makes the mirror card post (thread + buttons) fail. */
-class WatchTransport extends FakeSlackTransport {
+class WatchTransport extends WaitingDiscordTransport {
 	failMirror = false;
 	readonly #waiters = new Set<() => void>();
 
-	override async postMessage(args: {
-		channel: string;
-		text: string;
-		threadTs?: string | undefined;
-		blocks?: readonly unknown[] | undefined;
-	}): Promise<{ ts: string }> {
-		if (this.failMirror && args.threadTs !== undefined && hasButtons(args.blocks)) {
-			throw new SlackCallError("definitive", "slack_platform_error:not_in_channel");
+	override async createMessage(args: CreateMessageArgs): Promise<{ id: string }> {
+		if (this.failMirror && args.messageReference !== undefined && hasButtons(args.components)) {
+			throw new DiscordCallError("definitive", "discord_http_403:50001 Missing Access", 403, 50001);
 		}
-		const result = await super.postMessage(args);
+		const result = await super.createMessage(args);
 		this.#wake();
 		return result;
 	}
 
-	override async updateMessage(args: {
-		channel: string;
-		ts: string;
-		text: string;
-		blocks?: readonly unknown[] | undefined;
-	}): Promise<void> {
-		await super.updateMessage(args);
+	override async editMessage(args: EditMessageArgs): Promise<void> {
+		await super.editMessage(args);
 		this.#wake();
 	}
 
@@ -84,13 +96,10 @@ class WatchTransport extends FakeSlackTransport {
 		for (const waiter of [...this.#waiters]) waiter();
 	}
 
-	posts(): Post[] {
-		return this.calls.filter((call): call is Post => call.method === "postMessage");
-	}
-
-	edits(channel: string, ts: string): Update[] {
+	edits(channel: string, messageId: string): Update[] {
 		return this.calls.filter(
-			(call): call is Update => call.method === "updateMessage" && call.channel === channel && call.ts === ts,
+			(call): call is Update =>
+				call.method === "editMessage" && call.channelId === channel && call.messageId === messageId,
 		);
 	}
 
@@ -158,6 +167,8 @@ describe("broker: mirror card in the asking thread", () => {
 		dir = mkdtempSync(join(tmpdir(), "ompbot-approval-thread-"));
 		store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock: { now: () => 1_000 }, redact });
 		transport = new WatchTransport();
+		transport.setChannel({ id: ESC, type: 0, guildId: GUILD });
+		transport.setChannel({ id: REQ, type: 0, guildId: GUILD });
 		timers = new ManualTimers();
 		lines = [];
 		logWaiters = new Set();
@@ -172,9 +183,9 @@ describe("broker: mirror card in the asking thread", () => {
 	function broker(escalationChannel: string | null = ESC): ApprovalBroker {
 		return new ApprovalBroker({
 			timezone: "Asia/Seoul",
-			channels: registryOf(new SlackChannel(transport)),
+			channels: registryOf(new DiscordChannel(transport, { ownerUserId: OWNER })),
 			ownerUserId: OWNER,
-			escalationChannel: escalationChannel ?? undefined,
+			escalationChannel: escalationChannel === null ? undefined : { discord: escalationChannel },
 			log: createLogger({
 				sink: (line) => {
 					lines.push(line);
@@ -189,10 +200,10 @@ describe("broker: mirror card in the asking thread", () => {
 		});
 	}
 
-	const origin = { originKey: `slack/ch/${REQ}/t/${THREAD}`, channel: REQ, threadTs: THREAD };
+	const origin = { originKey: `discord/ch/${REQ}/t/${THREAD}`, channel: REQ, threadTs: THREAD };
 	const detail = { action: "git push --force origin main", impact: "main 이력이 바뀜" };
-	const canonicalPost = () => transport.posts().find((p) => p.channel === ESC && p.threadTs === undefined);
-	const mirrorPost = () => transport.posts().find((p) => p.channel === REQ && p.threadTs === THREAD);
+	const canonicalPost = () => transport.posts().find((p) => p.channelId === ESC && threadOf(p) === undefined);
+	const mirrorPost = () => transport.posts().find((p) => p.channelId === REQ && threadOf(p) === THREAD);
 
 	/** Asks with an origin thread and waits until both cards are up; returns the canonical and mirror ts. */
 	async function askInThread(b: ApprovalBroker, signal?: AbortSignal) {
@@ -200,7 +211,7 @@ describe("broker: mirror card in the asking thread", () => {
 		await untilLog(/event=approval_mirror(ed|_failed) /);
 		const canonical = canonicalPost();
 		if (canonical === undefined) throw new Error("no canonical card");
-		return { result, canonicalTs: canonical.ts, mirrorTs: mirrorPost()?.ts };
+		return { result, canonicalTs: canonical.id, mirrorTs: mirrorPost()?.id };
 	}
 
 	test("AC-1: the mirror card lands in the asking thread with the same title and fields, buttons carrying the canonical key, no owner mention; the row records mirror_ref", async () => {
@@ -208,40 +219,42 @@ describe("broker: mirror card in the asking thread", () => {
 		const { result, canonicalTs, mirrorTs } = await askInThread(b);
 		const canonical = canonicalPost() as Post;
 		const mirror = mirrorPost() as Post;
-		expect(canonical.text.split("\n")[0]).toBe(`🔐 승인 요청 <@${OWNER}>`);
-		expect(JSON.stringify(transport.edits(ESC, canonicalTs).at(-1)?.blocks)).toContain(`<@${OWNER}>`);
-		expect(mirror.text).not.toContain(`<@${OWNER}>`);
-		expect(JSON.stringify(mirror.blocks)).not.toContain(`<@${OWNER}>`);
-		expect(JSON.stringify(mirror.blocks)).not.toContain("요청 위치");
+		expect(textOf(canonical).split("\n")[0]).toBe(`🔐 승인 요청 <@${OWNER}>`);
+		expect(JSON.stringify(transport.edits(ESC, canonicalTs).at(-1)?.embeds)).toContain(`<@${OWNER}>`);
+		expect(textOf(mirror)).not.toContain(`<@${OWNER}>`);
+		expect(JSON.stringify(mirror.embeds)).not.toContain(`<@${OWNER}>`);
+		expect(JSON.stringify(mirror.embeds)).not.toContain("요청 위치");
 		// Same header and field section as the canonical card.
-		const canonicalBlocks = transport.edits(ESC, canonicalTs).at(-1)?.blocks ?? [];
-		expect(mirror.blocks?.[0]).toEqual(canonicalBlocks[0]);
-		expect(mirror.blocks?.find((b) => typeof b === "object" && b !== null && "fields" in b)).toEqual(
-			canonicalBlocks.find((b) => typeof b === "object" && b !== null && "fields" in b),
-		);
-		expect(actionIds(mirror.blocks)).toEqual([
+		const canonicalEmbed = transport.edits(ESC, canonicalTs).at(-1)?.embeds?.[0] as {
+			title?: string;
+			fields?: unknown;
+		};
+		const mirrorEmbed = mirror.embeds?.[0] as { title?: string; fields?: unknown };
+		expect(mirrorEmbed.title).toEqual(canonicalEmbed.title);
+		expect(mirrorEmbed.fields).toEqual(canonicalEmbed.fields);
+		expect(actionIds(mirror.components)).toEqual([
 			approvalActionId("approve", ESC, canonicalTs),
 			approvalActionId("deny", ESC, canonicalTs),
 		]);
-		expect(contextText(mirror.blocks)).toContain("버튼으로 답해 주세요(이 스레드의 글 답장은 승인으로 세지 않음)");
-		expect(contextText(mirror.blocks)).toContain(`https://slack.test/archives/${ESC}/p${canonicalTs.replace(".", "")}`);
+		expect(contextText(mirror.embeds)).toContain("버튼으로 답해 주세요(이 스레드의 글 답장은 승인으로 세지 않음)");
+		expect(contextText(mirror.embeds)).toContain(`https://discord.com/channels/${GUILD}/${ESC}/${canonicalTs}`);
 		expect(b.handleAction({ actionId: approvalActionId("approve", ESC, canonicalTs), userId: OWNER })).toBe(true);
 		expect(await result).toBe("approved");
 		expect(store.getApproval(`${ESC}:${canonicalTs}`)?.mirrorRef).toBe(`${REQ}:${mirrorTs}`);
 		// No pointer line once the mirror is up.
-		expect(transport.posts().filter((p) => p.text.startsWith("🔐 승인 요청을"))).toHaveLength(0);
+		expect(transport.posts((text) => text.startsWith("🔐 승인 요청을"))).toHaveLength(0);
 	});
 
 	test("AC-1: a failed mirror post falls back to the pointer line; the row keeps no mirror_ref", async () => {
 		transport.failMirror = true;
 		const b = broker();
 		const { result, canonicalTs } = await askInThread(b);
-		await transport.until(() => transport.posts().some((p) => p.text.startsWith("🔐 승인 요청을")), "pointer");
-		const pointers = transport.posts().filter((p) => p.text.startsWith("🔐 승인 요청을"));
+		await transport.until(() => transport.posts((text) => text.startsWith("🔐 승인 요청을")).length > 0, "pointer");
+		const pointers = transport.posts((text) => text.startsWith("🔐 승인 요청을"));
 		expect(pointers).toHaveLength(1);
-		expect(pointers[0]).toMatchObject({ channel: REQ, threadTs: THREAD });
-		expect(pointers[0]?.text).toStartWith(`🔐 승인 요청을 <#${ESC}>에 올렸습니다 — force push main`);
-		expect(hasButtons(pointers[0]?.blocks)).toBe(false);
+		expect(pointers[0]).toMatchObject({ channelId: REQ, messageReference: { messageId: THREAD } });
+		expect(textOf(pointers[0])).toStartWith(`🔐 승인 요청을 <#${ESC}>에 올렸습니다 — force push main`);
+		expect(hasButtons(pointers[0]?.components)).toBe(false);
 		expect(store.getApproval(`${ESC}:${canonicalTs}`)?.mirrorRef).toBeNull();
 		b.handleAction({ actionId: approvalActionId("deny", ESC, canonicalTs), userId: OWNER });
 		expect(await result).toBe("denied");
@@ -250,7 +263,7 @@ describe("broker: mirror card in the asking thread", () => {
 	test("AC-2: no origin, an origin without a thread, no escalation channel or the escalation channel itself: one card, no mirror", async () => {
 		const settleAll = async (pending: Promise<ApprovalResult>) => {
 			await transport.until(
-				() => transport.calls.some((c) => c.method === "updateMessage" && hasButtons(c.blocks)),
+				() => transport.calls.some((c) => c.method === "editMessage" && hasButtons(c.components)),
 				"buttons",
 			);
 			timers.fireAll();
@@ -258,14 +271,14 @@ describe("broker: mirror card in the asking thread", () => {
 		};
 		// No origin: the card stays in the request channel, nothing else is posted.
 		await settleAll(broker().ask(REQ, "a"));
-		expect(transport.posts().map((p) => [p.channel, p.threadTs])).toEqual([[REQ, undefined]]);
+		expect(transport.posts().map((p) => [p.channelId, threadOf(p)])).toEqual([[REQ, undefined]]);
 
 		// An origin without a thread (channel top level): the escalation card + today's pointer line, no mirror.
 		transport.calls.length = 0;
 		const top = broker();
-		const pendingTop = top.ask(REQ, "b", { origin: { originKey: `slack/ch/${REQ}`, channel: REQ } });
-		await transport.until(() => transport.posts().some((p) => p.text.startsWith("🔐 승인 요청을")), "pointer");
-		expect(transport.posts().map((p) => [p.channel, p.threadTs, hasButtons(p.blocks)])).toEqual([
+		const pendingTop = top.ask(REQ, "b", { origin: { originKey: `discord/ch/${REQ}`, channel: REQ } });
+		await transport.until(() => transport.posts((text) => text.startsWith("🔐 승인 요청을")).length > 0, "pointer");
+		expect(transport.posts().map((p) => [p.channelId, threadOf(p), hasButtons(p.components)])).toEqual([
 			[ESC, undefined, false],
 			[REQ, undefined, false],
 		]);
@@ -277,8 +290,8 @@ describe("broker: mirror card in the asking thread", () => {
 			transport.calls.length = 0;
 			const b = broker(escalation);
 			await settleAll(b.ask(REQ, "c", { origin }));
-			expect(transport.posts().map((p) => p.channel)).toEqual([REQ]);
-			expect(transport.posts().filter((p) => p.text.startsWith("🔐 승인 요청을"))).toHaveLength(0);
+			expect(transport.posts().map((p) => p.channelId)).toEqual([REQ]);
+			expect(transport.posts((text) => text.startsWith("🔐 승인 요청을"))).toHaveLength(0);
 		}
 	});
 
@@ -287,7 +300,7 @@ describe("broker: mirror card in the asking thread", () => {
 		const { result, canonicalTs } = await askInThread(b);
 		const approve = approvalActionId("approve", ESC, canonicalTs);
 		// The mirror's button carries the canonical key, so a mirror click is this very call.
-		expect(actionIds(mirrorPost()?.blocks)[0]).toBe(approve);
+		expect(actionIds(mirrorPost()?.components)[0]).toBe(approve);
 		expect(b.handleAction({ actionId: approve, userId: OWNER })).toBe(true);
 		expect(b.handleAction({ actionId: approve, userId: OWNER })).toBe(false);
 		expect(await result).toBe("approved");
@@ -340,10 +353,10 @@ describe("broker: mirror card in the asking thread", () => {
 			await result;
 			const canonical = transport.edits(ESC, canonicalTs).at(-1);
 			const mirror = transport.edits(REQ, mirrorTs ?? "").at(-1);
-			expect(contextText(canonical?.blocks)).toContain(line);
-			expect(contextText(mirror?.blocks)).toBe(contextText(canonical?.blocks));
-			expect(actionIds(canonical?.blocks)).toEqual([]);
-			expect(actionIds(mirror?.blocks)).toEqual([]);
+			expect(contextText(canonical?.embeds)).toContain(line);
+			expect(contextText(mirror?.embeds)).toBe(contextText(canonical?.embeds));
+			expect(actionIds(canonical?.components)).toEqual([]);
+			expect(actionIds(mirror?.components)).toEqual([]);
 		});
 	}
 
@@ -355,10 +368,10 @@ describe("broker: mirror card in the asking thread", () => {
 		expect(await result).toBe("denied");
 		const canonical = transport.edits(ESC, canonicalTs).at(-1);
 		const mirror = transport.edits(REQ, mirrorTs ?? "").at(-1);
-		expect(contextText(canonical?.blocks)).toContain("기다리던 작업이 중단돼 만료됨");
-		expect(contextText(mirror?.blocks)).toBe(contextText(canonical?.blocks));
-		expect(actionIds(canonical?.blocks)).toEqual([]);
-		expect(actionIds(mirror?.blocks)).toEqual([]);
+		expect(contextText(canonical?.embeds)).toContain("기다리던 작업이 중단돼 만료됨");
+		expect(contextText(mirror?.embeds)).toBe(contextText(canonical?.embeds));
+		expect(actionIds(canonical?.components)).toEqual([]);
+		expect(actionIds(mirror?.components)).toEqual([]);
 	});
 
 	test("AC-5: a timed-out card keeps one `다시 요청` button on both cards, carrying the canonical key", async () => {
@@ -369,10 +382,10 @@ describe("broker: mirror card in the asking thread", () => {
 		const retry = `ompbot:approval:retry:${ESC}:${canonicalTs}`;
 		const canonical = transport.edits(ESC, canonicalTs).at(-1);
 		const mirror = transport.edits(REQ, mirrorTs ?? "").at(-1);
-		expect(actionIds(canonical?.blocks)).toEqual([retry]);
-		expect(actionIds(mirror?.blocks)).toEqual([retry]);
-		expect(contextText(mirror?.blocks)).toBe(contextText(canonical?.blocks));
-		expect(contextText(canonical?.blocks)).toContain("⌛ 시간 초과: 거부로 처리됨");
+		expect(actionIds(canonical?.components)).toEqual([retry]);
+		expect(actionIds(mirror?.components)).toEqual([retry]);
+		expect(contextText(mirror?.embeds)).toBe(contextText(canonical?.embeds));
+		expect(contextText(canonical?.embeds)).toContain("⌛ 시간 초과: 거부로 처리됨");
 		expect(store.getApproval(`${ESC}:${canonicalTs}`)?.status).toBe("expired");
 		// The broker leaves the retry click to the daemon.
 		expect(parseApprovalActionId(retry)).toEqual({ decision: "retry", channel: ESC, ts: canonicalTs });
@@ -383,13 +396,13 @@ describe("broker: mirror card in the asking thread", () => {
 		const b = broker(null);
 		const pending = b.ask(REQ, "d");
 		await transport.until(
-			() => transport.calls.some((c) => c.method === "updateMessage" && hasButtons(c.blocks)),
+			() => transport.calls.some((c) => c.method === "editMessage" && hasButtons(c.components)),
 			"buttons",
 		);
 		timers.fireAll();
 		expect(await pending).toBe("timeout");
 		const card = transport.posts()[0] as Post;
-		expect(actionIds(transport.edits(REQ, card.ts).at(-1)?.blocks)).toEqual([]);
+		expect(actionIds(transport.edits(REQ, card.id).at(-1)?.components)).toEqual([]);
 	});
 
 	test("AC-4/AC-5: a restart expiry redraws the mirror of rows that recorded one; old rows only their card; retry only with an asking thread", async () => {
@@ -403,43 +416,52 @@ describe("broker: mirror card in the asking thread", () => {
 				expiresAt: 999_000,
 				...(threadRef === undefined ? {} : { originKey: origin.originKey, originThreadRef: threadRef }),
 			});
-		row("1.1", "with mirror", `${REQ}:${THREAD}`);
-		expect(store.setApprovalMirrorRef(`${ESC}:1.1`, `${REQ}:8.8`)).toBe(true);
-		row("2.2", "old row", `${REQ}:${THREAD}`);
-		row("3.3", "no thread");
-		row("4.4", "❓ 질문 카드", `${REQ}:${THREAD}`);
+		row(ROW_1, "with mirror", `${REQ}:${THREAD}`);
+		expect(store.setApprovalMirrorRef(`${ESC}:${ROW_1}`, `${REQ}:${MIRROR_ID}`)).toBe(true);
+		row(ROW_2, "old row", `${REQ}:${THREAD}`);
+		row(ROW_3, "no thread");
+		row(ROW_4, "❓ 질문 카드", `${REQ}:${THREAD}`);
 		expect(await broker().expireStale(false)).toBe(4);
 		const retryOf = (ts: string) => [`ompbot:approval:retry:${ESC}:${ts}`];
-		expect(actionIds(transport.edits(ESC, "1.1").at(-1)?.blocks)).toEqual(retryOf("1.1"));
-		expect(actionIds(transport.edits(REQ, "8.8").at(-1)?.blocks)).toEqual(retryOf("1.1"));
-		expect(transport.edits(REQ, "8.8").at(-1)?.text).toBe(transport.edits(ESC, "1.1").at(-1)?.text);
-		expect(actionIds(transport.edits(ESC, "2.2").at(-1)?.blocks)).toEqual(retryOf("2.2"));
-		expect(actionIds(transport.edits(ESC, "3.3").at(-1)?.blocks)).toEqual([]);
-		expect(actionIds(transport.edits(ESC, "4.4").at(-1)?.blocks)).toEqual([]);
-		// Only row 1.1 has a mirror: five edits in all, one per card.
-		expect(transport.calls.filter((c) => c.method === "updateMessage")).toHaveLength(5);
+		expect(actionIds(transport.edits(ESC, ROW_1).at(-1)?.components)).toEqual(retryOf(ROW_1));
+		expect(actionIds(transport.edits(REQ, MIRROR_ID).at(-1)?.components)).toEqual(retryOf(ROW_1));
+		expect(transport.edits(REQ, MIRROR_ID).at(-1)?.content).toBe(transport.edits(ESC, ROW_1).at(-1)?.content);
+		expect(actionIds(transport.edits(ESC, ROW_2).at(-1)?.components)).toEqual(retryOf(ROW_2));
+		expect(actionIds(transport.edits(ESC, ROW_3).at(-1)?.components)).toEqual([]);
+		expect(actionIds(transport.edits(ESC, ROW_4).at(-1)?.components)).toEqual([]);
+		// Only the first row has a mirror: five edits in all, one per card.
+		expect(transport.calls.filter((c) => c.method === "editMessage")).toHaveLength(5);
 		// mirror_ref is written only on a pending row.
-		expect(store.setApprovalMirrorRef(`${ESC}:2.2`, `${REQ}:9.9`)).toBe(false);
+		expect(store.setApprovalMirrorRef(`${ESC}:${ROW_2}`, `${REQ}:900000000000000199`)).toBe(false);
 	});
 });
 
 describe("daemon: 다시 요청 on a timed-out approval card", () => {
-	const DM = "D1";
-	const ORIGIN = `slack/dm/${DM}`;
-	const ASK_THREAD = "1700.000001";
+	const DM = OWNER_DM;
+	const ORIGIN = `discord/dm/${DM}`;
+	const ASK_THREAD = "700000000000000001";
+	const MISSING_CARD = "900000000000009999";
 	let home: TestHome;
 	let daemon: Daemon;
-	let transport: WaitingTransport;
+	let transport: WaitingDiscordTransport;
 	let logs: string[];
+	let interactionSeq = 0n;
 
 	beforeEach(async () => {
 		home = makeHome("ompbot-approval-retry-");
 		logs = [];
-		transport = new WaitingTransport();
+		transport = new WaitingDiscordTransport();
+		transport.setChannel({ id: ESC, type: 0, guildId: GUILD });
+		transport.setChannel({ id: DM, type: 1 });
 		const sessions = new FakeSessionStore();
+		const discord = home.config.channels.discord;
+		if (discord === undefined) throw new Error("no discord config");
 		daemon = new Daemon({
-			config: { ...home.config, escalationChannel: ESC },
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			config: {
+				...home.config,
+				channels: { ...home.config.channels, discord: { ...discord, escalationChannelId: ESC } },
+			},
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: (line) => logs.push(line), clock: { now: () => Date.now() }, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -455,13 +477,16 @@ describe("daemon: 다시 요청 on a timed-out approval card", () => {
 
 	/** A settled approval row with its canonical card in the escalation channel and (optionally) a mirror in the thread. */
 	async function seed(options: { mirror?: boolean; expire?: boolean; threadRef?: string } = {}) {
-		const canonical = await transport.postMessage({ channel: ESC, text: `🔐 승인 요청 <@${OWNER}>\nforce push main` });
-		const approvalId = `${ESC}:${canonical.ts}`;
+		const canonical = await transport.createMessage({
+			channelId: ESC,
+			content: `🔐 승인 요청 <@${OWNER}>\nforce push main`,
+		});
+		const approvalId = `${ESC}:${canonical.id}`;
 		const now = Date.now();
 		daemon.store.createApproval({
 			approvalId,
 			channel: ESC,
-			messageTs: canonical.ts,
+			messageTs: canonical.id,
 			summary: "force push main\n자세히",
 			createdAt: now,
 			expiresAt: now + 60_000,
@@ -471,47 +496,58 @@ describe("daemon: 다시 요청 on a timed-out approval card", () => {
 		let mirrorTs: string | undefined;
 		if (options.mirror !== false) {
 			mirrorTs = (
-				await transport.postMessage({ channel: DM, threadTs: ASK_THREAD, text: "🔐 승인 요청\nforce push main" })
-			).ts;
+				await transport.createMessage({
+					channelId: DM,
+					messageReference: { messageId: ASK_THREAD },
+					content: "🔐 승인 요청\nforce push main",
+				})
+			).id;
 			daemon.store.setApprovalMirrorRef(approvalId, `${DM}:${mirrorTs}`);
 		}
 		if (options.expire !== false) daemon.store.decideApproval(approvalId, "expired", now);
-		return { canonicalTs: canonical.ts, mirrorTs };
+		return { canonicalTs: canonical.id, mirrorTs };
 	}
 
 	function retry(canonicalTs: string, from: { channel: string; ts: string }, user = OWNER): Promise<void> {
-		return transport.emitBlockAction({
+		interactionSeq += 1n;
+		const interaction: DiscordInteraction = {
+			id: String(800_000_000_000_000_000n + interactionSeq),
+			application_id: "600000000000000000",
+			type: 3,
+			token: `token-${interactionSeq}`,
+			channel_id: from.channel,
 			user: { id: user },
-			channel: { id: from.channel },
-			message: { ts: from.ts },
-			actions: [{ action_id: `ompbot:approval:retry:${ESC}:${canonicalTs}`, value: "retry" }],
-		});
+			data: { custom_id: `ompbot:approval:retry:${ESC}:${canonicalTs}`, component_type: 2 },
+			message: { id: from.ts, channel_id: from.channel },
+		};
+		return transport.emitInteraction(interaction);
 	}
 
 	const markers = () => transport.posts((text) => text === "🔘 다시 요청 (버튼)");
 	const retryInbounds = () =>
 		daemon.store.listInbound().filter((row) => row.textRef.trim().startsWith("다시 요청: force push main"));
-	const lastEdit = (channel: string, ts: string) =>
+	const lastEdit = (channel: string, messageId: string): Update | undefined =>
 		transport.calls
-			.filter((c): c is Update => c.method === "updateMessage" && c.channel === channel && c.ts === ts)
+			.filter((c): c is Update => c.method === "editMessage" && c.channelId === channel && c.messageId === messageId)
 			.at(-1);
 
 	test("AC-6: a retry click puts one 🔘 marker and one owner '다시 요청: …' in the asking thread and redraws both cards without buttons", async () => {
 		const { canonicalTs, mirrorTs } = await seed();
 		await retry(canonicalTs, { channel: DM, ts: mirrorTs ?? "" });
 		expect(markers()).toHaveLength(1);
-		expect(markers()[0]).toMatchObject({ channel: DM, threadTs: ASK_THREAD });
+		expect(markers()[0]).toMatchObject({ channelId: DM, messageReference: { messageId: ASK_THREAD } });
 		const inbound = retryInbounds();
 		expect(inbound).toHaveLength(1);
-		expect(inbound[0]).toMatchObject({ originKey: ORIGIN, threadRef: `${DM}:${ASK_THREAD}` });
+		// A Discord DM has no threads: the owner message is its own thread root, anchored on the marker it follows.
+		expect(inbound[0]).toMatchObject({ originKey: ORIGIN, threadRef: `${DM}:${markers()[0]?.id}` });
 		expect(inbound[0]?.textRef).toContain("ompbot_request_approval");
 		for (const [channel, ts] of [
 			[ESC, canonicalTs],
 			[DM, mirrorTs ?? ""],
 		] as const) {
 			const edit = lastEdit(channel, ts);
-			expect(actionIds(edit?.blocks)).toEqual([]);
-			expect(contextText(edit?.blocks)).toMatch(/"text":"▶ 다시 요청됨 · \d\d:\d\d"/);
+			expect(actionIds(edit?.components)).toEqual([]);
+			expect(contextText(edit?.embeds)).toMatch(/^-# ▶ 다시 요청됨 · \d\d:\d\d$/);
 		}
 		expect(logs.some((l) => l.includes("event=action_ignored"))).toBe(false);
 	});
@@ -532,12 +568,12 @@ describe("daemon: 다시 요청 on a timed-out approval card", () => {
 	test("AC-6: a row that is not expired, a missing row and an asking thread that does not parse: no inbound, approval_retry_ignored, ⚠️ note", async () => {
 		const pending = await seed({ expire: false, mirror: false });
 		await retry(pending.canonicalTs, { channel: ESC, ts: pending.canonicalTs });
-		expect(contextText(lastEdit(ESC, pending.canonicalTs)?.blocks)).toContain("⚠️ 다시 요청할 수 없음");
+		expect(contextText(lastEdit(ESC, pending.canonicalTs)?.embeds)).toContain("⚠️ 다시 요청할 수 없음");
 		const badThread = await seed({ threadRef: "not-a-thread", mirror: false });
 		await retry(badThread.canonicalTs, { channel: ESC, ts: badThread.canonicalTs });
-		expect(contextText(lastEdit(ESC, badThread.canonicalTs)?.blocks)).toContain("⚠️ 다시 요청할 수 없음");
-		await retry("9999.000001", { channel: ESC, ts: "9999.000001" });
-		expect(lastEdit(ESC, "9999.000001")?.text).toContain("⚠️ 다시 요청할 수 없음");
+		expect(contextText(lastEdit(ESC, badThread.canonicalTs)?.embeds)).toContain("⚠️ 다시 요청할 수 없음");
+		await retry(MISSING_CARD, { channel: ESC, ts: MISSING_CARD });
+		expect(lastEdit(ESC, MISSING_CARD)?.content).toContain("⚠️ 다시 요청할 수 없음");
 		expect(markers()).toHaveLength(0);
 		expect(retryInbounds()).toHaveLength(0);
 		expect(logs.filter((l) => l.includes("event=approval_retry_ignored"))).toHaveLength(3);
@@ -546,7 +582,9 @@ describe("daemon: 다시 요청 on a timed-out approval card", () => {
 
 	test("AC-6: the marker post fails: no inbound, approval_retry_inject_rejected, both cards say it did not go in", async () => {
 		const { canonicalTs, mirrorTs } = await seed();
-		transport.failNext.postMessage = [new SlackCallError("definitive", "slack_platform_error:channel_not_found")];
+		transport.failNext.createMessage = [
+			new DiscordCallError("definitive", "discord_http_403:50001 Missing Access", 403, 50001),
+		];
 		await retry(canonicalTs, { channel: DM, ts: mirrorTs ?? "" });
 		expect(retryInbounds()).toHaveLength(0);
 		expect(logs.filter((l) => l.includes("event=approval_retry_inject_rejected"))).toHaveLength(1);
@@ -555,14 +593,14 @@ describe("daemon: 다시 요청 on a timed-out approval card", () => {
 			[DM, mirrorTs ?? ""],
 		] as const) {
 			const edit = lastEdit(channel, ts);
-			expect(actionIds(edit?.blocks)).toEqual([]);
-			expect(contextText(edit?.blocks)).toContain("⚠️ 다시 요청을 넣지 못함");
+			expect(actionIds(edit?.components)).toEqual([]);
+			expect(contextText(edit?.embeds)).toContain("⚠️ 다시 요청을 넣지 못함");
 		}
 	});
 
 	test("AC-6: a click by anyone but the owner is denied before it reaches the daemon", async () => {
 		const { canonicalTs, mirrorTs } = await seed();
-		await retry(canonicalTs, { channel: DM, ts: mirrorTs ?? "" }, "UOTHER");
+		await retry(canonicalTs, { channel: DM, ts: mirrorTs ?? "" }, "100000000000000002");
 		expect(logs.some((l) => l.includes("event=action_denied"))).toBe(true);
 		expect(markers()).toHaveLength(0);
 		expect(retryInbounds()).toHaveLength(0);

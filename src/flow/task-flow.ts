@@ -50,6 +50,8 @@ export function taskFlowStatus(tasks: FlowTask[], transitions: FlowTransition[],
 				else if (kind === "lost") set("agent", "fail", "에이전트 없음", at);
 				else if (kind === "resume") fixFailed(at);
 				else if (kind === "reached") reach(at);
+				else if (kind === "silent45")
+					set("progress", nodes.get("progress")?.status ?? "running", "작업 중 45분 무갱신", at);
 				else if (kind === "stale2h") set("progress", nodes.get("progress")?.status ?? "running", "2시간 무갱신", at);
 				else if (kind === "blocked") {
 					// `blocked:<n>:<reason>`; notices written before the counter existed are `blocked:<reason>`.

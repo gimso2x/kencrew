@@ -13,7 +13,7 @@ import { missingRpcMethods, REQUIRED_RPC_METHODS } from "../src/omp/rpc-driver";
 import { redact } from "../src/redact";
 import type { Store } from "../src/store/db";
 
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = "discord/dm/200000000000000001";
 let dir: string;
 let sessionsRoot: string;
 let now: number;
@@ -157,11 +157,11 @@ describe("command parsing", () => {
 		expect(parseCommand("브리핑 해줘")).toBeUndefined();
 	});
 
-	test("!budget and /budget-ompbot take an argument, so off/on reach the command and bare !budget answers totals", () => {
+	test("!budget and /budget-ompbot are bare commands; `!budget off` is not a command", () => {
 		expect(parseCommand("!budget")).toEqual({ kind: "budget", arg: "" });
-		expect(parseCommand("!budget off")).toEqual({ kind: "budget", arg: "off" });
-		expect(parseCommand("!budget on")).toEqual({ kind: "budget", arg: "on" });
-		expect(parseCommand(" /budget-ompbot off ")).toEqual({ kind: "budget", arg: "off" });
+		expect(parseCommand("/budget-ompbot")).toEqual({ kind: "budget", arg: "" });
+		expect(parseCommand("!budget off")).toBeUndefined();
+		expect(parseCommand("!budget on")).toBeUndefined();
 		// A bare `!budget` in the middle of a sentence is a prompt, not a command.
 		expect(parseCommand("예산 보려면 !budget")).toBeUndefined();
 	});
@@ -469,9 +469,9 @@ describe("⑥ distill", () => {
 			peer: { userId: "UPEER00001", name: "떡" },
 			text: "!distill",
 			quoted: [],
-			platformMessageId: "C1:1.1",
-			originKey: "slack/ch/C1/t/1.1",
-			threadRef: "C1:1.1",
+			platformMessageId: "300000000000000001:700000000000000001",
+			originKey: "discord/ch/300000000000000001/t/700000000000000001",
+			threadRef: "300000000000000001:700000000000000001",
 		});
 		if (!peer.accept) throw new Error("rejected");
 		expect(parseCommand(peer.inbound.text)).toBeUndefined();

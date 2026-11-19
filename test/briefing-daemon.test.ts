@@ -5,17 +5,15 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { Daemon } from "../src/daemon/daemon";
+import type { UploadFileArgs } from "../src/discord/transport";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import type { InboundRow } from "../src/store/db";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
-const ORIGIN = "slack/dm/D1";
-const CHANNEL = "D1";
+const ORIGIN = `discord/dm/${OWNER_DM}`;
 
 let home: TestHome;
 let clock: { t: number; now(): number };
@@ -40,17 +38,11 @@ afterEach(async () => {
 	home.remove();
 });
 
-/** A Slack transport that also signals the uploads the briefing ends with (the success path posts no text). */
-class BriefingTransport extends WaitingTransport {
+/** A Discord transport that also signals the uploads the briefing ends with (the success path posts no text). */
+class BriefingTransport extends WaitingDiscordTransport {
 	readonly #uploadWaiters = new Set<() => void>();
 
-	override async uploadFile(args: {
-		channel: string;
-		threadTs?: string | undefined;
-		filePath: string;
-		title?: string | undefined;
-		comment?: string | undefined;
-	}): Promise<{ fileId: string }> {
+	override async uploadFile(args: UploadFileArgs): Promise<{ id: string }> {
 		const result = await super.uploadFile(args);
 		for (const waiter of [...this.#uploadWaiters]) waiter();
 		return result;
@@ -147,7 +139,7 @@ async function boot(options: { holdTurns?: boolean; briefingRun?: ProcessRunner 
 	driver = made;
 	const d = new Daemon({
 		config: home.config,
-		channels: [new SlackBinding(new SlackChannel(transport))],
+		channels: [discordBinding(transport)],
 		clock,
 		log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 		ompVersion: "omp-test 0",
@@ -204,12 +196,11 @@ describe("AC-4: !brief", () => {
 		await waitForRowState(d, "discarded");
 		const [upload] = uploads();
 		expect(uploads()).toHaveLength(1);
-		expect(upload?.channel).toBe(CHANNEL);
+		expect(upload?.channelId).toBe(OWNER_DM);
 		expect(upload?.filePath).toContain(join("media", "briefing"));
-		expect(upload?.title).toContain("ompbot 브리핑");
-		expect(upload?.comment).toContain("주의");
+		expect(upload?.content).toContain("주의");
 		// Only the injected marker was posted as text: the image is the answer, no extra line.
-		expect(transport.posts().filter((post) => !post.text.startsWith("🧪 inject"))).toHaveLength(0);
+		expect(transport.posts().filter((post) => !(post.content ?? "").startsWith("🧪 inject"))).toHaveLength(0);
 		const row = d.store.listInbound({ originKey: ORIGIN })[0];
 		expect(row?.state).toBe("discarded");
 		expect(d.store.listDeliveries({ originKey: ORIGIN })).toHaveLength(0);
@@ -227,17 +218,17 @@ describe("AC-4: !brief", () => {
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "!brief" });
 		await transport.waitForPosts((text) => text.includes("브리핑 이미지를 만들지 못했습니다:"));
 		expect(failurePosts()).toHaveLength(1);
-		expect(failurePosts()[0]?.text).toContain("Fatal: no display");
+		expect(failurePosts()[0]?.content).toContain("Fatal: no display");
 		expect(uploads()).toHaveLength(0);
 	});
 
 	test("an upload that throws is the same failure line", async () => {
 		const d = await boot({ briefingRun: chromium() });
-		transport.failNext.uploadFile = [new Error("slack down")];
+		transport.failNext.uploadFile = [new Error("discord down")];
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "!brief" });
 		await transport.waitForPosts((text) => text.includes("브리핑 이미지를 만들지 못했습니다:"));
 		expect(failurePosts()).toHaveLength(1);
-		expect(failurePosts()[0]?.text).toContain("slack down");
+		expect(failurePosts()[0]?.content).toContain("discord down");
 	});
 
 	test("a second !brief while a capture runs is answered at once and starts no second capture", async () => {

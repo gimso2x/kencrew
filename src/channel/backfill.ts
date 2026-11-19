@@ -1,5 +1,18 @@
-// What the Slack and Discord backfills share: the dead-letter verdict and the single-flight pass runner.
+// What the platform backfills share: the scan budget's platform-neutral constants, the recovery notice, the
+// dead-letter verdict and the single-flight pass runner. Each platform keeps only its own page size (`PAGE_LIMIT`).
 import { errorText } from "./text";
+
+/** How far back the very first pass reaches when a target has no watermark (upstream: 24h bounded bootstrap). */
+export const BOOTSTRAP_LOOKBACK_MS = 24 * 60 * 60_000;
+/** Pages one target reads per pass; the rest waits for the next pass (the watermark keeps the place). */
+export const MAX_PAGES = 10;
+/** Definitive per-message failures before the message is dead-lettered and skipped (upstream: 3). */
+export const MAX_MESSAGE_ATTEMPTS = 3;
+
+/** The notice a pass posts under the oldest message it recovered: the answers it brought back are being processed. */
+export function recoveryNotice(recovered: number): string {
+	return `⏬ 봇이 응답하지 못한 동안 도착한 메시지 ${recovered}건을 처리합니다`;
+}
 
 const TRANSIENT_STORE_ERROR = /SQLITE_(BUSY|LOCKED|FULL|IOERR)/;
 

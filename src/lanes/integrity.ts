@@ -8,6 +8,7 @@ export interface IntegrityRefusal {
 		| "stub_implementation"
 		| "guard_deletion_without_adversarial_regression"
 		| "unproven_claim_word"
+		| "undeclared_feature_removal"
 		| "lane_diff_unavailable";
 	excerpt: string;
 	remedy: string;
@@ -42,6 +43,12 @@ const CLAIM_WORD =
 	/(?:통과|검증 완료|수정 완료|고쳤|해결됐|해결됨|(?<![A-Za-z0-9_-])(?:verified|passing|passed|fixed|green)(?![A-Za-z0-9_-]))/i;
 const COMMAND_TOKEN =
 	/(?<![A-Za-z0-9_-])(?:bun\s+(?:run\s+)?(?:test|check|typecheck|x)|bunx|(?<![A-Za-z0-9_/.-])(?:tsc|biome)(?!\.\w)|(?:npm|yarn|pnpm)\s+(?:run\s+)?test|pytest|go\s+test|cargo\s+test|make\s+test|vitest|jest|git(?=\s))(?![A-Za-z0-9_-])/i;
+/** A script file whose export declarations are public API; re-export lists and other languages are not judged. */
+const EXPORT_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs)$/i;
+const EXPORT_DECLARATION =
+	/^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function\b\s*\*?|class\b|abstract\s+class\b|const\b|let\b|var\b|interface\b|type\b|enum\b)\s*([A-Za-z_$][\w$]*)/;
+/** `false &&` / `&& false` / `if (false)` / `if (0)` on comment- and string-free code; a comparison with false is no switch-off. */
+const FEATURE_OFF = /\bif\s*\(\s*(?:false|0)\s*\)|(?<![=!]=\s*|[=!]==\s*)\bfalse\b\s*&&|&&\s*false\b(?!\s*[=!]=)/;
 const MAX_REFUSALS = 8;
 
 interface DiffLine {
@@ -49,6 +56,8 @@ interface DiffLine {
 	text: string;
 	/** Hunk ordinal within the diff: a block comment opened in one hunk does not run into the next. */
 	hunk: number;
+	/** Removed lines only: the line's code with comments cut away, read in old-side order within the hunk. */
+	code?: string;
 }
 
 const OCTAL_ESCAPE_RUN = /(?:\\[0-3][0-7]{2})+/g;
@@ -83,6 +92,8 @@ function parseDiff(diff: string): { added: DiffLine[]; removed: DiffLine[] } {
 	let newFile = "";
 	let inHunk = false;
 	let hunk = 0;
+	// Block-comment state of the old side (context and removed lines); a hunk starts outside any comment.
+	let oldInBlock = false;
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i] as string;
 		if (line.startsWith("diff ")) {
@@ -101,12 +112,22 @@ function parseDiff(diff: string): { added: DiffLine[]; removed: DiffLine[] } {
 		if (line.startsWith("@@")) {
 			inHunk = true;
 			hunk += 1;
+			oldInBlock = false;
 			continue;
 		}
 		if (line.startsWith("+")) {
 			if (CODE_EXT.test(newFile)) added.push({ file: newFile, text: line.slice(1), hunk });
 		} else if (line.startsWith("-")) {
-			if (CODE_EXT.test(oldFile)) removed.push({ file: oldFile, text: line.slice(1), hunk });
+			if (CODE_EXT.test(oldFile)) {
+				const text = line.slice(1);
+				const scan = isUnfinishedMarker(text, oldInBlock);
+				// A leading `*` outside a seen block comment may be a continued multiplication, so it stays code.
+				const code = !oldInBlock && /^\s*\*/.test(text) ? text : scan.code;
+				oldInBlock = scan.inBlock;
+				removed.push({ file: oldFile, text, hunk, code });
+			}
+		} else if (line.startsWith(" ") && inHunk) {
+			oldInBlock = isUnfinishedMarker(line.slice(1), oldInBlock).inBlock;
 		}
 	}
 	return { added, removed };
@@ -159,19 +180,28 @@ function commentText(text: string): string | undefined {
  * slash-star comment from the line before.
  */
 function isUnfinishedMarker(text: string, inBlock: boolean): { marker: boolean; inBlock: boolean; code: string } {
-	let code = text;
-	let comment: string | undefined;
+	let rest = text;
+	let marker = false;
 	if (inBlock) {
 		const close = text.indexOf("*/");
 		if (close < 0) return { marker: UNFINISHED.test(text), inBlock: true, code: "" };
-		comment = text.slice(0, close);
-		code = text.slice(close + 2);
+		marker = UNFINISHED.test(text.slice(0, close));
+		rest = text.slice(close + 2);
 	}
-	const trailing = commentText(code);
-	const opensBlock = trailing?.startsWith("/*") === true && !trailing.includes("*/", 2);
-	const marker =
-		(comment !== undefined && UNFINISHED.test(comment)) || (trailing !== undefined && UNFINISHED.test(trailing));
-	return { marker, inBlock: opensBlock, code: trailing === undefined ? code : code.slice(0, -trailing.length) };
+	// Closed slash-star comments in the middle of the line are cut too, so code after them is still seen.
+	let code = "";
+	for (;;) {
+		const trailing = commentText(rest);
+		if (trailing === undefined) return { marker, inBlock: false, code: code + rest };
+		code += rest.slice(0, -trailing.length);
+		const close = trailing.startsWith("/*") ? trailing.indexOf("*/", 2) : -1;
+		if (close < 0) {
+			marker ||= UNFINISHED.test(trailing);
+			return { marker, inBlock: trailing.startsWith("/*"), code };
+		}
+		marker ||= UNFINISHED.test(trailing.slice(0, close));
+		rest = trailing.slice(close + 2);
+	}
 }
 
 /** Blanks string literals so words inside quotes are not read as code. */
@@ -200,6 +230,8 @@ function refusal(category: IntegrityRefusal["category"], file: string, text: str
 		stub_implementation: "스텁 본문을 구현하거나, 이번 범위가 아니면 해당 코드를 되돌리세요.",
 		guard_deletion_without_adversarial_regression:
 			"삭제한 가드/부정 테스트를 복원하거나, 같은 동작을 증명하는 부정 케이스 테스트를 추가하세요.",
+		undeclared_feature_removal:
+			"지운 export/꺼 둔 기능을 되살리거나, 의도한 삭제면 완료 보고에 그 이름을 적으세요(꺼 둔 줄은 같은 줄에 이슈 번호).",
 		unproven_claim_word: "보고의 '통과/검증됨' 주장에 실제 실행한 검증 명령(bun test 등)을 함께 적으세요.",
 		lane_diff_unavailable:
 			"base 브랜치를 읽지 못해 레인의 변경을 가려낼 수 없습니다. base 브랜치가 저장소에 있는지 확인하고 다시 완료를 알리세요.",
@@ -221,6 +253,8 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 	let inBlock = false;
 	/** An added test line whose code (comments cut away) declares or asserts a negative case. */
 	let hasAdversarialTest = false;
+	/** The first added line that switches a feature off by a constant condition. */
+	let featureOff: DiffLine | undefined;
 	for (const line of added) {
 		const key = `${line.file}\0${line.hunk}`;
 		if (key !== blockKey) {
@@ -238,10 +272,20 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 		}
 		if (STUB_THROW.test(line.text) || STUB_CALL.test(withoutStrings(line.text)))
 			refusals.push(refusal("stub_implementation", line.file, line.text));
+		if (
+			featureOff === undefined &&
+			!TEST_PATH.test(line.file) &&
+			!LINKED_REASON.test(line.text) &&
+			FEATURE_OFF.test(withoutStrings(scan.code))
+		)
+			featureOff = line;
 	}
 
 	const addedText = new Set(added.map((line) => line.text.trim()));
-	const deletedGuards = removed.filter((line) => GUARD_WORD.test(line.text) || NEGATIVE_TEST.test(line.text));
+	const deletedGuards = removed.filter((line) => {
+		const code = line.code ?? line.text;
+		return GUARD_WORD.test(code) || NEGATIVE_TEST.test(code);
+	});
 	// A guard edited in place (same file and hunk) only in a plain string or a trailing comment is kept, not deleted:
 	// each added line answers for one deleted guard at most (qa-l #83).
 	const paired = new Set<DiffLine>();
@@ -263,6 +307,17 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 	}
 
 	const summary = input.summary.trim();
+	const removedExport = removed.find((line) => {
+		if (!EXPORT_EXT.test(line.file) || TEST_PATH.test(line.file)) return false;
+		const name = EXPORT_DECLARATION.exec(line.text)?.[1];
+		if (name === undefined) return false;
+		const named = new RegExp(`(?<![\\w$])${name.replace(/\$/g, "\\$")}(?![\\w$])`);
+		return !added.some((other) => EXPORT_DECLARATION.exec(other.text)?.[1] === name) && !named.test(summary);
+	});
+	const switchedOff = removedExport ?? featureOff;
+	if (switchedOff !== undefined)
+		refusals.push(refusal("undeclared_feature_removal", switchedOff.file, switchedOff.text));
+
 	if (summary !== "" && CLAIM_WORD.test(summary) && !COMMAND_TOKEN.test(summary)) {
 		refusals.push(refusal("unproven_claim_word", "summary", summary));
 	}

@@ -2,13 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
 import { QUOTED_HEADER } from "../src/core/normalize";
-import {
-	discordThreadHref,
-	renderDashboardPage,
-	renderFlowChain,
-	renderTaskFacts,
-	slackThreadHref,
-} from "../src/dashboard/html";
+import { discordThreadHref, esc, renderDashboardPage, renderFlowChain, renderTaskFacts } from "../src/dashboard/html";
 import {
 	buildSnapshot,
 	type DashboardSnapshot,
@@ -31,6 +25,8 @@ const DAY = 24 * HOUR;
 const TOKEN = "xoxb-TEST-0";
 const REQUEST_A = `<https://example.test/pr/1|PR 1> 고쳐 줘 ${TOKEN}\n둘째 줄`;
 const INTEGRITY = "무결성 검사용 git diff가 스윕 상한을 넘음";
+/** The server-channel origin of a thread letter: a thread is a Discord snowflake, the letter stays its `thread_ref`. */
+const originOf = (thread: string): string => `discord/ch/300000000000000001/t/10000000000000${thread.charCodeAt(0)}`;
 
 let home: TestHome;
 let dbPath: string;
@@ -57,7 +53,7 @@ function seed(db: Database, tasks: Seed[]): void {
 			[
 				t.id,
 				`title ${t.id}`,
-				`slack/ch/C1/t/${t.thread}`,
+				originOf(t.thread),
 				t.thread,
 				`/srv/work/repo-${t.id.toLowerCase()}`,
 				`task/${t.id}`,
@@ -96,15 +92,15 @@ function seedDatabase(): void {
 	const db = new Database(dbPath, { strict: true });
 	for (const thread of ["A", "B"]) {
 		db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES (?, 1, '/s', ?)", [
-			`slack/ch/C1/t/${thread}`,
+			originOf(thread),
 			NOW,
 		]);
 	}
 	db.run(
 		`INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, thread_ref)
-		 VALUES ('a1', 'slack/ch/C1/t/A', 1, ?, 'answered', ?, 'A'), ('a2', 'slack/ch/C1/t/A', 1, '나중 말', 'answered', ?, 'A'),
-		        ('b1', 'slack/ch/C1/t/B', 1, '<https://example.test/docs/x> 봐 줘', 'answered', ?, 'B')`,
-		[REQUEST_A, NOW - 4 * HOUR, NOW - 3 * HOUR, NOW - 6 * HOUR],
+		 VALUES ('a1', ?, 1, ?, 'answered', ?, 'A'), ('a2', ?, 1, '나중 말', 'answered', ?, 'A'),
+		        ('b1', ?, 1, '<https://example.test/docs/x> 봐 줘', 'answered', ?, 'B')`,
+		[originOf("A"), REQUEST_A, NOW - 4 * HOUR, originOf("A"), NOW - 3 * HOUR, originOf("B"), NOW - 6 * HOUR],
 	);
 	seed(db, [
 		{
@@ -246,8 +242,8 @@ describe("flows snapshot", () => {
 		expect(a.now).toEndWith(" · 외 열림 1");
 		expect([a.done, a.total]).toEqual([1, 3]);
 		expect(a.title).toBe("PR 1 고쳐 줘 [REDACTED] 둘째 줄");
-		expect(a.originKey).toBe("slack/ch/C1/t/A");
-		expect(a.place).toBe("채널 C1 스레드");
+		expect(a.originKey).toBe(originOf("A"));
+		expect(a.place).toBe("Discord 채널 300000000000000001 스레드");
 		expect(a.tasks[2]?.stage).toEqual({ label: "오너 리뷰 차례", msg: "Outcome 도달 · 머지 대기", tone: "wait" });
 
 		const b = chain(flows, "B");
@@ -332,7 +328,7 @@ describe("flow view", () => {
 		// The flow view is in the side nav, current on its own page.
 		expect(html).toContain('data-view="flow" aria-current="page"');
 		// The request box opens its conversation in the turns view; a TASK box opens its panel here.
-		expect(html).toContain('href="?view=turns&amp;item=slack%2Fch%2FC1%2Ft%2FA"');
+		expect(html).toContain(`href="?view=turns&amp;item=${encodeURIComponent(originOf("A"))}"`);
 		expect(html).toContain('href="?view=flow&amp;item=T-A2" data-item="T-A2"');
 	});
 
@@ -343,7 +339,7 @@ describe("flow view", () => {
 		const chainOf = (head: string) => /<section class="detail-flow"[\s\S]*?<\/section>/.exec(head)?.[0] ?? "";
 
 		// The turns panel of thread A: its three TASKs, 1/3 끝남, 지금 여기 on the working one, no box selected.
-		const turn = chainOf(headOf(renderDashboardPage(snapshot, { view: "turns", item: "slack/ch/C1/t/A" })));
+		const turn = chainOf(headOf(renderDashboardPage(snapshot, { view: "turns", item: originOf("A") })));
 		expect(turn).toContain("1/3 끝남");
 		for (const id of ["T-A1", "T-A2", "T-A3"]) expect(turn).toContain(`<b>${id}</b>`);
 		expect(turn.split('class="flow-here-chip"').length - 1).toBe(1);
@@ -362,42 +358,9 @@ describe("flow view", () => {
 		// A conversation with no TASK has no chain section.
 		const lone = renderDashboardPage(
 			{ ...snapshot, flows: { ok: true, items: [] } },
-			{ view: "turns", item: "slack/ch/C1/t/A" },
+			{ view: "turns", item: originOf("A") },
 		);
 		expect(headOf(lone)).not.toContain("detail-flow");
-	});
-
-	test("a conversation's panel bar links to its Slack thread on every tab, only with the workspace id", async () => {
-		expect(slackThreadHref("T1", "C0123456789:1794271582.056679")).toBe(
-			"slack://channel?team=T1&id=C0123456789&message=1794271582.056679&thread_ts=1794271582.056679",
-		);
-		expect(slackThreadHref("T1", "D0123456789:1794271582.056679")).toContain("id=D0123456789&message=");
-		expect(slackThreadHref("T1", "C1ABC:-")).toBe("slack://channel?team=T1&id=C1ABC");
-		expect(slackThreadHref(null, "C1ABC:1.2")).toBe("");
-		expect(slackThreadHref("T1", "A")).toBe("");
-
-		const built = await buildSnapshot(deps());
-		if (!built.turns.ok) throw new Error(built.turns.error);
-		const turns = {
-			...built.turns,
-			threads: built.turns.threads.map((thread) =>
-				thread.originKey === "slack/ch/C1/t/A" ? { ...thread, threadRef: "C1ABC:1794271582.056679" } : thread,
-			),
-		};
-		const barOf = (page: string) => /<div class="detail-bar">([\s\S]*?)<\/div>/.exec(page)?.[1] ?? "";
-		const bar = barOf(
-			renderDashboardPage({ ...built, turns, slackTeam: "T1" }, { view: "turns", item: "slack/ch/C1/t/A" }),
-		);
-		expect(bar).toContain(
-			'id="detail-slack" class="button is-ghost detail-slack" href="slack://channel?team=T1&amp;id=C1ABC&amp;message=1794271582.056679&amp;thread_ts=1794271582.056679">',
-		);
-		// Without the workspace id, or on a panel that is not a conversation, the link is there but hidden.
-		expect(barOf(renderDashboardPage({ ...built, turns }, { view: "turns", item: "slack/ch/C1/t/A" }))).toMatch(
-			/id="detail-slack"[^>]* hidden>/,
-		);
-		expect(barOf(renderDashboardPage({ ...built, turns, slackTeam: "T1" }, { task: "T-A3" }))).toMatch(
-			/id="detail-slack"[^>]* hidden>/,
-		);
 	});
 
 	test("a Discord conversation's panel bar links to Discord: DMs always, server threads and lanes with the one server id", async () => {
@@ -411,7 +374,7 @@ describe("flow view", () => {
 		expect(discordThreadHref(guild, `discord/ch/${ch}`, `${ch}:${msg}`)).toBe(`${web}/${guild}/${ch}/${msg}`);
 		expect(discordThreadHref(null, `discord/ch/${ch}/t/${msg}`, `${ch}:${msg}`)).toBe("");
 		expect(discordThreadHref(guild, "monitor/m1", `${ch}:${msg}`)).toBe("");
-		expect(discordThreadHref(guild, "slack/ch/C1/t/A", "C1ABC:1794271582.056679")).toBe("");
+		expect(discordThreadHref(guild, "slack/ch/C1/t/A", `${ch}:${msg}`)).toBe("");
 
 		// The one configured server becomes the snapshot's `discordGuild`; none or several leave it null.
 		const base = deps();
@@ -426,18 +389,15 @@ describe("flow view", () => {
 		const turns = {
 			...built.turns,
 			threads: built.turns.threads.map((thread) =>
-				thread.originKey === "slack/ch/C1/t/A" ? { ...thread, originKey: key, threadRef: `${ch}:${msg}` } : thread,
+				thread.originKey === originOf("A") ? { ...thread, originKey: key, threadRef: `${ch}:${msg}` } : thread,
 			),
 		};
 		const barOf = (page: string) => /<div class="detail-bar">([\s\S]*?)<\/div>/.exec(page)?.[1] ?? "";
-		const bar = barOf(
-			renderDashboardPage({ ...built, turns, slackTeam: "T1", discordGuild: guild }, { view: "turns", item: key }),
-		);
+		const bar = barOf(renderDashboardPage({ ...built, turns, discordGuild: guild }, { view: "turns", item: key }));
 		expect(bar).toContain(
-			`id="detail-discord" class="button is-ghost detail-slack" href="${web}/${guild}/${msg}" target="_blank" rel="noopener noreferrer">디스코드에서 답하기`,
+			`id="detail-discord" class="button is-ghost detail-reply" href="${web}/${guild}/${msg}" target="_blank" rel="noopener noreferrer">디스코드에서 답하기`,
 		);
-		// A Discord conversation has no Slack link; without the server id its Discord link is hidden too.
-		expect(bar).toMatch(/id="detail-slack"[^>]* hidden>/);
+		// Without the server id the Discord link is hidden.
 		expect(barOf(renderDashboardPage({ ...built, turns }, { view: "turns", item: key }))).toMatch(
 			/id="detail-discord"[^>]* hidden>/,
 		);
@@ -498,8 +458,8 @@ describe("request preview without ompbot's quote wrapping", () => {
 		const db = new Database(dbPath, { strict: true });
 		db.run(
 			`INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, thread_ref)
-			 VALUES ('d1', 'slack/ch/C1/t/D', 1, ?, 'answered', ?, 'D')`,
-			[QUOTE, NOW - 8 * DAY],
+			 VALUES ('d1', ?, 1, ?, 'answered', ?, 'D')`,
+			[originOf("D"), QUOTE, NOW - 8 * DAY],
 		);
 		const quoted = chain(flowsOf(await buildSnapshot(deps())), "D");
 		expect(quoted.title).toBe("[첨부] title T-D1");
@@ -512,8 +472,8 @@ describe("request preview without ompbot's quote wrapping", () => {
 /** A flow of TASKs registered/closed at the given `+09:00` times (`closed` undefined = still open). */
 const flowOf = (tasks: Array<{ id: string; created: string; closed?: string }>): FlowChainInfo => ({
 	threadRef: "Q",
-	originKey: "slack/ch/C1/t/Q",
-	place: "채널 C1 스레드",
+	originKey: originOf("Q"),
+	place: "Discord 채널 300000000000000001 스레드",
 	title: "qa 50개",
 	requestedAt: "2026-11-12T01:07:00+09:00",
 	updatedAt: "2026-11-12T08:04:34+09:00",
@@ -850,10 +810,12 @@ describe("shipped renderers", () => {
 		const typicalNoteShipped = new Function("formatTypicalRange", `"use strict"; return (${String(typicalNote)});`)(
 			formatTypicalRangeShipped,
 		) as typeof typicalNote;
+		const escShipped = isolated(esc);
 		const withNote = <T>(fn: T): T =>
-			new Function(...names, "typicalNote", `"use strict"; return (${String(fn)});`)(
+			new Function(...names, "typicalNote", "esc", `"use strict"; return (${String(fn)});`)(
 				...values,
 				typicalNoteShipped,
+				escShipped,
 			) as T;
 		const flow = withNote(renderFlowChain);
 		const facts = withNote(renderTaskFacts);

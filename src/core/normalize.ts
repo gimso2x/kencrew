@@ -1,5 +1,5 @@
-// Single entry point for "who may talk to omp and what counts as an instruction". The Slack adapter and
-// `ompbot inject` (todo 7) both call normalizeInbound, so owner gating and quoted-content fencing cannot diverge.
+// Single entry point for "who may talk to omp and what counts as an instruction". Every chat adapter calls
+// normalizeInbound, so owner gating and quoted-content fencing cannot diverge.
 import { randomBytes } from "node:crypto";
 import { injectionWarning, scanForInjection } from "../safety/injection";
 import { type ChatPlatform, chatOriginKey, parseChatOrigin, platformOfConversationId } from "./origin-key";
@@ -16,10 +16,10 @@ export interface NormalizeInput {
 	ts: string;
 	threadTs?: string | undefined;
 	subtype?: string | undefined;
-	/** Slack `channel_type`: `im` (the default) is the owner DM; anything else is a channel conversation. */
+	/** `im` (the default) is the owner DM; anything else is a channel conversation. */
 	channelType?: string | undefined;
-	/** Platform of `channel` (the origin key namespace). Default Slack. */
-	platform?: ChatPlatform | undefined;
+	/** Platform of `channel` (the origin key namespace). */
+	platform: ChatPlatform;
 	/** Test seam: returns the 16-hex fence id. Defaults to crypto randomness, fresh per message. */
 	fenceId?: () => string;
 }
@@ -44,14 +44,14 @@ export function isOwner(userId: string | undefined, ownerUserId: string): boolea
 	return userId !== undefined && userId !== "" && userId === ownerUserId;
 }
 
-/** `slack/dm/<D…>` for the owner DM, `slack/ch/<C…|G…>` for a channel (one conversation per channel); `discord/…` alike. */
-export function originKeyForChannel(channel: string, channelType = "im", platform: ChatPlatform = "slack"): string {
-	return chatOriginKey({ platform, kind: channelType === "im" ? "dm" : "ch", conversationId: channel });
+/** `<platform>/dm/<id>` for the owner DM, `<platform>/ch/<id>` for a channel (one conversation per channel). */
+export function originKeyForChannel(channel: string, channelType: string | undefined, platform: ChatPlatform): string {
+	return chatOriginKey({ platform, kind: (channelType ?? "im") === "im" ? "dm" : "ch", conversationId: channel });
 }
 
 /**
  * Session origin of one inbound message. In a channel every thread — a new root (`threadTs` absent, empty or equal
- * to `ts`, Slack's history shape for roots) and every reply under it — is its own origin `slack/ch/<C>/t/<rootTs>`:
+ * to `ts`) and every reply under it — is its own origin `<platform>/ch/<C>/t/<rootTs>`:
  * its own omp session and mailbox, so a second root never steers into another root's running turn and answers stay
  * on their own thread. Only a root that is a chat command (`!model …`, `!new`, `!followup …`, …) stays on the channel
  * origin, where channel settings, session management and explicit follow-ups have always applied. DMs ignore threads
@@ -63,7 +63,7 @@ export function originKeyForMessage(
 	ts: string,
 	threadTs: string | undefined,
 	text: string,
-	platform: ChatPlatform = "slack",
+	platform: ChatPlatform,
 ): string {
 	if (channelType === undefined || channelType === "im") return originKeyForChannel(channel, channelType, platform);
 	const root = threadTs === undefined || threadTs === "" || threadTs === ts;
@@ -77,16 +77,10 @@ export function threadRefOfOrigin(originKey: string): string | undefined {
 	return ref?.kind === "ch" && ref.threadId !== undefined ? threadRefOf(ref.conversationId, ref.threadId) : undefined;
 }
 
-/** True for thread-session origins (`slack/ch/<C>/t/<rootTs>`). */
+/** True for thread-session origins (`<platform>/ch/<C>/t/<rootTs>`). */
 export function isThreadOrigin(originKey: string): boolean {
 	return threadRefOfOrigin(originKey) !== undefined;
 }
-
-/**
- * Whether the bot answers a daemon-put owner message in `channel` as in a DM or as in a channel (where the bot mention
- * leads the text). Slack DM ids start with `D`; every other conversation counts as a channel.
- */
-export const conversationKind = (channel: string): "dm" | "ch" => (channel.startsWith("D") ? "dm" : "ch");
 
 export function threadRefOf(channel: string, threadTs: string): string {
 	return `${channel}:${threadTs}`;
@@ -95,7 +89,7 @@ export function threadRefOf(channel: string, threadTs: string): string {
 /** `threadTs` of a thread ref that means "post at the top level of the channel" (monitor output). */
 export const TOP_LEVEL_TS = "-";
 
-/** Placeholder the Slack adapter swaps for ` · [스레드 보기](<permalink>)` when it posts (the ledger has no Slack access). */
+/** Placeholder the adapter swaps for ` · [스레드 보기](<permalink>)` when it posts (the ledger has no platform access). */
 export const THREAD_LINK_PREFIX = "{{thread-link:";
 
 export function parseThreadRef(threadRef: string): { channel: string; threadTs: string } | undefined {
@@ -108,11 +102,6 @@ export function parseThreadRef(threadRef: string): { channel: string; threadTs: 
 export function platformOfThreadRef(threadRef: string): ChatPlatform | undefined {
 	const ref = parseThreadRef(threadRef);
 	return ref === undefined ? undefined : platformOfConversationId(ref.channel);
-}
-
-/** Slack escapes only &, < and > in message text. */
-export function unescapeSlackText(text: string): string {
-	return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
 }
 
 // Anything shaped like one of our fences, whatever its id. Removed from quoted content in a loop so that
@@ -197,12 +186,8 @@ export function normalizeInbound(input: NormalizeInput): NormalizeResult {
 
 	const fence = (input.fenceId ?? (() => randomBytes(8).toString("hex")))();
 	const body = input.text.trim();
-	const platform = input.platform ?? "slack";
-	const quotedBlock = wrapQuoted(
-		input.quoted,
-		fence,
-		`전달·인용된 ${platform === "slack" ? "Slack" : platform === "teams" ? "Teams" : "Discord"} 글`,
-	);
+	const platform = input.platform;
+	const quotedBlock = wrapQuoted(input.quoted, fence, `전달·인용된 ${platform === "teams" ? "Teams" : "Discord"} 글`);
 	if (body === "" && quotedBlock === "") return { accept: false, reason: "empty" };
 	// The origin reads the exact text the mailbox parses, so a root stays on the channel origin iff it runs as a command.
 	const text = [body, quotedBlock].filter((part) => part !== "").join("\n\n");

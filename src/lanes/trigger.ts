@@ -31,6 +31,11 @@ export function isReopenCommand(text: string): boolean {
 	return /^!reopen(?:\s|$)/.test(text.trim());
 }
 
+/** `닫아` as the whole message: closes a `not-done` lane whose check failed under a planned deferral. */
+export function isOwnerAcceptText(text: string): boolean {
+	return text.trim() === "닫아";
+}
+
 /** What an owner message does in a closed lane's thread (`classifyClosedLaneMessage`). */
 export type ClosedLaneMessage = "reopen" | "control" | "question" | "land" | "discard";
 

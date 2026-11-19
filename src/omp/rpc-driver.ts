@@ -211,7 +211,7 @@ export interface RpcOmpDriverOptions {
 	/** Parent environment source (tests); default `process.env`. */
 	baseEnv?: Record<string, string | undefined>;
 	/**
-	 * Owner answers to omp's select/confirm/input/editor/ask dialogs (Slack cards). With it the driver opts in to the
+	 * Owner answers to omp's select/confirm/input/editor/ask dialogs (chat cards). With it the driver opts in to the
 	 * `ask` dialog (`set_ask_dialog enabled:true`) and spawns `--mode rpc-ui` so omp offers the `ask` tool; without it
 	 * the child stays headless `rpc` and every dialog is cancelled at once.
 	 */

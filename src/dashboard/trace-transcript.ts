@@ -168,7 +168,7 @@ export function readTranscript(
 	if (window.live && scope.depth === 0 && tail === "other" && !waiting && lastIn !== undefined) {
 		const name = result.model ?? "model";
 		result.spans.push({
-			id: "pending-model",
+			id: `${scope.prefix}pending-model`,
 			name,
 			kind: "llm",
 			status: "running",

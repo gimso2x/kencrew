@@ -22,9 +22,7 @@ const SNAPSHOT_KEYS = [
 	"gates",
 	"backup",
 	"jobs",
-	"slackTeam",
 	"ompbotCli",
-	"slackOff",
 	"discordGuild",
 ];
 
@@ -126,10 +124,10 @@ describe("ompbot dashboard", () => {
 	test("each opened page and detail read writes one dashboard_request line without the origin, id or card", async () => {
 		const url = await startDashboard(["--port", String(freePort())]);
 		for (const path of [
-			"?view=turns&origin=slack/dm/DSECRET1&id=ISECRET2&card=CSECRET3",
+			"?view=turns&origin=discord/dm/200000000000000099&id=ISECRET2&card=CSECRET3",
 			"?view=%0Aforged",
 			"api/turn/7/trace",
-			"api/thread/conversation?origin=slack/dm/DSECRET1",
+			"api/thread/conversation?origin=discord/dm/200000000000000099",
 			"api/monitor/detail?id=ISECRET2",
 			"api/snapshot",
 			"healthz",
@@ -147,7 +145,18 @@ describe("ompbot dashboard", () => {
 			"dashboard_request kind=conversation",
 			"dashboard_request kind=monitor_detail",
 		]);
-		expect(stderr).not.toMatch(/SECRET/);
+		expect(stderr).not.toMatch(/SECRET|200000000000000099/);
+	});
+
+	test("the process wires api/diff: a lane the database does not know is 404 unknown_lane (not diff_disabled), and the use is logged", async () => {
+		const url = await startDashboard(["--port", String(freePort())]);
+		const response = await fetch(`${url}api/diff?lane=nope`);
+		expect(response.status).toBe(404);
+		expect(await response.json()).toEqual({ error: "unknown_lane" });
+		proc?.kill("SIGTERM");
+		expect(await proc?.exited).toBe(0);
+		expect(await new Response(proc?.stderr).text()).toContain("dashboard_request kind=diff");
+		proc = undefined;
 	});
 
 	test("AC-9: without herdrBoard no board source starts; the page keeps the herdr agent list block", async () => {

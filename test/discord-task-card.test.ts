@@ -1,5 +1,5 @@
 // [TASK] card buttons on Discord (doc/plans/discord-channel.md §9): 머지 and 추천대로 clicks go through the same
-// core.onAction → #handleTaskCardButton path as Slack and become an owner message in the task's Discord thread.
+// core.onAction → #handleTaskCardButton path as on every channel and become an owner message in the task's Discord thread.
 // 추천대로 has its recommendation back from the ledger: Discord buttons carry no value.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ChannelBinding } from "../src/channel/adapter";
@@ -9,8 +9,6 @@ import { DiscordChannel } from "../src/discord/channel";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import type { TaskJudgement } from "../src/tasks/checker";
 import { acceptanceItems } from "../src/tasks/docs";
 import type { TaskRow } from "../src/tasks/ledger";
@@ -21,14 +19,7 @@ import {
 	taskMergeActionId,
 	taskRecommendActionId,
 } from "../src/tasks/notify";
-import {
-	DISCORD_OWNER,
-	makeHome,
-	type TestHome,
-	WaitingDiscordTransport,
-	WaitingTransport,
-	withDiscord,
-} from "./helpers/bot-home";
+import { makeHome, OWNER, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 
 const GUILD = "300000000000000001";
@@ -49,14 +40,11 @@ beforeEach(async () => {
 	discord = new WaitingDiscordTransport();
 	discord.setChannel({ id: CH, type: 0, guildId: GUILD });
 	discord.setChannel({ id: THREAD, type: 11, parentId: CH, guildId: GUILD });
-	port = new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER });
+	port = new DiscordChannel(discord, { ownerUserId: OWNER });
 	const sessions = new FakeSessionStore();
-	const channels: ChannelBinding[] = [
-		new SlackBinding(new SlackChannel(new WaitingTransport())),
-		new DiscordBinding(port),
-	];
+	const channels: ChannelBinding[] = [new DiscordBinding(port)];
 	daemon = new Daemon({
-		config: withDiscord(home),
+		config: home.config,
 		channels,
 		log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 		ompVersion: "omp-test 0",
@@ -99,7 +87,7 @@ function click(customId: string, card: string): Promise<void> {
 		token: `token-${seq}`,
 		channel_id: THREAD,
 		guild_id: GUILD,
-		member: { user: { id: DISCORD_OWNER } },
+		member: { user: { id: OWNER } },
 		data: { custom_id: customId, component_type: 2 },
 		message: { id: card, channel_id: THREAD },
 	});
@@ -121,7 +109,7 @@ describe("Discord [TASK] card buttons", () => {
 		const row = seedTask("review");
 		const card = await port.post(
 			{ conversationId: CH, threadId: THREAD },
-			cardMessage(buildReviewWaitingCard(row, 24, DISCORD_OWNER), port),
+			cardMessage(buildReviewWaitingCard(row, 24, OWNER), port),
 		);
 		const posted = discord.calls.find((c) => c.method === "createMessage" && c.id === card.messageId);
 		expect(JSON.stringify(posted)).toContain(taskMergeActionId(row.taskId));
@@ -142,7 +130,7 @@ describe("Discord [TASK] card buttons", () => {
 		} as unknown as TaskJudgement;
 		const card = await port.post(
 			{ conversationId: CH, threadId: THREAD },
-			cardMessage(buildBlockedCard(row, judgement, DISCORD_OWNER), port),
+			cardMessage(buildBlockedCard(row, judgement, OWNER), port),
 		);
 		await click(taskRecommendActionId(row.taskId), card.messageId);
 		expect(discord.posts((text) => text === "🔘 추천대로 (버튼)").map((p) => p.channelId)).toEqual([THREAD]);

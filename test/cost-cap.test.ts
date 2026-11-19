@@ -9,12 +9,12 @@ import type { InboundRecord } from "../src/core/types";
 import { createLogger } from "../src/log";
 import type { OmpEvent, OmpTurnUsage } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
-import { budgetBreach, dailyBudgetState, sessionWindowCost } from "../src/ops/cost-cap";
+import { sessionWindowCost } from "../src/ops/cost-cap";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
 import { localDay } from "../src/time";
 
-const ORIGIN = "slack/dm/DBUDGET";
+const ORIGIN = "discord/dm/200000000000000009";
 
 class FakeClock {
 	t = Date.UTC(2026, 10, 10, 12, 0, 0);
@@ -39,6 +39,7 @@ let router: OriginRouter;
 let drivers: FakeOmpDriver[];
 let logLines: string[];
 let escalations: TurnFailureEscalation[];
+let capWarnings: Array<{ originKey: string; threadRef: string; text: string }>;
 let costCap: { turnUsd?: number; dailyUsd?: number } | undefined;
 let escalateAfter: number | undefined;
 let sessionStore: FakeSessionStore;
@@ -50,6 +51,7 @@ beforeEach(() => {
 	drivers = [];
 	logLines = [];
 	escalations = [];
+	capWarnings = [];
 	costCap = undefined;
 	escalateAfter = undefined;
 	sessionStore = new FakeSessionStore();
@@ -68,6 +70,7 @@ function buildRouter(options: { sessionFile?: string; turnUsage?: () => OmpTurnU
 		costCap: () => costCap,
 		...(escalateAfter === undefined ? {} : { escalateAfter }),
 		onEscalate: (info) => escalations.push(info),
+		onTurnCostCap: (info) => capWarnings.push(info),
 		driverFactory: (_origin, sessionDir) => {
 			const driver = new FakeOmpDriver({
 				holdTurns: true,
@@ -117,27 +120,29 @@ async function finishTurn(driver: FakeOmpDriver): Promise<void> {
 const bodies = (): string[] => store.listDeliveries({ originKey: ORIGIN }).map((row) => row.body);
 
 describe("AC-1: per-turn cost cap", () => {
-	test("turnUsd=1: $0.6+$0.5 steers once with the cap, a later $0.2 does not steer again", async () => {
+	test("turnUsd=1: $0.6+$0.5 warns the thread once, never steers, and the turn goes on past 1.5x", async () => {
 		costCap = { turnUsd: 1 };
 		const driver = await startTurn("비싼 작업");
 		driver.emitTestEvent(usageEvent(0.6));
-		expect(driver.calls.filter((call) => call.startsWith("steer:"))).toHaveLength(0);
+		expect(capWarnings).toHaveLength(0);
 		driver.emitTestEvent(usageEvent(0.5));
-		// The steer runs on the mailbox's serial chain (a held turn keeps the lane busy): wait for it to drain.
+		expect(capWarnings).toHaveLength(1);
+		expect(capWarnings[0]).toMatchObject({ originKey: ORIGIN });
+		expect(capWarnings[0]?.threadRef).toBe(`m${counter}`);
+		expect(capWarnings[0]?.text).toContain("턴 상한 $1.00");
+		expect(capWarnings[0]?.text).toContain("$3.00에서 멈춥니다");
+		// $1.1 -> $2.0 is past 1.5x and still below 3x: no second warning, no steer, no abort.
+		driver.emitTestEvent(usageEvent(0.9));
 		await router.mailbox(ORIGIN).sweepIdle();
-		const steers = driver.calls.filter((call) => call.startsWith("steer:"));
-		expect(steers).toHaveLength(1);
-		expect(steers[0]).toContain("비용 상한($1.00)");
-		driver.emitTestEvent(usageEvent(0.2));
-		await router.mailbox(ORIGIN).sweepIdle();
-		expect(driver.calls.filter((call) => call.startsWith("steer:"))).toHaveLength(1);
+		expect(capWarnings).toHaveLength(1);
+		expect(driver.calls.filter((call) => call.startsWith("steer:"))).toHaveLength(0);
 		expect(driver.calls).not.toContain("abort");
 		expect(logLines.some((line) => line.includes("event=cost_cap_turn_soft"))).toBe(true);
 		driver.release();
 		await router.mailbox(ORIGIN).sweepIdle();
 	});
 
-	test("reaching 1.5x aborts the turn: one `cost_cap` failure notice, no consecutive-failure escalation", async () => {
+	test("reaching 3x aborts the turn: one `cost_cap` failure notice, no consecutive-failure escalation", async () => {
 		costCap = { turnUsd: 1 };
 		// With escalateAfter=1 any counted failure escalates at once: the exclusion is what keeps this at zero.
 		// It is read when a mailbox is built, so the router is rebuilt before the first message is routed.
@@ -150,21 +155,22 @@ describe("AC-1: per-turn cost cap", () => {
 			off();
 			settled.resolve();
 		});
-		driver.emitTestEvent(usageEvent(1.6));
+		driver.emitTestEvent(usageEvent(3.2));
 		await settled.promise;
 		await router.mailbox(ORIGIN).sweepIdle();
 		expect(driver.calls).toContain("abort");
 		expect(bodies()).toHaveLength(1);
-		expect(bodies()[0]).toContain("비용 상한 $1.00의 1.5배를 넘어 턴을 멈췄습니다");
-		expect(bodies()[0]).toContain("이번 턴 $1.60");
+		expect(bodies()[0]).toContain("비용 상한 $1.00의 3배를 넘어 턴을 멈췄습니다");
+		expect(bodies()[0]).toContain("이번 턴 $3.20");
 		expect(escalations).toHaveLength(0);
 		expect(logLines.some((line) => line.includes("event=turn_failures_escalated"))).toBe(false);
 	});
 
-	test("without `costCap` a turn never steers nor aborts", async () => {
+	test("without `costCap` a turn never warns nor aborts", async () => {
 		const driver = await startTurn("평범한 작업");
 		driver.emitTestEvent(usageEvent(9.9));
 		driver.emitTestEvent(usageEvent(9.9));
+		expect(capWarnings).toHaveLength(0);
 		expect(driver.calls.filter((call) => call.startsWith("steer:"))).toHaveLength(0);
 		expect(driver.calls).not.toContain("abort");
 		driver.release();
@@ -183,8 +189,8 @@ describe("AC-2: daily ledger", () => {
 		expect(store.dailyCost(late)).toBe(4);
 		expect(store.dailyCost(late, ORIGIN)).toBe(2);
 		expect(store.topDailyOrigins(late, 3)).toEqual([
-			{ originKey: "monitor/daily", cost: 2 },
 			{ originKey: ORIGIN, cost: 2 },
+			{ originKey: "monitor/daily", cost: 2 },
 		]);
 
 		clock.advance(60_000);
@@ -351,7 +357,6 @@ describe("agy turns in the daily ledger", () => {
 		costCap = { turnUsd: 1, dailyUsd: 10 };
 		router = buildRouter({ turnUsage: () => AGY_TURN });
 		const day = localDay(clock.now(), "Asia/Seoul");
-		const before = budgetBreach(dailyBudgetState({ store, day, cap: 10 }));
 
 		await finishTurn(await startTurn("서팍 검토 한 번"));
 		expect(ledgerRow(day)).toEqual({ cost: 0, calls: 3 });
@@ -359,7 +364,7 @@ describe("agy turns in the daily ledger", () => {
 		expect(ledgerRow(day)).toEqual({ cost: 0, calls: 6 });
 
 		expect(store.dailyCost(day, ORIGIN)).toBe(0);
-		expect(budgetBreach(dailyBudgetState({ store, day, cap: 10 }))).toEqual(before);
+		expect(capWarnings).toEqual([]);
 		expect(drivers.flatMap((driver) => driver.calls).filter((call) => call.startsWith("steer:"))).toEqual([]);
 		const usage = logLines.filter((line) => line.includes("event=agy_usage"));
 		expect(usage).toHaveLength(2);

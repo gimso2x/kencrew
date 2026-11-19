@@ -31,11 +31,11 @@ import { collectGates, gateOptionsFromConfig } from "../ops/gates";
 import { socketDrainCall, waitForDrain } from "./drain";
 import { runProfileSync } from "./omp";
 
-export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--cut-after <min>] [--merged-at <iso>] [--report-origin <slack/ch/C|slack/dm/D|discord/ch/<id>|discord/dm/<id>> --report-thread <ts|message id> [--report-plain]] [--no-code-rollback] [--clear-rollback] [--allow-detached] [--json]
+export const APPLY_USAGE = `  apply [--detach] [--stamp <YYYYMMDD-HHMMSS>] [--timeout <min>] [--cut-after <min>] [--merged-at <iso>] [--report-origin <discord/ch/<id>|discord/dm/<id>> --report-thread <message id> [--report-plain]] [--no-code-rollback] [--clear-rollback] [--allow-detached] [--json]
                                  precheck (main, HEAD==main, clean src, bun) → backup + config copy → with config ompProfile,
                                  ompbot omp sync (a failure stops here) → drain --wait (default 60 min) → systemctl --user
                                  restart <this home's unit> → wait for a fresh daemon (2 min) → wait for its heartbeat
-                                 after the restart with no Slack/Discord transport down (2 min) → gates/doctor summary; ok
+                                 after the restart with no Discord transport down (2 min) → gates/doctor summary; ok
                                  with doctor rc=0 and no omp_runtime/turns_failing gate open records the loaded commit in
                                  <home>/head.last-good. On failure restores config and restarts once; if that restart
                                  fails too, the code goes back to head.last-good (main only, no staged or uncommitted
@@ -109,17 +109,10 @@ export async function applyCommand(
 	const reportOrigin = values["report-origin"];
 	const reportThread = values["report-thread"];
 	if (reportOrigin !== undefined && !isReportOrigin(reportOrigin)) {
-		return usageError(
-			"--report-origin must be slack/ch/<channel id>, slack/dm/<dm id>, discord/ch/<channel id> or discord/dm/<dm id>",
-		);
+		return usageError("--report-origin must be discord/ch/<channel id> or discord/dm/<dm id>");
 	}
-	if (
-		reportThread !== undefined &&
-		(reportOrigin === undefined || !reportThreadPattern(reportOrigin).test(reportThread))
-	) {
-		return usageError(
-			"--report-thread needs --report-origin and a Slack ts like 1793318305.840629 (slack/...) or a Discord message id (discord/...)",
-		);
+	if (reportThread !== undefined && (reportOrigin === undefined || !reportThreadPattern().test(reportThread))) {
+		return usageError("--report-thread needs --report-origin and a Discord message id");
 	}
 	if (values["report-plain"] === true && reportOrigin === undefined)
 		return usageError("--report-plain needs --report-origin");

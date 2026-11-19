@@ -107,8 +107,8 @@ describe("AC-4: written times carry the configured zone's offset (America/New_Yo
 		const row = ledger.register({
 			title: "t",
 			risk: "L1",
-			originKey: "slack/dm/D1",
-			threadRef: "C1:1.1",
+			originKey: "discord/dm/200000000000000001",
+			threadRef: "300000000000000001:400000000000000001",
 			host: null,
 			repo: "/r",
 			acceptance: [{ id: "AC-1", text: "a" }],
@@ -126,15 +126,15 @@ describe("AC-4: written times carry the configured zone's offset (America/New_Yo
 			candidates: [
 				{
 					kind: "inbound",
-					originKey: "slack/dm/D1",
-					threadRef: "D1:1.1",
+					originKey: "discord/dm/200000000000000001",
+					threadRef: "200000000000000001:400000000000000001",
 					createdAt: T,
 					text: "grafana 대시보드 설정 손봐줘",
 					opRef: null,
 				},
 			],
 			freshSession: true,
-			channel: "D1",
+			channel: "200000000000000001",
 			timezone: NY,
 		});
 		expect(result.block).toContain("- 2026-11-11 19:00 오너");
@@ -163,7 +163,7 @@ describe("AC-4: written times carry the configured zone's offset (America/New_Yo
 });
 
 describe("AC-6: prompt and tool texts name config.timezone and its offset", () => {
-	const persona = chatOriginKey({ platform: "slack", kind: "dm", conversationId: "D1" });
+	const persona = chatOriginKey({ platform: "discord", kind: "dm", conversationId: "200000000000000001" });
 
 	test("monitor tool descriptions", () => {
 		const ledger = openMonitorLedger(join(home, "ompbot.db"), { now: () => T });

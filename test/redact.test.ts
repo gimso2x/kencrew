@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { byteLength, REDACTED, redact, redactToBudget, truncateUtf8 } from "../src/redact";
+import { byteLength, REDACTED, redact, truncateUtf8 } from "../src/redact";
 
 describe("redact", () => {
 	test.each([
@@ -125,18 +125,18 @@ describe("byte budget", () => {
 	test("budget is applied after masking: growth from masking cannot exceed it", () => {
 		const input = "xoxb-a"; // 6 bytes raw, 10 bytes masked
 		expect(byteLength(input)).toBe(6);
-		const out = redactToBudget(input, 8);
+		const out = truncateUtf8(redact(input), 8);
 		expect(byteLength(out)).toBeLessThanOrEqual(8);
 		expect(out).not.toContain("xoxb");
 	});
 
 	test("shrinking masks leave room for later content", () => {
 		const input = `xoxb-${"A".repeat(100)} tail`;
-		expect(redactToBudget(input, 30)).toBe(`${REDACTED} tail`);
+		expect(truncateUtf8(redact(input), 30)).toBe(`${REDACTED} tail`);
 	});
 
 	test("result in bytes never exceeds the budget for multibyte output", () => {
-		const out = redactToBudget(`한글 xapp-TEST-0 ${"가".repeat(50)}`, 40);
+		const out = truncateUtf8(redact(`한글 xapp-TEST-0 ${"가".repeat(50)}`), 40);
 		expect(byteLength(out)).toBeLessThanOrEqual(40);
 		expect(out).not.toContain("xapp-");
 	});

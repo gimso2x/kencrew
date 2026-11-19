@@ -767,7 +767,6 @@ describe("collectGates adversarial", () => {
 			origin_silent: "closed", // a pre-migration inbound table has no origin_key/created_at columns
 			deliveries_overdue: "closed",
 			lanes_stuck: "closed",
-			slack_disconnected: "unknown", // no heartbeat stamp: nothing to judge
 			frozen: "closed",
 			disk_low: "closed", // diskPaths: [] reads statfs=unavailable
 			host_pressure: "closed",
@@ -862,10 +861,10 @@ describe("collectGates adversarial", () => {
 		const stale = gates([]);
 		expect(stale.code).toBe(1);
 		const lines = stale.out.trimEnd().split("\n");
-		expect(lines).toHaveLength(14);
-		// No heartbeat stamp in this home: the three heartbeat gates are unknown and named on the last line too.
+		expect(lines).toHaveLength(13);
+		// No heartbeat stamp in this home: the two heartbeat gates are unknown and named on the last line too.
 		expect(lines[lines.length - 1]).toMatch(
-			/^gates_done open=1 unknown=3 total=13 opened=backup_age\(hours=3[78]\.\d\) unknown_gates=sweep_stalled,slack_disconnected,monitors_stalled$/,
+			/^gates_done open=1 unknown=2 total=12 opened=backup_age\(hours=3[78]\.\d\) unknown_gates=sweep_stalled,monitors_stalled$/,
 		);
 		const json = gates(["--json"]);
 		expect(json.code).toBe(1);
@@ -875,11 +874,10 @@ describe("collectGates adversarial", () => {
 			gates: Array<{ name: string; state: string }>;
 		};
 		expect(parsed.open).toBe(1);
-		expect(parsed.unknown).toBe(3);
+		expect(parsed.unknown).toBe(2);
 		expect(parsed.gates.map((g) => g.name)).toEqual([
 			"backup_age",
 			"sweep_stalled",
-			"slack_disconnected",
 			"frozen",
 			"disk_low",
 			"host_pressure",
@@ -896,7 +894,7 @@ describe("collectGates adversarial", () => {
 		const healthy = gates([]);
 		expect(healthy.code).toBe(0);
 		expect(healthy.out.trimEnd().split("\n").pop()).toBe(
-			"gates_done open=0 unknown=3 total=13 unknown_gates=sweep_stalled,slack_disconnected,monitors_stalled",
+			"gates_done open=0 unknown=2 total=12 unknown_gates=sweep_stalled,monitors_stalled",
 		);
 	});
 });

@@ -58,9 +58,9 @@ function requireState(f: DeliveryFacts, event: DeliveryEvent, expected: Delivery
 }
 
 /**
- * Pure delivery state machine. `failed_ambiguous` is sticky: the send may have reached Slack, so neither failure
+ * Pure delivery state machine. `failed_ambiguous` is sticky: the send may have reached the platform, so neither failure
  * counts, backoff, nor the 24h freshness window move it; the row stays visible instead of being resent or dropped.
- * `rate_limited` (a 429, or the method still blocked by one) is Slack saying "later", not a failed send: it keeps
+ * `rate_limited` (a 429, or the method still blocked by one) is the platform saying "later", not a failed send: it keeps
  * `attempts` and waits until `retryAt`, so a long block cannot expire an answer — only the freshness window can.
  */
 export function transitionDelivery(

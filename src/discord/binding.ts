@@ -2,7 +2,7 @@
 // thread reader for turn context, built from `channels.discord`.
 import { join } from "node:path";
 import type { AdapterDeps, ChannelAdapter, ChannelBinding } from "../channel/adapter";
-import type { SlackThreadMessage } from "../core/mailbox";
+import type { ThreadMessage } from "../core/mailbox";
 import { parseChatOrigin } from "../core/origin-key";
 import { DiscordAdapter } from "./adapter";
 import { type BackfillTarget, discordCursorKey, snowflakeTime } from "./backfill";
@@ -14,7 +14,7 @@ const THREAD_CONTEXT_MAX_PAGES = 5;
 const THREAD_PAGE_LIMIT = 100;
 
 /** A Discord message as the mailbox's thread context reads it (`ts` is the message id). */
-function threadMessage(message: DiscordMessageEvent): SlackThreadMessage {
+function threadMessage(message: DiscordMessageEvent): ThreadMessage {
 	return {
 		ts: message.id,
 		text: message.content,
@@ -61,7 +61,7 @@ export class DiscordBinding implements ChannelBinding {
 			mediaRoot: join(deps.config.homeDir, "media"),
 			// Every Discord conversation is a channel to read: a DM, a server channel (its roots open threads), and a
 			// server thread, which is a channel of its own. A stored watermark keeps its channel a target after `ompbot
-			// gc` removed the quiet origin; Slack's `ch:`/`thr:` watermarks are never read here.
+			// gc` removed the quiet origin; `ch:`/`thr:` watermarks of the removed Slack backfill are never read here.
 			recovery: {
 				cursors: store,
 				maxPages: this.#backfillMaxPages,
@@ -86,7 +86,7 @@ export class DiscordBinding implements ChannelBinding {
 	 * from: it lives in the parent channel under the thread's own id, so it is the first message after `id − 1` there.
 	 * A `limit` (the root only) is that single read.
 	 */
-	readonly readThread = async (channel: string, threadTs: string, limit?: number): Promise<SlackThreadMessage[]> => {
+	readonly readThread = async (channel: string, threadTs: string, limit?: number): Promise<ThreadMessage[]> => {
 		const transport = this.port.transport;
 		const [root] = await transport.listMessages({ channelId: channel, after: String(BigInt(threadTs) - 1n), limit: 1 });
 		const out = root === undefined ? [] : [threadMessage(root)];

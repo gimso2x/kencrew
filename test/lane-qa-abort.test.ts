@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ProcessRunner, RunProcessOptions, RunProcessResult } from "../src/dispatch/omp";
 import type { LaneRow } from "../src/lanes/status";
 import type { AutoLandPolicy } from "../src/tasks/notify";
-import { makeHome, type TestHome } from "./helpers/bot-home";
+import { CHANNEL, makeHome, type TestHome } from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import { type LaneHarness, laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
 
@@ -51,7 +51,7 @@ async function startLane(h: LaneHarness, repo: string, title: string): Promise<L
 	const started = await h.manager.start({
 		title,
 		cwd: repo,
-		channel: "D1",
+		channel: CHANNEL,
 		brief: "a.txt를 만든다",
 		acceptance: [CHECK_A],
 		risk: "L3",

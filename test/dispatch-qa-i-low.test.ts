@@ -15,7 +15,7 @@ describe("dispatch tool (qa-i low)", () => {
 		const runs: string[][] = [];
 		let frozen: { reason: string } | undefined;
 		const tool = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: "/h",
 			workspaceDir: "/h/workspace",
@@ -39,7 +39,7 @@ describe("dispatch tool (qa-i low)", () => {
 		let seenSignal: AbortSignal | undefined;
 		let cmdSeen: string[] = [];
 		const tool = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			homeDir: "/h",
 			workspaceDir: "/h/workspace",
@@ -54,15 +54,24 @@ describe("dispatch tool (qa-i low)", () => {
 		await tool.execute({ task: "빌드 상태 요약" }, { signal: controller.signal });
 		expect(seenSignal).toBe(controller.signal);
 		const appendix = cmdSeen[cmdSeen.indexOf("--append-system-prompt") + 1] ?? "";
-		expect(appendix).not.toContain("slack_send_file");
+		expect(appendix).not.toContain("discord_send_file");
 		expect(appendix).not.toContain("ompbot_request_approval(");
 	});
 
 	test("buildFloorsPrompt with hostTools false has no tool lines", () => {
 		const text = buildFloorsPrompt("/tmp/h/secrets", undefined, false, false, false, {}, false);
-		expect(text).not.toContain("slack_send_file");
+		expect(text).not.toContain("discord_send_file");
 		expect(text).not.toContain("ompbot_request_approval(");
-		expect(buildFloorsPrompt("/tmp/h/secrets")).toContain("slack_send_file");
+		expect(buildFloorsPrompt("/tmp/h/secrets")).toContain("discord_send_file");
+	});
+
+	test("a Discord lane session gets Discord ask wording and its upload tool", () => {
+		const text = buildFloorsPrompt("/tmp/h/secrets", "ompbot/work/my-lane", false, true, false, {
+			lanePlatform: "discord",
+			laneCwd: "/repo",
+		});
+		expect(text).toContain("driven from the owner's Discord");
+		expect(text).toContain("discord_send_file");
 	});
 });
 
@@ -109,8 +118,8 @@ describe("injected owner doc with leading blanks (qa-i low)", () => {
 		const blanks = join(dir, "blanks.md");
 		writeFileSync(plain, body);
 		writeFileSync(blanks, `${" ".repeat(8_000)}${body}`);
-		const a = floorsSystemPrompt("/s/secrets", "slack/dm/D1", { persona: plain });
-		const b = floorsSystemPrompt("/s/secrets", "slack/dm/D1", { persona: blanks });
+		const a = floorsSystemPrompt("/s/secrets", "discord/dm/200000000000000001", { persona: plain });
+		const b = floorsSystemPrompt("/s/secrets", "discord/dm/200000000000000001", { persona: blanks });
 		expect(b).toBe(a);
 	});
 });

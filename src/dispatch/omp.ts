@@ -330,16 +330,25 @@ function herdrFailure(result: RunProcessResult, max = 160): string {
 	return redact(detail).slice(0, max);
 }
 
+/** `--env KEY=VALUE` pairs for herdr's `workspace create` / `tab create`: they reach the process launched in the new pane. */
+const envArgs = (env: Record<string, string> | undefined): string[] =>
+	Object.entries(env ?? {}).flatMap(([key, value]) => ["--env", `${key}=${value}`]);
+
 /**
  * `herdr workspace create --no-focus` (the owner's view stays where it is): returns the workspace's root pane id (the
- * agent needs a shell prompt pane) and the workspace id, so a failed start can close what it created.
+ * agent needs a shell prompt pane) and the workspace id, so a failed start can close what it created. `env` goes to
+ * the launched pane process (and so to the agent started in it), unlike `HerdrRunnerOptions.env` of herdr itself.
  */
 export async function herdrCreateWorkspace(
 	cwd: string,
 	label: string,
 	options: HerdrRunnerOptions = {},
+	env?: Record<string, string>,
 ): Promise<{ paneId: string; workspaceId: string | undefined } | { error: string }> {
-	const result = await herdrRun(["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus"], options);
+	const result = await herdrRun(
+		["workspace", "create", "--cwd", cwd, "--label", label, "--no-focus", ...envArgs(env)],
+		options,
+	);
 	if (result.code !== 0) return { error: `workspace create failed: ${herdrFailure(result)}` };
 	const parsed = parseHerdrJson<HerdrWorkspaceCreated>(result.stdout);
 	if (parsed === undefined) return { error: "workspace create output is not JSON" };
@@ -376,6 +385,8 @@ export async function herdrStartAgent(input: {
 	agentArgs?: string[];
 	/** Default omp. */
 	kind?: HerdrAgentKind;
+	/** Environment of the agent's pane (herdr `--env`), e.g. `OMP_WIKI_NOTE_DISABLE=1` for a [TASK] worker. */
+	env?: Record<string, string>;
 	/**
 	 * Close the workspace this call created when the first prompt fails (a [TASK] start, whose caller then removes the
 	 * worktree). Default false: a plain herdr dispatch keeps the agent up so the same name can be prompted again.
@@ -388,7 +399,7 @@ export async function herdrStartAgent(input: {
 	if (options.signal?.aborted === true) return { ok: false, error: "aborted before the agent started" };
 	const cleanup = uncancellable(options);
 	const label = `ompbot · ${name}`;
-	const ws = await herdrCreateWorkspace(cwd, label, options);
+	const ws = await herdrCreateWorkspace(cwd, label, options, input.env);
 	if ("error" in ws) return { ok: false, error: ws.error };
 	const started = await herdrRun(agentStartArgs(name, ws.paneId, input.agentArgs, input.kind), options);
 	if (started.code !== 0) {
@@ -414,6 +425,8 @@ export interface RemoteHerdrStartInput {
 	cwd: string;
 	/** Extra omp arguments (that host's `dispatchHosts.<h>.ompArgs`), passed after `--`; empty/absent → none. */
 	agentArgs?: string[];
+	/** Environment of the agent's pane (herdr `--env` on the workspace or tab it creates). */
+	env?: Record<string, string>;
 	/** Close the tab (or the workspace) this call created when the first prompt fails; see `herdrStartAgent`. */
 	closeOnPromptFailure?: boolean;
 	options?: HerdrRunnerOptions;
@@ -471,7 +484,10 @@ export async function herdrRemoteStart(
 	let tabId = "";
 	let paneId = "";
 	if (workspaceId === "") {
-		const created = await herdrRun(["workspace", "create", "--label", label, "--cwd", cwd, "--no-focus"], runner);
+		const created = await herdrRun(
+			["workspace", "create", "--label", label, "--cwd", cwd, "--no-focus", ...envArgs(input.env)],
+			runner,
+		);
 		if (created.code !== 0) return { ok: false, error: `workspace create failed: ${herdrFailure(created)}` };
 		const createdWs = parseHerdrJson<HerdrWorkspaceCreated>(created.stdout);
 		workspaceId = createdWs?.result?.workspace?.workspace_id ?? "";
@@ -481,7 +497,7 @@ export async function herdrRemoteStart(
 		if (workspaceId === "" || paneId === "") return { ok: false, error: "workspace create returned no ids" };
 	} else {
 		const tab = await herdrRun(
-			["tab", "create", "--workspace", workspaceId, "--cwd", cwd, "--label", name, "--no-focus"],
+			["tab", "create", "--workspace", workspaceId, "--cwd", cwd, "--label", name, "--no-focus", ...envArgs(input.env)],
 			runner,
 		);
 		if (tab.code !== 0) return { ok: false, error: `tab create failed: ${herdrFailure(tab)}` };

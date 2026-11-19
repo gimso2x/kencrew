@@ -43,11 +43,14 @@ function seedDatabase(): void {
 	openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
 	const db = new Database(dbPath, { strict: true });
 	const hour = 3_600_000;
-	db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES ('slack/dm/U1', 1, '/s', ?)", [NOW]);
+	db.run(
+		"INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES ('discord/dm/200000000000000001', 1, '/s', ?)",
+		[NOW],
+	);
 	db.run(
 		`INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, thread_ref, last_event_at)
-		 VALUES ('m1', 'slack/dm/U1', 1, ?, 'dispatched', ?, ?, 'D1:1.0', ?), ('m2', 'slack/dm/U1', 1, ?, 'pending', ?, NULL, NULL, NULL),
-		        ('m3', 'slack/dm/U1', 1, ?, 'answered', ?, ?, NULL, NULL)`,
+		 VALUES ('m1', 'discord/dm/200000000000000001', 1, ?, 'dispatched', ?, ?, '200000000000000001:700000000000000001', ?), ('m2', 'discord/dm/200000000000000001', 1, ?, 'pending', ?, NULL, NULL, NULL),
+		        ('m3', 'discord/dm/200000000000000001', 1, ?, 'answered', ?, ?, NULL, NULL)`,
 		// Every turn of the board's threads shows an 80-char masked request line; the rest of its body stays out.
 		[
 			`first request ${"가".repeat(80)} ${INBOUND_BODY}`,
@@ -63,18 +66,18 @@ function seedDatabase(): void {
 	);
 	db.run(
 		`INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at)
-		 VALUES ('slack/dm/U1', 'op1', 0, 'D1:1.0', ?, 'inflight', ?, ?)`,
+		 VALUES ('discord/dm/200000000000000001', 'op1', 0, '200000000000000001:700000000000000001', ?, 'inflight', ?, ?)`,
 		[DELIVERY_BODY, NOW, NOW],
 	);
 	db.run(
 		`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, reply_text)
-		 VALUES ('ap1', 'C1', '1.0', 'push to main', 'pending', ?, ?, 'slack/dm/U1', ?)`,
+		 VALUES ('ap1', '300000000000000001', '700000000000000001', 'push to main', 'pending', ?, ?, 'discord/dm/200000000000000001', ?)`,
 		[NOW - 1_000, NOW + hour, REPLY_TEXT],
 	);
 	db.run(
 		`INSERT INTO lanes (name, title, thread_ref, origin_key, cwd, session_dir, status, created_at, updated_at)
-		 VALUES ('lane-a', 'open lane', 'C1:2.0', 'lane/a', '/srv/a', '/s/a', 'working', ?, ?),
-		        ('lane-b', 'closed lane', 'C1:3.0', 'lane/b', '/srv/b', '/s/b', 'closed', ?, ?)`,
+		 VALUES ('lane-a', 'open lane', '300000000000000001:700000000000000002', 'lane/a', '/srv/a', '/s/a', 'working', ?, ?),
+		        ('lane-b', 'closed lane', '300000000000000001:700000000000000003', 'lane/b', '/srv/b', '/s/b', 'closed', ?, ?)`,
 		[NOW, NOW, NOW, NOW],
 	);
 	db.run(
@@ -105,11 +108,11 @@ function seedDatabase(): void {
 		db.run(
 			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
 				acceptance_json, created_at, updated_at, closed_at)
-			 VALUES (?, ?, 'L2', 'slack/dm/U1', ?, ?, '/srv/work/repo', ?, ?, ?, ?, ?, ?, ?, ?)`,
+			 VALUES (?, ?, 'L2', 'discord/dm/200000000000000001', ?, ?, '/srv/work/repo', ?, ?, ?, ?, ?, ?, ?, ?)`,
 			[
 				id,
 				title,
-				`C1:${id}`,
+				`300000000000000001:${id}`,
 				host,
 				id === "T-20261104-01" ? WORKTREE : `/srv/work/repo-${id.toLowerCase()}`,
 				`task/${id}`,
@@ -230,8 +233,8 @@ const STATUS: StatusReport = {
 	timezone: "Asia/Seoul",
 	daemonRunning: true,
 	origins: [
-		{ originKey: "slack/dm/U1", epoch: 1, ompPid: 42, busy: true },
-		{ originKey: "slack/ch/C1", epoch: 1, ompPid: null, busy: false },
+		{ originKey: "discord/dm/200000000000000001", epoch: 1, ompPid: 42, busy: true },
+		{ originKey: "discord/ch/300000000000000001", epoch: 1, ompPid: null, busy: false },
 	],
 	ledger: { pending: 0, inflight: 1, confirmed: 5, ambiguous: 0, expired: 0 },
 	inbound: { pending: 1, dispatched: 1, answered: 1, failed_notified: 0, discarded: 0 },
@@ -309,6 +312,50 @@ describe("dashboard snapshot", () => {
 			"T-20261104-03",
 			"T-20261103-01",
 		]);
+	});
+
+	test("AC-3: leftover slack/ rows (the removed channel) in inbound, deliveries, origins and approvals do not break the snapshot and show as plain text", async () => {
+		const db = new Database(dbPath, { strict: true });
+		for (const origin of ["slack/dm/D1", "slack/ch/C1/t/1.000"]) {
+			db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES (?, 1, '/s', ?)", [origin, NOW]);
+		}
+		const state = { "slack/dm/D1": "pending", "slack/ch/C1/t/1.000": "dispatched" } as const;
+		for (const [origin, thread] of [
+			["slack/dm/D1", "D1:2.000"],
+			["slack/ch/C1/t/1.000", "C1:1.000"],
+		] as const) {
+			db.run(
+				`INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, thread_ref)
+				 VALUES (?, ?, 1, ?, ?, ?, ?)`,
+				[thread, origin, `old slack ${origin}`, state[origin], NOW - 500, thread],
+			);
+			db.run(
+				`INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at)
+				 VALUES (?, ?, 0, ?, 'old slack answer', 'confirmed', ?, ?)`,
+				[origin, `slack-op-${thread}`, thread, NOW, NOW],
+			);
+		}
+		db.run(
+			`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key)
+			 VALUES ('ap-slack', 'C1', '1.000', 'old slack approval', 'pending', ?, ?, 'slack/ch/C1/t/1.000')`,
+			[NOW - 1_000, NOW + 3_600_000],
+		);
+		db.close();
+
+		const snapshot = await buildSnapshot(deps());
+		for (const section of [snapshot.daemon, snapshot.turns, snapshot.tasks, snapshot.approvals]) {
+			expect(section.ok).toBe(true);
+		}
+		const turns = turnsOf(snapshot);
+		const slackTurns = [...turns.values()].filter((turn) => turn.originKey.startsWith("slack/"));
+		expect(slackTurns.map((turn) => turn.originKey).sort()).toEqual(["slack/ch/C1/t/1.000", "slack/dm/D1"]);
+		expect(slackTurns.map((turn) => turn.preview).sort()).toEqual([
+			"old slack slack/ch/C1/t/1.000",
+			"old slack slack/dm/D1",
+		]);
+		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
+		expect(html).toContain("old slack slack/dm/D1");
+		expect(html).not.toContain('href="slack://');
 	});
 
 	test("AC-4: inflight deliveries and dispatched inbound keep their state after a snapshot", async () => {
@@ -493,7 +540,7 @@ const MASKED_BODY = "첫 줄\n둘째 줄   xoxb-TEST-0 sk-TESTKEY123 [첨부: /h
 /** Open turns of every kind next to the seeded ones (ids 4..12, in this order). */
 function seedTurns(): void {
 	const db = new Database(dbPath, { strict: true });
-	for (const origin of ["slack/ch/C9", "monitor/mon1", "slack/dm/U2"]) {
+	for (const origin of ["discord/ch/300000000000000009", "monitor/mon1", "discord/dm/200000000000000002"]) {
 		db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES (?, 1, '/s', ?)", [origin, NOW]);
 	}
 	const add = (id: string, origin: string, text: string, state: string, thread: string | null) =>
@@ -502,13 +549,43 @@ function seedTurns(): void {
 			 VALUES (?, ?, 1, ?, ?, ?, ?)`,
 			[id, origin, text, state, NOW - 500, thread],
 		);
-	add("slash:C9:aa", "slack/ch/C9", "/new-ompbot", "pending", "C9:-"); // 4
-	add("C9:2.0", "slack/ch/C9", "/new-ompbot", "pending", "C9:2.0"); // 5
+	add("slash:300000000000000009:aa", "discord/ch/300000000000000009", "/new-ompbot", "pending", "300000000000000009:-"); // 4
+	add(
+		"300000000000000009:700000000000000002",
+		"discord/ch/300000000000000009",
+		"/new-ompbot",
+		"pending",
+		"300000000000000009:700000000000000002",
+	); // 5
 	add("monitor:mon1:1", "monitor/mon1", "SECRET-MONITOR-PROMPT", "dispatched", null); // 6
-	add("C9:3.0", "slack/ch/C9", "  [자동 후속] apply 결과 ok. 영수증을 읽고 보고", "pending", "C9:3.0"); // 7
-	add("C9:4.0", "slack/ch/C9", "/followup-ompbot 이어서  해 줘", "pending", "C9:4.0"); // 8
-	add("D2:5.0", "slack/dm/U2", MASKED_BODY, "pending", "D2:-"); // 9
-	add("D2:6.0", "slack/dm/U2", `${"A".repeat(100)}${LONG_TAIL}`, "pending", "D2:6.0"); // 10
+	add(
+		"300000000000000009:700000000000000003",
+		"discord/ch/300000000000000009",
+		"  [자동 후속] apply 결과 ok. 영수증을 읽고 보고",
+		"pending",
+		"300000000000000009:700000000000000003",
+	); // 7
+	add(
+		"300000000000000009:700000000000000004",
+		"discord/ch/300000000000000009",
+		"/followup-ompbot 이어서  해 줘",
+		"pending",
+		"300000000000000009:700000000000000004",
+	); // 8
+	add(
+		"200000000000000002:700000000000000005",
+		"discord/dm/200000000000000002",
+		MASKED_BODY,
+		"pending",
+		"200000000000000002:-",
+	); // 9
+	add(
+		"200000000000000002:700000000000000006",
+		"discord/dm/200000000000000002",
+		`${"A".repeat(100)}${LONG_TAIL}`,
+		"pending",
+		"200000000000000002:700000000000000006",
+	); // 10
 	db.close();
 }
 
@@ -550,8 +627,8 @@ describe("dashboard turn context", () => {
 		}
 		expect(turnsOf(snapshot).get(1)).toMatchObject({
 			inboundId: 1,
-			originKey: "slack/dm/U1",
-			threadRef: "D1:1.0",
+			originKey: "discord/dm/200000000000000001",
+			threadRef: "200000000000000001:700000000000000001",
 			state: "dispatched",
 			createdAt: "2026-11-04T08:00:00+09:00",
 			ageMs: 3_600_000,
@@ -666,7 +743,15 @@ describe("dashboard turn context", () => {
 		expect(html).toContain('<p class="card-title">/new-ompbot</p>');
 		expect(html).toContain('<p class="card-title">첫 줄 둘째 줄 [REDACTED] [REDACTED] [첨부] 끝</p>');
 		expect(html).toContain('<p class="card-title">nightly</p>');
-		for (const label of ["대화", "명령", "모니터", "재시작 대기", "재시작이 기다리는 턴", "C9 채널 메인", "DM"]) {
+		for (const label of [
+			"대화",
+			"명령",
+			"모니터",
+			"재시작 대기",
+			"재시작이 기다리는 턴",
+			"Discord 300000000000000009 채널 메인",
+			"DM",
+		]) {
 			expect(html).toContain(`>${label}<`);
 		}
 		expect(html).toContain("진행 중인 턴 2개가 끝나면 재시작합니다 (가장 오래된 턴 경과 1시간 0분)");
@@ -780,7 +865,11 @@ const MINUTE = 60_000;
 /** Two dispatched turns past the starvation limit (one on a live approval) and one 9 minutes quiet. */
 function seedStalls(): { silentEvent: number; quiet: number; approved: number } {
 	const db = new Database(dbPath, { strict: true });
-	for (const origin of ["slack/ch/C7", "slack/ch/C8", "slack/ch/C6"]) {
+	for (const origin of [
+		"discord/ch/300000000000000007",
+		"discord/ch/300000000000000008",
+		"discord/ch/300000000000000006",
+	]) {
 		db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES (?, 1, '/s', ?)", [origin, NOW]);
 	}
 	const add = (id: string, origin: string, dispatchedAt: number, lastEventAt: number | null): number =>
@@ -788,17 +877,24 @@ function seedStalls(): { silentEvent: number; quiet: number; approved: number } 
 			db.run(
 				`INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, thread_ref, last_event_at)
 				 VALUES (?, ?, 1, 'work', 'dispatched', ?, ?, ?, ?)`,
-				[id, origin, dispatchedAt - MINUTE, dispatchedAt, `${origin.slice(-2)}:${id}`, lastEventAt],
+				[
+					id,
+					origin,
+					dispatchedAt - MINUTE,
+					dispatchedAt,
+					`${origin.slice(origin.lastIndexOf("/") + 1)}:${id}`,
+					lastEventAt,
+				],
 			).lastInsertRowid,
 		);
 	const ids = {
-		silentEvent: add("7.0", "slack/ch/C7", NOW - 11 * MINUTE, null),
-		quiet: add("8.0", "slack/ch/C8", NOW - 20 * MINUTE, NOW - 9 * MINUTE),
-		approved: add("6.0", "slack/ch/C6", NOW - 11 * MINUTE, null),
+		silentEvent: add("700000000000000007", "discord/ch/300000000000000007", NOW - 11 * MINUTE, null),
+		quiet: add("700000000000000008", "discord/ch/300000000000000008", NOW - 20 * MINUTE, NOW - 9 * MINUTE),
+		approved: add("700000000000000006", "discord/ch/300000000000000006", NOW - 11 * MINUTE, null),
 	};
 	db.run(
 		`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key)
-		 VALUES ('ap6', 'C6', '6.1', 'deploy', 'pending', ?, ?, 'slack/ch/C6')`,
+		 VALUES ('ap6', '300000000000000006', '700000000000000061', 'deploy', 'pending', ?, ?, 'discord/ch/300000000000000006')`,
 		[NOW - MINUTE, NOW + 60 * MINUTE],
 	);
 	db.close();
@@ -909,7 +1005,7 @@ describe("dashboard review fixes", () => {
 		const db = new Database(dbPath, { strict: true });
 		db.run(
 			`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key)
-			 VALUES ('ap7', 'C7', '7.1', 'push', 'pending', ?, ?, 'slack/ch/C7')`,
+			 VALUES ('ap7', '300000000000000007', '700000000000000071', 'push', 'pending', ?, ?, 'discord/ch/300000000000000007')`,
 			[NOW - MINUTE, NOW + 60 * MINUTE],
 		);
 		db.close();
@@ -926,11 +1022,11 @@ describe("dashboard review fixes", () => {
 		const snapshot = await buildSnapshot(deps());
 		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
 		const stalledCards = html
-			.split('<a class="card')
+			.split('<article class="card')
 			.slice(1)
 			.filter((card) => card.includes(">정체<"))
 			.map((card) => /data-row="([^"]+)"/.exec(card)?.[1]);
-		expect(stalledCards).toEqual(["slack/ch/C7"]);
+		expect(stalledCards).toEqual(["discord/ch/300000000000000007"]);
 
 		const source = await Bun.file(join(import.meta.dir, "..", "src", "dashboard", "html.ts")).text();
 		expect(source).not.toContain("STALL_MS");
@@ -990,8 +1086,8 @@ describe("TASK duration samples", () => {
 			db.run(
 				`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, repo, worktree, branch, agent, status,
 					acceptance_json, created_at, updated_at)
-				 VALUES (?, 't', 'L1', 'slack/dm/U1', ?, '/r', ?, ?, ?, 'review', '[]', ?, ?)`,
-				[id, `C1:${id}`, `/r/${id}`, `task/${id}`, id.toLowerCase(), NOW - DAY, NOW - DAY],
+				 VALUES (?, 't', 'L1', 'discord/dm/200000000000000001', ?, '/r', ?, ?, ?, 'review', '[]', ?, ?)`,
+				[id, `300000000000000001:${id}`, `/r/${id}`, `task/${id}`, id.toLowerCase(), NOW - DAY, NOW - DAY],
 			);
 			move(db, id, "working", "review", NOW - DAY + (i + 1) * MIN);
 		}

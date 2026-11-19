@@ -1,4 +1,4 @@
-// The lifecycle of a thread's ⏳ status message and 👀 reaction shared by the Slack and Discord adapters. Teams keeps
+// The lifecycle of a thread's ⏳ status message and 👀 reaction shared by the chat adapters. Teams keeps
 // its own (its status line posts only after a long turn, there are no reactions to swap and no delete), so only the
 // footer string is shared with it. The state machine — begin, cadenced running updates, the final delete/relabell and
 // the reaction swap with its rate-limit retries — lives here; the platform side of each step (post/edit/delete/
@@ -6,8 +6,9 @@
 // Retry-After and must be retried by a later tick.
 import type { TurnProgress } from "../core/mailbox";
 import { parseThreadRef, threadRefOf } from "../core/normalize";
+import type { Logger } from "../log";
 import type { FinalOutcome } from "./text";
-import { FINAL_MARKS, formatElapsed, formatFooter, runningStatusText } from "./text";
+import { errorText, FINAL_MARKS, formatElapsed, formatFooter, runningStatusText } from "./text";
 import type { AdapterClock } from "./types";
 
 /** One message the turn's 👀 sits on (and the final mark lands on): channel + message id. */
@@ -18,10 +19,10 @@ export interface StatusTarget {
 
 /** One thread's running status: what the tracker tracks and the platform callbacks read and fill in. */
 export interface StatusEntry {
-	/** Where the thread's messages (reactions, the status) live: Slack channel, Discord conversation. */
+	/** Where the thread's messages (reactions, the status) live: the Discord conversation. */
 	channel: string;
 	root: string;
-	/** Set by `create` when the ⏳ message is out (Slack: `channel`; Discord: the thread channel it landed in). */
+	/** Set by `create` when the ⏳ message is out (Discord: the thread channel it landed in). */
 	statusChannel: string | undefined;
 	statusId: string | undefined;
 	startedAt: number;
@@ -58,6 +59,84 @@ export interface StatusPlatform {
 	addMark(target: StatusTarget, mark: string): Promise<boolean>;
 	/** A registered [TASK] root keeps the task sweep's status reaction; the turn mark would fight it. */
 	isTaskRoot?(threadRef: string): boolean | undefined;
+}
+
+/** One status step's platform side: the bound transport call, the rate-limit test and the adapter's log. */
+export interface StatusStep {
+	/** The transport call, already inside the adapter's call wrapper (its rate-limit route included). */
+	run: () => Promise<void>;
+	/** `true` for this platform's rate-limit errors: the tracker retries the step on a later tick. */
+	isRateLimited(err: unknown): boolean;
+	log: Logger;
+}
+
+/** Posts the thread's `⏳` line; a refused post is one `status_create_failed` warn line and leaves the thread without one. */
+export async function createStatusMessage(
+	entry: StatusEntry,
+	log: Logger,
+	create: () => Promise<{ statusChannel: string; statusId: string }>,
+): Promise<void> {
+	try {
+		const posted = await create();
+		entry.statusChannel = posted.statusChannel;
+		entry.statusId = posted.statusId;
+	} catch (err) {
+		log.warn("status_create_failed", { thread: threadRefOf(entry.channel, entry.root), error: errorText(err) });
+	}
+}
+
+/**
+ * The running/final status edit the chat adapters share: the rate limit answers `true` (the tracker
+ * retries on a later tick), any other error is one warn line — `status_final_failed` for the final label,
+ * `status_update_failed` for a running update — and `false`. The edited text is bound inside `step.run`.
+ */
+export async function editStatusMessage(entry: StatusEntry, final: boolean, step: StatusStep): Promise<boolean> {
+	try {
+		await step.run();
+		return false;
+	} catch (err) {
+		if (step.isRateLimited(err)) return true;
+		step.log.warn(final ? "status_final_failed" : "status_update_failed", {
+			thread: threadRefOf(entry.channel, entry.root),
+			error: errorText(err),
+		});
+		return false;
+	}
+}
+
+/**
+ * The status delete the chat adapters share: `true` when rate limited (tick() deletes again). A refusal
+ * logs `status_delete_failed` and turns the finish into an update of the final label.
+ */
+export async function removeStatusMessage(entry: StatusEntry, step: StatusStep): Promise<boolean> {
+	try {
+		await step.run();
+		return false;
+	} catch (err) {
+		if (step.isRateLimited(err)) return true;
+		step.log.warn("status_delete_failed", {
+			thread: threadRefOf(entry.channel, entry.root),
+			error: errorText(err),
+		});
+		entry.finalAction = "update";
+		return false;
+	}
+}
+
+/**
+ * The reaction swap (👀 off, the final mark on) the chat adapters share: `true` when rate limited and the
+ * step must be retried later; other errors (no_reaction, unknown reaction) are final — one `reaction_skipped` info
+ * line. `method` names the call in that line when the platform has more than one.
+ */
+export async function swapStatusReaction(step: StatusStep, method?: string): Promise<boolean> {
+	try {
+		await step.run();
+		return false;
+	} catch (err) {
+		if (step.isRateLimited(err)) return true;
+		step.log.info("reaction_skipped", { ...(method === undefined ? {} : { method }), error: errorText(err) });
+		return false;
+	}
 }
 
 export class StatusTracker {

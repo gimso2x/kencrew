@@ -1,10 +1,18 @@
 import type { Server } from "bun";
 import type { LiveView } from "../core/live-turn";
-import { type BoardPanel, type BoardPromptRef, type BoardSource, type BoardTaskRef, boardView } from "./board";
+import {
+	type BoardCard,
+	type BoardPanel,
+	type BoardPromptRef,
+	type BoardSource,
+	type BoardTaskRef,
+	boardView,
+} from "./board";
+import type { DiffAnswer, DiffSubject } from "./diff";
 import { renderDashboardPage } from "./html";
 import type { MonitorDetail } from "./monitor-detail";
 import { proxyPaneGet } from "./proxy";
-import type { DashboardSnapshot } from "./snapshot";
+import { type DashboardSnapshot, JOB_NAME } from "./snapshot";
 import type { ThreadConversation } from "./thread-conversation";
 import type { TurnTrace } from "./trace";
 
@@ -31,7 +39,7 @@ export interface DashboardServerOptions {
 	/** Hears a snapshot that could not be built (answered as 500). */
 	onError?: (error: unknown) => void;
 	/**
-	 * Hears one owner-opened request: `page` (detail = the `view` query), `trace`, `conversation`, `monitor_detail` and
+	 * Hears one owner-opened request: `page` (detail = the `view` query), `trace`, `conversation`, `monitor_detail`, `diff` and
 	 * `board_pane`. Polls and streams (health, snapshot, board, live, board events) are not heard. A throw is ignored.
 	 */
 	onRequest?: (kind: string, detail?: string) => void;
@@ -39,6 +47,10 @@ export interface DashboardServerOptions {
 	board?: DashboardBoardOptions;
 	/** `api/turn/<id>/trace`: one turn's waterfall (read per request, never cached); absent = 404 `trace_disabled`. */
 	trace?: (inboundId: number) => TurnTrace;
+	/** `api/pane/trace`: the waterfall of a local omp worker card's last turn (read per request); absent = 404 `trace_disabled`. */
+	cardTrace?: (card: BoardCard) => TurnTrace;
+	/** `api/job/trace?name=<name>`: a background job's last turn waterfall (read per request); absent = 404 `trace_disabled`. */
+	jobTrace?: (name: string) => TurnTrace;
 	/**
 	 * `api/thread/conversation?origin=<key>[&before=<cursor>]`: one conversation's omp session, masked (read per
 	 * request, never cached); absent = 404 `conversation_disabled`.
@@ -49,6 +61,11 @@ export interface DashboardServerOptions {
 	 * per request, never cached); absent = 404 `monitor_detail_disabled`.
 	 */
 	monitorDetail?: (id: string) => MonitorDetail;
+	/**
+	 * `api/diff?lane=<name>` or `?task=<id>`: the change the owner is about to merge, masked and size-capped (read per
+	 * request, never cached); throws when git fails (500 `diff_failed`). Absent = 404 `diff_disabled`.
+	 */
+	diff?: (subject: DiffSubject) => Promise<DiffAnswer>;
 	/**
 	 * `api/thread/live` and its event stream: what the conversation's running turn is writing now (the daemon's `live`
 	 * op); throws when the daemon cannot be asked. Absent = 404 `live_disabled`.
@@ -70,10 +87,12 @@ const SNAPSHOT = /^\/(?:.*\/)?api\/snapshot$/;
 const HEALTH = /^\/(?:.*\/)?healthz$/;
 const BOARD = /^\/(?:.*\/)?api\/board$/;
 const BOARD_EVENTS = /^\/(?:.*\/)?api\/board\/events$/;
-const PANE = /^\/(?:.*\/)?api\/pane\/(conversation|plan)$/;
+const PANE = /^\/(?:.*\/)?api\/pane\/(conversation|plan|trace)$/;
+const JOB_TRACE = /^\/(?:.*\/)?api\/job\/trace$/;
 const TRACE = /^\/(?:.*\/)?api\/turn\/(\d{1,15})\/trace$/;
 const THREAD_CONVERSATION = /^\/(?:.*\/)?api\/thread\/conversation$/;
 const MONITOR_DETAIL = /^\/(?:.*\/)?api\/monitor\/detail$/;
+const DIFF = /^\/(?:.*\/)?api\/diff$/;
 const THREAD_LIVE = /^\/(?:.*\/)?api\/thread\/live$/;
 const THREAD_LIVE_EVENTS = /^\/(?:.*\/)?api\/thread\/live\/events$/;
 const MANIFEST = /^\/(?:.*\/)?manifest\.webmanifest$/;
@@ -371,6 +390,20 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 				}
 				return jsonReply(answer, answer.ok ? 200 : 404, head);
 			}
+			if (JOB_TRACE.test(pathname)) {
+				heard("trace");
+				if (options.jobTrace === undefined) return jsonReply({ error: "trace_disabled" }, 404, head);
+				const name = url.searchParams.get("name") ?? "";
+				if (!JOB_NAME.test(name)) return jsonReply({ error: "invalid_name" }, 400, head);
+				let answer: TurnTrace;
+				try {
+					answer = options.jobTrace(name);
+				} catch (error) {
+					options.onError?.(error);
+					return jsonReply({ ok: false, error: "trace_failed" }, 500, head);
+				}
+				return jsonReply(answer, answer.ok ? 200 : 404, head);
+			}
 			const liveEvents = THREAD_LIVE_EVENTS.test(pathname);
 			if (liveEvents || THREAD_LIVE.test(pathname)) {
 				if (options.live === undefined || live === undefined) return jsonReply({ error: "live_disabled" }, 404, head);
@@ -428,6 +461,21 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 				}
 				return answer.ok ? jsonReply(answer, 200, head) : jsonReply({ error: answer.error }, 404, head);
 			}
+			if (DIFF.test(pathname)) {
+				heard("diff");
+				if (options.diff === undefined) return jsonReply({ error: "diff_disabled" }, 404, head);
+				const lane = url.searchParams.get("lane") ?? "";
+				const task = url.searchParams.get("task") ?? "";
+				if ((lane === "") === (task === "")) return jsonReply({ error: "invalid_subject" }, 400, head);
+				let answer: DiffAnswer;
+				try {
+					answer = await options.diff(lane === "" ? { task } : { lane });
+				} catch (error) {
+					options.onError?.(error);
+					return jsonReply({ ok: false, error: "diff_failed" }, 500, head);
+				}
+				return answer.ok ? jsonReply(answer, 200, head) : jsonReply({ error: answer.error }, 404, head);
+			}
 			const pane = PANE.exec(pathname);
 			if (BOARD.test(pathname) || BOARD_EVENTS.test(pathname) || pane !== null) {
 				if (board === undefined || fanout === undefined) return jsonReply({ error: "board_disabled" }, 404, head);
@@ -443,10 +491,23 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 							})
 						: boardEvents(request, board, fanout, boardPanel);
 				}
-				heard("board_pane");
+				heard(pane?.[1] === "trace" ? "trace" : "board_pane");
 				// The pane proxy needs only the live card, not the TASK-matched board view (no database read).
+				if (pane?.[1] === "trace" && options.cardTrace === undefined) {
+					return jsonReply({ error: "trace_disabled" }, 404, head);
+				}
 				const card = board.source.card(url.searchParams.get("card") ?? "");
 				if (card === undefined) return jsonReply({ error: "unknown_pane" }, 404, head);
+				if (pane?.[1] === "trace" && options.cardTrace !== undefined) {
+					let answer: TurnTrace;
+					try {
+						answer = options.cardTrace(card);
+					} catch (error) {
+						options.onError?.(error);
+						return jsonReply({ ok: false, error: "trace_failed" }, 500, head);
+					}
+					return jsonReply(answer, answer.ok ? 200 : 404, head);
+				}
 				const proxied = await proxyPaneGet(
 					pane?.[1] === "plan" ? "plan" : "conversation",
 					board.source.origin,
@@ -474,7 +535,15 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 				});
 			}
 			const param = (name: string): string | undefined => url.searchParams.get(name) || undefined;
-			const [view, card, task, item, layout, stale] = ["view", "card", "task", "item", "layout", "stale"].map(param);
+			const [view, card, task, item, diff, layout, stale] = [
+				"view",
+				"card",
+				"task",
+				"item",
+				"diff",
+				"layout",
+				"stale",
+			].map(param);
 			return isPage
 				? reply(
 						renderDashboardPage(snapshot, {
@@ -483,6 +552,7 @@ export function startDashboardServer(options: DashboardServerOptions): Server<un
 							...(card === undefined ? {} : { card }),
 							...(task === undefined ? {} : { task }),
 							...(item === undefined ? {} : { item }),
+							...(diff === undefined ? {} : { diff }),
 							...(layout === undefined ? {} : { layout }),
 							...(stale === undefined ? {} : { stale }),
 						}),

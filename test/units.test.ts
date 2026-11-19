@@ -186,19 +186,6 @@ describe("ompbot units render --instance", () => {
 		expect(readdirSync(out).sort()).toEqual(INSTANCE_UNITS);
 		expect(run.out).toContain("enable --now ompbot-tteok-backup.timer ompbot-tteok-gc.timer");
 	});
-
-	test("the peer manifest is the shipped one without slash commands", async () => {
-		const read = (file: string) => JSON.parse(readFileSync(join(REPO, "packaging", file), "utf8"));
-		const base = read("slack-manifest.json");
-		const peer = read("slack-manifest-peer.json");
-		expect(peer.features.slash_commands).toBeUndefined();
-		expect([peer.display_information.name, peer.features.bot_user.display_name]).toEqual([
-			"ompbot-peer",
-			"ompbot-peer",
-		]);
-		expect(peer.oauth_config).toEqual(base.oauth_config);
-		expect(peer.settings).toEqual(base.settings);
-	});
 });
 
 describe("ompbot units render --out", () => {

@@ -9,6 +9,7 @@ import { MonitorSpecError, mergeMonitorSpec, parseMonitorSpec } from "../src/mon
 import { fsWatchStarter, MAX_WATCH_PATHS, WatcherSet, type WatchStarter } from "../src/monitors/watcher";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
+import { OWNER_DM } from "./helpers/bot-home";
 
 const T0 = Date.UTC(2026, 5, 1, 0, 0, 0);
 
@@ -91,8 +92,8 @@ beforeEach(() => {
 		path: join(dir, "ompbot.db"),
 		clock,
 		redact,
-		slackOwnerUserId: "UOWNER",
 	});
+	store.ensureOrigin(`discord/dm/${OWNER_DM}`, "sess/owner-dm");
 	scheduler = new MonitorScheduler({
 		store,
 		router: {

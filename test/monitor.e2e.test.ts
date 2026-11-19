@@ -2,12 +2,12 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { join } from "node:path";
-import { makeHome, type TestHome } from "./helpers/bot-home";
+import { makeHome, OWNER_DM, type TestHome } from "./helpers/bot-home";
 import { expectNoProcessesMentioning, killSpawned, runMain, spawnDaemon, TransportLog } from "./helpers/daemon-process";
 import { pickE2eModel } from "./helpers/omp-model";
 
 /**
- * Monitor E2E: a REAL omp persona session behind the real daemon process, file-backed fake Slack and a temp
+ * Monitor E2E: a REAL omp persona session behind the real daemon process, file-backed fake Discord and a temp
  * OMPBOT_HOME with FAKE tokens. The owner DM asks for a reminder one minute ahead; the persona registers an `at`
  * monitor through the `ompbot_monitor_add` host tool, the scheduler fires it, and the owner DM gets exactly one
  * top-level `⏰` post. Costs tokens: OMPBOT_E2E_OMP=1 only.
@@ -22,7 +22,7 @@ if (enabled && picked?.model === undefined)
 	console.log(`[skip] monitor.e2e.test.ts: ${picked?.reason ?? "no model offered"}`);
 const model = picked?.model;
 const REAL = model === undefined ? undefined : { ompExecutable: OMP_EXECUTABLE, model };
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = `discord/dm/${OWNER_DM}`;
 /** Failure bound for the whole scenario after the DM was injected. */
 const DEADLINE_MS = 240_000;
 const SCENARIO_TIMEOUT_MS = 330_000;

@@ -1,26 +1,29 @@
 // The one place that reads chat origin keys. Keys are built with `chatOriginKey` and otherwise treated as opaque
 // strings; anything that needs the platform, conversation or thread of a key asks `parseChatOrigin`.
 
-export type ChatPlatform = "slack" | "discord" | "teams";
+export type ChatPlatform = "discord" | "teams";
+
+/**
+ * Key namespace of the removed Slack channel. Old ledger rows keep it (gc and the dashboard still read them as plain
+ * text); no adapter takes it, so the daemon closes its open rows at start (`inbound_discarded reason=platform_removed`).
+ */
+export const REMOVED_PLATFORM_PREFIX = "slack/";
 
 export interface ChatOriginRef {
 	platform: ChatPlatform;
 	/** `dm`: a direct conversation with the owner; `ch`: a channel or group. */
 	kind: "dm" | "ch";
 	conversationId: string;
-	/** Thread inside the conversation (Slack root ts, Discord thread). */
+	/** Thread inside the conversation (Discord thread, Teams Activity id). */
 	threadId?: string;
 }
 
 /**
- * Exact id grammar per platform, the only definition of it. Slack ids start with an upper-case letter (`C…`, `D…`,
- * `G…`, `U…`) and run on alphanumeric, with `<sec>.<usec>` thread ts; Discord ids are snowflakes (digits only), so a
- * Slack id and a Discord id never look alike. A Teams conversation id (`19:…@thread.v2`, `a:…`) cannot sit in a key or
- * thread ref, so the ledger stands in an alias for it: `t` + 16 lower-case hex (`teams_conversations`); its thread is
- * the original Activity id, kept as it is.
+ * Exact id grammar per platform, the only definition of it. Discord ids are snowflakes (digits only). A Teams
+ * conversation id (`19:…@thread.v2`, `a:…`) cannot sit in a key or thread ref, so the ledger stands in an alias for
+ * it: `t` + 16 lower-case hex (`teams_conversations`); its thread is the original Activity id, kept as it is.
  */
 export const GRAMMAR: Readonly<Record<ChatPlatform, { readonly conversation: RegExp; readonly thread: RegExp }>> = {
-	slack: { conversation: /^[A-Z][A-Z0-9]{1,30}$/, thread: /^[0-9.]+$/ },
 	discord: { conversation: /^[0-9]{1,20}$/, thread: /^[0-9]+$/ },
 	teams: { conversation: /^t[0-9a-f]{16}$/, thread: /^[^\s/]+$/ },
 };
@@ -38,7 +41,7 @@ export function platformOfConversationId(id: string): ChatPlatform | undefined {
 }
 
 /**
- * Platform whose namespace `key` lives in (`slack/…`, `discord/…`, `teams/…`), whether or not the rest is
+ * Platform whose namespace `key` lives in (`discord/…`, `teams/…`), whether or not the rest is
  * well-formed; `undefined` for every other namespace. For "is this a chat surface" checks that must not depend on
  * the exact id grammar.
  */

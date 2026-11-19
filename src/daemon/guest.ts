@@ -23,12 +23,12 @@ import { ISOLATION_OVERLAY_YAML } from "../lanes/review";
 import type { Logger } from "../log";
 
 /** The only tool a guest/qa run gets: no read, grep, glob, bash, edit or write (they run with host rights). */
-export const GUEST_TOOLS = "web_search";
+const GUEST_TOOLS = "web_search";
 /** Hard limit of one guest/qa run. */
-export const GUEST_TIMEOUT_MS = 5 * 60_000;
+const GUEST_TIMEOUT_MS = 5 * 60_000;
 /** Runs at once, and runs waiting behind them; past that the asker gets `GUEST_BUSY_TEXT`. */
-export const GUEST_MAX_RUNNING = 2;
-export const GUEST_MAX_QUEUED = 5;
+const GUEST_MAX_RUNNING = 2;
+const GUEST_MAX_QUEUED = 5;
 export const GUEST_BUSY_TEXT = "지금 질문이 많아 잠시 뒤 다시 물어 주세요.";
 /** What the asker gets when the run timed out or failed. */
 export const GUEST_FAILED_TEXT = "⚠️ 답을 만들지 못했습니다. 잠시 뒤 다시 물어 주세요.";
@@ -38,9 +38,9 @@ export const GUEST_UNAVAILABLE_TEXT = "지금은 답할 수 없습니다. 잠시
 export const GUEST_COMMAND_TEXT = "이 대화에서는 `!` 명령을 쓸 수 없습니다. 질문만 받습니다.";
 /** Earlier question/answer pairs of the same conversation put before the question, and their character budget. */
 export const GUEST_CONTEXT_PAIRS = 6;
-export const GUEST_CONTEXT_MAX_CHARS = 8_000;
+const GUEST_CONTEXT_MAX_CHARS = 8_000;
 /** Longest answer kept and posted. */
-export const GUEST_ANSWER_MAX_CHARS = 8_000;
+const GUEST_ANSWER_MAX_CHARS = 8_000;
 
 /**
  * The `--config` overlay of a guest/qa run: memory off, no project MCP config, no autolearn, every discovery provider
@@ -49,9 +49,9 @@ export const GUEST_ANSWER_MAX_CHARS = 8_000;
 export const GUEST_OVERLAY_YAML = ISOLATION_OVERLAY_YAML;
 
 /** The agent dir a guest/qa run gets as `PI_CODING_AGENT_DIR`, under the ompbot home. */
-export const QA_AGENT_DIR_NAME = "omp-qa";
+const QA_AGENT_DIR_NAME = "omp-qa";
 /** Files of the real omp agent dir linked into `omp-qa` when present: login (agent.db) and models. Never copied. */
-export const QA_AGENT_LINKS = [
+const QA_AGENT_LINKS = [
 	"agent.db",
 	"agent.db-shm",
 	"agent.db-wal",
@@ -90,7 +90,7 @@ export function prepareQaAgentDir(ompbotHome: string, env: Record<string, string
 	return dir;
 }
 
-export interface GuestContextPair {
+interface GuestContextPair {
 	askerName: string | undefined;
 	question: string;
 	answer: string;
@@ -185,7 +185,7 @@ export class GuestQueue {
 	}
 }
 
-export interface GuestRunDeps {
+interface GuestRunDeps {
 	ompBin: string;
 	/** The ompbot home: `omp-qa` lives under it. */
 	homeDir: string;

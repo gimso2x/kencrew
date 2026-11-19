@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { tasksCommand } from "../src/cli/tasks";
 import { Daemon } from "../src/daemon/daemon";
+import { DiscordChannel } from "../src/discord/channel";
 import {
 	HERDR_INTERRUPT_WAIT_MS,
 	type HerdrAgentStatusResult,
@@ -12,19 +13,25 @@ import {
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import type { TaskJudgement } from "../src/tasks/checker";
 import { acceptanceItems } from "../src/tasks/docs";
 import type { TaskEvaluation } from "../src/tasks/evaluate";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { STALE_NOTICE_MS, type TaskSweepDeps, TaskSweeper } from "../src/tasks/sweeper";
 import { localIso } from "../src/time";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	BOT,
+	discordBinding,
+	GUILD,
+	makeHome,
+	OWNER,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
+import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 import { makeRepo } from "./helpers/git-fixtures";
 import { removeRepoAndWorktrees } from "./helpers/lane-harness";
-import { type FakeCall, FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 // herdr TASK pause (doc/plans/lane-task-parity.md E절): the pause lives in the ledger's notices as `pause:<ms>` /
 // `unpause:<ms>` marks, the sweep holds every prompt and the stale notice of a paused task (judging goes on), the
@@ -76,7 +83,7 @@ const reached = (): TaskJudgement =>
 interface Rig {
 	sweeper: TaskSweeper;
 	ledger: TaskLedger;
-	transport: FakeSlackTransport;
+	transport: FakeDiscordTransport;
 	clock: { ms: number };
 	row: TaskRow;
 	next: { value: TaskEvaluation };
@@ -95,13 +102,13 @@ function rig(over: Partial<TaskSweepDeps> = {}): Rig {
 	const row = ledger.register({
 		title: "로그 회전",
 		risk: "L2",
-		originKey: "slack/ch/C1/t/100.1",
-		threadRef: "C1:100.1",
+		originKey: "discord/ch/111111111111111111/t/222222222222222222",
+		threadRef: "111111111111111111:222222222222222222",
 		host: null,
 		repo: "/r/repo",
 		acceptance: acceptanceItems(["하나", "둘"]),
 	});
-	const transport = new FakeSlackTransport();
+	const transport = new FakeDiscordTransport();
 	const next: { value: TaskEvaluation } = { value: { ok: true, judgement: judgement() } };
 	const reminders: string[] = [];
 	const agent: { value: HerdrAgentStatusResult } = { value: { ok: true, status: "idle" } };
@@ -116,8 +123,8 @@ function rig(over: Partial<TaskSweepDeps> = {}): Rig {
 		},
 		agentStatus: async () => agent.value,
 		readAgent: async () => ({ ok: true, output: "" }),
-		channels: registryOf(new SlackChannel(transport)),
-		ownerUserId: "UOWN",
+		channels: registryOf(new DiscordChannel(transport, { ownerUserId: OWNER })),
+		ownerUserId: OWNER,
 		now: () => clock.ms,
 		log: { info: (event) => infos.push(event), warn() {} },
 		...over,
@@ -136,8 +143,8 @@ function rig(over: Partial<TaskSweepDeps> = {}): Rig {
 	};
 }
 
-const posts = (r: Rig) => r.transport.calls.filter((c) => c.method === "postMessage");
-const postText = (post: FakeCall | undefined): string => JSON.stringify(post ?? null);
+const posts = (r: Rig) => r.transport.calls.filter((c) => c.method === "createMessage");
+const postText = (post: FakeDiscordCall | undefined): string => JSON.stringify(post ?? null);
 
 describe("ledger pause marks", () => {
 	test("pause/unpause write notice marks; the larger mark wins, also within one millisecond", () => {
@@ -164,8 +171,8 @@ describe("ledger pause marks", () => {
 		const other = r.ledger.register({
 			title: "둘째",
 			risk: "L1",
-			originKey: "slack/ch/C1/t/100.1",
-			threadRef: "C1:100.1",
+			originKey: "discord/ch/111111111111111111/t/222222222222222222",
+			threadRef: "111111111111111111:222222222222222222",
 			host: null,
 			repo: "/r/repo",
 			acceptance: acceptanceItems(["x"]),
@@ -173,8 +180,11 @@ describe("ledger pause marks", () => {
 		r.ledger.transition(other.taskId, "blocked", "bot");
 		r.ledger.pauseTask(other.taskId);
 		expect(r.ledger.isPaused(r.ledger.require(other.taskId))).toBe(true);
-		expect(r.ledger.getByThread("C1:100.1").map((row) => row.taskId)).toEqual([r.row.taskId, other.taskId]);
-		expect(r.ledger.getByThread("C1:999.9")).toEqual([]);
+		expect(r.ledger.getByThread("111111111111111111:222222222222222222").map((row) => row.taskId)).toEqual([
+			r.row.taskId,
+			other.taskId,
+		]);
+		expect(r.ledger.getByThread("111111111111111111:222222222222222229")).toEqual([]);
 	});
 });
 
@@ -265,8 +275,8 @@ describe("the file-overlap prompt skips a paused task", () => {
 		const other = r.ledger.register({
 			title: "둘째",
 			risk: "L2",
-			originKey: "slack/ch/C1/t/200.1",
-			threadRef: "C1:200.1",
+			originKey: "discord/ch/111111111111111111/t/222222222222222223",
+			threadRef: "111111111111111111:222222222222222223",
 			host: null,
 			repo: "/r/repo",
 			acceptance: acceptanceItems(["x"]),
@@ -410,10 +420,20 @@ describe("herdrInterruptAgent (AC-3)", () => {
 	});
 });
 
+// Task threads on a Discord server: the channel, two task threads, and the ids of the owner's messages.
+const CH = "111111111111111111";
+const T1 = "222222222222222201";
+const T2 = "222222222222222202";
+/** A thread with no task, where the owner asks for a lane. */
+const T3 = "222222222222222203";
+const M0 = "333333333333333300";
+const M1 = "333333333333333301";
+const M2 = "333333333333333302";
+
 describe("pause from the task thread and the CLI (AC-2)", () => {
 	let home: TestHome;
 	let daemon: Daemon;
-	let transport: WaitingTransport;
+	let transport: WaitingDiscordTransport;
 	let drivers: Map<string, FakeOmpDriver>;
 	let herdrCalls: string[][];
 	let agentStatus: Map<string, string>;
@@ -421,7 +441,9 @@ describe("pause from the task thread and the CLI (AC-2)", () => {
 
 	beforeEach(async () => {
 		home = makeHome("ompbot-task-pause-");
-		transport = new WaitingTransport();
+		transport = new WaitingDiscordTransport();
+		transport.setChannel({ id: CH, type: 0, guildId: GUILD });
+		for (const thread of [T1, T2, T3]) transport.setChannel({ id: thread, type: 11, parentId: CH, guildId: GUILD });
 		drivers = new Map();
 		herdrCalls = [];
 		agentStatus = new Map();
@@ -437,7 +459,7 @@ describe("pause from the task thread and the CLI (AC-2)", () => {
 				}
 				return { code: 0, stdout: "", timedOut: false };
 			},
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -457,12 +479,12 @@ describe("pause from the task thread and the CLI (AC-2)", () => {
 		for (const repo of repos) removeRepoAndWorktrees(repo);
 	});
 
-	const seed = (threadTs: string, title = "로그 회전"): TaskRow => {
+	const seed = (thread: string, title = "로그 회전"): TaskRow => {
 		const row = daemon.store.tasks.register({
 			title,
 			risk: "L2",
-			originKey: `slack/dm/D1/t/${threadTs}`,
-			threadRef: `D1:${threadTs}`,
+			originKey: `discord/ch/${CH}/t/${thread}`,
+			threadRef: `${CH}:${thread}`,
 			host: null,
 			repo: "/r/repo",
 			acceptance: acceptanceItems(["하나"]),
@@ -470,63 +492,63 @@ describe("pause from the task thread and the CLI (AC-2)", () => {
 		agentStatus.set(row.agent, "idle");
 		return row;
 	};
-	const ownerMessage = (text: string, ts: string, threadTs: string) =>
+	/** The owner's message in a task thread, addressed to the bot by mention (the mention is stripped from the text). */
+	const ownerMessage = (content: string, id: string, thread: string) =>
 		transport.emitMessage({
-			type: "message",
-			channel: "D1",
-			channel_type: "im",
-			user: OWNER,
-			text,
-			ts,
-			thread_ts: threadTs,
+			id,
+			channel_id: thread,
+			guild_id: GUILD,
+			author: { id: OWNER },
+			content: `<@${BOT}> ${content}`,
+			type: 0,
 		});
 	const paused = (id: string) => daemon.store.tasks.isPaused(daemon.store.tasks.require(id));
 	const sentKeys = () => herdrCalls.filter((cmd) => cmd.includes("send-keys"));
 	const prompted = () => herdrCalls.filter((cmd) => cmd.includes("prompt"));
 
 	test("`멈춰` in a thread with one active task pauses only it, sends one Esc, never reaches omp; `계속` resumes it", async () => {
-		const mine = seed("1700.000100");
-		const other = seed("1700.000200", "다른 일");
+		const mine = seed(T1);
+		const other = seed(T2, "다른 일");
 		// A running lane elsewhere is left alone.
 		const repo = makeRepo(repos);
-		await daemon.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: side-lane @${repo}` });
-		await transport.waitForPosts((text) => text.includes("작업 레인 `side-lane`을 시작했습니다"));
+		await ownerMessage(`작업: side-lane @${repo}`, M0, T3);
+		await transport.waitForPosts((text: string) => text.includes("작업 레인 `side-lane`을 시작했습니다"));
 
-		await ownerMessage("멈춰", "1700.000300", "1700.000100");
-		await transport.waitForPosts((text) => text.includes("멈췄습니다") && text.includes(mine.taskId));
+		await ownerMessage("멈춰", M1, T1);
+		await transport.waitForPosts((text: string) => text.includes("멈췄습니다") && text.includes(mine.taskId));
 		expect(paused(mine.taskId)).toBe(true);
 		expect(paused(other.taskId)).toBe(false);
-		const row = daemon.store.getInbound("D1:1700.000300");
+		const row = daemon.store.getInbound(`${CH}:${M1}`);
 		expect(row?.state).toBe("answered");
 		expect(row?.opRef).toStartWith("task:");
-		expect(drivers.get(`slack/dm/D1/t/1700.000100`)).toBeUndefined();
+		expect(drivers.get(`discord/ch/${CH}/t/${T1}`)).toBeUndefined();
 		expect(sentKeys()).toEqual([["herdr", "agent", "send-keys", mine.agent, "esc"]]);
 		expect(prompted()).toEqual([]);
-		const answer = transport.posts((text) => text.includes(mine.taskId) && text.includes("멈췄습니다"))[0];
-		expect(answer?.text).toContain("멈춤을 확인했습니다");
+		const answer = transport.posts((text: string) => text.includes(mine.taskId) && text.includes("멈췄습니다"))[0];
+		expect(answer?.content).toContain("멈춤을 확인했습니다");
 		expect(daemon.store.getLane("side-lane")?.status).toBe("working");
 		expect(drivers.get("ompbot/work/side-lane")?.calls.includes("abort")).toBe(false);
 
-		await ownerMessage("계속", "1700.000400", "1700.000100");
-		await transport.waitForPosts((text) => text.includes("재개했습니다") && text.includes(mine.taskId));
+		await ownerMessage("계속", M2, T1);
+		await transport.waitForPosts((text: string) => text.includes("재개했습니다") && text.includes(mine.taskId));
 		expect(paused(mine.taskId)).toBe(false);
-		expect(daemon.store.getInbound("D1:1700.000400")?.opRef).toStartWith("task:");
+		expect(daemon.store.getInbound(`${CH}:${M2}`)?.opRef).toStartWith("task:");
 		expect(prompted()).toEqual([]);
 	});
 
 	test("a thread with two active tasks pauses nothing and answers both ids", async () => {
-		const a = seed("1700.000100");
-		const b = seed("1700.000100", "둘째");
-		await ownerMessage("멈춰", "1700.000300", "1700.000100");
-		await transport.waitForPosts((text) => text.includes(a.taskId) && text.includes(b.taskId));
+		const a = seed(T1);
+		const b = seed(T1, "둘째");
+		await ownerMessage("멈춰", M1, T1);
+		await transport.waitForPosts((text: string) => text.includes(a.taskId) && text.includes(b.taskId));
 		expect(paused(a.taskId)).toBe(false);
 		expect(paused(b.taskId)).toBe(false);
 		expect(sentKeys()).toEqual([]);
-		expect(daemon.store.getInbound("D1:1700.000300")?.opRef).toStartWith("task:");
+		expect(daemon.store.getInbound(`${CH}:${M1}`)?.opRef).toStartWith("task:");
 	});
 
 	test("a worker still herdr-working after the Esc: the sweep hold stands, the answer does not claim it stopped", async () => {
-		const mine = seed("1700.000100");
+		const mine = seed(T1);
 		agentStatus.set(mine.agent, "working");
 		const answer = await daemon.controlTask(mine.taskId, "pause");
 		expect(answer.ok).toBe(true);
@@ -537,8 +559,8 @@ describe("pause from the task thread and the CLI (AC-2)", () => {
 	});
 
 	test("`ompbot tasks pause|resume <id>` does the same through the daemon", async () => {
-		const mine = seed("1700.000100");
-		const other = seed("1700.000200", "다른 일");
+		const mine = seed(T1);
+		const other = seed(T2, "다른 일");
 		expect(await tasksCommand(["pause", mine.taskId], home.dir)).toBe(0);
 		expect(paused(mine.taskId)).toBe(true);
 		expect(paused(other.taskId)).toBe(false);

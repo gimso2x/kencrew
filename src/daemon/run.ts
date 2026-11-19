@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import type { ChannelBinding } from "../channel/adapter";
-import { type OmpbotConfig, readDiscordToken, readSlackTokens, readTeamsClientSecret } from "../config";
+import { type OmpbotConfig, readDiscordToken, readTeamsClientSecret } from "../config";
 import { parseChatOrigin } from "../core/origin-key";
 import { DiscordBinding } from "../discord/binding";
 import { DiscordChannel } from "../discord/channel";
@@ -11,7 +11,6 @@ import { FileFakeDiscordTransport } from "../discord/test-transport";
 import type { DiscordTransport } from "../discord/transport";
 import { createLogger, type Logger } from "../log";
 import { AgyOmpDriver } from "../omp/agy-driver";
-import { ClaudeOmpDriver } from "../omp/claude-driver";
 import { withOmpProfile } from "../omp/env";
 import { RpcOmpDriver } from "../omp/rpc-driver";
 import { testHostLoad } from "../ops/host-resources";
@@ -20,11 +19,6 @@ import { LogDirError, openLogSink } from "../ops/logfile";
 import { redact } from "../redact";
 import { spawnSystemPrompt } from "../safety/prompt";
 import { indexRuntimeSecrets } from "../safety/secret-index";
-import { SlackBinding } from "../slack/binding";
-import { SlackChannel } from "../slack/channel";
-import { SocketModeTransport } from "../slack/socket-transport";
-import { FileFakeTransport } from "../slack/test-transport";
-import type { SlackTransport } from "../slack/transport";
 import { TeamsBinding } from "../teams/binding";
 import { TeamsChannel } from "../teams/channel";
 import { TeamsConnector } from "../teams/transport";
@@ -112,18 +106,6 @@ function mergeMappings(base: Mapping, top: Mapping): Mapping {
 	return out;
 }
 
-function pickTransport(config: OmpbotConfig, env: Record<string, string | undefined>, log: Logger): SlackTransport {
-	if (env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_TEST_TRANSPORT)
-		return new FileFakeTransport(env.OMPBOT_TEST_TRANSPORT);
-	return new SocketModeTransport(readSlackTokens(config), {
-		onLifecycle: (event) => {
-			if (event.type === "connected") log.info("slack_socket_connected");
-			else if (event.type === "reconnecting") log.warn("slack_socket_reconnecting", { reason: event.detail });
-			else log.warn("slack_socket_error", { error: event.detail });
-		},
-	});
-}
-
 /**
  * The Discord binding when `channels.discord` is set: the real gateway + REST, or the file-logging fake for test
  * runs (`OMPBOT_TEST_DISCORD_TRANSPORT`). A non-retryable gateway close stops Discord alone and is logged.
@@ -168,17 +150,14 @@ function teamsBindings(config: OmpbotConfig): ChannelBinding[] {
 }
 
 /**
- * One binding per configured platform: Slack only when `channels.slack` is set (its tokens are read only then),
- * Discord only when `channels.discord` is, Teams only when `channels.teams` is.
+ * One binding per configured platform: Discord only when `channels.discord` is set, Teams only when `channels.teams` is.
  */
 export function channelBindings(
 	config: OmpbotConfig,
 	env: Record<string, string | undefined>,
 	log: Logger,
 ): ChannelBinding[] {
-	const slack =
-		config.channels.slack === undefined ? [] : [new SlackBinding(new SlackChannel(pickTransport(config, env, log)))];
-	return [...slack, ...discordBindings(config, env, log), ...teamsBindings(config)];
+	return [...discordBindings(config, env, log), ...teamsBindings(config)];
 }
 
 /** Logs the omp version on every start and warns when it differs from the one recorded by the previous start. */
@@ -313,8 +292,6 @@ export async function runDaemon(
 	process.on("exit", (code) => lastWords.info("daemon_exit", { code }));
 
 	const model = splitModel(config.model);
-	// claude children take a bare model id; a `model` naming another provider is an omp-only setting.
-	const claudeModel = model.provider === undefined || model.provider === "claude" ? model.model : undefined;
 	// agy children take a bare agy model id (`agy/gemini-3.8-flash-high` → `gemini-3.8-flash-high`).
 	const agyModel = model.provider === undefined || model.provider === "agy" ? model.model : undefined;
 	const secretsDir = join(config.homeDir, "secrets");
@@ -375,7 +352,7 @@ export async function runDaemon(
 		sweepMs: env.OMPBOT_TEST_HOOKS === "1" && env.OMPBOT_SWEEP_MS ? Number(env.OMPBOT_SWEEP_MS) : undefined,
 		driverFactory: (origin, sessionDir) => {
 			// Only the omp driver answers dialogs and narrows host tools for a peer-touched conversation.
-			const omp = config.agent !== "agy" && config.agent !== "claude";
+			const omp = config.agent !== "agy";
 			const overlayConfig = rpcOverlayFor(config, origin);
 			const answerDialog = omp ? daemon.answerDialogsFor(origin) : undefined;
 			const systemPrompt = spawnSystemPrompt({
@@ -389,7 +366,7 @@ export async function runDaemon(
 				ownerDialogs: answerDialog !== undefined,
 				peerTouched: omp && daemon.peerTouched(origin),
 				surface: daemon.floorsSurfaceFor(origin),
-				// agy and claude children get no ompbot host tools, so their floors name none.
+				// agy children get no ompbot host tools, so their floors name none.
 				hostTools: omp,
 				now: clock.now(),
 				log,
@@ -406,31 +383,19 @@ export async function runDaemon(
 						log,
 						originKey: origin,
 					})
-				: config.agent === "claude"
-					? new ClaudeOmpDriver({
-							claudeExecutable: config.claudeExecutable ?? "claude",
-							cwd: daemon.cwdFor(origin),
-							sessionDir,
-							...(claudeModel === undefined ? {} : { model: claudeModel }),
-							...(config.thinking === undefined ? {} : { thinking: config.thinking }),
-							secretsDir,
-							systemPrompt,
-							approval: daemon.requestApprovalFor(origin),
-							log,
-						})
-					: new DaemonRpcDriver({
-							ompExecutable: config.ompExecutable,
-							cwd: daemon.cwdFor(origin),
-							sessionDir,
-							...model,
-							...(config.thinking === undefined ? {} : { thinking: config.thinking }),
-							...botRpcEnv(config.ompProfile),
-							...(overlayConfig === undefined ? {} : { overlayConfig }),
-							extraArgs: ["--append-system-prompt", systemPrompt],
-							hostTools: daemon.hostToolsFor(origin),
-							answerDialog,
-							log,
-						});
+				: new DaemonRpcDriver({
+						ompExecutable: config.ompExecutable,
+						cwd: daemon.cwdFor(origin),
+						sessionDir,
+						...model,
+						...(config.thinking === undefined ? {} : { thinking: config.thinking }),
+						...botRpcEnv(config.ompProfile),
+						...(overlayConfig === undefined ? {} : { overlayConfig }),
+						extraArgs: ["--append-system-prompt", systemPrompt],
+						hostTools: daemon.hostToolsFor(origin),
+						answerDialog,
+						log,
+					});
 		},
 	});
 	claimSignals();

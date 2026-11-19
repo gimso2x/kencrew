@@ -7,13 +7,20 @@ import { planReload, RESTART_FIELDS } from "../src/daemon/reload";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	BOT,
+	CHANNEL,
+	discordBinding,
+	GUILD,
+	makeHome,
+	OWNER,
+	OWNER_DM,
+	ownerMessage,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { killSpawned, runMain, spawnDaemon } from "./helpers/daemon-process";
 import { ROOMY_STATFS } from "./helpers/disk";
-
-const CHANNEL = "C0SOLO00001";
 
 let home: TestHome;
 let daemon: Daemon | undefined;
@@ -37,20 +44,20 @@ function patchConfig(patch: Record<string, unknown>): void {
 
 describe("planReload", () => {
 	test("live fields follow the file (a removed one is removed); restart-bound and CLI fields are only reported", () => {
-		const current = { ...home.config, logChannel: "C0LOG000001", skillReviewTurns: 10 };
+		const current = { ...home.config, recallEnabled: false, skillReviewTurns: 10 };
 		const fresh = {
 			...home.config,
-			mentionFreeChannels: [CHANNEL],
+			costCap: { dailyUsd: 300 },
 			skillReviewTurns: 10,
 			model: "p/m",
 			sessionRetentionDays: 7,
 		};
 		const plan = planReload(current, fresh);
-		expect(plan.changed).toEqual(["mentionFreeChannels", "logChannel"]);
+		expect(plan.changed).toEqual(["recallEnabled", "costCap"]);
 		expect(plan.restartRequired).toEqual(["model"]);
 		expect(plan.cli).toEqual(["sessionRetentionDays"]);
-		expect(plan.next.mentionFreeChannels).toEqual([CHANNEL]);
-		expect("logChannel" in plan.next).toBe(false);
+		expect(plan.next.costCap).toEqual({ dailyUsd: 300 });
+		expect("recallEnabled" in plan.next).toBe(false);
 		expect(plan.next.model).toBeUndefined();
 	});
 
@@ -79,18 +86,16 @@ describe("planReload", () => {
 		expect(RESTART_FIELDS).toContain("ompConfigOverlay");
 	});
 
-	test("channels is restart-bound and the old ownerSlackUserId is no field of its own", () => {
+	test("channels is restart-bound: a changed owner is reported and the running one kept", () => {
 		expect(RESTART_FIELDS).toContain("channels");
-		expect(RESTART_FIELDS as readonly string[]).not.toContain("ownerSlackUserId");
-		const moved = planReload({ ...home.config, deprecated: ["ownerSlackUserId"] }, { ...home.config });
-		expect(moved.restartRequired).toEqual([]);
+		const discord = home.config.channels.discord;
+		if (discord === undefined) throw new Error("expected channels.discord");
 		const changed = planReload(
 			{ ...home.config },
-			{ ...home.config, channels: { slack: { ownerUserId: "UNEW0000" } } },
+			{ ...home.config, channels: { discord: { ...discord, ownerUserId: "100000000000000009" } } },
 		);
 		expect(changed.restartRequired).toEqual(["channels"]);
-		if (changed.next.channels.slack === undefined) throw new Error("expected channels.slack");
-		expect(changed.next.channels.slack.ownerUserId).toBe(OWNER);
+		expect(changed.next.channels.discord?.ownerUserId).toBe(OWNER);
 	});
 
 	test("recallEnabled applies live", () => {
@@ -111,13 +116,13 @@ describe("planReload", () => {
 	});
 });
 
-test("ompbot reload applies a new mention-free channel to the next message; an invalid file keeps the running config", async () => {
-	const transport = new WaitingTransport();
+test("ompbot reload applies a live field and refreshes last-good; an invalid file keeps the running config", async () => {
+	const transport = new WaitingDiscordTransport();
 	const clock = { now: () => Date.now() };
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		channels: [new SlackBinding(new SlackChannel(transport))],
+		channels: [discordBinding(transport)],
 		clock,
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
@@ -129,21 +134,14 @@ test("ompbot reload applies a new mention-free channel to the next message; an i
 	});
 	await daemon.start();
 	// boot: daemon_ready recorded the config it started with
-	expect(JSON.parse(readFileSync(join(home.dir, "config.json.last-good"), "utf8")).channels.slack.ownerUserId).toBe(
+	expect(JSON.parse(readFileSync(join(home.dir, "config.json.last-good"), "utf8")).channels.discord.ownerUserId).toBe(
 		OWNER,
 	);
-	const plain = (ts: string) =>
-		transport.emitMessage({ type: "message", channel: CHANNEL, channel_type: "channel", user: OWNER, text: "hi", ts });
 
-	await plain("1000.000001");
-	expect(daemon.store.getInbound(`${CHANNEL}:1000.000001`)).toBeUndefined();
-
-	patchConfig({ mentionFreeChannels: [CHANNEL], model: "p/m" });
+	patchConfig({ recallEnabled: false, model: "p/m" });
 	const reloaded = await runMain(home.dir, ["reload"]);
 	expect(reloaded.code).toBe(0);
-	expect(reloaded.stdout).toBe("config_reloaded changed=mentionFreeChannels restart_required=model cli=-\n");
-	await plain("1000.000002");
-	expect(daemon.store.getInbound(`${CHANNEL}:1000.000002`)).toBeDefined();
+	expect(reloaded.stdout).toBe("config_reloaded changed=recallEnabled restart_required=model cli=-\n");
 
 	const lastGood = join(home.dir, "config.json.last-good");
 	// model is restart-bound and was never booted on: this file is not a rollback target yet
@@ -151,52 +149,37 @@ test("ompbot reload applies a new mention-free channel to the next message; an i
 	patchConfig({ model: undefined });
 	const liveOnly = await runMain(home.dir, ["reload"]);
 	expect(liveOnly.stdout).toContain("restart_required=-");
-	expect(JSON.parse(readFileSync(lastGood, "utf8")).mentionFreeChannels).toEqual([CHANNEL]); // fully applied: refreshed
+	expect(JSON.parse(readFileSync(lastGood, "utf8")).recallEnabled).toBe(false); // fully applied: refreshed
 	expect(statSync(lastGood).mode & 0o777).toBe(0o600);
 	writeFileSync(join(home.dir, "config.json"), "{ not json", { mode: 0o600 });
 	const broken = await runMain(home.dir, ["reload"]);
 	expect(broken.code).toBe(1);
 	expect(broken.stderr).toContain("reload failed, config unchanged: config_invalid_json");
 	expect(readFileSync(lastGood, "utf8")).not.toContain("not json"); // a failed reload never becomes the rollback target
-	await plain("1000.000003");
-	expect(daemon.store.getInbound(`${CHANNEL}:1000.000003`)).toBeDefined();
 });
 
 describe("peer bot policy reload", () => {
-	const PEER = "UPEER00001";
-	const peerMessage = (ts: string, threadTs?: string) => ({
-		type: "message" as const,
-		channel: CHANNEL,
-		channel_type: "channel",
-		user: PEER,
-		bot_id: "B0PEER0001",
-		text: "<@UBOT> 검토 부탁",
-		ts,
-		...(threadTs === undefined ? {} : { thread_ts: threadTs }),
-	});
+	const PEER = "200000000000000001";
+	const THREAD = "700000000000000001";
 
-	test("peerBots, requireMention and peerHopLimit are live fields", () => {
-		const plan = planReload(
-			{ ...home.config },
-			{
-				...home.config,
-				peerBots: [{ userId: PEER, name: "떡" }],
-				requireMention: true,
-				peerHopLimit: { turns: 1, windowMinutes: 5 },
-			},
-		);
-		expect(plan.changed).toEqual(["peerBots", "requireMention", "peerHopLimit"]);
+	test("peerHopLimit is a live field", () => {
+		const plan = planReload({ ...home.config }, { ...home.config, peerHopLimit: { turns: 1, windowMinutes: 5 } });
+		expect(plan.changed).toEqual(["peerHopLimit"]);
 		expect(plan.restartRequired).toEqual([]);
-		expect(plan.next.peerBots).toEqual([{ userId: PEER, name: "떡" }]);
+		expect(plan.next.peerHopLimit).toEqual({ turns: 1, windowMinutes: 5 });
 	});
 
-	test("a reload reaches the running adapter: peers, requireMention and the hop limit apply to the next message", async () => {
-		const transport = new WaitingTransport();
+	test("a reload reaches the running Discord adapter: the hop limit applies to the next peer message", async () => {
+		const transport = new WaitingDiscordTransport();
+		transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
+		transport.setChannel({ id: THREAD, type: 11, parentId: CHANNEL, guildId: GUILD });
 		const clock = { now: () => Date.now() };
 		const sessions = new FakeSessionStore();
+		const discord = home.config.channels.discord;
+		if (discord === undefined) throw new Error("home without channels.discord");
 		daemon = new Daemon({
-			config: { ...home.config, mentionFreeChannels: [CHANNEL] },
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			config: { ...home.config, channels: { discord: { ...discord, peerBots: [{ userId: PEER, name: "떡" }] } } },
+			channels: [discordBinding(transport, { peerBots: [{ userId: PEER, name: "떡" }] })],
 			clock,
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
@@ -207,45 +190,40 @@ describe("peer bot policy reload", () => {
 			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
 		});
 		await daemon.start();
-		const owner = (ts: string) =>
-			transport.emitMessage({
-				type: "message",
-				channel: CHANNEL,
-				channel_type: "channel",
-				user: OWNER,
-				text: "hi",
-				ts,
+		let seq = 0n;
+		const peerPost = async (): Promise<string> => {
+			seq += 1n;
+			const id = String(710_000_000_000_000_000n + seq);
+			await transport.emitMessage({
+				id,
+				channel_id: THREAD,
+				guild_id: GUILD,
+				author: { id: PEER, bot: true },
+				content: `<@${BOT}> 검토 부탁`,
+				type: 0,
 			});
-		const row = (ts: string) => daemon?.store.getInbound(`${CHANNEL}:${ts}`);
+			return `${CHANNEL}:${id}`;
+		};
+		const row = (key: string) => daemon?.store.getInbound(key);
+		const peerBots = [{ userId: PEER, name: "떡" }];
+		// peerBots lives under channels.discord (restart-bound): the file keeps the same list, only the cap changes.
+		const path = join(home.dir, "config.json");
+		const writeFile = (top: Record<string, unknown>) => {
+			const base = JSON.parse(readFileSync(path, "utf8"));
+			base.channels.discord.peerBots = peerBots;
+			delete base.peerHopLimit;
+			writeFileSync(path, JSON.stringify({ ...base, ...top }), { mode: 0o600 });
+		};
 
-		await transport.emitMessage(peerMessage("1000.000001"));
-		expect(row("1000.000001")).toBeUndefined(); // no peerBots yet: any bot message is dropped
+		expect(row(await peerPost())?.peerUserId).toBe(PEER); // default cap: 3 turns
 
-		// The file is the source of truth for every live field: the mention-free channel stays in each patch.
-		const solo = { mentionFreeChannels: [CHANNEL] };
-		patchConfig({ ...solo, peerBots: [{ userId: PEER, name: "떡" }], peerHopLimit: { turns: 1, windowMinutes: 30 } });
-		expect(daemon.reloadConfig("ipc")).toMatchObject({ ok: true, changed: ["peerBots", "peerHopLimit"] });
-		await transport.emitMessage(peerMessage("1000.000002"));
-		expect(row("1000.000002")?.peerUserId).toBe(PEER);
-		await transport.emitMessage(peerMessage("1000.000003", "1000.000002"));
-		expect(row("1000.000003")).toBeUndefined(); // the reloaded limit (1 turn) caps the thread
+		writeFile({ peerHopLimit: { turns: 1, windowMinutes: 30 } });
+		expect(daemon.reloadConfig("ipc")).toMatchObject({ ok: true, changed: ["peerHopLimit"] });
+		expect(row(await peerPost())).toBeUndefined(); // the reloaded limit (1 turn) caps the thread
 
-		patchConfig({
-			...solo,
-			peerBots: [{ userId: PEER, name: "떡" }],
-			peerHopLimit: { turns: 1, windowMinutes: 30 },
-			requireMention: true,
-		});
-		expect(daemon.reloadConfig("ipc")).toMatchObject({ ok: true, changed: ["requireMention"] });
-		await owner("1000.000004"); // mention-free channel, but requireMention wins
-		expect(row("1000.000004")).toBeUndefined();
-
-		patchConfig({ ...solo, peerBots: undefined, peerHopLimit: undefined, requireMention: undefined });
-		expect(daemon.reloadConfig("ipc")).toMatchObject({ ok: true });
-		await transport.emitMessage(peerMessage("1000.000005"));
-		expect(row("1000.000005")).toBeUndefined(); // peers removed again
-		await owner("1000.000006");
-		expect(row("1000.000006")).toBeDefined(); // requireMention removed again
+		writeFile({});
+		expect(daemon.reloadConfig("ipc")).toMatchObject({ ok: true, changed: ["peerHopLimit"] });
+		expect(row(await peerPost())?.peerUserId).toBe(PEER); // limit removed: back to the default
 	});
 });
 
@@ -254,7 +232,7 @@ test("reloading a config that turns herdr on answers restartRequired with herdr"
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+		channels: [discordBinding(new WaitingDiscordTransport())],
 		clock,
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
@@ -278,7 +256,7 @@ describe("boot last-good", () => {
 		daemon = new Daemon({
 			config: home.config,
 			bootConfigText,
-			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			clock,
 			log: createLogger({ sink: (line) => void lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -305,18 +283,6 @@ describe("boot last-good", () => {
 		expect(readFileSync(lastGood(), "utf8")).toBe(loaded);
 	});
 
-	test("a config still on ownerSlackUserId logs config_deprecated_key once at boot; the new key logs nothing", async () => {
-		const deprecatedLines = (lines: string[]) => lines.filter((l) => l.includes("event=config_deprecated_key"));
-		const current = await boot(readFileSync(join(home.dir, "config.json"), "utf8"));
-		expect(deprecatedLines(current)).toEqual([]);
-		await daemon?.stop();
-		home.config = { ...home.config, deprecated: ["ownerSlackUserId"] };
-		const legacy = deprecatedLines(await boot(undefined));
-		expect(legacy).toHaveLength(1);
-		expect(legacy[0]).toContain("key=ownerSlackUserId");
-		expect(legacy[0]).toContain("use=channels.slack.ownerUserId");
-	});
-
 	test("without the text loadConfig read the reason is config_unreadable and nothing is recorded", async () => {
 		const lines = await boot(undefined);
 		expect(existsSync(lastGood())).toBe(false);
@@ -327,11 +293,11 @@ describe("boot last-good", () => {
 test("real daemon process: SIGHUP reloads config.json instead of stopping", async () => {
 	const spawned = spawnDaemon(home.dir, join(home.dir, "transport.jsonl"));
 	await spawned.waitLog(/event=daemon_ready/);
-	patchConfig({ escalationChannel: "C0ESC000001", watcherRoots: [home.dir] });
+	patchConfig({ recallEnabled: false, watcherRoots: [home.dir] });
 	spawned.signal("SIGHUP");
 	const line = await spawned.waitLog(/event=config_reloaded/);
 	expect(line).toContain("trigger=sighup");
-	expect(line).toContain("changed=escalationChannel");
+	expect(line).toContain("changed=recallEnabled");
 	expect(line).toContain("restart_required=watcherRoots");
 	expect(JSON.parse((await runMain(home.dir, ["status", "--json"])).stdout)).toMatchObject({ daemonRunning: true });
 	spawned.signal("SIGTERM");
@@ -339,14 +305,14 @@ test("real daemon process: SIGHUP reloads config.json instead of stopping", asyn
 });
 
 test("AC-9 (T-20261115-03): a reloaded lanes.models.middle reaches the next [TASK] through the running daemon's dispatch tool", async () => {
-	const transport = new WaitingTransport();
+	const transport = new WaitingDiscordTransport();
 	const clock = { now: () => Date.now() };
 	const sessions = new FakeSessionStore();
-	const live = { mentionFreeChannels: [CHANNEL], herdr: {} };
+	const live = { herdr: {} };
 	patchConfig({ ...live, lanes: { models: { middle: "a/one" } } });
 	daemon = new Daemon({
 		config: { ...home.config, ...live, lanes: { models: { middle: "a/one" } } },
-		channels: [new SlackBinding(new SlackChannel(transport))],
+		channels: [discordBinding(transport)],
 		clock,
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
@@ -359,15 +325,7 @@ test("AC-9 (T-20261115-03): a reloaded lanes.models.middle reaches the next [TAS
 	});
 	await daemon.start();
 	const running = daemon;
-	const ts = `${Math.floor(Date.now() / 1000)}.000100`;
-	await transport.emitMessage({
-		type: "message",
-		channel: CHANNEL,
-		channel_type: "channel",
-		user: OWNER,
-		text: "[TASK] 등록해줘",
-		ts,
-	});
+	await transport.emitMessage(ownerMessage("600000000000000001", "[TASK] 등록해줘"));
 	await transport.waitForPosts((text) => text.includes("ECHO [TASK] 등록해줘"));
 	// Fixture: the ledger records the worker model the real tool path hands it. The repo is a plain directory, so the
 	// start stops at `git worktree add` (before any herdr call) and the registration is undone.
@@ -379,7 +337,7 @@ test("AC-9 (T-20261115-03): a reloaded lanes.models.middle reaches the next [TAS
 		return register(input);
 	};
 	// The tool is taken once, before the reload: only a per-call read of the config can see the new model.
-	const tool = running.hostToolsFor(`slack/ch/${CHANNEL}/t/${ts}`).find((t) => t.name === "ompbot_dispatch");
+	const tool = running.hostToolsFor(`discord/dm/${OWNER_DM}`).find((t) => t.name === "ompbot_dispatch");
 	if (tool === undefined) throw new Error("dispatch tool missing");
 	const repo = mkdtempSync(join(tmpdir(), "ompbot-reload-tier-"));
 	try {

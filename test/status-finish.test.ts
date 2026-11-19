@@ -1,39 +1,40 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { Daemon } from "../src/daemon/daemon";
+import type { CreateMessageArgs, EditMessageArgs, MessageTarget, ReactionArgs } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = `discord/dm/${OWNER_DM}`;
+/** Discord appends a `_✅ hh:mm_` footer line to answers; the tests compare the text above it. */
+const firstLine = (text: string | undefined): string | undefined => text?.split("\n")[0];
 const clock = { now: () => Date.now() };
 
-/** Transport that lets a test await "the Slack state satisfies X" without polling or sleeping. */
-class SettlingTransport extends WaitingTransport {
+/** Transport that lets a test await "the Discord state satisfies X" without polling or sleeping. */
+class SettlingTransport extends WaitingDiscordTransport {
 	readonly #waiters = new Set<() => void>();
 
 	#notify(): void {
 		for (const waiter of [...this.#waiters]) waiter();
 	}
 
-	override async updateMessage(args: { channel: string; ts: string; text: string }): Promise<void> {
-		await super.updateMessage(args);
+	override async editMessage(args: EditMessageArgs): Promise<void> {
+		await super.editMessage(args);
 		this.#notify();
 	}
 
-	override async deleteMessage(args: { channel: string; ts: string }): Promise<void> {
+	override async deleteMessage(args: MessageTarget): Promise<void> {
 		await super.deleteMessage(args);
 		this.#notify();
 	}
 
-	override async addReaction(args: { channel: string; timestamp: string; name: string }): Promise<void> {
+	override async addReaction(args: ReactionArgs): Promise<void> {
 		await super.addReaction(args);
 		this.#notify();
 	}
 
-	override async removeReaction(args: { channel: string; timestamp: string; name: string }): Promise<void> {
+	override async removeReaction(args: ReactionArgs): Promise<void> {
 		await super.removeReaction(args);
 		this.#notify();
 	}
@@ -42,28 +43,35 @@ class SettlingTransport extends WaitingTransport {
 	stuckStatuses(): string[] {
 		const stuck: string[] = [];
 		for (const call of this.calls) {
-			if (call.method !== "postMessage" || !call.text.startsWith("⏳")) continue;
-			if (this.deleted().includes(call.ts)) continue;
-			const updates = this.calls.filter((c) => c.method === "updateMessage" && c.ts === call.ts);
+			if (call.method !== "createMessage" || !call.content?.startsWith("⏳")) continue;
+			if (this.deleted().includes(call.id)) continue;
+			const updates = this.calls.filter((c) => c.method === "editMessage" && c.messageId === call.id);
 			const last = updates.at(-1);
-			if (last?.method !== "updateMessage" || last.text.startsWith("⏳")) stuck.push(call.ts);
+			if (last?.method !== "editMessage" || last.content?.startsWith("⏳")) stuck.push(call.id);
 		}
 		return stuck;
 	}
 
 	deleted(): string[] {
-		return this.calls.flatMap((c) => (c.method === "deleteMessage" ? [c.ts] : []));
+		return this.calls.flatMap((c) => (c.method === "deleteMessage" ? [c.messageId] : []));
+	}
+
+	/** The ids of the messages an edit starting with `prefix` went to. */
+	editedTo(prefix: string): string[] {
+		return this.calls.flatMap((c) =>
+			c.method === "editMessage" && c.content?.startsWith(prefix) ? [c.messageId] : [],
+		);
 	}
 
 	/** Messages that still carry our 👀. */
 	eyesLeft(): string[] {
 		const eyes = new Map<string, number>();
 		for (const call of this.calls) {
-			if ((call.method === "addReaction" || call.method === "removeReaction") && call.name === "eyes") {
-				eyes.set(call.timestamp, (eyes.get(call.timestamp) ?? 0) + (call.method === "addReaction" ? 1 : -1));
+			if ((call.method === "addReaction" || call.method === "removeReaction") && call.emoji === "👀") {
+				eyes.set(call.messageId, (eyes.get(call.messageId) ?? 0) + (call.method === "addReaction" ? 1 : -1));
 			}
 		}
-		return [...eyes].filter(([, n]) => n > 0).map(([ts]) => ts);
+		return [...eyes].filter(([, n]) => n > 0).map(([id]) => id);
 	}
 
 	settled(extra: () => boolean, timeoutMs = 5_000): Promise<void> {
@@ -122,7 +130,7 @@ async function boot(
 	const { sweepMs, ...driverExtra } = extra;
 	const d = new Daemon({
 		config: home.config,
-		channels: [new SlackBinding(new SlackChannel(transport))],
+		channels: [discordBinding(transport)],
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
@@ -159,10 +167,10 @@ describe("status messages are finished for every row of a turn and for commands"
 		await transport.waitForPosts((t) => t.startsWith("ANSWER"));
 		await transport.settled(() => transport.deleted().length >= 1);
 		// The lead thread holds the answer, so its status goes away; the steered thread's status ends as ✅.
-		const [lead, steered] = transport.posts((t) => t.startsWith("⏳")).map((c) => c.ts);
+		const [lead, steered] = transport.posts((t) => t.startsWith("⏳")).map((c) => c.id);
 		expect(transport.deleted()).toEqual([lead ?? ""]);
-		const finals = transport.calls.filter((c) => c.method === "updateMessage" && c.text.startsWith("✅"));
-		expect(finals.map((c) => (c.method === "updateMessage" ? c.ts : ""))).toEqual([steered ?? ""]);
+		const finals = transport.editedTo("✅");
+		expect(finals).toEqual([steered ?? ""]);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
 		// Exactly one answer even though two threads were finished.
@@ -193,7 +201,7 @@ describe("status messages are finished for every row of a turn and for commands"
 		await driver.steered.promise;
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "/new-ompbot" });
 		await transport.waitForPosts((t) => t.startsWith("🆕"));
-		await transport.settled(() => transport.calls.filter((c) => c.method === "updateMessage").length >= 2);
+		await transport.settled(() => transport.calls.filter((c) => c.method === "editMessage").length >= 2);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
 	});
@@ -212,10 +220,12 @@ describe("status messages are finished for every row of a turn and for commands"
 		driver.release();
 		await transport.waitForPosts((t) => t.startsWith("ANSWER"));
 		await transport.settled(() => transport.deleted().length >= 1);
-		expect(transport.calls.some((c) => c.method === "updateMessage" && c.text.startsWith("🚫 취소됨"))).toBe(true);
+		expect(transport.editedTo("🚫 취소됨").length > 0).toBe(true);
 		// The cancelled followup never reaches omp; the running turn answers normally.
 		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:long job"]);
-		expect(transport.posts((t) => t.startsWith("ANSWER")).map((c) => c.text)).toEqual(["ANSWER long job"]);
+		expect(transport.posts((t) => t.startsWith("ANSWER")).map((c) => firstLine(c.content))).toEqual([
+			"ANSWER long job",
+		]);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
 	});
@@ -227,16 +237,15 @@ describe("status messages are finished for every row of a turn and for commands"
 		await transport.waitForPosts((t) => t.startsWith("⏳"), 1);
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "/followup-ompbot next job" });
 		await transport.waitForPosts((t) => t.startsWith("⏳"), 2);
-		const statuses = transport.posts((t) => t.startsWith("⏳")).map((c) => c.ts);
+		const statuses = transport.posts((t) => t.startsWith("⏳")).map((c) => c.id);
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "!stop" });
 		await transport.waitForPosts((t) => t.startsWith("⏹"));
-		const cancelled = () =>
-			transport.calls.flatMap((c) => (c.method === "updateMessage" && c.text.startsWith("🚫 취소됨") ? [c.ts] : []));
+		const cancelled = () => transport.editedTo("🚫 취소됨");
 		await transport.settled(() => statuses.every((ts) => cancelled().includes(ts)));
 		const driver = drivers[0];
 		if (!driver) throw new Error("driver not created");
 		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:long job"]);
-		expect(transport.posts((t) => t.startsWith("⏹")).map((c) => c.text)).toEqual([
+		expect(transport.posts((t) => t.startsWith("⏹")).map((c) => firstLine(c.content))).toEqual([
 			"⏹ 멈췄습니다. 세션은 그대로라 이어서 말하면 됩니다. 대기 1개를 취소했습니다.",
 		]);
 		expect(transport.posts((t) => t.startsWith("ANSWER") || t.startsWith("[turn failed]"))).toEqual([]);
@@ -267,10 +276,9 @@ describe("interim deliveries go out while the turn runs", () => {
 		});
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "wap 분석" });
 		await transport.waitForPosts((t) => t.startsWith("NOTE"));
-		expect(transport.posts((t) => t.startsWith("EARLY") || t.startsWith("NOTE")).map((c) => c.text)).toEqual([
-			"EARLY 분석 답",
-			"NOTE 지도 생성 중, 브라우저는 절반만 됩니다.",
-		]);
+		expect(
+			transport.posts((t) => t.startsWith("EARLY") || t.startsWith("NOTE")).map((c) => firstLine(c.content)),
+		).toEqual(["EARLY 분석 답", "NOTE 지도 생성 중, 브라우저는 절반만 됩니다."]);
 		// The turn still runs: its ⏳ message is neither deleted nor relabelled, and no answer went out yet.
 		expect(transport.stuckStatuses()).toHaveLength(1);
 		expect(transport.posts((t) => t.startsWith("ANSWER"))).toEqual([]);
@@ -279,22 +287,19 @@ describe("interim deliveries go out while the turn runs", () => {
 		driver.release();
 		await transport.waitForPosts((t) => t.startsWith("ANSWER"));
 		await transport.settled(() => transport.deleted().length >= 1);
-		expect(transport.posts((t) => t.startsWith("ANSWER")).map((c) => c.text)).toEqual(["ANSWER 지도 완료"]);
+		expect(transport.posts((t) => t.startsWith("ANSWER")).map((c) => firstLine(c.content))).toEqual([
+			"ANSWER 지도 완료",
+		]);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
 	});
 });
 
-/** Every answer post fails like a dropped connection (ambiguous: it may have reached Slack). */
+/** Every answer post fails like a dropped connection (ambiguous: it may have reached Discord). */
 class LosingTransport extends SettlingTransport {
-	override async postMessage(args: {
-		channel: string;
-		text: string;
-		threadTs?: string | undefined;
-		blocks?: readonly unknown[] | undefined;
-	}): Promise<{ ts: string }> {
-		if (args.text.startsWith("ANSWER")) throw new Error("socket hang up");
-		return super.postMessage(args);
+	override async createMessage(args: CreateMessageArgs): Promise<{ id: string }> {
+		if (args.content?.startsWith("ANSWER")) throw new Error("socket hang up");
+		return super.createMessage(args);
 	}
 }
 
@@ -308,9 +313,7 @@ describe("an answer that could not be sent", () => {
 		if (!driver) throw new Error("driver not created");
 		await driver.prompted.promise;
 		driver.release();
-		await transport.settled(() =>
-			transport.calls.some((c) => c.method === "updateMessage" && c.text.startsWith("⚠️ 답을 보내지 못했습니다")),
-		);
+		await transport.settled(() => transport.editedTo("⚠️ 답을 보내지 못했습니다").length > 0);
 		expect(transport.posts((t) => t.startsWith("ANSWER"))).toEqual([]);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);

@@ -10,8 +10,8 @@ const clock = { now: () => NOW };
 function item(deliveryId: number, extra: Partial<DeliveryItem> = {}): DeliveryItem {
 	return {
 		deliveryId,
-		originKey: "slack/dm/D1",
-		threadRef: "D1:1.1",
+		originKey: "discord/dm/200000000000000001",
+		threadRef: "200000000000000001:700000000000000001",
 		body: `답 ${deliveryId}`,
 		redelivered: false,
 		...extra,

@@ -53,7 +53,7 @@ const STEER_NOTICE_HEAD = "↪ 이 요청은 진행 중이던 작업에 합쳐�
 /** Op ref infix of a text a running turn sent before its end (`<opRef>:interim:<n>`); it never finishes the status. */
 export const INTERIM_INFIX = ":interim:";
 /** Origin key prefix of Teams guest/qa deliveries (`teams-qa/<alias>`): no session, no inbound row behind them. */
-export const TEAMS_QA_ORIGIN_PREFIX = "teams-qa/";
+const TEAMS_QA_ORIGIN_PREFIX = "teams-qa/";
 /** Head of a failed-turn notice delivery (`failedNotice` in the mailbox); never recall material. */
 const TURN_FAILED_HEAD = "[turn failed]";
 /** How far back recall candidates reach. */
@@ -65,7 +65,6 @@ export const TURN_SAMPLE_WINDOW_MS = 30 * 24 * 60 * 60_000;
 export const TURN_SAMPLE_LIMIT = 200;
 /** Origin-key prefixes of every chat platform (`chatPlatformOf`): the turns typical durations are read from. */
 const CHAT_ORIGIN_PREFIXES = Object.keys({
-	slack: true,
 	discord: true,
 	teams: true,
 } satisfies Record<ChatPlatform, true>).map((platform) => `${platform}/%`);
@@ -76,7 +75,7 @@ const COMPLETION_MARKER = /^(?:✅|:white_check_mark:) 완료/;
 export const ALERT_INCIDENT_REPEAT_MS = 24 * 60 * 60_000;
 
 /** Outcome of counting one alert occurrence: whether to notify the owner now, and how the condition has stood. */
-export interface AlertIncident {
+interface AlertIncident {
 	notify: boolean;
 	/** Occurrences counted in this alert period (first alert included). */
 	count: number;
@@ -93,13 +92,12 @@ export interface AlertIncident {
 export type { DeliveryState, InboundState } from "./transitions";
 export { StoreError } from "./transitions";
 
-export interface StoreClock {
+interface StoreClock {
 	now(): number;
 }
 
-/** The #log channel of each platform that has one (Slack: top-level `logChannel`, Discord: `channels.discord.logChannelId`). */
+/** The #log channel of each platform that has one (Discord: `channels.discord.logChannelId`). */
 export interface LogChannels {
-	slack?: string | undefined;
 	discord?: string | undefined;
 }
 
@@ -128,13 +126,11 @@ export interface StoreOptions {
 	timezone: string;
 	/** Applied to every body / text / error string before it is stored. */
 	redact: (text: string) => string;
-	/** Fallback Slack channel for monitor output before any owner DM is known. */
-	slackOwnerUserId?: string;
 	/**
 	 * The #log ledger channel of each platform: a completion report is copied to the one of its own platform; a platform
-	 * without one gets no copies. A string is the Slack channel alone.
+	 * without one gets no copies.
 	 */
-	logChannel?: string | LogChannels | undefined;
+	logChannel?: LogChannels | undefined;
 	hooks?: {
 		/** Runs inside the answer transaction after inbound rows became `answered`, before delivery rows exist. */
 		afterInboundAnswered?: () => void;
@@ -155,7 +151,7 @@ export interface TeamsConversation {
 }
 
 /** Where owner notices go when nothing else names a conversation (`Store.ownerHome()`). */
-export interface OwnerHome {
+interface OwnerHome {
 	platform: ChatPlatform;
 	conversationId: string;
 }
@@ -174,7 +170,7 @@ export interface OriginRow {
 }
 
 /** Per-origin runtime settings kept across idle release, restarts and `/new-ompbot`. */
-export type OriginSettings = Pick<OriginRow, "model" | "thinking">;
+type OriginSettings = Pick<OriginRow, "model" | "thinking">;
 
 export interface InboundRow {
 	platformMessageId: string;
@@ -187,9 +183,9 @@ export interface InboundRow {
 	opRef: string | null;
 	/** omp session `leafId` (entry-id string) read right before dispatch; null when the session had no entries. */
 	entryCursor: string | null;
-	/** Slack thread the reply goes to (`<channel>:<thread_ts>`); backfilled from platform_message_id for pre-migration rows. */
+	/** Thread the reply goes to (`<channel>:<thread_ts>`); backfilled from platform_message_id for pre-migration rows. */
 	threadRef: string;
-	/** Slack user id of the peer bot that wrote this row; null for every owner row (and rows from before the column). */
+	/** User id of the peer bot that wrote this row; null for every owner row (and rows from before the column). */
 	peerUserId: string | null;
 }
 
@@ -206,7 +202,7 @@ export interface DeliveryRow {
 	redelivered: boolean;
 	createdAt: number;
 	lastError: string | null;
-	/** Slack messages of this row already posted before a rate limit cut the send (resume skips them); 0 when none. */
+	/** Messages of this row already posted before a rate limit cut the send (resume skips them); 0 when none. */
 	sentParts: number;
 	/** Top-level answer cut after part 1: the ts parts 2+ reply under. */
 	replyTs: string | null;
@@ -274,7 +270,7 @@ const APPROVALS_DDL = `CREATE TABLE IF NOT EXISTS approvals (
 	origin_url TEXT
 );`;
 
-export const LANES_DDL = `CREATE TABLE IF NOT EXISTS lanes (
+const LANES_DDL = `CREATE TABLE IF NOT EXISTS lanes (
 	name TEXT PRIMARY KEY,
 	title TEXT NOT NULL,
 	thread_ref TEXT NOT NULL UNIQUE,
@@ -293,7 +289,7 @@ export const LANES_DDL = `CREATE TABLE IF NOT EXISTS lanes (
  * Turn snapshot ledger for `!undo` (doc/plans/turn-undo.md §D): one row per repository a conversation turn changed, with
  * the git trees before and after it. `reverted_at` marks a turn already put back (NULL = still undoable).
  */
-export const TURN_SNAPSHOTS_DDL = `CREATE TABLE IF NOT EXISTS turn_snapshots (
+const TURN_SNAPSHOTS_DDL = `CREATE TABLE IF NOT EXISTS turn_snapshots (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	origin_key TEXT NOT NULL,
 	op_ref TEXT NOT NULL,
@@ -308,6 +304,82 @@ export const TURN_SNAPSHOTS_DDL = `CREATE TABLE IF NOT EXISTS turn_snapshots (
 );
 CREATE INDEX IF NOT EXISTS turn_snapshots_origin ON turn_snapshots(origin_key, id);
 CREATE INDEX IF NOT EXISTS turn_snapshots_ended ON turn_snapshots(ended_at);`;
+
+/**
+ * Wiki result notes (`src/wiki`). `wiki_notes`: one row per note `source_id`, a `draft` (collected before a landing
+ * removes its worktree and branch) until the note is written, then `sent`: a unit is written once, restarts included.
+ * `wiki_turn_notes`: one row per committing conversation turn and repository, kept here because `turn_snapshots` keeps
+ * 20 rows per origin and is gc'd; the grouping into one note per thread and day is made when the day is over.
+ */
+const WIKI_NOTES_DDL = `CREATE TABLE IF NOT EXISTS wiki_notes (
+	source_id TEXT PRIMARY KEY,
+	state TEXT NOT NULL CHECK (state IN ('draft','sent')),
+	draft TEXT,
+	at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS wiki_turn_notes (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	origin_key TEXT NOT NULL,
+	op_ref TEXT NOT NULL,
+	repo TEXT NOT NULL,
+	thread_ref TEXT NOT NULL,
+	group_key TEXT NOT NULL,
+	day TEXT NOT NULL,
+	inbound TEXT NOT NULL,
+	conclusion TEXT NOT NULL,
+	commits_json TEXT NOT NULL,
+	ended_at INTEGER NOT NULL,
+	sent_at INTEGER,
+	UNIQUE (origin_key, op_ref, repo)
+);
+CREATE INDEX IF NOT EXISTS wiki_turn_notes_unsent ON wiki_turn_notes(sent_at, day);`;
+
+export interface WikiTurnInput {
+	originKey: string;
+	opRef: string;
+	repo: string;
+	threadRef: string;
+	/** Notes of one group go out as one: `thread:<threadRef>` for a channel thread, `turn:<originKey>:<opRef>` otherwise. */
+	groupKey: string;
+	/** The turn's end as a `YYYYMMDD` day in the bot's time zone. */
+	day: string;
+	inbound: string;
+	conclusion: string;
+	commits: { sha: string; subject: string }[];
+	endedAt: number;
+}
+
+export interface WikiTurnRow extends WikiTurnInput {
+	id: number;
+}
+
+interface WikiTurnSql {
+	id: number;
+	origin_key: string;
+	op_ref: string;
+	repo: string;
+	thread_ref: string;
+	group_key: string;
+	day: string;
+	inbound: string;
+	conclusion: string;
+	commits_json: string;
+	ended_at: number;
+}
+
+const toWikiTurn = (r: WikiTurnSql): WikiTurnRow => ({
+	id: r.id,
+	originKey: r.origin_key,
+	opRef: r.op_ref,
+	repo: r.repo,
+	threadRef: r.thread_ref,
+	groupKey: r.group_key,
+	day: r.day,
+	inbound: r.inbound,
+	conclusion: r.conclusion,
+	commits: JSON.parse(r.commits_json) as { sha: string; subject: string }[],
+	endedAt: r.ended_at,
+});
 
 export interface TurnSnapshotRow {
 	id: number;
@@ -365,14 +437,14 @@ const toTurnSnapshot = (r: TurnSnapshotSql): TurnSnapshotRow => ({
 });
 
 /** Rows kept per origin: an old turn's `!undo` target stops being reachable long before `gc` runs. */
-export const TURN_SNAPSHOT_ROWS_KEPT = 20;
+const TURN_SNAPSHOT_ROWS_KEPT = 20;
 
 /**
  * The last instructions given to herdr agents, for the dashboard card's 마지막 지시 line
  * (doc/plans/dashboard-model-and-last-prompt.md §B): one masked one-line preview per prompt, never the text itself.
  * `host` is '' for local herdr.
  */
-export const HERDR_PROMPTS_DDL = `CREATE TABLE IF NOT EXISTS herdr_prompts (
+const HERDR_PROMPTS_DDL = `CREATE TABLE IF NOT EXISTS herdr_prompts (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	host TEXT NOT NULL,
 	agent TEXT NOT NULL,
@@ -384,7 +456,7 @@ export const HERDR_PROMPTS_DDL = `CREATE TABLE IF NOT EXISTS herdr_prompts (
 CREATE INDEX IF NOT EXISTS herdr_prompts_agent ON herdr_prompts(agent, id);`;
 
 /** start: a new agent (a resume that starts one too) · followup: a prompt to a running one · remind: the sweep's nudge. */
-export type HerdrPromptKind = "start" | "followup" | "remind";
+type HerdrPromptKind = "start" | "followup" | "remind";
 
 /** One prompt herdr took; `host` null = local herdr. */
 export interface HerdrPromptInput {
@@ -397,9 +469,9 @@ export interface HerdrPromptInput {
 }
 
 /** Rows kept per agent. */
-export const HERDR_PROMPT_ROWS_KEPT = 20;
+const HERDR_PROMPT_ROWS_KEPT = 20;
 /** Rows older than this are dropped on the next record. */
-export const HERDR_PROMPT_KEEP_MS = 30 * 24 * 60 * 60_000;
+const HERDR_PROMPT_KEEP_MS = 30 * 24 * 60 * 60_000;
 /** Longest stored preview. */
 export const HERDR_PROMPT_PREVIEW_CHARS = 120;
 
@@ -478,7 +550,7 @@ const toLaneBoardPost = (r: LaneBoardPostSql): LaneBoardPost => ({
 });
 
 /** Where one reader stands in one channel: the last post read and the last one a turn prompt announced (0 = none). */
-export interface LaneBoardCursor {
+interface LaneBoardCursor {
 	lastRead: number;
 	lastNoticed: number;
 }
@@ -585,6 +657,7 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 );
 ${LEGACY_FEEDBACK_DDL}
 ${TURN_SNAPSHOTS_DDL}
+${WIKI_NOTES_DDL}
 ${HERDR_PROMPTS_DDL}
 ${PEER_CALLS_DDL}
 ${LANE_BOARD_DDL}
@@ -621,7 +694,7 @@ const toLane = (r: LaneSql): LaneRow => ({
 /** The registry keeps the newest entries only; a lane that lives for weeks must not grow without bound. */
 const MAX_LANE_HISTORY = 200;
 
-export type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "replied";
+type ApprovalStatus = "pending" | "approved" | "denied" | "expired" | "replied";
 
 export interface ApprovalRow {
 	approvalId: string;
@@ -742,7 +815,6 @@ export class Store {
 	readonly monitors: MonitorLedger;
 	/** [TASK] registry; shares this connection. */
 	readonly tasks: TaskLedger;
-	private readonly slackOwnerUserId: string | undefined;
 	private logChannels: LogChannels = {};
 	/** Rows `sweepExpired` expired that no adapter took yet (`takeExpired`); memory only, like the statuses they end. */
 	private expiredUnfinished: DeliveryRow[] = [];
@@ -761,14 +833,13 @@ export class Store {
 			.run(this.clock.now());
 	}
 
-	/** Config reload: answers recorded from now on copy to the new #log channels (a string: Slack's alone). */
-	setLogChannel(channel: string | LogChannels | undefined): void {
-		this.logChannels = typeof channel === "string" ? { slack: channel } : { ...channel };
+	/** Config reload: answers recorded from now on copy to the new #log channels. */
+	setLogChannel(channel: LogChannels | undefined): void {
+		this.logChannels = { ...channel };
 	}
 
 	constructor(options: StoreOptions) {
 		this.clock = options.clock;
-		this.slackOwnerUserId = options.slackOwnerUserId;
 		this.setLogChannel(options.logChannel);
 		this.redact = options.redact;
 		this.hooks = options.hooks ?? {};
@@ -1205,7 +1276,7 @@ export class Store {
 			.run(this.clock.now(), originKey, opRef);
 	}
 
-	/** Distinct Slack threads of every inbound row that belongs to the op (the whole steered batch, not only the lead). */
+	/** Distinct threads of every inbound row that belongs to the op (the whole steered batch, not only the lead). */
 	threadsOfOp(originKey: string, opRef: string): string[] {
 		const rows = this.db
 			.query("SELECT DISTINCT thread_ref FROM inbound WHERE origin_key = ? AND op_ref = ? ORDER BY thread_ref")
@@ -1214,7 +1285,7 @@ export class Store {
 	}
 
 	/**
-	 * Earliest inbound row of a Slack thread other than the given message — normally the thread root, which was
+	 * Earliest inbound row of a thread other than the given message — normally the thread root, which was
 	 * dispatched to the parent channel's origin and is therefore invisible to the thread-reply session.
 	 */
 	getThreadRootInbound(threadRef: string, excludeMessageId: string): InboundRow | undefined {
@@ -1326,7 +1397,7 @@ export class Store {
 	}
 
 	/**
-	 * Slack conversations with an inbound message since `since`, each with the thread of its newest message (newest
+	 * Conversations with an inbound message since `since`, each with the thread of its newest message (newest
 	 * first, at most `limit`) — the restart notice targets. Monitor origins never take inbound from people.
 	 */
 	recentConversations(since: number, limit: number): Array<{ originKey: string; threadRef: string }> {
@@ -1444,7 +1515,7 @@ export class Store {
 
 	/**
 	 * The single choke point where chat answers become deliveries also writes the log-channel copy of a completion
-	 * report: a Slack or Discord chat or work-lane answer (never commands) whose first non-empty line starts with
+	 * report: a Discord chat or work-lane answer (never commands) whose first non-empty line starts with
 	 * `✅ 완료`. It goes to the #log channel of the answer's own platform (a lane: its thread's), never another
 	 * platform's. The copy is one delivery on `<logChannel>:-` under `<opRef>:log-copy`, so a replayed answer inserts
 	 * nothing new.
@@ -1453,8 +1524,7 @@ export class Store {
 		if (COMMAND_OP_REF.test(input.opRef)) return;
 		const lane = input.originKey.startsWith(LANE_ORIGIN_PREFIX);
 		const platform = lane ? platformOfThreadRef(input.threadRef) : chatPlatformOf(input.originKey);
-		const logChannel =
-			platform === "slack" ? this.logChannels.slack : platform === "discord" ? this.logChannels.discord : undefined;
+		const logChannel = platform === "discord" ? this.logChannels.discord : undefined;
 		if (logChannel === undefined) return;
 		const first = body.split("\n").find((line) => line.trim() !== "");
 		if (first === undefined || !COMPLETION_MARKER.test(first.trim())) return;
@@ -1531,21 +1601,11 @@ export class Store {
 	 * The owner's live DM origin key on `platform` (`<platform>/dm/<id>`), newest by updated_at — undefined before the
 	 * owner ever DM'd there.
 	 */
-	ownerDmOrigin(platform: ChatPlatform = "slack"): string | undefined {
+	ownerDmOrigin(platform: ChatPlatform): string | undefined {
 		const row = this.db
 			.query("SELECT origin_key FROM origins WHERE origin_key LIKE ? ORDER BY updated_at DESC LIMIT 1")
 			.get(`${platform}/dm/%`) as { origin_key: string } | null;
 		return row?.origin_key;
-	}
-
-	/**
-	 * Slack only: the owner's known Slack DM, else the Slack owner user id (Slack opens that DM), else `""`. Owner
-	 * notices route through `ownerHome()` instead, which never yields an empty conversation.
-	 */
-	ownerChannel(): string {
-		const origin = this.ownerDmOrigin();
-		const dm = origin === undefined ? undefined : parseChatOrigin(origin)?.conversationId;
-		return dm ?? this.slackOwnerUserId ?? "";
 	}
 
 	/** `!home`: the conversation owner notices go to from now on, ahead of every fallback of `ownerHome()`. */
@@ -1561,8 +1621,7 @@ export class Store {
 
 	/**
 	 * Where daemon-level owner notices and channel-less monitor reports go: ① the home registered with `!home`, ② the
-	 * Slack owner DM when Slack is on (its known DM, else the owner user id — the long-standing behavior), ③ the
-	 * owner's newest 1:1 conversation on any platform, ④ the conversation the owner last wrote in. `undefined` before
+	 * owner's newest 1:1 conversation on any platform, ③ the conversation the owner last wrote in. `undefined` before
 	 * any of them exists (a fresh install whose owner has not written yet): callers warn and never post to an empty id.
 	 */
 	ownerHome(): OwnerHome | undefined {
@@ -1574,10 +1633,6 @@ export class Store {
 			const ref = parseChatOrigin(`${registered.platform}/ch/${registered.conversation_id}`);
 			if (ref !== undefined) return { platform: ref.platform, conversationId: ref.conversationId };
 		}
-		const slackDm = this.ownerDmOrigin("slack");
-		const slackDmId = slackDm === undefined ? undefined : parseChatOrigin(slackDm)?.conversationId;
-		if (slackDmId !== undefined) return { platform: "slack", conversationId: slackDmId };
-		if (this.slackOwnerUserId !== undefined) return { platform: "slack", conversationId: this.slackOwnerUserId };
 		// A Teams 1:1 the owner wrote in counts even when no session came of it (`ownerMode: qa`), by `owner_at`.
 		const dms = this.db
 			.query(
@@ -1596,7 +1651,7 @@ export class Store {
 		const spoken = this.db
 			.query(
 				`SELECT origin_key FROM inbound WHERE peer_user_id IS NULL
-				 AND (origin_key LIKE 'slack/%' OR origin_key LIKE 'discord/%' OR origin_key LIKE 'teams/dm/%')
+				 AND (origin_key LIKE 'discord/%' OR origin_key LIKE 'teams/dm/%')
 				 ORDER BY inbound_id DESC LIMIT 50`,
 			)
 			.all() as Array<{ origin_key: string }>;
@@ -2057,6 +2112,99 @@ export class Store {
 			.run(at, originKey, opRef).changes;
 	}
 
+	// ---- wiki result notes ----
+
+	/** The note's state: its draft JSON, `"sent"`, or `undefined` for a unit never seen. */
+	wikiNoteState(sourceId: string): { state: "draft"; draft: string } | { state: "sent" } | undefined {
+		const row = this.db.query("SELECT state, draft FROM wiki_notes WHERE source_id = ?").get(sourceId) as {
+			state: "draft" | "sent";
+			draft: string | null;
+		} | null;
+		if (row === null) return undefined;
+		return row.state === "sent" ? { state: "sent" } : { state: "draft", draft: row.draft ?? "" };
+	}
+
+	/** Keeps (or replaces) the unit's draft; a unit already `sent` stays so. */
+	saveWikiDraft(sourceId: string, draft: string): void {
+		this.db
+			.query(
+				`INSERT INTO wiki_notes (source_id, state, draft, at) VALUES (?, 'draft', ?, ?)
+				 ON CONFLICT(source_id) DO UPDATE SET draft = excluded.draft, at = excluded.at WHERE state = 'draft'`,
+			)
+			.run(sourceId, draft, this.clock.now());
+	}
+
+	dropWikiDraft(sourceId: string): void {
+		this.db.query("DELETE FROM wiki_notes WHERE source_id = ? AND state = 'draft'").run(sourceId);
+	}
+
+	markWikiNoteSent(sourceId: string): void {
+		this.db
+			.query(
+				`INSERT INTO wiki_notes (source_id, state, draft, at) VALUES (?, 'sent', NULL, ?)
+				 ON CONFLICT(source_id) DO UPDATE SET state = 'sent', draft = NULL, at = excluded.at`,
+			)
+			.run(sourceId, this.clock.now());
+	}
+
+	/** Records a committing turn once per repository (a turn is never recorded twice); `true` = a new row. */
+	addWikiTurn(input: WikiTurnInput): boolean {
+		return (
+			this.db
+				.query(
+					`INSERT INTO wiki_turn_notes (origin_key, op_ref, repo, thread_ref, group_key, day, inbound, conclusion, commits_json, ended_at)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(origin_key, op_ref, repo) DO NOTHING`,
+				)
+				.run(
+					input.originKey,
+					input.opRef,
+					input.repo,
+					input.threadRef,
+					input.groupKey,
+					input.day,
+					this.redact(input.inbound),
+					this.redact(input.conclusion),
+					JSON.stringify(input.commits),
+					input.endedAt,
+				).changes > 0
+		);
+	}
+
+	/** Turns not yet part of a written note, oldest first. */
+	listUnsentWikiTurns(): WikiTurnRow[] {
+		return (
+			this.db.query("SELECT * FROM wiki_turn_notes WHERE sent_at IS NULL ORDER BY ended_at, id").all() as WikiTurnSql[]
+		).map(toWikiTurn);
+	}
+
+	markWikiTurnsSent(ids: readonly number[]): void {
+		const mark = this.db.query("UPDATE wiki_turn_notes SET sent_at = ? WHERE id = ?");
+		const now = this.clock.now();
+		this.db.transaction(() => {
+			for (const id of ids) mark.run(now, id);
+		})();
+	}
+
+	/** Drops sent turn rows and `sent` notes older than `before`, and unsent rows that never went out for as long. */
+	pruneWikiNotes(before: number): void {
+		this.db.query("DELETE FROM wiki_turn_notes WHERE COALESCE(sent_at, ended_at) < ?").run(before);
+		this.db.query("DELETE FROM wiki_notes WHERE at < ?").run(before);
+	}
+
+	/**
+	 * What a turn was asked and how it ended: the first inbound of the op (`text_ref` is already redacted) and the
+	 * body of its last delivery part (both `""` when the rows are gone).
+	 */
+	turnTexts(originKey: string, opRef: string): { inbound: string; conclusion: string } {
+		const inbound = this.db
+			.query("SELECT text_ref FROM inbound WHERE origin_key = ? AND op_ref = ? ORDER BY inbound_id LIMIT 1")
+			.get(originKey, opRef) as { text_ref: string } | null;
+		const delivery = this.db
+			.query("SELECT body FROM deliveries WHERE origin_key = ? AND op_ref = ? ORDER BY part DESC LIMIT 1")
+			.get(originKey, opRef) as { body: string } | null;
+		return { inbound: inbound?.text_ref ?? "", conclusion: delivery?.body ?? "" };
+	}
+
 	// ---- deliveries ----
 
 	getDelivery(deliveryId: number): DeliveryRow | undefined {
@@ -2074,7 +2222,7 @@ export class Store {
 	}
 
 	/**
-	 * Confirmed first-part deliveries other origins posted into a Slack thread, oldest first — answers the
+	 * Confirmed first-part deliveries other origins posted into a thread, oldest first — answers the
 	 * thread's own session has never seen (the root's answers come from the parent channel's origin).
 	 */
 	listThreadForeignDeliveries(threadRef: string, excludeOriginKey: string, limit: number): DeliveryRow[] {
@@ -2283,7 +2431,7 @@ export class Store {
 	}
 
 	/**
-	 * Slack refused the send for now (429, or the method still blocked): back to `pending` at `retry.at` without
+	 * The platform refused the send for now (429, or the method still blocked): back to `pending` at `retry.at` without
 	 * counting an attempt; `sentParts`/`replyTs` record how far a multi-message answer got, so the resume posts only
 	 * the rest. Still expires past the freshness window.
 	 */

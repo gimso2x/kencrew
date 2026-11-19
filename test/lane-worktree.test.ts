@@ -7,7 +7,7 @@ import { LaneInputError } from "../src/lanes/manager";
 import { buildWorkStartTool } from "../src/lanes/tools";
 import { createTaskHostOps } from "../src/tasks/host";
 import { localDay } from "../src/time";
-import { makeHome, type TestHome } from "./helpers/bot-home";
+import { CHANNEL, makeHome, type TestHome } from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import { LANE_START, laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
 
@@ -53,7 +53,7 @@ describe("lane start creates its own worktree and branch (AC-1)", () => {
 		const baseSha = git(repo, "rev-parse", "HEAD");
 
 		const h = laneHarness(home.dir);
-		const lane = await h.manager.start({ title: "worktree lane", cwd: join(repo, "pkg"), channel: "D1" });
+		const lane = await h.manager.start({ title: "worktree lane", cwd: join(repo, "pkg"), channel: CHANNEL });
 		await h.settle();
 
 		const laneId = `L-${DAY}-01`;
@@ -94,7 +94,7 @@ describe("lane start refusals and concurrency (AC-2)", () => {
 		const plain = realpathSync(mkdtempSync(join(tmpdir(), "ompbot-lane-plain-")));
 		repos.push(plain);
 		const h = laneHarness(home.dir);
-		const refused = await h.manager.start({ title: "plain", cwd: plain, channel: "D1" }).catch((e: unknown) => e);
+		const refused = await h.manager.start({ title: "plain", cwd: plain, channel: CHANNEL }).catch((e: unknown) => e);
 		expect(refused).toBeInstanceOf(LaneInputError);
 		expect(String((refused as Error).message)).toContain("git");
 		expect(h.store.listLanes()).toHaveLength(0);
@@ -107,7 +107,7 @@ describe("lane start refusals and concurrency (AC-2)", () => {
 		const repo = makeRepo(repos);
 		git(repo, "checkout", "-q", "--detach");
 		const h = laneHarness(home.dir);
-		const refused = await h.manager.start({ title: "detached", cwd: repo, channel: "D1" }).catch((e: unknown) => e);
+		const refused = await h.manager.start({ title: "detached", cwd: repo, channel: CHANNEL }).catch((e: unknown) => e);
 		expect(refused).toBeInstanceOf(LaneInputError);
 		expect(String((refused as Error).message)).toContain("HEAD");
 		expect(h.store.listLanes()).toHaveLength(0);
@@ -120,7 +120,7 @@ describe("lane start refusals and concurrency (AC-2)", () => {
 	test("a repository path outside TASK_PATH_PATTERN (space, Hangul) is refused: no row, no worktree", async () => {
 		const repo = makeRepo(repos, "ompbot 레인 repo-");
 		const h = laneHarness(home.dir);
-		const refused = await h.manager.start({ title: "unsafe", cwd: repo, channel: "D1" }).catch((e: unknown) => e);
+		const refused = await h.manager.start({ title: "unsafe", cwd: repo, channel: CHANNEL }).catch((e: unknown) => e);
 		expect(refused).toBeInstanceOf(LaneInputError);
 		expect(h.store.listLanes()).toHaveLength(0);
 		expect(h.transport.posts()).toEqual([]);
@@ -133,8 +133,8 @@ describe("lane start refusals and concurrency (AC-2)", () => {
 		const repo = makeRepo(repos);
 		const h = laneHarness(home.dir);
 		const [a, b] = await Promise.all([
-			h.manager.start({ title: "first", cwd: repo, channel: "D1" }),
-			h.manager.start({ title: "second", cwd: repo, channel: "D1" }),
+			h.manager.start({ title: "first", cwd: repo, channel: CHANNEL }),
+			h.manager.start({ title: "second", cwd: repo, channel: CHANNEL }),
 		]);
 		await h.settle();
 		expect(h.store.listLanes().map((lane) => lane.status)).toEqual(["working", "working"]);
@@ -144,7 +144,7 @@ describe("lane start refusals and concurrency (AC-2)", () => {
 		expect(a.cwd).not.toBe(b.cwd);
 		expect(laneWorktrees(repo).sort()).toEqual(worktrees);
 		// A third start on the same repository, while both run, takes the next free id.
-		const c = await h.manager.start({ title: "third", cwd: repo, channel: "D1" });
+		const c = await h.manager.start({ title: "third", cwd: repo, channel: CHANNEL });
 		expect(c.meta.laneId).toBe(`L-${DAY}-03`);
 		await h.settle();
 		h.close();
@@ -154,7 +154,7 @@ describe("lane start refusals and concurrency (AC-2)", () => {
 		const repo = makeRepo(repos);
 		git(repo, "branch", `lane/L-${DAY}-01`);
 		const h = laneHarness(home.dir);
-		const lane = await h.manager.start({ title: "skip", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "skip", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		expect(lane.meta.laneId).toBe(`L-${DAY}-02`);
 		h.close();
@@ -164,7 +164,7 @@ describe("lane start refusals and concurrency (AC-2)", () => {
 describe("ompbot_work_start acceptance and risk (AC-3)", () => {
 	test("the tool schema offers acceptance and risk", () => {
 		const h = laneHarness(home.dir);
-		const tool = buildWorkStartTool(h.manager, "D1");
+		const tool = buildWorkStartTool(h.manager, CHANNEL, `discord/ch/${CHANNEL}`);
 		expect(tool.parameters).toMatchObject({ properties: { acceptance: { type: "array" }, risk: { type: "string" } } });
 		h.close();
 	});
@@ -172,7 +172,7 @@ describe("ompbot_work_start acceptance and risk (AC-3)", () => {
 	test("acceptance items are stored with AC ids and the given risk", async () => {
 		const repo = makeRepo(repos);
 		const h = laneHarness(home.dir);
-		const tool = buildWorkStartTool(h.manager, "D1");
+		const tool = buildWorkStartTool(h.manager, CHANNEL, `discord/ch/${CHANNEL}`);
 		const signal = new AbortController().signal;
 		const reply = await tool.execute(
 			{
@@ -201,7 +201,7 @@ describe("ompbot_work_start acceptance and risk (AC-3)", () => {
 	test("omitted: risk L3 and acceptance []", async () => {
 		const repo = makeRepo(repos);
 		const h = laneHarness(home.dir);
-		const tool = buildWorkStartTool(h.manager, "D1");
+		const tool = buildWorkStartTool(h.manager, CHANNEL, `discord/ch/${CHANNEL}`);
 		await tool.execute({ title: "defaults", cwd: repo }, { signal: new AbortController().signal });
 		const lane = h.store.getLane("defaults");
 		if (lane === undefined) throw new Error("no lane defaults");
@@ -218,7 +218,7 @@ describe("ompbot_work_start acceptance and risk (AC-3)", () => {
 	test("a malformed `[check: …]`, an out-of-range risk or a non-list acceptance is refused before anything is created", async () => {
 		const repo = makeRepo(repos);
 		const h = laneHarness(home.dir);
-		const tool = buildWorkStartTool(h.manager, "D1");
+		const tool = buildWorkStartTool(h.manager, CHANNEL, `discord/ch/${CHANNEL}`);
 		const signal = new AbortController().signal;
 		const cases: Record<string, unknown>[] = [
 			{ title: "bad-check", cwd: repo, acceptance: ["테스트가 통과한다 [check: bun test]"] },

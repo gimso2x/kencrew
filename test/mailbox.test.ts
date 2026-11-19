@@ -25,7 +25,7 @@ import {
 	type TurnFailureEscalation,
 	type TurnSettledInfo,
 } from "../src/core/mailbox";
-import { OriginRouter, openBotStore, sessionDirFor, slackDmOrigin } from "../src/core/origin";
+import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
 import {
 	IDLE_STOP_MS,
 	type InboundRecord,
@@ -57,7 +57,7 @@ import {
 import { healSessionModelFile } from "../src/omp/session-heal";
 import { redact } from "../src/redact";
 import { ApprovalBroker } from "../src/safety/approval";
-import { answerDialogOnSlack } from "../src/safety/choice";
+import { answerDialog } from "../src/safety/choice";
 import { peerTouchedTurnNotice } from "../src/safety/prompt";
 import { openStore, type Store } from "../src/store/db";
 import { localDay } from "../src/time";
@@ -270,7 +270,9 @@ function writeSavedSession(originKey: string, model: string): string {
 	return file;
 }
 
-const ORIGIN = "slack/dm/D1";
+const DM_ID = "200000000000000001";
+const CH_ID = "300000000000000001";
+const ORIGIN = `discord/dm/${DM_ID}`;
 let dir: string;
 let clock: FakeClock;
 let store: Store;
@@ -290,9 +292,9 @@ let coldCaches: ColdCacheInfo[];
 let escalateAfter: number | undefined;
 let restoreListed: readonly string[] | undefined;
 let sessionBackupsRoot: string | undefined;
-/** Set: the router gets a Slack thread source whose `botUserId()` returns `id` (peer failure notices mention it). */
+/** Set: the router gets a Discord thread source whose `botUserId()` returns `id` (peer failure notices mention it). */
 let threadBot: { id: string | undefined } | undefined;
-/** Set: the router's `hostTools` answer (false = an agy/claude child without host tools). */
+/** Set: the router's `hostTools` answer (false = an agy child without host tools). */
 let hostTools: boolean | undefined;
 
 /** Fresh router over the current test knobs; `defaultModel` is only readable here, so stale-model tests rebuild the router. */
@@ -311,7 +313,7 @@ function buildRouter(): OriginRouter {
 			: {
 					threadSource: new Map([
 						[
-							"slack" as const,
+							"discord" as const,
 							{
 								botUserId: () => threadBot?.id,
 								replies: async () => [],
@@ -1161,12 +1163,9 @@ describe("mailbox: consecutive failure escalation (무인 신뢰성 루프)", ()
 describe("origin routing and idle stop", () => {
 	test("a DM thread reply has the same origin as the top-level message and shares one conversation", async () => {
 		driverOptions = { holdTurns: true };
-		const top = slackDmOrigin({ channelId: "D9" });
-		const reply = slackDmOrigin({ channelId: "D9", threadTs: "1700000000.000100" });
-		expect(reply).toBe(top);
-		expect(top).toBe("slack/dm/D9");
-		await router.route(msg("top", { originKey: top }));
-		await router.route(msg("in thread", { originKey: reply, threadRef: "1700000000.000100" }));
+		const origin = "discord/dm/200000000000000009";
+		await router.route(msg("top", { originKey: origin }));
+		await router.route(msg("in thread", { originKey: origin, threadRef: `${DM_ID}:700000000000000100` }));
 		expect(drivers).toHaveLength(1);
 		expect(drivers[0]?.calls.filter((c) => c.startsWith("prompt:") || c.startsWith("steer:"))).toEqual([
 			"prompt:top",
@@ -1202,8 +1201,8 @@ describe("origin routing and idle stop", () => {
 });
 
 describe("mailbox: thread inherits channel model settings", () => {
-	const CHANNEL = "slack/ch/C1";
-	const THREAD = "slack/ch/C1/t/123";
+	const CHANNEL = `discord/ch/${CH_ID}`;
+	const THREAD = `discord/ch/${CH_ID}/t/700000000000000123`;
 
 	test("a thread with no choice of its own applies the parent channel's model and thinking", async () => {
 		store.ensureOrigin(CHANNEL, sessionDirFor(join(dir, "sessions"), CHANNEL, 1));
@@ -1230,7 +1229,7 @@ describe("mailbox: thread inherits channel model settings", () => {
 	});
 
 	test("a thread whose parent channel is unknown falls back to the omp default with no setModel call", async () => {
-		await router.route(msg("hello", { originKey: "slack/ch/C2/t/456" }));
+		await router.route(msg("hello", { originKey: "discord/ch/300000000000000002/t/700000000000000456" }));
 		const driver = drivers[0] as SteerFailingDriver;
 		expect(driver.calls.filter((c) => c.startsWith("setModel:"))).toEqual([]);
 		expect(driver.calls.filter((c) => c.startsWith("setThinking:"))).toEqual([]);
@@ -1540,7 +1539,7 @@ describe("mailbox: finished answers and wait notes reach the thread before the t
 
 	test("a turn without answer text still quotes (응답 없음) in a steered thread's pointer", async () => {
 		const { finish } = await heldTurn([{ role: "assistant", text: "", stopReason: "stop" }]);
-		await router.route(msg("이것도", { threadRef: "D1:900.000009" }));
+		await router.route(msg("이것도", { threadRef: `${DM_ID}:700000000000000009` }));
 		await finish();
 		const notices = store.listDeliveries({ originKey: ORIGIN }).filter((d) => d.opRef.includes(":steer:"));
 		expect(notices.map((d) => d.body.split("\n")[1])).toEqual([`> ${NO_ANSWER}`]);
@@ -1564,6 +1563,22 @@ describe("mailbox: finished answers and wait notes reach the thread before the t
 		expect(rows()).toEqual([]);
 		await finish();
 		expect(rows()).toEqual([[opRef, LAST]]);
+	});
+
+	test("the summary written beside an `ask` call goes out before the choice, not lost at the turn end", async () => {
+		// 2026-11-18: a review summary with a peer mention sat in the same message as `ask` and never reached Discord.
+		const summary = "리뷰가 끝났습니다. 판정표 35건, 스펙 3개. <@1234567890123456789> 스펙 검토를 부탁합니다.";
+		const { opRef, finish } = await heldTurn([
+			{ role: "assistant", text: summary, stopReason: "toolUse", toolCalls: ["ask"] },
+			{ role: "toolResult", text: '{"choice":"1"}' },
+			{ role: "assistant", text: LAST, stopReason: "stop" },
+		]);
+		expect(rows()).toEqual([[`${opRef}:interim:0`, summary]]);
+		await finish();
+		expect(rows()).toEqual([
+			[`${opRef}:interim:0`, summary],
+			[opRef, LAST],
+		]);
 	});
 
 	test("AC-4: a monitor turn makes no interim delivery and answers with its last text", async () => {
@@ -1594,7 +1609,13 @@ describe("mailbox: finished answers and wait notes reach the thread before the t
 	test("AC-5: a `✅ 완료` answer that went out early is copied to the log channel exactly once at the turn end", async () => {
 		await router.close();
 		store.close();
-		store = openStore({ timezone: "Asia/Seoul", path: join(dir, "log.db"), clock, redact, logChannel: "C0LOGCHAN01" });
+		store = openStore({
+			timezone: "Asia/Seoul",
+			path: join(dir, "log.db"),
+			clock,
+			redact,
+			logChannel: { discord: "678901234567890123" }, // gitleaks:allow (fake snowflake)
+		});
 		router = buildRouter();
 		const report = "✅ 완료 — wap 분석\n게이트 중계기 확인, 세션 쿠키 갱신 경로 정리.";
 		const { opRef, finish } = await heldTurn([
@@ -1614,11 +1635,11 @@ describe("mailbox: finished answers and wait notes reach the thread before the t
 
 	test("AC-5: a row steered in from another thread gets its pointer notice once, at the turn end", async () => {
 		const { opRef, finish } = await heldTurn(waitTurn);
-		await router.route(msg("이것도", { threadRef: "D1:900.000009" }));
+		await router.route(msg("이것도", { threadRef: `${DM_ID}:700000000000000009` }));
 		const notices = () => store.listDeliveries({ originKey: ORIGIN }).filter((d) => d.opRef.includes(":steer:"));
 		expect(notices()).toEqual([]);
 		await finish();
-		expect(notices().map((d) => [d.opRef, d.threadRef])).toEqual([[`${opRef}:steer:0`, "D1:900.000009"]]);
+		expect(notices().map((d) => [d.opRef, d.threadRef])).toEqual([[`${opRef}:steer:0`, `${DM_ID}:700000000000000009`]]);
 		expect(notices()[0]?.body).toContain(FIRST.slice(0, 20));
 	});
 });
@@ -1683,8 +1704,8 @@ describe("mailbox: an owner steer written before the turn's answer reached the o
 });
 
 describe("mailbox: steered messages from another thread get a pointer notice", () => {
-	const LEAD = "D1:100.000001";
-	const OTHER = "D1:200.000002";
+	const LEAD = `${DM_ID}:700000000000000001`;
+	const OTHER = `${DM_ID}:700000000000000002`;
 	const notices = () =>
 		store
 			.listDeliveries({ originKey: ORIGIN })
@@ -1707,7 +1728,7 @@ describe("mailbox: steered messages from another thread get a pointer notice", (
 		expect(notices()).toEqual([
 			{
 				thread: OTHER,
-				body: "↪ 이 요청은 진행 중이던 작업에 합쳐져서 답을 다른 스레드에 올렸어\n> 첫 줄 요약{{thread-link:D1:100.000001}}",
+				body: `↪ 이 요청은 진행 중이던 작업에 합쳐져서 답을 다른 스레드에 올렸어\n> 첫 줄 요약{{thread-link:${DM_ID}:700000000000000001}}`,
 			},
 		]);
 		expect(store.listDeliveries({ originKey: ORIGIN }).filter((d) => d.threadRef === LEAD)).toHaveLength(1);
@@ -1725,7 +1746,7 @@ describe("mailbox: steered messages from another thread get a pointer notice", (
 		expect(
 			notice?.body.startsWith("↪ 이 요청은 진행 중이던 작업에 합쳐져서 답을 다른 스레드에 올렸어\n> [turn failed]"),
 		).toBe(true);
-		expect(notice?.body.endsWith("{{thread-link:D1:100.000001}}")).toBe(true);
+		expect(notice?.body.endsWith(`{{thread-link:${DM_ID}:700000000000000001}}`)).toBe(true);
 	});
 
 	test("steered messages of the turn's own thread get no notice", async () => {
@@ -1803,7 +1824,7 @@ class ReportingDriver extends FakeOmpDriver {
 }
 
 describe("mailbox: session resume check", () => {
-	const RESUME_ORIGIN = "slack/dm/DRESUME";
+	const RESUME_ORIGIN = "discord/dm/200000000000000010";
 	let mismatches: SessionMismatchInfo[];
 	let opened: ReportingDriver[];
 
@@ -1920,7 +1941,7 @@ class LoopDriver extends FakeOmpDriver {
 }
 
 describe("mailbox: tool repeat loop (stuck-loop)", () => {
-	const LOOP_ORIGIN = "slack/dm/DLOOP";
+	const LOOP_ORIGIN = "discord/dm/200000000000000011";
 	let loops: StuckLoopInfo[];
 	let opened: LoopDriver[];
 
@@ -2048,7 +2069,7 @@ describe("mailbox: tool repeat loop (stuck-loop)", () => {
 });
 
 describe("mailbox: an owner message answers the origin's one open omp dialog", () => {
-	const DIALOG_ORIGIN = "slack/dm/D7";
+	const DIALOG_ORIGIN = "discord/dm/200000000000000007";
 	let answers: string[];
 	let ambiguous: Array<{ originKey: string; threadRef: string }>;
 	let open: number;
@@ -2189,7 +2210,7 @@ describe("mailbox: an owner message answers the origin's one open omp dialog", (
 });
 
 describe("mailbox + real ApprovalBroker: a message outside a select's options", () => {
-	const ORIGIN_KEY = "slack/dm/D8";
+	const ORIGIN_KEY = "discord/dm/200000000000000008";
 	const OTHER = "Other (type your own)";
 	let opened: FakeOmpDriver[];
 	let broker: ApprovalBroker;
@@ -2222,8 +2243,13 @@ describe("mailbox + real ApprovalBroker: a message outside a select's options", 
 
 	/** The fake driver's side: omp's dialog answerer, backed by the real broker. */
 	function ask(mailbox: OriginMailbox, request: OmpDialogRequest, signal = new AbortController().signal) {
-		const origin = { originKey: ORIGIN_KEY, channel: "D8", threadTs: "1.1", opRef: mailbox.turnOpRef };
-		return answerDialogOnSlack(broker, origin, request, signal);
+		const origin = {
+			originKey: ORIGIN_KEY,
+			channel: "200000000000000008",
+			threadTs: "700000000000000001",
+			opRef: mailbox.turnOpRef,
+		};
+		return answerDialog(broker, origin, request, signal);
 	}
 
 	/** Resolves once the n-th choice card is registered (the broker logs it right after). */
@@ -2240,10 +2266,14 @@ describe("mailbox + real ApprovalBroker: a message outside a select's options", 
 		requested = [];
 		requests = 0;
 		const port: ChannelPort = {
-			platform: "slack",
+			platform: "discord",
 			post: async (target, msg) => {
 				posts.push(msg.text);
-				return { platform: "slack", conversationId: target.conversationId, messageId: `${200 + posts.length}.0` };
+				return {
+					platform: "discord",
+					conversationId: target.conversationId,
+					messageId: String(800_000_000_000_000_000n + BigInt(posts.length)),
+				};
 			},
 			edit: async () => undefined,
 			react: async () => undefined,
@@ -2254,7 +2284,7 @@ describe("mailbox + real ApprovalBroker: a message outside a select's options", 
 		broker = new ApprovalBroker({
 			timezone: "Asia/Seoul",
 			channels: registryOf(port),
-			ownerUserId: "U_OWNER",
+			ownerUserId: "100000000000000001",
 			log: createLogger({
 				sink: (line) => {
 					if (!line.includes("choice_requested")) return;
@@ -2351,7 +2381,7 @@ describe("mailbox: a child started before a peer bot wrote in its conversation",
 			platformMessageId: "peer-1",
 			textRef: "peer",
 			threadRef: "peer-1",
-			peerUserId: "UPEER00001",
+			peerUserId: "100000000000000077",
 		});
 
 		// Both queued turns (the peer's and the owner's) fail at the prompt: no notice reached the child yet.
@@ -2374,7 +2404,7 @@ describe("mailbox: a child started before a peer bot wrote in its conversation",
 		expect(drivers).toHaveLength(1);
 	});
 
-	test("a child without host tools (agy, claude) is kept and gets no notice", async () => {
+	test("a child without host tools (agy) is kept and gets no notice", async () => {
 		hostTools = false;
 		router = buildRouter();
 		const mailbox = router.mailbox(ORIGIN);
@@ -2385,7 +2415,7 @@ describe("mailbox: a child started before a peer bot wrote in its conversation",
 			platformMessageId: "peer-1",
 			textRef: "peer",
 			threadRef: "peer-1",
-			peerUserId: "UPEER00001",
+			peerUserId: "100000000000000077",
 		});
 		await mailbox.resumePending();
 		await mailbox.sweepIdle();
@@ -2398,16 +2428,16 @@ describe("mailbox: a child started before a peer bot wrote in its conversation",
 });
 
 describe("mailbox: a peer bot's failed turn answers that bot", () => {
-	const PEER = "UPEER00001";
-	const BOT = "UBOT";
+	const PEER = "100000000000000077";
+	const BOT = "500000000000000000";
 	const notice = `<@${BOT}> <@${PEER}> 응답 실패(Cloud Code Assist stream ended) — 다시 요청하거나 직접 검토해 주세요`;
 	let seq = 0;
 
 	/** Records a peer bot's row (fenced like `normalizePeerInbound`) as the root of its own thread origin. */
 	function peerRow(text: string): { origin: string; threadRef: string } {
-		const ts = `900.${++seq}`;
-		const origin = `slack/ch/C1/t/${ts}`;
-		const threadRef = `C1:${ts}`;
+		const ts = `7000000000000009${String(++seq).padStart(2, "0")}`;
+		const origin = `discord/ch/${CH_ID}/t/${ts}`;
+		const threadRef = `${CH_ID}:${ts}`;
 		store.ensureOrigin(origin, sessionDirFor(join(dir, "sessions"), origin, 1));
 		store.recordInbound({
 			originKey: origin,
@@ -2829,11 +2859,11 @@ describe("mailbox: !restart runs without a driver or a turn", () => {
 	const deliveriesOf = (threadRef: string) => store.listDeliveries({}).filter((d) => d.threadRef === threadRef);
 
 	test("AC-2: the provider gets the conversation and thread once; its line is the one restart: answer", async () => {
-		const record = msg("!restart", { threadRef: "D1:100.1" });
+		const record = msg("!restart", { threadRef: `${DM_ID}:700000000000000101` });
 		await router.route(record);
 		expect(drivers).toHaveLength(0);
-		expect(restartCalls).toEqual([[ORIGIN, "D1:100.1"]]);
-		const answers = deliveriesOf("D1:100.1");
+		expect(restartCalls).toEqual([[ORIGIN, `${DM_ID}:700000000000000101`]]);
+		const answers = deliveriesOf(`${DM_ID}:700000000000000101`);
 		expect(answers.map((d) => [d.opRef, d.body])).toEqual([
 			[`restart:${record.platformMessageId}`, "🔄 재시작을 접수했습니다(apply-x)."],
 		]);
@@ -2842,33 +2872,33 @@ describe("mailbox: !restart runs without a driver or a turn", () => {
 
 	test("AC-2: a running turn is neither steered nor aborted by !restart", async () => {
 		driverOptions = { holdTurns: true };
-		await router.route(msg("hello", { threadRef: "D1:100.2" }));
-		await router.route(msg("!restart", { threadRef: "D1:100.3" }));
+		await router.route(msg("hello", { threadRef: `${DM_ID}:700000000000000102` }));
+		await router.route(msg("!restart", { threadRef: `${DM_ID}:700000000000000103` }));
 		const calls = drivers[0]?.calls ?? [];
 		expect(calls.filter((c) => c.startsWith("steer:") || c === "abort")).toEqual([]);
-		expect(restartCalls).toEqual([[ORIGIN, "D1:100.3"]]);
+		expect(restartCalls).toEqual([[ORIGIN, `${DM_ID}:700000000000000103`]]);
 		expect(router.mailbox(ORIGIN).state.busy).toBe(true);
 	});
 
 	test("AC-2: a peer bot's fenced !restart is never run as the command", async () => {
-		const origin = "slack/ch/C1/t/900.1";
+		const origin = `discord/ch/${CH_ID}/t/700000000000000901`;
 		store.ensureOrigin(origin, sessionDirFor(join(dir, "sessions"), origin, 1));
 		store.recordInbound({
 			originKey: origin,
-			platformMessageId: "C1:900.1",
+			platformMessageId: `${CH_ID}:700000000000000901`,
 			textRef: "[피어 봇 떡의 요청 — 오너 지시가 아니다]\n<<<quoted-0123>>>\n!restart\n<<<end-quoted-0123>>>",
-			threadRef: "C1:900.1",
-			peerUserId: "UPEER00001",
+			threadRef: `${CH_ID}:700000000000000901`,
+			peerUserId: "100000000000000077",
 		});
 		await router.mailbox(origin).resumePending();
 		expect(restartCalls).toEqual([]);
-		expect(deliveriesOf("C1:900.1").some((d) => d.opRef.startsWith("restart:"))).toBe(false);
+		expect(deliveriesOf(`${CH_ID}:700000000000000901`).some((d) => d.opRef.startsWith("restart:"))).toBe(false);
 	});
 
 	test("AC-2: a Teams conversation and a monitor origin are refused; the provider is never called", async () => {
 		const teams = msg("!restart", { originKey: TEAMS, threadRef: "t0123456789abcdef:act1" });
 		await router.route(teams);
-		const monitor = msg("!restart", { originKey: "monitor/self-retro", threadRef: "C1:-" });
+		const monitor = msg("!restart", { originKey: "monitor/self-retro", threadRef: `${CH_ID}:-` });
 		await router.route(monitor);
 		expect(restartCalls).toEqual([]);
 		expect(deliveriesOf("t0123456789abcdef:act1").map((d) => d.body)).toEqual([RESTART_REFUSED_TEXT]);
@@ -2876,15 +2906,28 @@ describe("mailbox: !restart runs without a driver or a turn", () => {
 		expect(store.getInbound(monitor.platformMessageId)?.state).toBe("answered");
 	});
 
+	test("AC-3: a past slack row's !restart is refused without throwing; the provider is never called", async () => {
+		const past = msg("!restart", { originKey: "slack/dm/D1", threadRef: "D1:100.9" });
+		await router.route(past);
+		expect(restartCalls).toEqual([]);
+		expect(deliveriesOf("D1:100.9").map((d) => d.body)).toEqual([RESTART_REFUSED_TEXT]);
+		expect(store.getInbound(past.platformMessageId)?.state).toBe("answered");
+	});
+
 	test("AC-3c: during a drain !restart is answered at once and never left pending for the next process", async () => {
 		router.draining = true;
-		const typed = msg("!restart", { threadRef: "D1:100.4" });
+		const typed = msg("!restart", { threadRef: `${DM_ID}:700000000000000104` });
 		await router.route(typed);
 		// A row already pending when the drain began (recorded, its dispatch queued behind the flip) is settled too.
-		store.recordInbound({ originKey: ORIGIN, platformMessageId: "late", textRef: "!restart", threadRef: "D1:100.5" });
+		store.recordInbound({
+			originKey: ORIGIN,
+			platformMessageId: "late",
+			textRef: "!restart",
+			threadRef: `${DM_ID}:700000000000000105`,
+		});
 		await router.mailbox(ORIGIN).resumePending();
-		expect(deliveriesOf("D1:100.4").map((d) => d.body)).toEqual([RESTART_DRAINING_TEXT]);
-		expect(deliveriesOf("D1:100.5").map((d) => d.body)).toEqual([RESTART_DRAINING_TEXT]);
+		expect(deliveriesOf(`${DM_ID}:700000000000000104`).map((d) => d.body)).toEqual([RESTART_DRAINING_TEXT]);
+		expect(deliveriesOf(`${DM_ID}:700000000000000105`).map((d) => d.body)).toEqual([RESTART_DRAINING_TEXT]);
 		expect(store.listInbound({ originKey: ORIGIN, state: "pending" })).toEqual([]);
 		router.draining = false;
 		await router.mailbox(ORIGIN).resumePending();

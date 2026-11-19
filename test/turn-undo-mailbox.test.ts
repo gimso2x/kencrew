@@ -22,7 +22,7 @@ class FakeClock {
 	}
 }
 
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = "discord/dm/200000000000000001";
 let dir: string;
 let home: string;
 let clock: FakeClock;
@@ -38,6 +38,8 @@ let gitFailRepos: Set<string>;
 let gitHook: (() => void) | undefined;
 /** A git subcommand (`restore`) that fails while every other call runs. */
 let gitFailCommand: string | undefined;
+/** What `turnUndo.onCommitted` was told: the turns that left a repository at another head. */
+let committed: Array<{ opRef: string; threadRef: string; repos: string[] }>;
 interface ApprovalCard {
 	summary: string;
 	settle: (approval: "approved" | "denied" | "timeout") => void;
@@ -80,6 +82,9 @@ function buildRouter(): OriginRouter {
 			return promise;
 		},
 		run: countingGit(realGit),
+		onCommitted: async (turn) => {
+			committed.push({ opRef: turn.opRef, threadRef: turn.threadRef, repos: turn.rows.map((row) => row.repo) });
+		},
 	};
 	return new OriginRouter({
 		timezone: "Asia/Seoul",
@@ -128,6 +133,7 @@ beforeEach(() => {
 	gitFailRepos = new Set();
 	gitHook = undefined;
 	gitFailCommand = undefined;
+	committed = [];
 	approvals = [];
 	sessionStore = new FakeSessionStore();
 	router = buildRouter();
@@ -237,6 +243,23 @@ describe("turn snapshots around a turn (AC-3)", () => {
 		expect(rows[0]?.repo).toBe(repo);
 		expect(rows[0]?.revertedAt).toBeNull();
 		expect(rows[0]?.endedAt as number).toBeGreaterThanOrEqual(rows[0]?.startedAt as number);
+	});
+
+	test("onCommitted hears a turn whose repository head moved, with the turn's request and answer in the ledger", async () => {
+		const repo = makeRepo(repos);
+		driverOptions = {
+			respond: () => {
+				writeFileSync(join(repo, "committed.txt"), "commit\n");
+				git(repo, "add", "--", "committed.txt");
+				git(repo, "commit", "-q", "-m", "feat: 커밋");
+				return "커밋했습니다";
+			},
+		};
+		await runRecordedTurn("커밋해줘");
+		expect(committed).toHaveLength(1);
+		expect(committed[0]?.repos).toEqual([repo]);
+		const opRef = committed[0]?.opRef as string;
+		expect(store.turnTexts(ORIGIN, opRef)).toEqual({ inbound: "커밋해줘", conclusion: "커밋했습니다" });
 	});
 
 	test("startedAt is the time the before-capture began, not when it finished", async () => {
@@ -528,7 +551,7 @@ describe("a repository without a snapshot is named, never silently skipped (#92)
 describe("overlap with another conversation (AC-6c)", () => {
 	test("a file two overlapping conversations changed stays put; the one only this conversation changed comes back", async () => {
 		const repo = makeRepo(repos);
-		const other = "slack/dm/D2";
+		const other = "discord/dm/200000000000000002";
 		// The ledger rows of both turns are real captures of this work tree: A's window overlaps B's.
 		const before = await captureTreeForTest(repo);
 		writeFileSync(join(repo, "x.txt"), "by A\n");

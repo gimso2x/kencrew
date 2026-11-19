@@ -36,7 +36,7 @@ export type FakeDiscordCall =
 	| ({ method: "listMessages" } & ListMessagesArgs);
 
 /**
- * In-memory transport, the Discord twin of `FakeSlackTransport`: every call lands in `calls`, `failNext[method]`
+ * In-memory Discord transport: every call lands in `calls`, `failNext[method]`
  * queues errors thrown by that method's next calls, `emit*` feed gateway events to the handlers given to `start`.
  */
 export class FakeDiscordTransport implements DiscordTransport {

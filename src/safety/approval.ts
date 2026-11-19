@@ -15,7 +15,7 @@ export interface ApprovalOrigin {
 	originKey: string;
 	/** The running turn's opRef when the dialog was asked: a text held for an `input` is only used within its turn. */
 	opRef?: string | undefined;
-	/** Slack channel of the conversation. */
+	/** Channel of the conversation. */
 	channel: string;
 	/** The conversation's current thread (absent: the channel's main view). */
 	threadTs?: string | undefined;
@@ -35,7 +35,7 @@ export const CHOICE_ACTION_PREFIX = "ompbot:choice";
 /** An unanswered card counts as denied after this long; the deadline is shown under its buttons. */
 export const DEFAULT_APPROVAL_TIMEOUT_MS = 30 * 60 * 1000;
 const SUMMARY_LIMIT = 2500;
-/** Per-section limit for the optional structured fields; the whole card stays under `CARD_LIMIT` for one Slack section. */
+/** Per-section limit for the optional structured fields; the whole card stays under `CARD_LIMIT` for one card section. */
 const FIELD_LIMIT = 400;
 const CARD_LIMIT = 2900;
 
@@ -231,9 +231,8 @@ export interface ApprovalStore {
 	}>;
 }
 
-/** The escalation channel of each platform that has one (Slack: `escalationChannel`, Discord: `channels.discord.escalationChannelId`). */
+/** The escalation channel of each platform that has one (Discord: `channels.discord.escalationChannelId`). */
 export interface EscalationChannels {
-	slack?: string | undefined;
 	discord?: string | undefined;
 }
 
@@ -245,9 +244,9 @@ export interface ApprovalBrokerOptions {
 	platformOwners?: Partial<Record<ChatPlatform, string>> | undefined;
 	/**
 	 * The channel of each platform that receives the cards of that platform's requests that carry an origin (`ask` with
-	 * `origin`); a platform without one: the origin's own channel. A string is the Slack channel alone.
+	 * `origin`); a platform without one: the origin's own channel.
 	 */
-	escalationChannel?: string | EscalationChannels | undefined;
+	escalationChannel?: EscalationChannels | undefined;
 	log: Logger;
 	/** Durable ledger for approvals: survives restarts, double-click safe, expired rows are swept into cards. */
 	store: ApprovalStore;
@@ -333,7 +332,7 @@ const CHOICE_LEDGER_GRACE_MS = 60_000;
 const CHOICE_HEADS = ["❓", "🔒"];
 /** A free text held for the `input` dialog behind an "Other" row is used within this long, else dropped. */
 const HELD_INPUT_TTL_MS = 60_000;
-/** Slack: at most 75 characters per button label. */
+/** At most 75 characters per button label. */
 const BUTTON_LABEL_LIMIT = 75;
 
 /** One short line of the owner's reply for the settled card. */
@@ -447,9 +446,9 @@ export class ApprovalBroker {
 		return requests.length;
 	}
 
-	/** Config reload: cards requested from now on go to the new escalation channels (a string: Slack's alone). */
-	setEscalationChannel(channel: string | EscalationChannels | undefined): void {
-		this.#escalation = typeof channel === "string" ? { slack: channel } : { ...channel };
+	/** Config reload: cards requested from now on go to the new escalation channels */
+	setEscalationChannel(channel: EscalationChannels | undefined): void {
+		this.#escalation = { ...channel };
 	}
 
 	/** Like `ask`, for callers with no use for a free-text reply (a reply counts as not approved). */
@@ -465,8 +464,8 @@ export class ApprovalBroker {
 
 	/** `채널·스레드 링크` text of the requesting conversation; without a thread link it is the channel alone. */
 	#whereOf(origin: ApprovalOrigin, threadUrl: string | undefined): string {
-		// A Discord DM id is a snowflake, so only the origin's kind tells it; a Slack DM id starts with `D`.
-		const dm = parseChatOrigin(origin.originKey)?.kind === "dm" || origin.channel.startsWith("D");
+		// A Discord DM id is a snowflake, so only the origin's kind tells it.
+		const dm = parseChatOrigin(origin.originKey)?.kind === "dm";
 		const label = dm ? "DM" : `<#${origin.channel}>`;
 		return threadUrl === undefined ? label : `${label} · <${threadUrl}|스레드 보기>`;
 	}
@@ -499,8 +498,7 @@ export class ApprovalBroker {
 		const { log, store } = this.#options;
 		// Each platform has its own escalation channel: a request never moves to another platform's.
 		const requestPlatform = platformOfConversationId(requestChannel);
-		const escalation =
-			requestPlatform === "slack" || requestPlatform === "discord" ? this.#escalation[requestPlatform] : undefined;
+		const escalation = requestPlatform === "discord" ? this.#escalation[requestPlatform] : undefined;
 		const escalated =
 			origin !== undefined &&
 			escalation !== undefined &&

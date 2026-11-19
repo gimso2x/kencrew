@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createLogger, fileSink } from "../src/log";
+import { createLogger } from "../src/log";
 import { createAggregatingLogger, startServiceAlive } from "../src/ops/log-hygiene";
+import { openLogSink } from "../src/ops/logfile";
 import { byteLength, clearSecretIndex, indexSecretValue, redact } from "../src/redact";
 
 const clock = { now: () => Date.UTC(2026, 9, 19, 12, 0, 0) };
@@ -94,8 +95,8 @@ describe("logger", () => {
 	});
 
 	test("file sink writes a 0600 log with no token pattern (grep -c = 0)", () => {
-		const path = join(dir, "ompbot.log");
-		const log = createLogger({ sink: fileSink(path), clock, redact });
+		const { path, sink } = openLogSink(dir);
+		const log = createLogger({ sink, clock, redact });
 		log.info("startup", { bot: "xoxb-TEST-0", app: "xapp-TEST-0", other: "xoxe-TEST-0" });
 		log.error("failure", { err: "auth failed for xoxp-TEST-0" });
 		const text = readFileSync(path, "utf8");

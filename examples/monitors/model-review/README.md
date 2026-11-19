@@ -39,7 +39,7 @@ python3 "$H/scripts/model-review.py" check <보고 파일> --collect <수집 파
 
 수집기 인자: `--home`(기본 `$OMPBOT_HOME`, 둘 다 없으면 exit 2), `--extra-home`, `--allow-same-provider`, `--omp-sessions`(기본 `~/.omp/agent/sessions`), `--state-dir`(기본 `<home>/workspace/model-review`), `--omp`, `--now <ISO8601>`, `--days N`(기본 7), `--no-snapshot`, `--mcp-config <file>`(기본 `~/.omp/agent/mcp.json`). 못 읽은 소스는 `## 소스 상태`에 `missing`/`error`로 남고 exit 0이다. DB는 읽기 전용으로 열고, 쓰는 파일은 `<state-dir>/catalog-<YYYY-MM-DD>.json` 하나뿐이다(같은 날 재실행은 덮어씀). 첫 회차는 비교할 스냅샷이 없어 `catalog-prev: missing`, `기준 스냅샷 저장(비교 없음)`이 정상이다.
 
-용도는 세션 경로 첫 세그먼트로 가른다: `monitor` 모니터, `ompbot%2Fwork%2F` 레인, `review` 리뷰, `discord`·`slack`·`telegram`·`teams` 대화, 그 밖 기타, `--omp-sessions` 아래는 omp직접. jsonl 파일명(확장자 제외)과 같은 이름 디렉터리 아래의 jsonl은 깊이와 관계없이 하위로 먼저 판정한다.
+용도는 세션 경로 첫 세그먼트로 가른다: `monitor` 모니터, `ompbot%2Fwork%2F` 레인, `review` 리뷰, `discord`·`telegram`·`teams` 대화, 그 밖 기타, `--omp-sessions` 아래는 omp직접. jsonl 파일명(확장자 제외)과 같은 이름 디렉터리 아래의 jsonl은 깊이와 관계없이 하위로 먼저 판정한다.
 
 `## MCP 호출`은 정보 섹션이다(규칙 없음, 제안 근거로 쓰지 않음). assistant 메시지의 toolCall 중 이름이 `mcp__<서버>_<도구>`인 것과 `write`의 `path`가 `xd://mcp__<서버>_<도구>`인 것만 센다. 서버 이름은 `--mcp-config`의 `mcpServers` 키로 가르고(못 읽으면 `mcp__` 뒤 첫 `_` 앞까지), 오류는 같은 toolCallId의 toolResult `isError`다. 창 안 호출이 없는 설정 서버는 `0`으로 나온다.
 

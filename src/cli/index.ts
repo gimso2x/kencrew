@@ -34,7 +34,7 @@ const DISPATCH_HOST_CHECK_MS = 10_000;
 const USAGE = `usage: ompbot <command>
 ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single instance)
   status [--json]                ledger counts, origins, omp version
-  doctor                         check home, secrets, omp, omp runtime, bun, Slack auth, backup bundle; then herdr --version and the herdr omp
+  doctor                         check home, secrets, omp, omp runtime, bun, Discord auth, backup bundle; then herdr --version and the herdr omp
                                  integration (herdr on), and ssh reach plus the herdr omp integration per dispatchHosts entry (integration
                                  and host lines are warnings and do not change the exit code)
   gc [--dry-run]                 delete previous-epoch session dirs, idle thread origins and deleted-monitor origins older than sessionRetentionDays (default 30)
@@ -51,13 +51,13 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
   unfreeze                       remove <home>/FROZEN
   gates [--json] [--strict]      read-only health projection; each gate is open, closed or unknown (nothing to judge: no
                                  heartbeat stamp or no ompbot.db yet); exit 1 if any open, with --strict also if any unknown.
-                                 gates: backup_age, offsite_age (only with config offsite), sweep_stalled, slack_disconnected,
+                                 gates: backup_age, offsite_age (only with config offsite), sweep_stalled,
                                  discord_disconnected (only with config channels.discord), frozen,
                                  herdr_unreachable (only with a herdr-health stamp), omp_runtime (only with agent omp),
                                  disk_low, host_pressure, inbound_starved, origin_silent, deliveries_overdue, lanes_stuck,
                                  monitors_failed, monitors_stalled, turns_failing, ledger_unreadable,
-                                 cost_cap (only with config costCap.dailyUsd)
-  inject --origin <slack|discord>/<dm|ch>/ID --as-owner --text <t> [--quoted <q>] [--thread <ts|message id>]
+                                 cost_cap (warning only, with config costCap.dailyUsd)
+  inject --origin discord/<dm|ch>/ID --as-owner --text <t> [--quoted <q>] [--thread <message id>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
 ${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${LANES_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${TEAMS_USAGE}`;

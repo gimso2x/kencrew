@@ -8,7 +8,7 @@ export function seedDb(homeDir: string): void {
 	const db = new Database(join(homeDir, "ompbot.db"), { create: true, strict: true });
 	db.run("PRAGMA journal_mode=WAL");
 	db.run("CREATE TABLE origins (origin_key TEXT PRIMARY KEY, epoch INTEGER NOT NULL)");
-	db.run("INSERT INTO origins VALUES ('slack/dm/D1', 1)");
+	db.run("INSERT INTO origins VALUES ('discord/dm/200000000000000001', 1)");
 	db.close();
 }
 

@@ -27,12 +27,14 @@ import {
 	formatReadFailureNotice,
 	formatSpecChangedNotice,
 	formatStaleNotice,
+	formatWorkingSilentNotice,
 	NUDGE_MAX,
 	postCardToThread,
 	postToThread,
+	type ReachedAutoLandNote,
 	setStatusReaction,
 	type TaskCard,
-	type TaskSlackLog,
+	type TaskChatLog,
 	taskLandNote,
 	unmetLines,
 } from "./notify";
@@ -45,6 +47,11 @@ export const TASK_SWEEP_MS = 5 * 60_000;
 export const STALE_REMIND_MS = 30 * 60_000;
 /** ... and this long → the task thread is told once. */
 export const STALE_NOTICE_MS = 2 * 60 * 60_000;
+/**
+ * A herdr-working agent gets no reminder, so a hung or looping worker would stay silent until the 2-hour notice: this
+ * long without a PROGRESS.md update while working, the thread is told once earlier with the screen tail (dori `STALLED`).
+ */
+export const WORKING_SILENT_NOTICE_MS = 45 * 60_000;
 /** A task left in review this long is brought up to the owner again, once per interval. */
 export const REVIEW_REALERT_MS = 24 * 60 * 60_000;
 /** Consecutive unreadable sweeps before the thread is told once. */
@@ -200,6 +207,8 @@ export interface TaskSweepDeps {
 	channels: ChannelRegistry;
 	/** The task's herdr board card link for the reached/blocked/stale notices; absent → no board footer. */
 	boardLink?(row: TaskRow): Promise<string | undefined>;
+	/** The dashboard's diff view of the task for the reached card; absent or undefined → no `변경 보기:` line. */
+	diffLink?(row: TaskRow): string | undefined;
 	/** Live `taskAutoLand` (maxRisk defaulted); `undefined` (or absent) → every reached task gets the 머지 question. */
 	autoLandPolicy?(): AutoLandPolicy | undefined;
 	/** Whether a local task's repository shares its git common directory with one of `repos`. Never asked for a remote task. */
@@ -218,9 +227,11 @@ export interface TaskSweepDeps {
 	gatePending?(row: TaskRow): Promise<boolean>;
 	/** Why auto-merge is held after an apply code rollback (`<home>/autoland.hold`); undefined = not held. */
 	autoLandHold?(): string | undefined;
+	/** `false` while the daemon cannot land (draining, unstarted): a reach then waits for the next sweep, without a card. */
+	autoLandReady?(): boolean;
 	ownerUserId: string;
 	now(): number;
-	log: TaskSlackLog & { info(event: string, fields?: Record<string, unknown>): void };
+	log: TaskChatLog & { info(event: string, fields?: Record<string, unknown>): void };
 }
 
 /** What one check did, for the CLI (`tasks check`). */
@@ -442,6 +453,11 @@ export class TaskSweeper {
 		}
 
 		if (judgement.reached) {
+			// A daemon that cannot land now (a restart's drain) leaves the reach to the next sweep: nothing to ask the owner.
+			if (this.#deps.autoLandPolicy?.() !== undefined && this.#deps.autoLandReady?.() === false) {
+				log.info("task_reach_deferred", { task: row.taskId, reason: "not_ready" });
+				return this.#result(row, status, judgement, actions);
+			}
 			// The reviewed row, not the swept one: the core landing behind `autoLand` refuses a task not in review.
 			const reviewed = ledger.transition(
 				row.taskId,
@@ -538,7 +554,7 @@ export class TaskSweeper {
 		const policy = this.#deps.autoLandPolicy?.();
 		const link = await this.#boardLink(row);
 		if (policy === undefined || this.#deps.autoLand === undefined) {
-			await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link));
+			await this.#post(row, this.#reached(row, judgement, ownerUserId, link));
 			actions.push("Outcome notice");
 			return;
 		}
@@ -558,14 +574,17 @@ export class TaskSweeper {
 		// A task in the confident band is judged without the gate's receipts first: only one the gate alone holds back
 		// reaches `autoLand`, whose gate then runs review → QA → landing (doc/plans/task-review-qa-gate.md 설계 4).
 		const band = confidentBand(row.risk, policy);
-		const ungated = band === undefined ? policy : { repos: policy.repos, maxRisk: band.maxRisk };
+		const ungated =
+			band === undefined
+				? policy
+				: {
+						repos: policy.repos,
+						maxRisk: band.maxRisk,
+					};
 		if ([...held, ...autoLandBlockers(row, judgement, ungated, repoMatched)].length > 0) {
 			const blockers = [...held, ...autoLandBlockers(row, judgement, policy, repoMatched)];
 			log.info("task_autoland_skipped", { task: row.taskId, reasons: blockers.join(" · ") });
-			await this.#post(
-				row,
-				buildReachedCard(row, judgement, ownerUserId, link, { kind: "skipped", reasons: blockers }),
-			);
+			await this.#post(row, this.#reached(row, judgement, ownerUserId, link, { kind: "skipped", reasons: blockers }));
 			actions.push("Outcome notice (auto-merge skipped)");
 			return;
 		}
@@ -580,7 +599,7 @@ export class TaskSweeper {
 		}
 		// One card per reach, by what the landing came to.
 		if (outcome.state === "not_accepted") {
-			await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link, { kind: "failed" }));
+			await this.#post(row, this.#reached(row, judgement, ownerUserId, link, { kind: "failed" }));
 			actions.push("Outcome notice (auto-merge failed)");
 			return;
 		}
@@ -595,13 +614,13 @@ export class TaskSweeper {
 				reasons: outcome.reasons,
 				gate: this.#deps.ledger.require(row.taskId).gate,
 			};
-			await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link, card));
+			await this.#post(row, this.#reached(row, judgement, ownerUserId, link, card));
 			actions.push("Outcome notice (gate held)");
 			return;
 		}
 		if (outcome.state === "blocked") {
 			const reasons = [taskLandNote(outcome)];
-			await this.#post(row, buildReachedCard(row, judgement, ownerUserId, link, { kind: "skipped", reasons }));
+			await this.#post(row, this.#reached(row, judgement, ownerUserId, link, { kind: "skipped", reasons }));
 			actions.push("Outcome notice (auto-merge blocked)");
 			return;
 		}
@@ -624,7 +643,7 @@ export class TaskSweeper {
 							channels,
 							log,
 							row.threadRef,
-							buildReachedCard(row, judgement, ownerUserId, link, { kind: "gating" }),
+							this.#reached(row, judgement, ownerUserId, link, { kind: "gating" }),
 						)
 					: Promise.resolve(undefined),
 			ended: async (end: TaskGateEnd, card) => {
@@ -646,12 +665,12 @@ export class TaskSweeper {
 				const reasons = end.blockers.length > 0 ? end.blockers : landed === undefined ? [] : [taskLandNote(landed)];
 				log.info("task_autoland_skipped", { task: row.taskId, reasons: reasons.join(" · ") });
 				if (card !== undefined) {
-					const gated = buildReachedCard(row, judgement, ownerUserId, link, { kind: "gated", gate: end.gate });
+					const gated = this.#reached(row, judgement, ownerUserId, link, { kind: "gated", gate: end.gate });
 					await editThreadCard(channels, log, card, gated);
 				}
 				await this.#post(
 					row,
-					buildReachedCard(row, judgement, ownerUserId, link, { kind: "skipped", reasons, gate: end.gate }),
+					this.#reached(row, judgement, ownerUserId, link, { kind: "skipped", reasons, gate: end.gate }),
 				);
 			},
 		};
@@ -672,13 +691,17 @@ export class TaskSweeper {
 		const evaluation = await this.#deps.evaluate(row, this.#checks);
 		if (!evaluation.ok || !(await this.#repoMatches(row, policy.repos))) return;
 		const { judgement } = evaluation;
-		if (autoLandBlockers(row, judgement, { repos: policy.repos, maxRisk: band.maxRisk }, true).length > 0) return;
+		const ungated = {
+			repos: policy.repos,
+			maxRisk: band.maxRisk,
+		};
+		if (autoLandBlockers(row, judgement, ungated, true).length > 0) return;
 		const link = await this.#boardLink(row);
 		const outcome = await autoLand(row, this.#gateHooks(row, judgement, link, false));
 		log.info("task_gate_resumed", { task: row.taskId, state: outcome.state });
 		if (outcome.state === "held" && outcome.reasons.length > 0) {
 			const card = { kind: "skipped" as const, reasons: outcome.reasons, gate: ledger.require(row.taskId).gate };
-			await this.#post(row, buildReachedCard(row, judgement, this.#deps.ownerUserId, link, card));
+			await this.#post(row, this.#reached(row, judgement, this.#deps.ownerUserId, link, card));
 		}
 	}
 
@@ -865,6 +888,20 @@ export class TaskSweeper {
 				actions.push("stale reminder to agent");
 			}
 		}
+		if (
+			pausedAt === undefined &&
+			status === "working" &&
+			age >= WORKING_SILENT_NOTICE_MS &&
+			age < STALE_NOTICE_MS &&
+			ledger.recordNotice(row.taskId, `silent45:${base}`)
+		) {
+			const screen = await this.#readAgent(row);
+			await this.#post(
+				row,
+				formatWorkingSilentNotice(row, Math.floor(age / 60_000), screen, await this.#boardLink(row)),
+			);
+			actions.push("working silent notice");
+		}
 		if (pausedAt === undefined && age >= STALE_NOTICE_MS && ledger.recordNotice(row.taskId, `stale2h:${base}`)) {
 			// A question left unanswered must not sink with the stale notice: the owner is mentioned then.
 			const asked = question === undefined ? undefined : this.#deps.ownerUserId;
@@ -1021,6 +1058,17 @@ export class TaskSweeper {
 		}
 		if (!result.ok) this.#deps.log.warn("task_agent_status_failed", { task: row.taskId, error: result.error });
 		return result;
+	}
+
+	/** The reached card with the diff view line when the board is configured. */
+	#reached(
+		row: TaskRow,
+		judgement: TaskJudgement,
+		ownerUserId: string,
+		link: string | undefined,
+		note?: ReachedAutoLandNote,
+	): TaskCard {
+		return buildReachedCard(row, judgement, ownerUserId, link, note, this.#deps.diffLink?.(row));
 	}
 
 	async #boardLink(row: TaskRow): Promise<string | undefined> {

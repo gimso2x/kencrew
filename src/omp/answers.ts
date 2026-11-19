@@ -26,14 +26,14 @@ export function turnAnswerParts(entries: readonly OmpEntry[]): string[] {
 	return parts;
 }
 
-/** Shortest status note (characters of the trimmed text) next to a `wait` call that is sent while the turn runs. */
+/** Shortest status note (characters of the trimmed text) next to a `wait` or `ask` call that is sent while the turn runs. */
 export const WAIT_NOTE_MIN_CHARS = 20;
 
 /**
  * What a finished assistant message (omp `message_end` payload) of a running turn has for the owner: a stop-ended
  * answer (`answer`), or a note of at least {@link WAIT_NOTE_MIN_CHARS} characters written in the same message as a
- * `wait` call (`waitNote`: status while blocking, answers to owner messages steered in meanwhile). Text is extracted
- * like `entryText`: text blocks only, verbatim.
+ * `wait` call (status while blocking, answers to owner messages steered in meanwhile) or an `ask` call (the context
+ * the owner must read before choosing) — `waitNote`. Text is extracted like `entryText`: text blocks only, verbatim.
  */
 export function interimOf(message: unknown): { kind: "answer" | "waitNote"; text: string } | undefined {
 	if (typeof message !== "object" || message === null) return undefined;
@@ -43,7 +43,11 @@ export function interimOf(message: unknown): { kind: "answer" | "waitNote"; text
 	if (stopReason === "stop") return text.trim() === "" ? undefined : { kind: "answer", text };
 	if (stopReason !== "toolUse" || !Array.isArray(content)) return undefined;
 	const waits = content.some(
-		(part) => typeof part === "object" && part !== null && part.type === "toolCall" && part.name === "wait",
+		(part) =>
+			typeof part === "object" &&
+			part !== null &&
+			part.type === "toolCall" &&
+			(part.name === "wait" || part.name === "ask"),
 	);
 	return waits && Array.from(text.trim()).length >= WAIT_NOTE_MIN_CHARS ? { kind: "waitNote", text } : undefined;
 }

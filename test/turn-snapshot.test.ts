@@ -64,7 +64,7 @@ function rowOf(
 ): TurnSnapshotRow {
 	return {
 		id: 1,
-		originKey: "slack/dm/D1",
+		originKey: "discord/dm/200000000000000001",
 		opRef: "fake_req_1",
 		repo: repos[0] ?? "",
 		headBefore: snapshots.before.head,
@@ -231,11 +231,11 @@ describe("planUndo / applyUndo (AC-2)", () => {
 
 		const a = rowOf(
 			{ before: base, after: aAfter },
-			{ id: 1, originKey: "slack/dm/DA", startedAt: 1000, endedAt: 2000 },
+			{ id: 1, originKey: "discord/dm/200000000000000011", startedAt: 1000, endedAt: 2000 },
 		);
 		const b = rowOf(
 			{ before: base, after: bAfter },
-			{ id: 2, originKey: "slack/dm/DB", startedAt: 1500, endedAt: 3000 },
+			{ id: 2, originKey: "discord/dm/200000000000000012", startedAt: 1500, endedAt: 3000 },
 		);
 
 		const plan = await planUndo({ row: b, others: [a] });
@@ -262,11 +262,11 @@ describe("planUndo / applyUndo (AC-2)", () => {
 		const bAfter = await captureTree(repo);
 		const a = rowOf(
 			{ before: base, after: aAfter },
-			{ id: 1, originKey: "slack/dm/DA", startedAt: 1000, endedAt: 2000 },
+			{ id: 1, originKey: "discord/dm/200000000000000011", startedAt: 1000, endedAt: 2000 },
 		);
 		const b = rowOf(
 			{ before: base, after: bAfter },
-			{ id: 2, originKey: "slack/dm/DB", startedAt: 1500, endedAt: 3000 },
+			{ id: 2, originKey: "discord/dm/200000000000000012", startedAt: 1500, endedAt: 3000 },
 		);
 		// Only the other row's diff fails; the row's own diff and tree listings still work.
 		const failing: GitRunner = async (dir, args, options) => {
@@ -298,11 +298,11 @@ describe("planUndo / applyUndo (AC-2)", () => {
 
 		const a = rowOf(
 			{ before: base, after: aAfter },
-			{ id: 1, originKey: "slack/dm/DA", startedAt: 1000, endedAt: 2000 },
+			{ id: 1, originKey: "discord/dm/200000000000000011", startedAt: 1000, endedAt: 2000 },
 		);
 		const b = rowOf(
 			{ before: aAfter, after: bAfter },
-			{ id: 2, originKey: "slack/dm/DA", startedAt: 2500, endedAt: 3000 },
+			{ id: 2, originKey: "discord/dm/200000000000000011", startedAt: 2500, endedAt: 3000 },
 		);
 
 		const plan = await planUndo({ row: b, others: [a] });
@@ -471,7 +471,7 @@ describe("ledger retention and refs (AC-4)", () => {
 		let pruned: TurnSnapshotRow[] = [];
 		for (let i = 0; i < 21; i++) {
 			const recorded = store.recordTurnSnapshot({
-				originKey: "slack/dm/D1",
+				originKey: "discord/dm/200000000000000001",
 				opRef: `op_${i}`,
 				repo,
 				headBefore: "h0",
@@ -484,12 +484,12 @@ describe("ledger retention and refs (AC-4)", () => {
 			pruned = recorded.pruned;
 		}
 		expect(pruned.map((row) => row.opRef)).toEqual(["op_0"]);
-		const kept = store.listTurnSnapshots({ originKey: "slack/dm/D1" });
+		const kept = store.listTurnSnapshots({ originKey: "discord/dm/200000000000000001" });
 		expect(kept).toHaveLength(20);
 		expect(kept.map((row) => row.opRef)).not.toContain("op_0");
 		// Another origin keeps its own rows.
 		store.recordTurnSnapshot({
-			originKey: "slack/dm/D2",
+			originKey: "discord/dm/200000000000000002",
 			opRef: "other",
 			repo,
 			headBefore: "h0",
@@ -499,7 +499,7 @@ describe("ledger retention and refs (AC-4)", () => {
 			startedAt: 1,
 			endedAt: 2,
 		});
-		expect(store.listTurnSnapshots({ originKey: "slack/dm/D2" })).toHaveLength(1);
+		expect(store.listTurnSnapshots({ originKey: "discord/dm/200000000000000002" })).toHaveLength(1);
 	});
 
 	test("removeTurnRefsSync ignores an inherited GIT_DIR/GIT_WORK_TREE: only the named repository loses its refs (qa-l #18)", () => {
@@ -538,12 +538,12 @@ describe("ledger retention and refs (AC-4)", () => {
 
 		const written = await recordTurn({
 			store,
-			originKey: "slack/dm/D1",
+			originKey: "discord/dm/200000000000000001",
 			opRef: "op",
 			capture: { startedAt: 1, endedAt: 2, before: new Map([[repo, base]]), after: new Map([[repo, after]]) },
 		});
 		expect(written).toBe(1);
-		const rows = store.listTurnSnapshots({ originKey: "slack/dm/D1" });
+		const rows = store.listTurnSnapshots({ originKey: "discord/dm/200000000000000001" });
 		expect(rows).toHaveLength(1);
 		const id = rows[0]?.id as number;
 		expect(git(repo, "rev-parse", `refs/ompbot/turns/${id}/before^{tree}`)).toBe(base.tree);
@@ -575,11 +575,11 @@ describe("ledger retention and refs (AC-4)", () => {
 			const opRef = `op_${daysAgo}`;
 			await recordTurn({
 				store,
-				originKey: "slack/dm/D1",
+				originKey: "discord/dm/200000000000000001",
 				opRef,
 				capture: { startedAt: endedAt - 1, endedAt, before: new Map([[repo, base]]), after: new Map([[repo, after]]) },
 			});
-			const rows = store.listTurnSnapshots({ originKey: "slack/dm/D1" });
+			const rows = store.listTurnSnapshots({ originKey: "discord/dm/200000000000000001" });
 			const row = rows.find((candidate) => candidate.opRef === opRef);
 			if (row === undefined) throw new Error(`row ${opRef} was not recorded`);
 			return row.id;
@@ -603,7 +603,7 @@ describe("ledger retention and refs (AC-4)", () => {
 			redact: (text) => text,
 		});
 		stores.push(reopened);
-		const kept = reopened.listTurnSnapshots({ originKey: "slack/dm/D1" });
+		const kept = reopened.listTurnSnapshots({ originKey: "discord/dm/200000000000000001" });
 		expect(kept.map((row) => row.id)).toEqual([freshId]);
 		expect(git(repo, "for-each-ref", "--format=%(refname)", "refs/ompbot/turns")).toBe(
 			`refs/ompbot/turns/${freshId}/after\nrefs/ompbot/turns/${freshId}/before`,
@@ -617,11 +617,11 @@ describe("ledger retention and refs (AC-4)", () => {
 		const base = await captureTree(repo);
 		const written = await recordTurn({
 			store,
-			originKey: "slack/dm/D1",
+			originKey: "discord/dm/200000000000000001",
 			opRef: "op",
 			capture: { startedAt: 1, endedAt: 2, before: new Map([[repo, base]]), after: new Map([[repo, base]]) },
 		});
 		expect(written).toBe(0);
-		expect(store.listTurnSnapshots({ originKey: "slack/dm/D1" })).toEqual([]);
+		expect(store.listTurnSnapshots({ originKey: "discord/dm/200000000000000001" })).toEqual([]);
 	});
 });

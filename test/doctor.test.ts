@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { OmpbotConfig } from "../src/config";
 import { checkDiscord, checkInjectedFiles, countOmpModels } from "../src/daemon/doctor";
 import { readVersion } from "../src/daemon/tools";
-import { makeHome, type TestHome, withDiscord } from "./helpers/bot-home";
+import { makeHome, type TestHome } from "./helpers/bot-home";
 
 let home: TestHome;
 let lines: string[];
@@ -165,7 +165,7 @@ describe("qa50b I-18: the doctor's bun line", () => {
 
 describe("doctor: discord", () => {
 	test("on: token mode, the bot user and the gateway each give one ok discord line; the token never shows", async () => {
-		const config: OmpbotConfig = withDiscord(home);
+		const config: OmpbotConfig = home.config;
 		const token = readFileSync(config.channels.discord?.botTokenFile ?? "", "utf8").trim();
 		await checkDiscord(config, report, fakeFetch(healthy));
 		expect(lines).toEqual([
@@ -178,7 +178,7 @@ describe("doctor: discord", () => {
 	});
 
 	test("a refused token (401) is a fail discord line", async () => {
-		const config = withDiscord(home);
+		const config = home.config;
 		await checkDiscord(
 			config,
 			report,
@@ -194,7 +194,7 @@ describe("doctor: discord", () => {
 	});
 
 	test("a token file that is not 0600 fails and no request is made", async () => {
-		const config = withDiscord(home);
+		const config = home.config;
 		chmodSync(config.channels.discord?.botTokenFile ?? "", 0o644);
 		await checkDiscord(config, report, fakeFetch(healthy));
 		expect(lines).toEqual(["fail discord token: mode=0644 expected=0600"]);
@@ -202,7 +202,7 @@ describe("doctor: discord", () => {
 	});
 
 	test("off: no discord line and no request", async () => {
-		await checkDiscord(home.config, report, fakeFetch(healthy));
+		await checkDiscord({ ...home.config, channels: {} }, report, fakeFetch(healthy));
 		expect(lines).toEqual([]);
 		expect(seen).toHaveLength(0);
 	});

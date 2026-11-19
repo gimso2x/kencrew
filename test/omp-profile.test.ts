@@ -191,7 +191,7 @@ describe("AC-2: ompProfile reaches every bot omp child", () => {
 	test("simple dispatch (ompbot_dispatch omp -p) runs with the configured profile", async () => {
 		const { calls, run } = recordingRunner();
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			ompProfile: "ompbot",
 			homeDir: "/h",
@@ -220,8 +220,13 @@ describe("AC-3: ompProfile follows omp's profile name rule", () => {
 			join(home, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				channels: { slack: { ownerUserId: "UOWNER0" } },
-				slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+				channels: {
+					discord: {
+						ownerUserId: "100000000000000001",
+						applicationId: "600000000000000000",
+						botTokenFile: "secrets/bot.token",
+					},
+				},
 				ompExecutable: "/usr/local/bin/omp",
 				workspaceDir: "workspace",
 				...extra,
@@ -256,7 +261,7 @@ describe("AC-3: ompProfile follows omp's profile name rule", () => {
 });
 
 describe("ompConfigOverlay: one --config for every omp child of the install", () => {
-	const ORIGINS = ["slack/dm/D0123456789", "discord/ch/123456/t/789", "monitor/daily", "lane/L-20261115-01"];
+	const ORIGINS = ["discord/dm/200000000000000001", "discord/ch/123456/t/789", "monitor/daily", "lane/L-20261115-01"];
 	const GROUP = `teams/ch/${teamsAlias("19:abcdef0123456789@thread.v2")}`;
 	const OLD_PRINT_ARGV = ["omp", "-p", "--no-session", "--append-system-prompt"];
 
@@ -268,8 +273,13 @@ describe("ompConfigOverlay: one --config for every omp child of the install", ()
 			join(home, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				channels: { slack: { ownerUserId: "UOWNER0" } },
-				slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+				channels: {
+					discord: {
+						ownerUserId: "100000000000000001",
+						applicationId: "600000000000000000",
+						botTokenFile: "secrets/bot.token",
+					},
+				},
 				ompExecutable: "/usr/local/bin/omp",
 				workspaceDir: "workspace",
 				...(overlay === null ? {} : { ompConfigOverlay: "glm.omp.yml" }),
@@ -295,7 +305,7 @@ describe("ompConfigOverlay: one --config for every omp child of the install", ()
 	async function simpleDispatchArgv(ompConfigOverlay: string | undefined): Promise<string[]> {
 		const { calls, run } = recordingRunner();
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D0123456789",
+			originKey: "discord/dm/200000000000000001",
 			ompExecutable: "omp",
 			...(ompConfigOverlay === undefined ? {} : { ompConfigOverlay }),
 			homeDir: "/h",

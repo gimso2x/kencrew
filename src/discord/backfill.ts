@@ -2,7 +2,13 @@
 // session, a restart or a failed live ingest does not, so a pass reads every Discord conversation's channel after its
 // watermark and feeds the messages through the adapter's live ingest path, where the ledger's duplicate check stops
 // anything already taken. Snowflake ids grow with time, so `after=<watermark>` is the whole window.
-import { countsTowardDeadLetter, SingleFlightBackfill } from "../channel/backfill";
+import {
+	BOOTSTRAP_LOOKBACK_MS,
+	countsTowardDeadLetter,
+	MAX_MESSAGE_ATTEMPTS,
+	MAX_PAGES,
+	SingleFlightBackfill,
+} from "../channel/backfill";
 import { errorText } from "../channel/text";
 import type { IngestOutcome } from "../channel/types";
 import type { Logger } from "../log";
@@ -16,18 +22,12 @@ import {
 
 /** Discord's `limit` maximum for a channel's message list. */
 export const PAGE_LIMIT = 100;
-/** Pages one target reads per pass; the rest waits for the next pass (the watermark keeps the place). */
-export const MAX_PAGES = 10;
-/** How far back a target without a watermark reaches on its first pass. */
-export const BOOTSTRAP_LOOKBACK_MS = 24 * 60 * 60_000;
-/** Definitive failures of one message before it is skipped so the messages after it are not held forever. */
-export const MAX_MESSAGE_ATTEMPTS = 3;
 /** Discord JSON error codes of a channel the bot cannot read: Unknown Channel, Missing Access. */
 const UNREADABLE_CODES: ReadonlySet<number> = new Set([10003, 50001]);
 /** First millisecond of the Discord epoch (2015-01-01T00:00:00Z); a snowflake's top 42 bits count from here. */
 const DISCORD_EPOCH_MS = 1_420_070_400_000n;
 
-/** The watermark key of a channel; Slack's are `ch:` / `thr:`, so the two never share a row. */
+/** The watermark key of a channel; the removed Slack backfill used `ch:` / `thr:`, so the two never share a row. */
 export function discordCursorKey(channelId: string): string {
 	return `dc:${channelId}`;
 }
@@ -48,9 +48,21 @@ function laterId(a: string, b: string): string {
 	return BigInt(a) >= BigInt(b) ? a : b;
 }
 
+/**
+ * Ledger row holding the epoch ms a channel was quarantined at, so a deleted or left channel is not read again on
+ * every daemon restart. Not under the `dc:` prefix: it is not a watermark.
+ */
+export function discordQuarantineKey(channelId: string): string {
+	return `bfq:dc:${channelId}`;
+}
+
+/** A quarantined channel is read again once a day, so a restored channel or re-invited bot comes back by itself. */
+export const QUARANTINE_RETRY_MS = 24 * 60 * 60 * 1000;
+
 export interface BackfillCursors {
 	getCursor(key: string): string | undefined;
 	setCursor(key: string, value: string): void;
+	deleteCursor(key: string): void;
 }
 
 /** One channel to read: a DM (`dm: true`), a server channel or thread (`false`), or not known yet (`undefined`). */
@@ -92,8 +104,8 @@ function unreadable(err: unknown): boolean {
 }
 
 /**
- * Single-flight recovery. A channel the bot cannot read is quarantined until the restart, so a left server costs one
- * failed read.
+ * Single-flight recovery. A channel the bot cannot read is quarantined for a day, kept in the ledger across restarts,
+ * so a deleted channel or left server costs one failed read a day.
  */
 export class DiscordBackfill extends SingleFlightBackfill {
 	readonly #deps: DiscordBackfillDeps;
@@ -124,7 +136,7 @@ export class DiscordBackfill extends SingleFlightBackfill {
 		let recovered = 0;
 		let skipped = 0;
 		for (const target of targets.values()) {
-			if (this.#quarantined.has(target.channelId)) {
+			if (this.#isQuarantined(target.channelId)) {
 				skipped += 1;
 				continue;
 			}
@@ -141,8 +153,17 @@ export class DiscordBackfill extends SingleFlightBackfill {
 		});
 	}
 
+	#isQuarantined(channelId: string): boolean {
+		if (this.#quarantined.has(channelId)) return true;
+		const at = Number(this.#deps.cursors.getCursor(discordQuarantineKey(channelId)));
+		if (!Number.isFinite(at) || this.#deps.now() - at >= QUARANTINE_RETRY_MS) return false;
+		this.#quarantined.add(channelId);
+		return true;
+	}
+
 	#quarantine(key: string, channelId: string, error: string): void {
 		this.#quarantined.add(channelId);
+		this.#deps.cursors.setCursor(discordQuarantineKey(channelId), String(this.#deps.now()));
 		this.#deps.log.warn("backfill_quarantined", { target: key, error });
 	}
 
@@ -206,6 +227,10 @@ export class DiscordBackfill extends SingleFlightBackfill {
 				if (unreadable(err)) this.#quarantine(key, target.channelId, redact(errorText(err)));
 				else log.warn("backfill_read_failed", { target: key, error: redact(errorText(err)) });
 				return done.scanned;
+			}
+			// Readable again (restored channel, re-invited bot): drop the day-long quarantine left by an earlier failure.
+			if (page === 0 && cursors.getCursor(discordQuarantineKey(target.channelId)) !== undefined) {
+				cursors.deleteCursor(discordQuarantineKey(target.channelId));
 			}
 			done.scanned += messages.length;
 			for (const message of messages) {

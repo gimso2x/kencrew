@@ -9,9 +9,6 @@ import type { OmpbotConfig } from "../config";
 
 /** Read by the running daemon on every use (after reload: the next inbound, card, answer, omp child or sweep). */
 export const LIVE_FIELDS = [
-	"mentionFreeChannels",
-	"logChannel",
-	"escalationChannel",
 	"skillReviewTurns",
 	"dispatchHosts",
 	"workerOmpArgs",
@@ -21,12 +18,12 @@ export const LIVE_FIELDS = [
 	"taskAutoLand",
 	"restartNotice",
 	"recallEnabled",
-	"peerBots",
-	"requireMention",
 	"peerHopLimit",
 	// The peer silence sweep and the call recording read it after every reload.
 	"peerSilenceAlert",
 	"turnSnapshot",
+	// Every note write reads it, so an added or removed block turns the notes on or off.
+	"wikiNotes",
 	"costCap",
 	// The lane manager reads `lanes.completionNudges` at every lane turn end.
 	"lanes",
@@ -43,7 +40,6 @@ export const LIVE_FIELDS = [
 export const RESTART_FIELDS = [
 	// The owner of each platform: the adapters and the approval broker take it when they start.
 	"channels",
-	"slack",
 	"ompExecutable",
 	"ompProfile",
 	// The file's path; its contents are read by each new omp child, so editing the file needs no restart.
@@ -52,7 +48,6 @@ export const RESTART_FIELDS = [
 	// Day keys, prompts and monitor tool descriptions take it when the daemon starts.
 	"timezone",
 	"agent",
-	"claudeExecutable",
 	"agyExecutable",
 	"model",
 	"thinking",
@@ -76,7 +71,7 @@ export const CLI_FIELDS = ["sessionRetentionDays", "maxBundleBytes", "apply"] as
 
 /**
  * Compile-time guard: a new config field must land in one of the three lists, or `reload` never reports it.
- * `schemaVersion`, `homeDir` and `configPath` come from where the file was loaded, and `deprecated` / `warnings` from which key
+ * `schemaVersion`, `homeDir` and `configPath` come from where the file was loaded, and `warnings` from which key
  * names it uses, not from a setting in it.
  */
 type UnclassifiedField = Exclude<
@@ -87,7 +82,6 @@ type UnclassifiedField = Exclude<
 	| "schemaVersion"
 	| "homeDir"
 	| "configPath"
-	| "deprecated"
 	| "warnings"
 >;
 const _everyFieldClassified: [UnclassifiedField] extends [never] ? true : never = true;

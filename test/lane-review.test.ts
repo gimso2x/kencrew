@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { DiscordChannelConfig, OmpbotConfig } from "../src/config";
 import { parseThreadRef } from "../src/core/normalize";
 import { Daemon } from "../src/daemon/daemon";
 import { GUEST_OVERLAY_YAML } from "../src/daemon/guest";
@@ -29,15 +30,21 @@ import { defaultGit, type GitRunner } from "../src/lanes/verify";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import type { TaskRisk } from "../src/tasks/docs";
 import { createTaskHostOps } from "../src/tasks/host";
 import type { AutoLandPolicy } from "../src/tasks/notify";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	CHANNEL,
+	discordBinding,
+	GUILD,
+	makeHome,
+	OWNER_DM,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
+import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import { type LaneHarness, laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
-import type { FakeCall } from "./helpers/slack-fake-transport";
 
 // The independent review before a lane's auto-merge (doc/plans/lane-review-receipt.md). Git is real (temp
 // repositories); the reviewer's `omp -p` is a fake process runner.
@@ -46,7 +53,7 @@ const CHECK_A = 'a.txt가 있다 [check: command ["sh","-c","test -f a.txt"]]';
 const MODEL = "test/reviewer";
 const REVIEW = { model: MODEL, timeoutMs: 60_000 };
 
-type Post = Extract<FakeCall, { method: "postMessage" }>;
+type Post = Extract<FakeDiscordCall, { method: "createMessage" }>;
 
 let home: TestHome;
 let repos: string[];
@@ -128,6 +135,14 @@ function commitIn(dir: string, file: string): string {
 	return git(dir, "rev-parse", "HEAD");
 }
 
+/** The test home's config with lanes opening in the server channel `CHANNEL` (the DM has no lane channel of its own). */
+function laneConfig(): OmpbotConfig {
+	return {
+		...home.config,
+		channels: { discord: { ...(home.config.channels.discord as DiscordChannelConfig), laneChannelId: CHANNEL } },
+	};
+}
+
 function requireLane(h: LaneHarness, name: string): LaneRow {
 	const lane = h.store.getLane(name);
 	if (lane === undefined) throw new Error(`no lane ${name}`);
@@ -144,7 +159,7 @@ async function closeLane(
 	const started = await h.manager.start({
 		title: "review",
 		cwd: repo,
-		channel: "D1",
+		channel: CHANNEL,
 		brief: "a.txt를 만든다",
 		acceptance: [CHECK_A],
 		risk,
@@ -158,9 +173,9 @@ async function closeLane(
 	return { lane: requireLane(h, started.name), sha };
 }
 
-const rootTsOf = (lane: LaneRow): string => parseThreadRef(lane.threadRef)?.threadTs ?? "";
-const cardPosts = (transport: WaitingTransport, lane: LaneRow): Post[] =>
-	transport.posts().filter((post) => post.threadTs === rootTsOf(lane) && post.ts !== lane.meta.statusTs);
+const rootIdOf = (lane: LaneRow): string => parseThreadRef(lane.threadRef)?.threadTs ?? "";
+const cardPosts = (transport: WaitingDiscordTransport, lane: LaneRow): Post[] =>
+	transport.posts().filter((post) => post.channelId === rootIdOf(lane) && post.id !== lane.meta.statusTs);
 const diffFiles = (lane: LaneRow): string[] =>
 	existsSync(reviewsDir()) ? readdirSync(reviewsDir()).filter((entry) => entry.startsWith(`${lane.meta.laneId}-`)) : [];
 /** The argument after `flag` in an argv. */
@@ -243,7 +258,7 @@ describe("review before auto-merge", () => {
 		expect(after.meta.land?.state).toBe("landed");
 		const cards = cardPosts(h.transport, lane);
 		expect(cards).toHaveLength(1);
-		expect(cards[0]?.text).toContain(`🔎 독립 리뷰 CLEAR · ${MODEL}`);
+		expect(cards[0]?.content).toContain(`🔎 독립 리뷰 CLEAR · ${MODEL}`);
 		// AC-12: the landing removed the review's diff file.
 		expect(diffFiles(lane)).toEqual([]);
 		await h.manager.tick();
@@ -265,10 +280,10 @@ describe("review before auto-merge", () => {
 		expect(blocked.meta.land?.state).toBe("pending");
 		const cards = cardPosts(h.transport, lane);
 		expect(cards).toHaveLength(1);
-		expect(cards[0]?.text).toContain("자동 머지 안 함: 독립 리뷰 BLOCK");
-		expect(cards[0]?.text).toContain("*리뷰 지적*");
-		expect(cards[0]?.text).toContain("테스트를 지웠다");
-		expect(JSON.stringify(cards[0]?.blocks ?? [])).toContain(`ompbot:lane:merge:${lane.name}`);
+		expect(cards[0]?.content).toContain("자동 머지 안 함: 독립 리뷰 BLOCK");
+		expect(cards[0]?.content).toContain("*리뷰 지적*");
+		expect(cards[0]?.content).toContain("테스트를 지웠다");
+		expect(JSON.stringify(cards[0]?.components ?? [])).toContain(`ompbot:lane:merge:${lane.name}`);
 		expect(diffFiles(lane)).toEqual([]);
 
 		const outcome = await h.manager.requestLand(lane.name, "owner");
@@ -299,7 +314,7 @@ describe("review before auto-merge", () => {
 		expect(requireLane(h, lane.name).meta.review).toMatchObject({ sha, verdict: "inconclusive", reason });
 		expect(counted.calls).toHaveLength(0);
 		expect(requireLane(h, lane.name).meta.land?.state).toBe("pending");
-		expect(cardPosts(h.transport, lane)[0]?.text).toContain(`독립 리뷰 확인 불가(${reason})`);
+		expect(cardPosts(h.transport, lane)[0]?.content).toContain(`독립 리뷰 확인 불가(${reason})`);
 		h.close();
 	});
 
@@ -309,9 +324,9 @@ describe("review before auto-merge", () => {
 		const policy = { repos: [repo], maxRisk: "L2" as const, review: REVIEW };
 		const first = harness(fake.run, policy);
 		// The Outcome card cannot be posted: the lane stays without a card for the next announce.
-		const post = first.transport.postMessage.bind(first.transport);
-		first.transport.postMessage = async (args) => {
-			if (args.text.includes("머지 대기")) throw new Error("slack down");
+		const post = first.transport.createMessage.bind(first.transport);
+		first.transport.createMessage = async (args) => {
+			if (args.content?.includes("머지 대기")) throw new Error("discord down");
 			return post(args);
 		};
 		const { lane, sha } = await closeLane(first, repo);
@@ -321,12 +336,14 @@ describe("review before auto-merge", () => {
 		first.close();
 
 		const second = harness(fake.run, policy);
+		// A fresh port after the restart: the lane thread is known to Discord, not to this transport yet.
+		second.transport.setChannel({ id: rootIdOf(lane), type: 11, parentId: CHANNEL, guildId: GUILD });
 		await second.manager.tick();
 		await second.settle();
 		expect(fake.calls).toHaveLength(1);
 		const shown = requireLane(second, lane.name);
 		expect(shown.meta.land?.cardTs).toBeDefined();
-		expect(cardPosts(second.transport, shown)[0]?.text).toContain("독립 리뷰 BLOCK");
+		expect(cardPosts(second.transport, shown)[0]?.content).toContain("독립 리뷰 BLOCK");
 		await second.manager.tick();
 		await second.settle();
 		expect(fake.calls).toHaveLength(1);
@@ -577,7 +594,7 @@ describe("run QA after the review (doc/plans/bot-org-risk-gates.md 단계 3, 레
 		expect(after.meta.land?.state).toBe("landed");
 		const cards = cardPosts(h.transport, lane);
 		expect(cards).toHaveLength(1);
-		expect(cards[0]?.text).toContain("🧪 실행 QA(뚱기 · test-qa): PASS");
+		expect(cards[0]?.content).toContain("🧪 실행 QA(뚱기 · test-qa): PASS");
 		// AC-6: the copy is gone, from disk and from git's worktree list.
 		expect(leftCopies()).toEqual([]);
 		expect(worktreeList(repo)).not.toContain(copy);
@@ -612,7 +629,7 @@ describe("run QA after the review (doc/plans/bot-org-risk-gates.md 단계 3, 레
 			expect(after.meta.land?.state).toBe("pending");
 			const cards = cardPosts(h.transport, lane);
 			expect(cards).toHaveLength(1);
-			expect(cards[0]?.text).toContain(`자동 머지 안 함: ${reason}`);
+			expect(cards[0]?.content).toContain(`자동 머지 안 함: ${reason}`);
 			expect(leftCopies()).toEqual([]);
 			expect(worktreeList(repo)).not.toContain(qaWorktreePath(qaDir(), lane, sha));
 			const worktree = after.meta.worktree ?? "";
@@ -641,7 +658,7 @@ describe("run QA after the review (doc/plans/bot-org-risk-gates.md 단계 3, 레
 		const after = requireLane(h, lane.name);
 		expect(after.meta.qa).toBeUndefined();
 		expect(counted.calls).toHaveLength(1);
-		expect(cardPosts(h.transport, lane)[0]?.text).not.toContain("실행 QA");
+		expect(cardPosts(h.transport, lane)[0]?.content).not.toContain("실행 QA");
 		h.close();
 	});
 
@@ -653,7 +670,7 @@ describe("run QA after the review (doc/plans/bot-org-risk-gates.md 단계 3, 레
 		const { lane } = await closeLane(h, repo, true, "L4");
 		expect(fake.calls).toHaveLength(0);
 		expect(counted.calls).toHaveLength(0);
-		const text = cardPosts(h.transport, lane)[0]?.text ?? "";
+		const text = cardPosts(h.transport, lane)[0]?.content ?? "";
 		expect(text).toContain("자동 머지 안 함: 위험 L4 > L2");
 		expect(text).not.toContain("실행 QA");
 		h.close();
@@ -785,7 +802,7 @@ describe("reviewLane: the prompt and the diff file (AC-8)", () => {
 	const lane = (over: Partial<LaneRow["meta"]> = {}): LaneRow => ({
 		name: "review",
 		title: "리뷰 제목",
-		threadRef: "D1:1.0",
+		threadRef: `${CHANNEL}:900000000000000001`,
 		originKey: "ompbot/work/review",
 		cwd: "/wt",
 		sessionDir: "/s",
@@ -1030,7 +1047,8 @@ describe("review confidence (doc/plans/lane-review-confidence.md)", () => {
 describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the lanes (AC-12)", () => {
 	test("the configured model and the default timeout reach the reviewer", async () => {
 		const repo = makeRepo(repos);
-		const transport = new WaitingTransport();
+		const transport = new WaitingDiscordTransport();
+		transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
 		const called = Promise.withResolvers<ReviewCall>();
 		const fake = fakeRunner((call) => {
 			called.resolve(call);
@@ -1039,8 +1057,11 @@ describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the l
 		const sessions = new FakeSessionStore();
 		const clock = { now: () => Date.now() };
 		const daemon = new Daemon({
-			config: { ...home.config, taskAutoLand: { repos: [repo], review: { model: "daemon/model" } } },
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			config: {
+				...laneConfig(),
+				taskAutoLand: { repos: [repo], review: { model: "daemon/model" } },
+			},
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: () => {}, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -1051,7 +1072,7 @@ describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the l
 		daemons.push(daemon);
 		await daemon.start();
 		const signal = new AbortController().signal;
-		const start = daemon.hostToolsFor("slack/dm/D1").find((tool) => tool.name === "ompbot_work_start");
+		const start = daemon.hostToolsFor(`discord/dm/${OWNER_DM}`).find((tool) => tool.name === "ompbot_work_start");
 		await start?.execute(
 			{ title: "daemon-review", cwd: repo, brief: "데몬 브리프", acceptance: [CHECK_A], risk: "L2" },
 			{ signal },
@@ -1079,20 +1100,21 @@ describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the l
 
 	test("review confidence AC-7: review.confident reaches the lanes — explicit L3 is reviewed and auto-merged on CLEAR 0.90; no risk and L4 ask unreviewed", async () => {
 		const repo = makeRepo(repos);
-		const transport = new WaitingTransport();
+		const transport = new WaitingDiscordTransport();
+		transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
 		const fake = fakeRunner(() => ({ code: 0, stdout: "확인함\nCONFIDENCE: 0.90\nVERDICT: CLEAR", timedOut: false }));
 		const sessions = new FakeSessionStore();
 		const clock = { now: () => Date.now() };
 		const landed: string[] = [];
 		const daemon = new Daemon({
 			config: {
-				...home.config,
+				...laneConfig(),
 				taskAutoLand: {
 					repos: [repo],
 					review: { model: "daemon/model", confident: { maxRisk: "L3", minConfidence: 0.85 } },
 				},
 			},
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: () => {}, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -1106,7 +1128,7 @@ describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the l
 		daemons.push(daemon);
 		await daemon.start();
 		const signal = new AbortController().signal;
-		const start = daemon.hostToolsFor("slack/dm/D1").find((tool) => tool.name === "ompbot_work_start");
+		const start = daemon.hostToolsFor(`discord/dm/${OWNER_DM}`).find((tool) => tool.name === "ompbot_work_start");
 		const closeWith = async (title: string, risk: string | undefined): Promise<LaneRow> => {
 			await start?.execute(
 				{ title, cwd: repo, brief: `${title} 브리프`, acceptance: [CHECK_A], ...(risk === undefined ? {} : { risk }) },
@@ -1133,8 +1155,8 @@ describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the l
 			["confident-l4", "L4"],
 		] as const) {
 			const [card] = transport.posts((text) => text.includes(`머지 대기 · ${title}`));
-			expect(card?.text).toContain(`자동 머지 안 함: 위험 ${risk} > L2`);
-			expect(card?.text).not.toContain("독립 리뷰");
+			expect(card?.content).toContain(`자동 머지 안 함: 위험 ${risk} > L2`);
+			expect(card?.content).not.toContain("독립 리뷰");
 			expect(daemon.store.getLane(title)?.meta.review).toBeUndefined();
 		}
 		expect(l4.meta.risk).toBe("L4");
@@ -1145,7 +1167,7 @@ describe("through the daemon: #autoLandPolicy hands taskAutoLand.review to the l
 		expect(argOf(fake.calls[0]?.cmd ?? [], "--model")).toBe("daemon/model");
 		expect(fake.calls[0]?.cmd.at(-1)).toContain("confident-l3 브리프");
 		const [auto] = transport.posts((text) => text.includes("자동 머지 · confident-l3"));
-		expect(auto?.text).toContain("🔎 독립 리뷰 CLEAR 0.90 · daemon/model");
+		expect(auto?.content).toContain("🔎 독립 리뷰 CLEAR 0.90 · daemon/model");
 		expect(daemon.store.getLane("confident-l3")?.meta.review).toMatchObject({ verdict: "CLEAR", confidence: 0.9 });
 		expect(transport.posts((text) => text.includes("머지 대기 · confident-l3"))).toHaveLength(0);
 		expect(fake.calls).toHaveLength(1);

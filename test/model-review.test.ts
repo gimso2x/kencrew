@@ -279,22 +279,23 @@ describe("model-review collect.py", () => {
 		expect([...order].sort((a, b) => a - b)).toEqual(order);
 		expect(models).not.toContain("100.00"); // 창 밖 100$ 레코드
 
-		// 용도별(총 6.20$): 대화 = discord 2.00 + 깊이3 1.00 + slack 부모 0.30, 하위 = 깊이2 0.20 + 깊이4 0.15 + omp 하위 0.05
+		// 용도별(총 6.20$): 대화 = discord 2.00 + 깊이3 1.00, 기타 = other 0.20 + 제거된 slack 부모 0.30, 하위 = 깊이2 0.20 + 깊이4 0.15 + omp 하위 0.05
 		const uses = section(out, "## 용도별");
 		for (const row of [
-			"| 대화 | pa/big | 4 | 3.30 | 53.2 | 0.00 |",
+			"| 대화 | pa/big | 3 | 3.00 | 48.4 | 0.00 |",
 			"| 대화 | pa/small | 1 | 0.50 | 8.1 | 0.00 |",
 			"| omp직접 | pa/big | 2 | 0.80 | 12.9 | 0.00 |",
 			"| 모니터 | pa/small | 2 | 0.50 | 8.1 | 0.00 |",
 			"| 레인 | pb/mid | 1 | 0.40 | 6.5 | 0.00 |",
 			"| 리뷰 | pb/mid | 1 | 0.10 | 1.6 | 100.00 |",
+			"| 기타 | pa/big | 1 | 0.30 | 4.8 | 0.00 |",
 			"| 기타 | pb/mid | 1 | 0.20 | 3.2 | 0.00 |",
 			"| 하위 | pa/small | 2 | 0.25 | 4.0 | 0.00 |",
 			"| 하위 | pb/mid | 1 | 0.15 | 2.4 | 0.00 |",
 		]) {
 			expect(uses).toContain(row);
 		}
-		expect(uses.split("\n").filter((line) => /^\| [^-|]/.test(line) && !line.startsWith("| 용도"))).toHaveLength(9);
+		expect(uses.split("\n").filter((line) => /^\| [^-|]/.test(line) && !line.startsWith("| 용도"))).toHaveLength(10);
 
 		const fallbacks = section(out, "## 한도·폴백");
 		expect(fallbacks).toContain("- pa/big → pb/mid: 2건 (사유: 429 rate_limit code 1308 ×2)");

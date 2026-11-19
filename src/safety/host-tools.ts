@@ -90,7 +90,6 @@ function protectedInodeMatches(root: string, target: { dev: number; ino: number 
 
 /** How a tool description names each platform. */
 const PLATFORM_NAMES: Record<ChatPlatform, string> = {
-	slack: "Slack",
 	discord: "Discord",
 	teams: "Teams",
 };
@@ -109,10 +108,10 @@ export interface HostToolDeps {
 	channel?: string;
 	/**
 	 * Thread the upload lands in, resolved when the tool runs (the origin's current conversation — the agent never
-	 * knows Slack ts values, the host owns them). Absent/unresolvable → the channel's main view.
+	 * knows platform ts values, the host owns them). Absent/unresolvable → the channel's main view.
 	 */
 	threadTs?: () => string | undefined;
-	/** `omp` binary for the dispatch tool's simple mode; the tool is registered only for Slack chat origins. */
+	/** `omp` binary for the dispatch tool's simple mode; the tool is registered only for chat origins. */
 	ompExecutable?: string;
 	/** Config `ompProfile` of the dispatch tool's simple `omp -p` run. */
 	ompProfile?: string;
@@ -223,11 +222,11 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 	const channel = deps.channel ?? chatOrigin?.conversationId;
 	// The origin's own platform, else the lane's channel's; a tool without either refuses at run time (`needChannel`).
 	const platform =
-		chatOrigin?.platform ?? (channel === undefined ? undefined : platformOfConversationId(channel)) ?? "slack";
+		chatOrigin?.platform ?? (channel === undefined ? undefined : platformOfConversationId(channel)) ?? "discord";
 	const platformName = PLATFORM_NAMES[platform];
 	const fileTool = sendFileToolName(platform);
 	const needChannel = (): string => {
-		if (channel === undefined) throw new Error(`origin is not a Slack conversation: ${deps.originKey}`);
+		if (channel === undefined) throw new Error(`origin is not a chat conversation: ${deps.originKey}`);
 		return channel;
 	};
 	// The dispatch tool is a chat-surface feature: DM and channel sessions only (lanes, monitors, review never).
@@ -310,7 +309,7 @@ export function buildHostTools(deps: HostToolDeps): HostToolDef[] {
 						name: "ompbot_request_approval",
 						label: "Ask owner for approval",
 						description:
-							"Ask the owner to approve an irreversible or risky action with approve/deny buttons in Slack. Waits for the click. Result is `approved`, `denied`, `denied (timeout)` or `replied: <owner text>` (the owner answered in the card's thread instead of clicking); proceed on `approved`, or on a reply only when it plainly approves this exact action — otherwise treat it as not approved.",
+							"Ask the owner to approve an irreversible or risky action with approve/deny buttons in chat. Waits for the click. Result is `approved`, `denied`, `denied (timeout)` or `replied: <owner text>` (the owner answered in the card's thread instead of clicking); proceed on `approved`, or on a reply only when it plainly approves this exact action — otherwise treat it as not approved.",
 						parameters: {
 							type: "object",
 							properties: {

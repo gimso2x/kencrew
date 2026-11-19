@@ -16,9 +16,7 @@ import {
 import { WEBHOOK_MAX_BODY_BYTES, WEBHOOK_MAX_PAYLOAD_BYTES, WebhookServer, webhookUrl } from "../src/monitors/webhook";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
 const NOW = Date.parse("2026-10-19T06:00:00Z");
 let home: TestHome;
@@ -394,12 +392,12 @@ describe("daemon with a webhook monitor", () => {
 		const port = probe.port as number;
 		await probe.stop(true);
 		writeFileSync(join(workspaceDir, "procedure.md"), "PROCEDURE-MARKER 먼저 상태를 확인");
-		const transport = new WaitingTransport();
+		const transport = new WaitingDiscordTransport();
 		const sessions = new FakeSessionStore();
 		const prompts: string[] = [];
 		const daemon = new Daemon({
 			config: { ...home.config, webhook: { port } },
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -415,6 +413,7 @@ describe("daemon with a webhook monitor", () => {
 		});
 		try {
 			await daemon.start();
+			daemon.store.ensureOrigin(`discord/dm/${OWNER_DM}`, "sess/owner-dm");
 			const row = daemon.store.monitors.addMonitor(
 				parseMonitorSpec(
 					{
@@ -437,7 +436,7 @@ describe("daemon with a webhook monitor", () => {
 			expect(prompts[0]).toContain("BODY-MARKER build 42 ok");
 			expect(prompts[0]).toContain("[수신 본문]");
 			expect(prompts[0]).toContain("PROCEDURE-MARKER");
-			expect(transport.posts((text) => text.startsWith("⏰ "))[0]?.text).toBe("⏰ deploys\n웹훅 처리 완료");
+			expect(transport.posts((text) => text.startsWith("⏰ "))[0]?.content).toBe("⏰ deploys\n웹훅 처리 완료");
 		} finally {
 			await daemon.stop();
 		}
@@ -448,7 +447,7 @@ describe("daemon with a webhook monitor", () => {
 		const blocker = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
 		const daemon = new Daemon({
 			config: { ...home.config, webhook: { port: blocker.port as number } },
-			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			log: log(),
 			ompVersion: "omp-test 0",
 			bootId: "boot",

@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DiscordChannel } from "../src/discord/channel";
+import type { EditMessageArgs } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { normalizeIncidentError } from "../src/monitors/incidents";
 import { type ClaimResult, MONITOR_INCIDENT_REPEAT_MS } from "../src/monitors/ledger";
@@ -19,13 +21,11 @@ import {
 	approvalActionId,
 	parseApprovalActionId,
 } from "../src/safety/approval";
-import { SlackChannel } from "../src/slack/channel";
 import { openStore, type Store } from "../src/store/db";
-import { hasButtons } from "./helpers/bot-home";
+import { CHANNEL, hasButtons, OWNER, OWNER_DM } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
+import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
-const OWNER = "UOWNER";
 const T0 = Date.UTC(2026, 5, 1, 0, 0, 0);
 const MINUTE = 60_000;
 
@@ -54,7 +54,7 @@ beforeEach(() => {
 	mkdirSync(join(dir, "workspace"));
 	clock = new FakeClock();
 	const log = createLogger({ sink: () => undefined, clock, redact });
-	store = openStore({ timezone: "Asia/Seoul", path: dbPath(), clock, redact, slackOwnerUserId: OWNER });
+	store = openStore({ timezone: "Asia/Seoul", path: dbPath(), clock, redact });
 	// The router only has to accept the hand-off: events stay `dispatched`, so stages show what the ledger decided.
 	scheduler = new MonitorScheduler({
 		store,
@@ -531,19 +531,14 @@ describe("recordMonitorIncident", () => {
 // ---------------------------------------------------------------------------------------------------------------
 
 /** Resolves `shown` when the buttons go up and `finalized` when a card update removes them. */
-class CardTransport extends FakeSlackTransport {
+class CardTransport extends FakeDiscordTransport {
 	readonly shown = Promise.withResolvers<{ ts: string }>();
 	readonly finalized = Promise.withResolvers<{ text: string }>();
 
-	override async updateMessage(args: {
-		channel: string;
-		ts: string;
-		text: string;
-		blocks?: readonly unknown[] | undefined;
-	}): Promise<void> {
-		await super.updateMessage(args);
-		if (hasButtons(args.blocks)) this.shown.resolve({ ts: args.ts });
-		else this.finalized.resolve({ text: args.text });
+	override async editMessage(args: EditMessageArgs): Promise<void> {
+		await super.editMessage(args);
+		if (hasButtons(args.components)) this.shown.resolve({ ts: args.messageId });
+		else this.finalized.resolve({ text: args.content ?? "" });
 	}
 }
 
@@ -566,7 +561,7 @@ class ManualTimers implements ApprovalTimers {
 const quietLog = () => createLogger({ sink: () => undefined, clock: { now: () => 0 }, redact });
 
 function makeBroker(
-	transport: FakeSlackTransport,
+	transport: FakeDiscordTransport,
 	timers: ApprovalTimers,
 	now: () => number,
 	approvalStore: ApprovalStore = store as unknown as ApprovalStore,
@@ -574,7 +569,7 @@ function makeBroker(
 ): ApprovalBroker {
 	return new ApprovalBroker({
 		timezone: "Asia/Seoul",
-		channels: registryOf(new SlackChannel(transport)),
+		channels: registryOf(new DiscordChannel(transport, { ownerUserId: OWNER })),
 		ownerUserId: OWNER,
 		log: quietLog(),
 		store: approvalStore,
@@ -584,16 +579,20 @@ function makeBroker(
 	});
 }
 
-const click = (decision: "approve" | "deny", ts: string, userId = OWNER, channel = "D1") => ({
+const click = (decision: "approve" | "deny", ts: string, userId = OWNER, channel = OWNER_DM) => ({
 	actionId: approvalActionId(decision, channel, ts),
 	userId,
 });
 
 describe("durable approval rows (db)", () => {
+	const APPROVAL_1 = `${OWNER_DM}:700000000000000001`;
+	const APPROVAL_2 = `${OWNER_DM}:700000000000000002`;
+	const APPROVAL_3 = `${OWNER_DM}:700000000000000003`;
+	const APPROVAL_UNKNOWN = `${OWNER_DM}:700000000000000099`;
 	const create = (id: string, expiresAt: number) =>
 		store.createApproval({
 			approvalId: id,
-			channel: "D1",
+			channel: OWNER_DM,
 			messageTs: id.split(":")[1] ?? id,
 			summary: "s",
 			createdAt: 1_000,
@@ -601,71 +600,72 @@ describe("durable approval rows (db)", () => {
 		});
 
 	test("expires_at boundary: one ms before is not due, exactly now is due, and a second sweep finds nothing", () => {
-		create("D1:1.1", 5_000);
+		create(APPROVAL_1, 5_000);
 		expect(store.expirePendingApprovals(4_999)).toEqual([]);
-		expect(approvalStatus("D1:1.1")).toBe("pending");
-		expect(store.expirePendingApprovals(5_000).map((row) => row.approvalId)).toEqual(["D1:1.1"]);
+		expect(approvalStatus(APPROVAL_1)).toBe("pending");
+		expect(store.expirePendingApprovals(5_000).map((row) => row.approvalId)).toEqual([APPROVAL_1]);
 		expect(store.expirePendingApprovals(5_000)).toEqual([]);
-		expect(approvalStatus("D1:1.1")).toBe("expired");
+		expect(approvalStatus(APPROVAL_1)).toBe("expired");
 	});
 
 	test("every terminal state is final: approve->deny, deny->approve, expired->approve, unknown id", () => {
-		create("D1:1.1", 90_000);
-		create("D1:2.2", 90_000);
-		create("D1:3.3", 90_000);
-		expect(store.decideApproval("D1:1.1", "approved", 2_000)).toBe(true);
-		expect(store.decideApproval("D1:1.1", "denied", 2_001)).toBe(false);
-		expect(approvalStatus("D1:1.1")).toBe("approved");
-		expect(store.decideApproval("D1:2.2", "denied", 2_000)).toBe(true);
-		expect(store.decideApproval("D1:2.2", "approved", 2_001)).toBe(false);
-		expect(approvalStatus("D1:2.2")).toBe("denied");
-		expect(store.expirePendingApprovals(1, false).map((row) => row.approvalId)).toEqual(["D1:3.3"]);
-		expect(store.decideApproval("D1:3.3", "approved", 2_002)).toBe(false);
-		expect(store.decideApproval("D9:9.9", "approved", 2_003)).toBe(false);
+		create(APPROVAL_1, 90_000);
+		create(APPROVAL_2, 90_000);
+		create(APPROVAL_3, 90_000);
+		expect(store.decideApproval(APPROVAL_1, "approved", 2_000)).toBe(true);
+		expect(store.decideApproval(APPROVAL_1, "denied", 2_001)).toBe(false);
+		expect(approvalStatus(APPROVAL_1)).toBe("approved");
+		expect(store.decideApproval(APPROVAL_2, "denied", 2_000)).toBe(true);
+		expect(store.decideApproval(APPROVAL_2, "approved", 2_001)).toBe(false);
+		expect(approvalStatus(APPROVAL_2)).toBe("denied");
+		expect(store.expirePendingApprovals(1, false).map((row) => row.approvalId)).toEqual([APPROVAL_3]);
+		expect(store.decideApproval(APPROVAL_3, "approved", 2_002)).toBe(false);
+		expect(store.decideApproval(APPROVAL_UNKNOWN, "approved", 2_003)).toBe(false);
 	});
 
 	test("DEFECT (design): a row that is already due (now >= expires_at) but not yet swept can still be approved", () => {
-		create("D1:1.1", 5_000);
+		create(APPROVAL_1, 5_000);
 		// expirePendingApprovals(5_000) would expire this row, so deciding "approved" at 5_000 must lose.
-		expect(store.decideApproval("D1:1.1", "approved", 5_000)).toBe(false);
+		expect(store.decideApproval(APPROVAL_1, "approved", 5_000)).toBe(false);
 	});
 
 	test("a forced sweep takes future rows and leaves decided rows alone", () => {
-		create("D1:1.1", 9_000_000);
-		create("D1:2.2", 9_000_000);
-		store.decideApproval("D1:1.1", "approved", 2_000);
-		expect(store.expirePendingApprovals(3_000, false).map((row) => row.approvalId)).toEqual(["D1:2.2"]);
-		expect(approvalStatus("D1:1.1")).toBe("approved");
+		create(APPROVAL_1, 9_000_000);
+		create(APPROVAL_2, 9_000_000);
+		store.decideApproval(APPROVAL_1, "approved", 2_000);
+		expect(store.expirePendingApprovals(3_000, false).map((row) => row.approvalId)).toEqual([APPROVAL_2]);
+		expect(approvalStatus(APPROVAL_1)).toBe("approved");
 	});
 
 	test("duplicate approval ids are rejected by the primary key instead of overwriting", () => {
-		create("D1:1.1", 9_000);
-		expect(() => create("D1:1.1", 99_000)).toThrow();
+		create(APPROVAL_1, 9_000);
+		expect(() => create(APPROVAL_1, 99_000)).toThrow();
 		expect(
-			rawQuery<{ expires_at: number }>("SELECT expires_at FROM approvals WHERE approval_id = 'D1:1.1'")[0]?.expires_at,
+			rawQuery<{ expires_at: number }>(`SELECT expires_at FROM approvals WHERE approval_id = '${APPROVAL_1}'`)[0]
+				?.expires_at,
 		).toBe(9_000);
 	});
 });
 
 describe("approval action ids", () => {
 	test("round trip", () => {
-		expect(parseApprovalActionId(approvalActionId("deny", "D123", "1800000000.000001"))).toEqual({
+		expect(parseApprovalActionId(approvalActionId("deny", CHANNEL, "700000000000000001"))).toEqual({
 			decision: "deny",
-			channel: "D123",
-			ts: "1800000000.000001",
+			channel: CHANNEL,
+			ts: "700000000000000001",
 		});
 	});
 
 	test.each([
 		["empty", ""],
-		["wrong prefix", "ompbot:approvalx:approve:D1:1.1"],
-		["upper-case decision", `${APPROVAL_ACTION_PREFIX}:APPROVE:D1:1.1`],
-		["unknown decision", `${APPROVAL_ACTION_PREFIX}:maybe:D1:1.1`],
-		["empty channel", `${APPROVAL_ACTION_PREFIX}:approve::1.1`],
-		["empty ts", `${APPROVAL_ACTION_PREFIX}:approve:D1:`],
-		["extra segment", `${APPROVAL_ACTION_PREFIX}:approve:D1:1.1:extra`],
-		["missing segment", `${APPROVAL_ACTION_PREFIX}:approve:D1`],
-		["leading space", ` ${APPROVAL_ACTION_PREFIX}:approve:D1:1.1`],
+		["wrong prefix", `ompbot:approvalx:approve:${OWNER_DM}:1001`],
+		["upper-case decision", `${APPROVAL_ACTION_PREFIX}:APPROVE:${OWNER_DM}:1001`],
+		["unknown decision", `${APPROVAL_ACTION_PREFIX}:maybe:${OWNER_DM}:1001`],
+		["empty channel", `${APPROVAL_ACTION_PREFIX}:approve::1001`],
+		["empty ts", `${APPROVAL_ACTION_PREFIX}:approve:${OWNER_DM}:`],
+		["extra segment", `${APPROVAL_ACTION_PREFIX}:approve:${OWNER_DM}:1001:extra`],
+		["missing segment", `${APPROVAL_ACTION_PREFIX}:approve:${OWNER_DM}`],
+		["leading space", ` ${APPROVAL_ACTION_PREFIX}:approve:${OWNER_DM}:1001`],
 	])("rejects %s", (_name, actionId) => {
 		expect(parseApprovalActionId(actionId)).toBeUndefined();
 	});
@@ -679,9 +679,9 @@ describe("ApprovalBroker races", () => {
 		const transport = new CardTransport();
 		const timers = new ManualTimers();
 		const broker = makeBroker(transport, timers, opts.now ?? (() => 1_000), opts.store, opts.timeoutMs);
-		const done = broker.request("D1", "git push --force", opts.signal);
+		const done = broker.request(OWNER_DM, "git push --force", opts.signal);
 		const { ts } = await transport.shown.promise;
-		return { transport, timers, broker, done, ts, id: `D1:${ts}` };
+		return { transport, timers, broker, done, ts, id: `${OWNER_DM}:${ts}` };
 	}
 
 	test("click before the timeout: approved wins, the ledger says approved, the timer is cleared", async () => {
@@ -733,8 +733,8 @@ describe("ApprovalBroker races", () => {
 		now = 61_000; // exactly expires_at: the sweep (daemon.ts sweeper) expires the row and relabels the card
 		expect(await broker.expireStale()).toBe(1);
 		expect(approvalStatus(id)).toBe("expired");
-		const card = transport.calls.filter((c) => c.method === "updateMessage").at(-1);
-		expect(card?.method === "updateMessage" ? card.text : "").toContain("시간 초과");
+		const card = transport.calls.filter((c) => c.method === "editMessage").at(-1);
+		expect(card?.method === "editMessage" ? (card.content ?? "") : "").toContain("시간 초과");
 		// The owner clicks the (already relabelled) card in the window before the in-memory timer fires.
 		const handled = broker.handleAction(click("approve", ts));
 		timers.fireAll();
@@ -746,10 +746,10 @@ describe("ApprovalBroker races", () => {
 
 	test("non-owner clicks, foreign message ts and malformed ids are ignored; the owner's click still works afterwards", async () => {
 		const { broker, done, ts, id } = await start();
-		expect(broker.handleAction(click("approve", ts, "UINTRUDER"))).toBe(false);
-		expect(broker.handleAction(click("approve", "1800000000.999999"))).toBe(false);
-		expect(broker.handleAction(click("approve", ts, OWNER, "D2"))).toBe(false);
-		expect(broker.handleAction({ actionId: "ompbot:approval:approve:D1", userId: OWNER })).toBe(false);
+		expect(broker.handleAction(click("approve", ts, "100000000000000099"))).toBe(false);
+		expect(broker.handleAction(click("approve", "999999999999999999"))).toBe(false);
+		expect(broker.handleAction(click("approve", ts, OWNER, "200000000000000002"))).toBe(false);
+		expect(broker.handleAction({ actionId: `ompbot:approval:approve:${OWNER_DM}`, userId: OWNER })).toBe(false);
 		expect(broker.handleAction({ actionId: "something:else", userId: OWNER })).toBe(false);
 		expect(broker.pendingCount).toBe(1);
 		expect(approvalStatus(id)).toBe("pending");
@@ -767,9 +767,9 @@ describe("ApprovalBroker races", () => {
 		const final = await first.transport.finalized.promise;
 		expect(final.text).toContain("재시작으로 만료됨");
 		// A second boot sweep has nothing left to do and sends no further card update.
-		const updates = first.transport.count("updateMessage");
+		const updates = first.transport.count("editMessage");
 		expect(await second.expireStale(false)).toBe(0);
-		expect(first.transport.count("updateMessage")).toBe(updates);
+		expect(first.transport.count("editMessage")).toBe(updates);
 		first.timers.fireAll();
 		await first.done;
 	});
@@ -780,20 +780,20 @@ describe("ApprovalBroker races", () => {
 		const transport = new CardTransport();
 		const timers = new ManualTimers();
 		const broker = makeBroker(transport, timers, () => 1_000);
-		expect(await broker.request("D1", "rm -rf /", controller.signal)).toBe("denied");
+		expect(await broker.request(OWNER_DM, "rm -rf /", controller.signal)).toBe("denied");
 		expect(broker.pendingCount).toBe(0);
 		expect(timers.callbacks.size).toBe(0);
-		const ts = transport.calls.find((c) => c.method === "postMessage")?.ts ?? "";
+		const ts = transport.calls.find((c) => c.method === "createMessage")?.id ?? "";
 		// Nobody pressed anything: the ledger keeps `denied` for the owner's own no and records an abort as expired.
-		expect(approvalStatus(`D1:${ts}`)).toBe("expired");
+		expect(approvalStatus(`${OWNER_DM}:${ts}`)).toBe("expired");
 	});
 
 	test("a failing card update fails closed: denied, timer cleared, nothing left pending", async () => {
 		const transport = new CardTransport();
-		transport.failNext.updateMessage = [new Error("slack down")];
+		transport.failNext.editMessage = [new Error("discord down")];
 		const timers = new ManualTimers();
 		const broker = makeBroker(transport, timers, () => 1_000);
-		expect(await broker.request("D1", "deploy")).toBe("denied");
+		expect(await broker.request(OWNER_DM, "deploy")).toBe("denied");
 		expect(broker.pendingCount).toBe(0);
 		expect(timers.callbacks.size).toBe(0);
 	});
@@ -833,7 +833,7 @@ describe("ApprovalBroker races", () => {
 		await expect(done).resolves.toBe("denied");
 	});
 
-	test("DEFECT (minor): the 2500-char summary cut can split a surrogate pair and post a malformed string to Slack", async () => {
+	test("DEFECT (minor): the 2500-char summary cut can split a surrogate pair and post a malformed string to Discord", async () => {
 		const summary = `${"x".repeat(2499)}😀 tail`;
 		const { transport, timers, done } = await start();
 		timers.fireAll();
@@ -841,12 +841,17 @@ describe("ApprovalBroker races", () => {
 		const other = new CardTransport();
 		const otherTimers = new ManualTimers();
 		const broker = makeBroker(other, otherTimers, () => 1_000);
-		const pending = broker.request("D1", summary);
+		const pending = broker.request(OWNER_DM, summary);
 		await other.shown.promise;
-		const posted = other.calls.find((c) => c.method === "postMessage");
+		const posted = other.calls.find((c) => c.method === "createMessage");
 		otherTimers.fireAll();
 		await pending;
-		expect(posted?.method === "postMessage" ? posted.text.isWellFormed() : false).toBe(true);
-		expect(transport.count("postMessage")).toBe(1);
+		const description =
+			posted?.method === "createMessage"
+				? (posted.embeds?.[0] as { description?: string } | undefined)?.description
+				: undefined;
+		expect(description?.startsWith("xxx")).toBe(true);
+		expect(description?.isWellFormed()).toBe(true);
+		expect(transport.count("createMessage")).toBe(1);
 	});
 });

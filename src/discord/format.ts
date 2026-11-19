@@ -2,7 +2,15 @@
 // (the model's markdown, which Discord mostly draws as is) becomes messages of at most 2000 characters
 // (`renderDiscordParts`), its valid ```card fences embeds of their own (`renderDiscordMessages`).
 import { cardRuns, validateCard } from "../channel/card";
-import { chunkText, errorText, escapeMrkdwn, REDELIVERED_PREFIX, tableEndAt } from "../channel/text";
+import {
+	chunkText,
+	errorText,
+	escapeMrkdwn,
+	fenceCloseRun,
+	fenceOpenRun,
+	REDELIVERED_PREFIX,
+	tableEndAt,
+} from "../channel/text";
 import { cardToEmbed, type DiscordEmbed } from "./card";
 import { MESSAGE_CONTENT_LIMIT } from "./transport";
 
@@ -73,8 +81,8 @@ function fenceTables(text: string): { text: string; spans: Array<[number, number
 		const line = lines[i] ?? "";
 		// A fence opens on a line of 3+ backticks and an info string without backticks, and closes on a line of backticks
 		// alone at least as long; a fence closed on its own line (```bash x```) opens nothing.
-		if (fenceRun === 0) fenceRun = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length ?? 0;
-		else if ((/^ {0,3}(`+)[ \t]*\r?$/.exec(line)?.[1]?.length ?? 0) >= fenceRun) fenceRun = 0;
+		if (fenceRun === 0) fenceRun = fenceOpenRun(line) ?? 0;
+		else if ((fenceCloseRun(line) ?? 0) >= fenceRun) fenceRun = 0;
 		const end = fenceRun > 0 ? undefined : tableEndAt(lines, i, 3);
 		if (end === undefined) {
 			push(line);

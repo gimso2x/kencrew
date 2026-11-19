@@ -53,8 +53,13 @@ function writeConfig(extra: Record<string, unknown> = {}): void {
 		join(home, "config.json"),
 		JSON.stringify({
 			schemaVersion: 1,
-			channels: { slack: { ownerUserId: "UOWNER0" } },
-			slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+			channels: {
+				discord: {
+					ownerUserId: "100000000000000001",
+					applicationId: "600000000000000000",
+					botTokenFile: "secrets/bot.token",
+				},
+			},
 			ompExecutable: "/usr/local/bin/omp",
 			workspaceDir: "workspace",
 			...extra,

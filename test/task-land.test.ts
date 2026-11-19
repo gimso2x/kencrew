@@ -10,18 +10,16 @@ import { defaultGit } from "../src/lanes/verify";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import type { TaskJudgement } from "../src/tasks/checker";
 import { acceptanceItems, docsDirOf } from "../src/tasks/docs";
 import type { TaskEvaluation } from "../src/tasks/evaluate";
 import { createTaskHostOps } from "../src/tasks/host";
 import { landTask, type TaskLandDeps, taskLandHold } from "../src/tasks/land";
 import type { TaskRow } from "../src/tasks/ledger";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
-const CHANNEL = "C1";
-const THREAD = "1700.000100";
+const CHANNEL = "111111111111111111";
+const THREAD = "222222222222222222";
 const clock = { now: () => Date.now() };
 
 const git = (dir: string, ...args: string[]): string =>
@@ -62,7 +60,7 @@ beforeEach(async () => {
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+		channels: [discordBinding(new WaitingDiscordTransport())],
 		log: createLogger({ sink: () => {}, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
@@ -97,7 +95,7 @@ function seed(extraEvidence = ""): { row: TaskRow; feat: string } {
 	const registered = tasks.register({
 		title: "로그 회전",
 		risk: "L2",
-		originKey: `slack/ch/${CHANNEL}/t/${THREAD}`,
+		originKey: `discord/ch/${CHANNEL}/t/${THREAD}`,
 		threadRef: `${CHANNEL}:${THREAD}`,
 		host: null,
 		repo,
@@ -294,6 +292,7 @@ describe("landTask deps (real git)", () => {
 	function deps(over: Partial<TaskLandDeps> = {}): TaskLandDeps {
 		return {
 			land: createLaneLander({ removeWorktree: (input) => createTaskHostOps().removeWorktree(input) }),
+			mode: "auto",
 			judge: async () => passed(),
 			holdReason: () => undefined,
 			ledger: daemon.store.tasks,
@@ -319,6 +318,44 @@ describe("landTask deps (real git)", () => {
 		expect(git(repo, "rev-parse", "main")).toBe(main);
 		expect(tipOf(row)).toBe(tip);
 		expect(daemon.store.tasks.require(row.taskId).status).toBe("review");
+	});
+
+	describe("button click vs. integrity warnings (L3 task)", () => {
+		const claim = "무결성 unproven_claim_word: summary: 테스트가 모두 통과했습니다";
+		const l3 = (row: TaskRow): TaskRow => ({ ...row, risk: "L3" });
+
+		test("button: an unproven claim word alone does not hand the landing back", async () => {
+			const { row } = seed();
+			const result = await landTask(
+				l3(row),
+				deps({ mode: "button", judge: async () => passed({ integrityWarnings: [claim] }) }),
+			);
+			expect(result.state).toBe("landed");
+		});
+
+		test("auto: the same claim word at L3 still hands it back", async () => {
+			const { row } = seed();
+			const result = await landTask(
+				l3(row),
+				deps({ mode: "auto", judge: async () => passed({ integrityWarnings: [claim] }) }),
+			);
+			expect(result).toMatchObject({
+				state: "handoff",
+				reason: expect.stringContaining("무결성 경고: 무결성 unproven_claim_word"),
+			});
+		});
+
+		test.each([
+			"무결성 guard_deletion_without_adversarial_regression: test/x.test.ts",
+			"무결성 undeclared_feature_removal: src/x.ts",
+		])("button: %s still hands it back, even beside a claim word", async (warning) => {
+			const { row } = seed();
+			const result = await landTask(
+				l3(row),
+				deps({ mode: "button", judge: async () => passed({ integrityWarnings: [claim, warning] }) }),
+			);
+			expect(result).toMatchObject({ state: "handoff", reason: expect.stringContaining(warning) });
+		});
 	});
 
 	test("AC-10: a lane landing and a task landing on one repository share one lander: zero overlap", async () => {

@@ -1,6 +1,18 @@
 import { Database } from "bun:sqlite";
-import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { join } from "node:path";
+import {
+	closeSync,
+	type Dirent,
+	existsSync,
+	fstatSync,
+	openSync,
+	readdirSync,
+	readFileSync,
+	readSync,
+	realpathSync,
+	statSync,
+} from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, sep } from "node:path";
 import type { OmpbotConfig } from "../config";
 import { QUOTED_HEADER, TOP_LEVEL_TS } from "../core/normalize";
 import { parseChatOrigin } from "../core/origin-key";
@@ -64,7 +76,7 @@ import { readUsageLimits, type UsageLimitsInfo } from "./usage-limits";
 /** A snapshot is reused this long: IPC, herdr, ssh and git are not asked again inside it. */
 export const SNAPSHOT_TTL_MS = 10_000;
 /** A snapshot build still running after this is given up (answered as a failed snapshot). */
-export const SNAPSHOT_BUILD_TIMEOUT_MS = 30_000;
+const SNAPSHOT_BUILD_TIMEOUT_MS = 30_000;
 const IPC_TIMEOUT_MS = 10_000;
 const HERDR_LOCAL_TIMEOUT_MS = 10_000;
 const HERDR_SSH_TIMEOUT_MS = 15_000;
@@ -78,7 +90,7 @@ const ERROR_CHARS = 200;
 /** Every section either carries its data or says why it could not; one failed section never breaks the others. */
 export type Section<T> = ({ ok: true } & T) | { ok: false; error: string };
 
-export interface DaemonInfo {
+interface DaemonInfo {
 	/** True when the daemon answered over its socket; false = the numbers come from the database file. */
 	running: boolean;
 	ompVersion: string;
@@ -94,7 +106,6 @@ export interface DaemonInfo {
 		at: string;
 		ageMs: number;
 		loopMs?: number;
-		socket?: { state: "up" | "down"; since: string };
 		/** Discord gateway; absent on an install without Discord. */
 		discord?: { state: "up" | "down"; since: string };
 		draining?: boolean;
@@ -128,7 +139,7 @@ export interface TurnInfo {
 	blocksRestart: boolean;
 	/** Posted at the top level of its conversation (thread ref `<channel>:-`), not inside a thread. */
 	topLevel: boolean;
-	/** Typed as a Slack slash command (`slash:` platform message id). */
+	/** Typed as a slash command (`slash:` platform message id). */
 	slash: boolean;
 }
 
@@ -136,10 +147,10 @@ export type TurnKind = "message" | "command" | "auto" | "monitor";
 export type TurnWaitReason = "restart" | "frozen" | "followup" | "behind" | "queued";
 
 /** A thread's turn-board column: someone should look · a turn is open · every turn has ended. */
-export type ThreadColumn = "attention" | "working" | "done";
+type ThreadColumn = "attention" | "working" | "done";
 
 /** One turn of a thread as its detail lists it. */
-export interface ThreadTurn {
+interface ThreadTurn {
 	inboundId: number;
 	state: string;
 	createdAt: string;
@@ -148,7 +159,7 @@ export interface ThreadTurn {
 }
 
 /**
- * One conversation of the turn board (origin = Slack thread = omp session): open turns or activity in the last
+ * One conversation of the turn board (origin = chat thread = omp session): open turns or activity in the last
  * {@link THREAD_WINDOW_MS}. Of message bodies only masked one-line previews are here.
  */
 export interface ThreadInfo {
@@ -178,12 +189,14 @@ export interface ThreadInfo {
 	updatedAt: string;
 	/** Newest first, at most {@link THREAD_RECENT}. */
 	recent: ThreadTurn[];
+	/** Active running job names (`ok` or `stale`) whose `thread` matches `threadRef`, newest `updatedAt` first. */
+	jobs?: string[];
 	/** The model and thinking its omp session runs with ({@link SessionModel}); absent when unknown (no chip). */
 	model?: SessionModel;
 }
 
 /** A thread with no open turn stays on the board this long after its last activity. */
-export const THREAD_WINDOW_MS = 24 * 3_600_000;
+const THREAD_WINDOW_MS = 24 * 3_600_000;
 const THREAD_LIMIT = 200;
 const THREAD_RECENT = 20;
 
@@ -191,7 +204,7 @@ const THREAD_RECENT = 20;
 export const PREVIEW_CHARS = 80;
 const AUTO_FOLLOWUP_PREFIX = "[자동 후속";
 
-export type HerdrState = { ok: true; status: HerdrAgentStatus } | { ok: false; error: string };
+type HerdrState = { ok: true; status: HerdrAgentStatus } | { ok: false; error: string };
 
 export interface TaskInfo {
 	taskId: string;
@@ -293,7 +306,7 @@ export interface HerdrAgentInfo {
 	sayError?: string;
 }
 
-export interface AskInfo {
+interface AskInfo {
 	question: string;
 	options: string[];
 }
@@ -315,9 +328,9 @@ export interface PaneSay {
 }
 
 /** A {@link PaneSay} with its pane: the page merges it into the board card of the same host and pane. */
-export type HerdrSay = PaneSay & { host: string; paneId: string };
+type HerdrSay = PaneSay & { host: string; paneId: string };
 
-export type HerdrHostInfo = { host: string } & Section<{ agents: HerdrAgentInfo[] }>;
+type HerdrHostInfo = { host: string } & Section<{ agents: HerdrAgentInfo[] }>;
 
 export interface ApprovalInfo {
 	approvalId: string;
@@ -325,6 +338,8 @@ export interface ApprovalInfo {
 	createdAt: string;
 	expiresAt: string;
 	originKey: string | null;
+	/** The asking conversation's ref (`<channel>:<thread>`); the Discord thread link is built from it. */
+	originThreadRef: string | null;
 	/** The summary's first sentence (of its first line), at most 80 characters. */
 	title: string;
 	/** The card's sections (할 일·이유·영향·되돌릴 수 없는 이유); null for rows without them or with a broken value. */
@@ -338,7 +353,7 @@ export interface ApprovalInfo {
 	originLabel: string | null;
 }
 
-export type ApprovalOutcomeStatus = "approved" | "denied" | "expired" | "replied";
+type ApprovalOutcomeStatus = "approved" | "denied" | "expired" | "replied";
 
 /** A settled approval, as the 최근 결정 list shows it; the fields it shares with {@link ApprovalInfo} read the same. */
 export interface ApprovalDecision {
@@ -352,6 +367,7 @@ export interface ApprovalDecision {
 	/** Card up to its settling (`decided_at − created_at`, ≥ 0); null without `decidedAt`. */
 	tookMs: number | null;
 	originKey: string | null;
+	originThreadRef: string | null;
 	originLabel: string | null;
 	detail: ApprovalInfo["detail"];
 	cardUrl: string | null;
@@ -359,7 +375,7 @@ export interface ApprovalDecision {
 }
 
 /** Approvals settled in the last {@link APPROVAL_STATS_DAYS} days, by outcome. */
-export interface ApprovalStats {
+interface ApprovalStats {
 	days: number;
 	approved: number;
 	denied: number;
@@ -370,7 +386,7 @@ export interface ApprovalStats {
 }
 
 /** A monitor's ended events of the last {@link MONITOR_STATS_DAYS} days, by outcome. */
-export interface MonitorStats {
+interface MonitorStats {
 	days: number;
 	delivered: number;
 	quiet: number;
@@ -381,13 +397,13 @@ export interface MonitorStats {
 }
 
 /** A file a monitor uses, by name only (never its directory). */
-export interface MonitorFile {
+interface MonitorFile {
 	kind: "procedure" | "script";
 	name: string;
 }
 
 /** One monitor event as the list shows its last run. */
-export interface MonitorRun {
+interface MonitorRun {
 	stage: string;
 	at: string;
 	slotAt: string;
@@ -569,18 +585,16 @@ function monitorFiles(row: MonitorRow): MonitorFile[] {
 }
 
 /**
- * A channel as the owner knows it: the DM, the config's Slack or Discord log or escalation channel, else its id.
+ * A channel as the owner knows it: the DM, the config's Discord log or escalation channel, else its id.
  */
 function channelName(channel: string | null, config: DashboardConfig | undefined): string {
 	if (channel === null) return "오너 DM";
-	if (channel === config?.logChannel || channel === config?.channels?.discord?.logChannelId) return "로그 채널";
-	if (channel === config?.escalationChannel || channel === config?.channels?.discord?.escalationChannelId) {
-		return "에스컬레이션 채널";
-	}
+	if (channel === config?.channels?.discord?.logChannelId) return "로그 채널";
+	if (channel === config?.channels?.discord?.escalationChannelId) return "에스컬레이션 채널";
 	return `채널 ${channel}`;
 }
 
-export interface AlertInfo {
+interface AlertInfo {
 	scope: string;
 	signature: string;
 	count: number;
@@ -593,12 +607,12 @@ export interface AlertInfo {
 }
 
 /** A backup stamp's time and age. */
-export interface StampAge {
+interface StampAge {
 	at: string;
 	ageMs: number;
 }
 
-export interface BackupInfo {
+interface BackupInfo {
 	/** `<home>/backups/last-backup.ok`; absent when no backup has stamped yet. */
 	local?: StampAge;
 	/** `null` when config has no `offsite`; absent when it has one but no `offsite.ok` stamp exists. */
@@ -606,20 +620,22 @@ export interface BackupInfo {
 }
 
 /** `<home>/jobs/<name>.json` names the dashboard reads; any other entry of the directory is skipped unread. */
-const JOB_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+export const JOB_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const JOB_LIMIT = 50;
 /** A running job whose `updatedAt` is older than this reads as `stale`. */
-export const JOB_STALE_MS = 10 * 60_000;
+const JOB_STALE_MS = 10 * 60_000;
 /**
  * A `done` or `stopped` job, or a `running` one whose `pid` is gone (`dead`: its writer died without a final state),
  * leaves the list once its `updatedAt` is older than this.
  */
-export const JOB_DONE_KEEP_MS = 24 * 3_600_000;
+const JOB_DONE_KEEP_MS = 24 * 3_600_000;
 /** A `failed` job stays longer to be looked at, then leaves once its `updatedAt` is older than this. */
-export const JOB_FAILED_KEEP_MS = 7 * 24 * 3_600_000;
+const JOB_FAILED_KEEP_MS = 7 * 24 * 3_600_000;
 const JOB_TITLE_CHARS = 120;
 const JOB_DETAIL_CHARS = 200;
 const JOB_FIELD_CHARS = 200;
+const PROGRESS_MAX_BYTES = 64 * 1024;
+const PROGRESS_TAIL_LINES = 40;
 const ISO_8601 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
 
 export type JobState = "running" | "done" | "stopped" | "failed";
@@ -653,6 +669,12 @@ export interface JobInfo {
 	detail?: string;
 	/** Log path as text; the file is never opened. */
 	log?: string;
+	/** Progress file path as text; opened only when under allowed roots without a `secrets` path component. */
+	progress?: string;
+	/** Masked last 40 lines from the tail 64 KiB of `progress`; absent when unread or disallowed. */
+	progressLines?: string[];
+	/** Working directory path as text; used to locate the job's omp session folder when under allowed roots. */
+	cwd?: string;
 	health: JobHealth;
 }
 
@@ -683,20 +705,14 @@ export interface DashboardSnapshot {
 	/** Progress files of long-running jobs outside the bot (`<home>/jobs/*.json`), newest update first. */
 	jobs: Section<{ items: JobInfo[] }>;
 	/**
-	 * The Slack workspace id (config `slack.teamId`) the turn panels' 슬랙 스레드에서 답하기 link needs; null without
-	 * it. Always built; optional only so hand-made snapshots still type.
-	 */
-	slackTeam?: string | null;
-	/**
 	 * How a terminal runs this checkout's CLI, word by word (`bun`, `<repoDir>/src/main.ts`): the 터미널에서 보기 panels
-	 * show commands with it for the owner to paste — the dashboard never runs them. Optional like `slackTeam`.
+	 * show commands with it for the owner to paste — the dashboard never runs them. Always built; optional only so
+	 * hand-made snapshots still type.
 	 */
 	ompbotCli?: string[];
-	/** Config without `channels.slack`: the Slack card says 꺼짐 instead of waiting for a socket. Optional like `slackTeam`. */
-	slackOff?: boolean;
 	/**
 	 * The one Discord server (config `channels.discord.guildIds` with exactly one id) the turn panels' 디스코드에서
-	 * 답하기 link needs for server channels and lanes; null otherwise (DM links do not need it). Optional like `slackTeam`.
+	 * 답하기 link needs for server channels and lanes; null otherwise (DM links do not need it). Optional like `ompbotCli`.
 	 */
 	discordGuild?: string | null;
 	/** The "호스트 점검" card: only with config `dashboard.opsStatus` (absent otherwise, and in hand-made snapshots). */
@@ -718,28 +734,22 @@ export type DashboardConfig = Partial<
 		| "dispatchHosts"
 		| "herdrBoard"
 		| "costCap"
-		| "peerBots"
 		| "dashboard"
 	>
-> &
-	Partial<Pick<OmpbotConfig, "logChannel" | "escalationChannel">> & {
-		/** Only the workspace id is read, for the `slack://` links of the turn panels. */
-		slack?: { teamId?: string };
-		/**
-		 * Only the server ids are read, for the Discord links of the turn panels, the Discord peer bots, for the flow's
-		 * review node, and the Discord log, escalation and board channels, for the monitor channel labels; `slack` only for
-		 * whether Slack is on.
-		 */
-		channels?: {
-			slack?: { ownerUserId: string };
-			discord?: {
-				guildIds?: string[];
-				peerBots?: Array<{ userId: string; name: string }>;
-				logChannelId?: string;
-				escalationChannelId?: string;
-			};
+> & {
+	/**
+	 * Only the server ids are read, for the Discord links of the turn panels, the Discord peer bots, for the flow's
+	 * review node, and the Discord log, escalation and board channels, for the monitor channel labels.
+	 */
+	channels?: {
+		discord?: {
+			guildIds?: string[];
+			peerBots?: Array<{ userId: string; name: string }>;
+			logChannelId?: string;
+			escalationChannelId?: string;
 		};
 	};
+};
 
 export interface SnapshotDeps {
 	homeDir: string;
@@ -767,6 +777,8 @@ export interface SnapshotDeps {
 	collectGates?: (options: GatesOptions) => Gate[];
 	/** Whether a job's `pid` still runs; default {@link pidAlive}. */
 	isAlive?: (pid: number) => boolean;
+	/** User home for allowed job roots (`$HOME/work`, `$HOME/.ompbot-*`); defaults to `process.env.HOME ?? homedir()`. */
+	userHome?: string;
 	/** Read the model limit commands (default false): the dashboard server only; the daemon's `!brief` never runs them. */
 	usageLimits?: boolean;
 }
@@ -950,7 +962,7 @@ function approvalStats(db: Database, now: number): ApprovalStats {
 	return stats;
 }
 
-/** `DM` for any platform's owner DM; a channel by its id, named after its platform when that is not Slack. */
+/** `DM` for any platform's owner DM; a channel by its id, named after its platform when that is Discord (a removed `slack/` row keeps its plain label). */
 function originLabel(originKey: string | null): string | null {
 	if (originKey === null) return null;
 	if (parseChatOrigin(originKey)?.kind === "dm") return "DM";
@@ -1190,7 +1202,7 @@ const QUOTE_HEADS = [QUOTED_HEADER.slice(0, QUOTED_HEADER.indexOf("]") + 1), INJ
 
 /**
  * A request as one masked line: ompbot's quote wrapping removed (every header and warning line and every
- * `<<<quoted-…>>>` block; an open marker with no end drops the rest), secrets masked, Slack links and attachment notes
+ * `<<<quoted-…>>>` block; an open marker with no end drops the rest), secrets masked, mrkdwn links and attachment notes
  * folded, whitespace collapsed, cut to the limit. With none of the owner's words left (only quotes or attachments) the
  * line is `[첨부]` and `fallback` (a flow's first TASK title), else the attachment file names. `limit`: longest line.
  */
@@ -1234,11 +1246,118 @@ function jobText(value: unknown, limit: number): string | undefined {
 
 const isCount = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 
-/** One job file; a file that cannot be read as a job comes back `invalid` instead of failing the section. */
-function readJob(dir: string, file: string, now: number, isAlive: (pid: number) => boolean, timezone: string): JobInfo {
+const underRoot = (root: string, path: string): boolean =>
+	path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+
+export const hasSecretsSegment = (path: string): boolean => path.split(/[\\/]/).includes("secrets");
+
+/** Allowed real directories for job `progress` and `cwd` paths: `<ompbot home>`, `$HOME/work`, `$HOME/.ompbot-*`. */
+export function jobAllowedRoots(homeDir: string, userHome: string): string[] {
+	const candidates = [homeDir, join(userHome, "work")];
+	try {
+		for (const entry of readdirSync(userHome, { withFileTypes: true })) {
+			if (entry.name.startsWith(".ompbot-")) candidates.push(join(userHome, entry.name));
+		}
+	} catch {
+		// unreadable userHome: keep homeDir and work only
+	}
+	const roots: string[] = [];
+	for (const candidate of candidates) {
+		try {
+			const real = realpathSync(candidate);
+			if (statSync(real).isDirectory()) roots.push(real);
+		} catch {
+			// missing or inaccessible root
+		}
+	}
+	return roots;
+}
+
+/** Resolves a job `progress` file only if it is an absolute regular file inside `roots` with no `secrets` segment. */
+function resolveAllowedProgressFile(rawPath: string, roots: readonly string[]): string | undefined {
+	if (!isAbsolute(rawPath) || hasSecretsSegment(rawPath)) return undefined;
+	let real: string;
+	try {
+		real = realpathSync(rawPath);
+	} catch {
+		return undefined;
+	}
+	if (hasSecretsSegment(real) || !roots.some((root) => underRoot(root, real))) return undefined;
+	try {
+		if (!statSync(real).isFile()) return undefined;
+	} catch {
+		return undefined;
+	}
+	return real;
+}
+
+/** Checks whether a job `cwd` is an absolute path inside `roots` (or its nearest existing ancestor is) with no `secrets` segment. */
+export function isAllowedJobCwd(rawPath: string, roots: readonly string[]): boolean {
+	if (!isAbsolute(rawPath) || hasSecretsSegment(rawPath)) return false;
+	let probe = rawPath;
+	while (true) {
+		if (hasSecretsSegment(probe)) return false;
+		try {
+			const real = realpathSync(probe);
+			if (hasSecretsSegment(real) || !roots.some((root) => underRoot(root, real))) return false;
+			return statSync(real).isDirectory();
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== "ENOENT") return false;
+			const parent = dirname(probe);
+			if (parent === probe) return false;
+			probe = parent;
+		}
+	}
+}
+
+/** Reads up to the last 64 KiB of an allowed regular `progress` file, masks secrets before splitting, and returns at most 40 lines. */
+function readProgressTail(rawPath: string, roots: readonly string[]): string[] | undefined {
+	const real = resolveAllowedProgressFile(rawPath, roots);
+	if (real === undefined) return undefined;
+	let fd: number;
+	try {
+		fd = openSync(real, "r");
+	} catch {
+		return undefined;
+	}
+	try {
+		const st = fstatSync(fd);
+		if (!st.isFile()) return undefined;
+		const start = Math.max(0, st.size - PROGRESS_MAX_BYTES);
+		const length = st.size - start;
+		if (length === 0) return [];
+		const buf = Buffer.allocUnsafe(length);
+		let offset = 0;
+		while (offset < length) {
+			const n = readSync(fd, buf, offset, length - offset, start + offset);
+			if (n === 0) break;
+			offset += n;
+		}
+		const rawText = buf.subarray(0, offset).toString("utf8");
+		const clean = start > 0 ? rawText.replace(/^\uFFFD+/, "") : rawText;
+		const masked = redact(clean).replace(/\r?\n$/, "");
+		if (masked === "") return [];
+		return masked.split(/\r?\n/).slice(-PROGRESS_TAIL_LINES);
+	} catch {
+		return undefined;
+	} finally {
+		closeSync(fd);
+	}
+}
+
+/** One job file plus its unmasked `cwd` when present; a file that cannot be read as a job comes back `invalid`. */
+function readJobEntry(
+	dir: string,
+	file: string,
+	now: number,
+	isAlive: (pid: number) => boolean,
+	timezone: string,
+	allowedRoots?: readonly string[],
+): { job: JobInfo; rawCwd?: string } {
 	const name = file.slice(0, -".json".length);
 	const path = join(dir, file);
-	const invalid = (why: string): JobInfo => {
+	const invalid = (why: string): { job: JobInfo } => {
 		let modified = now;
 		try {
 			modified = statSync(path).mtimeMs;
@@ -1246,13 +1365,15 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
 			modified = now; // removed since the listing: its age is unknown
 		}
 		return {
-			name,
-			title: file,
-			state: null,
-			updatedAt: localIso(modified, timezone),
-			ageMs: now - modified,
-			detail: jobText(why, JOB_DETAIL_CHARS) ?? "",
-			health: "invalid",
+			job: {
+				name,
+				title: file,
+				state: null,
+				updatedAt: localIso(modified, timezone),
+				ageMs: now - modified,
+				detail: jobText(why, JOB_DETAIL_CHARS) ?? "",
+				health: "invalid",
+			},
 		};
 	};
 	let parsed: unknown;
@@ -1290,29 +1411,63 @@ function readJob(dir: string, file: string, now: number, isAlive: (pid: number) 
 	const thread = jobText(fields.thread, JOB_FIELD_CHARS);
 	const detail = jobText(fields.detail, JOB_DETAIL_CHARS);
 	const log = jobText(fields.log, JOB_FIELD_CHARS);
+	const progress = jobText(fields.progress, JOB_FIELD_CHARS);
+	const progressLines =
+		typeof fields.progress === "string" && fields.progress.trim() !== "" && allowedRoots !== undefined
+			? readProgressTail(fields.progress, allowedRoots)
+			: undefined;
+	const cwd = jobText(fields.cwd, JOB_FIELD_CHARS);
+	const rawCwd = typeof fields.cwd === "string" && fields.cwd.trim() !== "" ? fields.cwd : undefined;
 	return {
-		name,
-		title: jobText(fields.title, JOB_TITLE_CHARS) ?? name,
-		state,
-		...(counts ? { done, total } : {}),
-		...(counts && total > 0 ? { percent: Math.round((done / total) * 1000) / 10 } : {}),
-		...(unit === undefined ? {} : { unit }),
-		...(Number.isNaN(startedMs) ? {} : { startedAt: localIso(startedMs, timezone) }),
-		updatedAt: localIso(updatedMs, timezone),
-		ageMs,
-		...(pid === undefined ? {} : { pid }),
-		...(thread === undefined ? {} : { thread }),
-		...(detail === undefined ? {} : { detail }),
-		...(log === undefined ? {} : { log }),
-		health,
+		job: {
+			name,
+			title: jobText(fields.title, JOB_TITLE_CHARS) ?? name,
+			state,
+			...(counts ? { done, total } : {}),
+			...(counts && total > 0 ? { percent: Math.round((done / total) * 1000) / 10 } : {}),
+			...(unit === undefined ? {} : { unit }),
+			...(Number.isNaN(startedMs) ? {} : { startedAt: localIso(startedMs, timezone) }),
+			updatedAt: localIso(updatedMs, timezone),
+			ageMs,
+			...(pid === undefined ? {} : { pid }),
+			...(thread === undefined ? {} : { thread }),
+			...(detail === undefined ? {} : { detail }),
+			...(log === undefined ? {} : { log }),
+			...(progress === undefined ? {} : { progress }),
+			...(progressLines === undefined ? {} : { progressLines }),
+			...(cwd === undefined ? {} : { cwd }),
+			health,
+		},
+		...(rawCwd === undefined ? {} : { rawCwd }),
 	};
+}
+
+/** Reads one `<homeDir>/jobs/<name>.json` entry for on-demand trace lookup; returns undefined if absent or invalid name. */
+export function readJobFile(
+	homeDir: string,
+	name: string,
+	now: number,
+	isAlive: (pid: number) => boolean,
+	timezone: string,
+): { job: JobInfo; rawCwd?: string } | undefined {
+	if (!JOB_NAME.test(name)) return undefined;
+	const dir = join(homeDir, "jobs");
+	const file = `${name}.json`;
+	if (!existsSync(join(dir, file))) return undefined;
+	return readJobEntry(dir, file, now, isAlive, timezone);
 }
 
 /**
  * `<home>/jobs/<name>.json` files whose name passes {@link JOB_NAME}: newest update first, at most {@link JOB_LIMIT},
  * `done`, `stopped` and `dead` jobs only for {@link JOB_DONE_KEEP_MS}, `failed` ones for {@link JOB_FAILED_KEEP_MS}. No directory means no jobs. Reads only; never creates or removes.
  */
-function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolean, timezone: string): JobInfo[] {
+function readJobs(
+	homeDir: string,
+	now: number,
+	isAlive: (pid: number) => boolean,
+	timezone: string,
+	allowedRoots: readonly string[],
+): JobInfo[] {
 	const dir = join(homeDir, "jobs");
 	let entries: Dirent[];
 	try {
@@ -1323,7 +1478,7 @@ function readJobs(homeDir: string, now: number, isAlive: (pid: number) => boolea
 	}
 	return entries
 		.filter((entry) => entry.isFile() && entry.name.endsWith(".json") && JOB_NAME.test(entry.name.slice(0, -5)))
-		.map((entry) => readJob(dir, entry.name, now, isAlive, timezone))
+		.map((entry) => readJobEntry(dir, entry.name, now, isAlive, timezone, allowedRoots).job)
 		.filter((job) =>
 			job.state === "failed"
 				? job.ageMs <= JOB_FAILED_KEEP_MS
@@ -1472,9 +1627,6 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					at: iso(beat.ts.getTime()),
 					ageMs: now - beat.ts.getTime(),
 					...(beat.loopMs === undefined ? {} : { loopMs: beat.loopMs }),
-					...(beat.socket === undefined
-						? {}
-						: { socket: { state: beat.socket.state, since: iso(beat.socket.since.getTime()) } }),
 					...(beat.discord === undefined
 						? {}
 						: { discord: { state: beat.discord.state, since: iso(beat.discord.since.getTime()) } }),
@@ -1489,6 +1641,14 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const startedAt = info.running ? readLockStartedAt(deps.homeDir) : undefined;
 			if (startedAt !== undefined) info.started = { at: iso(startedAt), ageMs: now - startedAt };
 			return info;
+		});
+
+		const jobs = section(async () => {
+			const userHome = deps.userHome ?? process.env.HOME ?? homedir();
+			const allowedRoots = jobAllowedRoots(deps.homeDir, userHome);
+			const files = readJobs(deps.homeDir, now, deps.isAlive ?? pidAlive, timezone, allowedRoots);
+			const units = await readUnitJobs(run, files, now, timezone);
+			return { items: [...units, ...files].slice(0, JOB_LIMIT) };
 		});
 
 		const turns = section(async () => {
@@ -1600,10 +1760,26 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			const monitorNames = new Map(
 				rows<{ id: string; name: string }>(handle, "SELECT id, name FROM monitors").map((m) => [m.id, m.name]),
 			);
+			const jobSection = await jobs;
+			const activeJobs = jobSection.ok
+				? jobSection.items
+						.filter(
+							(job) =>
+								job.state === "running" && (job.health === "ok" || job.health === "stale") && job.thread !== undefined,
+						)
+						.slice()
+						.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+				: [];
+			const activeThreads = [...new Set(activeJobs.map((job) => job.thread as string))];
+			const jobSelect =
+				activeThreads.length === 0
+					? "0 AS has_job"
+					: `MAX(CASE WHEN thread_ref IN (${activeThreads.map(() => "?").join(",")}) THEN 1 ELSE 0 END) AS has_job`;
 			const threads = rows<{ origin_key: string; active: number }>(
 				handle,
-				`SELECT origin_key, MAX(${ACTIVE}) AS active, SUM(CASE WHEN ${OPEN} THEN 1 ELSE 0 END) AS open FROM inbound
-					GROUP BY origin_key HAVING open > 0 OR active >= ? ORDER BY open > 0 DESC, active DESC LIMIT ?`,
+				`SELECT origin_key, MAX(${ACTIVE}) AS active, SUM(CASE WHEN ${OPEN} THEN 1 ELSE 0 END) AS open, ${jobSelect} FROM inbound
+					GROUP BY origin_key HAVING open > 0 OR active >= ? OR has_job > 0 ORDER BY (open > 0 OR has_job > 0) DESC, active DESC LIMIT ?`,
+				...activeThreads,
 				since,
 				THREAD_LIMIT,
 			).flatMap((thread): ThreadInfo[] => {
@@ -1639,10 +1815,13 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					key,
 				);
 				const stalledCount = openTurns.filter((turn) => turn.stalled).length;
+				const threadRef = latest.threadRef ?? first.threadRef;
+				const threadJobs =
+					threadRef === null ? [] : activeJobs.filter((job) => job.thread === threadRef).map((job) => job.name);
 				const column: ThreadColumn =
 					stalledCount > 0 || (openTurns.length === 0 && latest.state === "failed_notified")
 						? "attention"
-						: openTurns.length > 0
+						: openTurns.length > 0 || threadJobs.length > 0
 							? "working"
 							: "done";
 				const monitor = key.startsWith(MONITOR_ORIGIN_PREFIX)
@@ -1652,7 +1831,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				return [
 					{
 						originKey: key,
-						threadRef: latest.threadRef ?? first.threadRef,
+						threadRef,
 						kind: latest.kind,
 						title: monitor ?? first.preview ?? key,
 						column,
@@ -1670,6 +1849,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 						stalledCount,
 						updatedAt: iso(thread.active),
 						recent: recent.map(brief),
+						...(threadJobs.length === 0 ? {} : { jobs: threadJobs }),
 						...(model === undefined ? {} : { model }),
 					},
 				];
@@ -1772,8 +1952,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				FROM task_transitions WHERE task_id IN (SELECT task_id FROM tasks WHERE ${scope}) ORDER BY transition_id`,
 				since,
 			);
-			// The spec review node shows when either platform has a peer bot (Slack `peerBots`, `channels.discord.peerBots`).
-			const peerReview = (config?.peerBots?.length ?? 0) > 0 || (config?.channels?.discord?.peerBots?.length ?? 0) > 0;
+			// The spec review node shows when Discord has a peer bot (`channels.discord.peerBots`).
+			const peerReview = (config?.channels?.discord?.peerBots?.length ?? 0) > 0;
 			const statuses = taskFlowStatus(read, transitions, peerReview);
 			const threads = new Map<string, TaskRow[]>();
 			for (const row of read) threads.set(row.threadRef, [...(threads.get(row.threadRef) ?? []), row]);
@@ -1815,7 +1995,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					"SELECT text_ref, created_at FROM inbound WHERE thread_ref = ? ORDER BY inbound_id LIMIT 1",
 					threadRef,
 				)[0];
-				// Slack link markup: `<url|label>` reads as the label, `<url>` as host/path.
+				// Link markup in the stored text: `<url|label>` reads as the label, `<url>` as host/path.
 				const text = request?.text_ref
 					.replace(/<(https?:[^|>]+)\|([^>]+)>/g, "$2")
 					.replace(/<https?:\/\/([^>]+)>/g, "$1");
@@ -1921,12 +2101,13 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					created_at: number;
 					expires_at: number;
 					origin_key: string | null;
+					origin_thread_ref: string | null;
 					detail_json: string | null;
 					card_url: string | null;
 					origin_url: string | null;
 				}>(
 					handle,
-					`SELECT approval_id, summary, created_at, expires_at, origin_key, ${optional} FROM approvals WHERE status = 'pending' ORDER BY created_at`,
+					`SELECT approval_id, summary, created_at, expires_at, origin_key, origin_thread_ref, ${optional} FROM approvals WHERE status = 'pending' ORDER BY created_at`,
 				).map((r): ApprovalInfo => {
 					const summary = redact(r.summary);
 					return {
@@ -1935,6 +2116,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 						createdAt: iso(r.created_at),
 						expiresAt: iso(r.expires_at),
 						originKey: r.origin_key,
+						originThreadRef: r.origin_thread_ref,
 						title: approvalTitle(summary),
 						detail: approvalDetail(r.detail_json),
 						cardUrl: r.card_url?.startsWith("https://") ? r.card_url : null,
@@ -1950,12 +2132,13 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					created_at: number;
 					decided_at: number | null;
 					origin_key: string | null;
+					origin_thread_ref: string | null;
 					detail_json: string | null;
 					card_url: string | null;
 					origin_url: string | null;
 				}>(
 					handle,
-					`SELECT approval_id, summary, status, created_at, decided_at, origin_key, ${optional} FROM approvals
+					`SELECT approval_id, summary, status, created_at, decided_at, origin_key, origin_thread_ref, ${optional} FROM approvals
 					WHERE status != 'pending' ORDER BY COALESCE(decided_at, created_at) DESC, created_at DESC LIMIT ?`,
 					APPROVAL_RECENT,
 				).map((r): ApprovalDecision => {
@@ -1969,6 +2152,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 						decidedAt: r.decided_at === null ? null : iso(r.decided_at),
 						tookMs: r.decided_at === null ? null : Math.max(0, r.decided_at - r.created_at),
 						originKey: r.origin_key,
+						originThreadRef: r.origin_thread_ref,
 						originLabel: originLabel(r.origin_key),
 						detail: approvalDetail(r.detail_json),
 						cardUrl: r.card_url?.startsWith("https://") ? r.card_url : null,
@@ -2061,12 +2245,6 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			}),
 		}));
 
-		const jobs = section(async () => {
-			const files = readJobs(deps.homeDir, now, deps.isAlive ?? pidAlive, timezone);
-			const units = await readUnitJobs(run, files, now, timezone);
-			return { items: [...units, ...files].slice(0, JOB_LIMIT) };
-		});
-
 		const guildIds = deps.config?.channels?.discord?.guildIds;
 
 		return {
@@ -2084,12 +2262,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			gates,
 			backup: await backup,
 			jobs: await jobs,
-			slackTeam: deps.config?.slack?.teamId ?? null,
 			ompbotCli: ["bun", join(deps.repoDir, "src", "main.ts")],
-			slackOff:
-				deps.config?.channels !== undefined &&
-				deps.config.channels.slack === undefined &&
-				deps.config.slack === undefined,
 			discordGuild: guildIds?.length === 1 ? (guildIds[0] ?? null) : null,
 			...(hostChecks === undefined ? {} : { hostChecks: await hostChecks }),
 			...(opsStatus?.url === undefined ? {} : { hostChecksUrl: opsStatus.url }),

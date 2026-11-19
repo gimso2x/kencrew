@@ -1,14 +1,13 @@
 import type { ActionButton } from "../channel/port";
 import { mentionToken } from "../channel/port";
-import { escapeMrkdwn } from "../channel/text";
-import type { ChatPlatform } from "../core/origin-key";
+import { diffViewLink } from "../dispatch/board";
 import { redact } from "../redact";
 import type { TaskCard } from "../tasks/notify";
 import { CHECK_TIMEOUT_MS } from "../tasks/signals";
 import { workerLine } from "../tasks/worker-tier";
 import { REVIEW_BLOCK } from "./land";
 import { formatConfidence } from "./review";
-import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneChanges, type LaneRow } from "./status";
+import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneChanges, type LaneRow, OWNER_ACCEPTED } from "./status";
 
 /**
  * The Outcome card of a closed work lane, in the lane's thread: what the lane claimed, what the core re-ran, and the
@@ -88,7 +87,7 @@ const buttonsOf = (lane: LaneRow): ActionButton[] => [
 
 /** What the two buttons do, as the grey line of a card that has them. */
 const buttonNote = (lane: LaneRow): string =>
-	`머지 = ff 머지 → push origin/${lane.meta.baseBranch ?? "?"} → worktree 정리 · 폐기 = worktree·브랜치 삭제 · 재시작은 따로 승인`;
+	`머지 = ff 머지 → push origin/${lane.meta.baseBranch ?? "?"} → worktree 정리 · 폐기 = worktree·브랜치 삭제 · 재시작은 포함 안 됨`;
 
 /** How to get the base branch back to where it was before the merge. */
 function undoLine(lane: LaneRow): string {
@@ -119,14 +118,13 @@ function overlapLine(changes: LaneChanges): string[] {
 	return changes.overlapError === undefined ? [] : ["⚠️ 겹침: 일부 확인 실패"];
 }
 
-/**
- * `platform` is the chat the card goes to: on Slack the body is mrkdwn, so the text the model wrote (claim summary,
- * review notes) and the landing's reasons are escaped there — `<!channel>` stays text (qa-l #82). The title is a
- * plain-text header and is left as it is.
- */
-export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform: ChatPlatform = "slack"): TaskCard {
+export function buildLaneOutcomeCard(
+	lane: LaneRow,
+	view: LaneCardView,
+	/** `herdrBoard.url`: with it the cards that wait for the owner link the dashboard's diff view; absent = no line. */
+	boardUrl?: string,
+): TaskCard {
 	const { meta } = lane;
-	const mrkdwn = (text: string): string => (platform === "slack" ? escapeMrkdwn(text) : text);
 	const base = meta.baseBranch ?? "?";
 	const sha = (meta.sha ?? "").slice(0, 12);
 	const acceptance = meta.acceptance ?? [];
@@ -141,15 +139,13 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform
 		return own.length > 0 && own.every((check) => check.ok);
 	}).length;
 	const claimed =
-		meta.claim === undefined
-			? []
-			: [`• ${mrkdwn(clip(redact(meta.claim.summary).replace(/\s+/g, " ").trim(), SUMMARY_MAX))}`];
+		meta.claim === undefined ? [] : [`• ${clip(redact(meta.claim.summary).replace(/\s+/g, " ").trim(), SUMMARY_MAX)}`];
 	const worker = workerLine({
 		tier: meta.tier ?? null,
 		tierReason: meta.tierReason ?? null,
 		workerModel: meta.workerModel ?? null,
 	});
-	const summary = worker === undefined ? claimed : [...claimed, mrkdwn(worker)];
+	const summary = worker === undefined ? claimed : [...claimed, worker];
 	const checkLine =
 		checks.length === 0
 			? ["재실행 검사 없음 — 봇이 직접 확인한 수락기준이 없습니다."]
@@ -157,17 +153,18 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform
 	// What the claim commit changed (`computeLaneChanges`): only the record of this very commit is shown.
 	const changes = meta.changes !== undefined && meta.changes.sha === meta.sha ? meta.changes : undefined;
 	const changeLines = changes === undefined ? [] : [...topLine(changes), ...overlapLine(changes)];
+	const diffLine = boardUrl === undefined ? [] : [`변경 보기: ${diffViewLink({ url: boardUrl }, `lane:${lane.name}`)}`];
 	// The close's scope check and the claim's leftovers (doc/plans/bot-org-risk-gates.md 단계 2).
 	const outside = meta.scopeViolations ?? [];
 	const leftovers = meta.leftovers ?? [];
 	const blockingLeft = leftovers.filter((item) => item.blocking).length;
 	const scopeLines =
 		meta.scopeError !== undefined
-			? [`⚠️ 범위 검사 실패: ${mrkdwn(meta.scopeError)}`]
+			? [`⚠️ 범위 검사 실패: ${meta.scopeError}`]
 			: outside.length === 0
 				? []
 				: [
-						`⚠️ 범위 밖 파일 ${outside.length}개: ${mrkdwn(outside.slice(0, SCOPE_SHOWN).join(", "))}${
+						`⚠️ 범위 밖 파일 ${outside.length}개: ${outside.slice(0, SCOPE_SHOWN).join(", ")}${
 							outside.length > SCOPE_SHOWN ? ` 외 ${outside.length - SCOPE_SHOWN}개` : ""
 						}`,
 					];
@@ -179,9 +176,9 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform
 			? []
 			: [
 					`🧪 실행 QA(뚱기 · ${qa.model.replace(/^.*\//, "").replace(/:[^:]*$/, "")}): ${
-						qa.verdict === "inconclusive" ? `확인 불가(${mrkdwn(qa.reason ?? "?")})` : qa.verdict
+						qa.verdict === "inconclusive" ? `확인 불가(${qa.reason ?? "?"})` : qa.verdict
 					}`,
-					...qa.findings.slice(0, QA_FINDINGS_SHOWN).map((finding) => `> ${mrkdwn(clip(redact(finding), 200))}`),
+					...qa.findings.slice(0, QA_FINDINGS_SHOWN).map((finding) => `> ${clip(redact(finding), 200)}`),
 				];
 	const held = meta.land?.autoLandHeld;
 	const integrity =
@@ -189,7 +186,9 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform
 			? [`⚠️ ${held}으로 닫힌 레인입니다(무결성 거부를 오너가 승인).`]
 			: held === INCONCLUSIVE_APPROVED
 				? [`⚠️ ${held}으로 닫힌 레인입니다(재실행 검사 ${CHECK_TIMEOUT_MS / 1000}초 초과를 오너가 승인).`]
-				: [];
+				: held === OWNER_ACCEPTED
+					? [`⚠️ ${held}으로 닫힌 레인입니다(실패한 검사를 오너가 수락).`]
+					: [];
 	const fields = [
 		{ label: "수락기준(봇 확인/전체)", value: `${confirmed}/${acceptance.length}` },
 		{ label: "재실행 검사", value: `${passed}/${checks.length}${pending}` },
@@ -231,7 +230,7 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform
 			view.skipped?.includes(REVIEW_BLOCK) === true && review?.verdict === "BLOCK" && review.notes !== ""
 				? [
 						"*리뷰 지적*",
-						...mrkdwn(clip(redact(review.notes), REVIEW_NOTES_SHOWN))
+						...clip(redact(review.notes), REVIEW_NOTES_SHOWN)
 							.split("\n")
 							.map((line) => `> ${line}`),
 					]
@@ -246,6 +245,7 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform
 				...integrity,
 				...checkLine,
 				...changeLines,
+				...diffLine,
 				...scopeLines,
 				...(leftovers.length === 0 ? [] : [`남은 일 ${leftoverCount}`]),
 				`브랜치 \`${meta.branch ?? "?"}\`를 \`${base}\`에 머지할까요?${mention(view.ownerUserId)}`,
@@ -287,17 +287,17 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform
 		const push =
 			land.pushed === undefined ? "push 없음(origin 원격이 없거나 push 대상이 아님)" : `push \`${land.pushed}\``;
 		return card(`✅ 머지 완료 · ${lane.title}`, [
-			`\`${base}\` ← \`${sha}\` (${how}) · ${push} · ${land.cleanup === undefined ? "worktree·브랜치 정리" : `⚠️ ${mrkdwn(redact(land.cleanup))}`}`,
+			`\`${base}\` ← \`${sha}\` (${how}) · ${push} · ${land.cleanup === undefined ? "worktree·브랜치 정리" : `⚠️ ${redact(land.cleanup)}`}`,
 			...summary,
 			undoLine(lane),
-			"서비스 반영(재시작)이 필요하면 따로 승인해 주세요.",
+			"서비스 반영(재시작)은 이 머지에 포함되지 않습니다.",
 		]);
 	}
 	if (land?.state === "merged-not-pushed") {
 		return card(`⚠️ 머지됨 · push 안 됨 · ${lane.title}`, [
 			`\`${base}\` ← \`${sha}\` (${how}) ${land.cleanup === undefined ? "머지와 worktree 정리는" : "머지는"} 끝났지만 push origin/${base}가 되지 않았습니다.${mention(view.ownerUserId)}`,
-			`사유: ${mrkdwn(redact(land.reason ?? "(알 수 없음)"))}`,
-			...(land.cleanup === undefined ? [] : [`⚠️ ${mrkdwn(redact(land.cleanup))}`]),
+			`사유: ${redact(land.reason ?? "(알 수 없음)")}`,
+			...(land.cleanup === undefined ? [] : [`⚠️ ${redact(land.cleanup)}`]),
 			`직접 확인한 뒤 \`git -C ${meta.repo ?? "<repo>"} push origin ${base}\`로 올려 주세요.`,
 			undoLine(lane),
 		]);
@@ -313,8 +313,9 @@ export function buildLaneOutcomeCard(lane: LaneRow, view: LaneCardView, platform
 		`🚧 머지 막힘 · ${lane.title}`,
 		[
 			`머지를 끝내지 못했습니다.${mention(view.ownerUserId)}`,
-			`사유: ${mrkdwn(redact(land?.reason ?? "(알 수 없음)"))}`,
+			`사유: ${redact(land?.reason ?? "(알 수 없음)")}`,
 			...summary,
+			...diffLine,
 			'원인을 치운 뒤 `머지`를 다시 누르거나 "머지해"라고 답해 주세요. 버리려면 `폐기`입니다.',
 		],
 		{ buttons: buttonsOf(lane), note: buttonNote(lane) },

@@ -10,10 +10,10 @@ function stringParam(params: Record<string, unknown>, key: string): string {
 }
 
 /**
- * Offered to chat sessions: starts a work lane in `channel` (same as the `작업: <제목> @<경로>` message). On Slack the
- * lane thread is in that conversation; on Discord it is a thread of that server channel.
+ * Offered to chat sessions: starts a work lane in `channel` (same as the `작업: <제목> @<경로>` message). On Discord
+ * the lane is a thread of that server channel.
  */
-export function buildWorkStartTool(manager: LaneManager, channel: string): HostToolDef {
+export function buildWorkStartTool(manager: LaneManager, channel: string, originKey: string): HostToolDef {
 	return {
 		name: "ompbot_work_start",
 		label: "Start work lane",
@@ -48,6 +48,17 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 					description:
 						"Model tier of the lane session (owner config `lanes.models`): high for design, debugging or wide changes; middle for ordinary implementation; low for mechanical edits. Omit to let the risk class decide (L0-L1 low, L2 middle, L3 and above or unrated high); L3 and above always run on high.",
 				},
+				tierReason: {
+					type: "string",
+					description:
+						"One line on why that model tier was chosen (shown on the lane card). Omit for the default wording.",
+				},
+				tierConfidence: {
+					type: "number",
+					minimum: 0,
+					maximum: 1,
+					description: "Confidence 0..1 in the tier choice (the judge's conf, when one was asked).",
+				},
 			},
 			required: ["title", "cwd"],
 			additionalProperties: false,
@@ -63,6 +74,9 @@ export function buildWorkStartTool(manager: LaneManager, channel: string): HostT
 				risk: params.risk,
 				scope: params.scope,
 				model: params.model,
+				tierReason: params.tierReason,
+				tierConfidence: params.tierConfidence,
+				parentOrigin: originKey,
 			});
 			const link = await manager.threadLink(lane);
 			const started = `lane ${lane.name} started (thread ${lane.threadRef}, origin ${lane.originKey})`;

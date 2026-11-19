@@ -26,7 +26,7 @@ const picked = enabled ? await pickE2eModel(OMP_EXECUTABLE) : undefined;
 if (enabled && picked?.model === undefined)
 	console.log(`[skip] omp-smoke.e2e.test.ts: ${picked?.reason ?? "no model offered"}`);
 const MODEL = picked?.model ?? "";
-const ORIGIN = "slack/dm/DSMOKE";
+const ORIGIN = "discord/dm/200000000000000012";
 // Failure deadline on an awaited final, never a wait for time to pass.
 const TURN_TIMEOUT_MS = 180_000;
 

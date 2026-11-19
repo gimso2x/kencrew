@@ -1,8 +1,7 @@
 /**
  * Inbound attachments, the platform-neutral part: the per-message budget, one hardened download (host allowlist,
  * manual redirects, size cap, image magic, atomic rename) and saving one file under `<mediaRoot>/inbound/` as the
- * prompt note the turn sees. Each platform supplies its hosts and headers (Slack sends its bot token to Slack hosts
- * only, Discord's CDN gets none) and its file fields.
+ * prompt note the turn sees. Each platform supplies its hosts and headers (Discord's CDN gets none) and its file fields.
  */
 import { createHash } from "node:crypto";
 import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
@@ -306,4 +305,29 @@ export async function saveInboundAttachment(input: {
 		log.warn("attachment_download_failed", { ...where, name, error: errorText(err) });
 		return `[첨부 실패: ${name} — ${oneLine(errorText(err), 200)}]`;
 	}
+}
+
+/**
+ * The scaffolding around `saveInboundAttachment` every adapter repeats: the "media storage is not configured" notice
+ * when `mediaRoot` is unset, the per-message budget (`MAX_INBOUND_FILES`, downloads in parallel, notes in file order)
+ * and the "skipped" notice for the files past it. `dir` names the message's download directory out of the media root;
+ * `saveOne` is the adapter's save-one-file step, its per-file prechecks included.
+ */
+export async function collectInboundNotes<T>(input: {
+	mediaRoot: string | undefined;
+	/** The download directory (`<mediaRoot>/inbound/<message>/`), derived once the media root is known. */
+	dir(mediaRoot: string): string;
+	files: readonly T[];
+	/** Saves one file into `dir` and returns its prompt note; a refused or failed file is a notice line, never a throw. */
+	saveOne(file: T, dir: string): string | Promise<string>;
+}): Promise<string[]> {
+	if (input.mediaRoot === undefined) {
+		return [`[첨부 실패: ${input.files.length}개 — 미디어 저장이 구성되지 않았습니다]`];
+	}
+	const dir = input.dir(input.mediaRoot);
+	const notes = await Promise.all(input.files.slice(0, MAX_INBOUND_FILES).map((file) => input.saveOne(file, dir)));
+	if (input.files.length > MAX_INBOUND_FILES) {
+		notes.push(`[첨부 생략: ${input.files.length - MAX_INBOUND_FILES}개 — 메시지당 최대 ${MAX_INBOUND_FILES}개]`);
+	}
+	return notes;
 }

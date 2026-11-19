@@ -29,17 +29,17 @@ export const STATUS_REACTIONS: Record<TaskStatus, string> = {
 /** Every status emoji except `keep`'s: the set a status swap clears so exactly one remains. */
 export const otherStatuses = (keep: TaskStatus): TaskStatus[] => TASK_STATUSES.filter((status) => status !== keep);
 
-export interface TaskSlackLog {
+export interface TaskChatLog {
 	warn(event: string, fields?: Record<string, unknown>): void;
 }
 
 /**
  * Makes `to` the single status reaction on the root of `threadRef`: removes the listed other statuses (a missing
- * reaction is not an error), then adds `to`. Slack failures are logged — a reaction never fails a task.
+ * reaction is not an error), then adds `to`. Chat failures are logged — a reaction never fails a task.
  */
 export async function setStatusReaction(
 	channels: ChannelRegistry,
-	log: TaskSlackLog,
+	log: TaskChatLog,
 	threadRef: string,
 	to: TaskStatus,
 	remove: readonly TaskStatus[] = otherStatuses(to),
@@ -76,7 +76,7 @@ export interface TaskCard {
 	note?: string;
 }
 
-/** A Slack section's text holds 3,000 characters: a longer card body is cut there. */
+/** A card section's text holds 3,000 characters: a longer card body is cut there. */
 const CARD_BODY_MAX = 3_000;
 
 /** The port message for a card (or a one-string notice), owner mentions rendered for the port. */
@@ -96,7 +96,7 @@ export function cardMessage(card: TaskCard | string, port: Pick<ChannelPort, "me
 /** Posts into the task thread (owner mentions rendered for the port); failures are logged and reported as `false`. */
 export async function postToThread(
 	channels: ChannelRegistry,
-	log: TaskSlackLog,
+	log: TaskChatLog,
 	threadRef: string,
 	card: TaskCard | string,
 ): Promise<boolean> {
@@ -106,7 +106,7 @@ export async function postToThread(
 /** `postToThread` that resolves with where the card went (for a later `editThreadCard`); `undefined` = not posted. */
 export async function postCardToThread(
 	channels: ChannelRegistry,
-	log: TaskSlackLog,
+	log: TaskChatLog,
 	threadRef: string,
 	card: TaskCard | string,
 ): Promise<MessageRef | undefined> {
@@ -124,7 +124,7 @@ export async function postCardToThread(
 /** Redraws a posted task card; a failure is logged and reported as `false`. */
 export async function editThreadCard(
 	channels: ChannelRegistry,
-	log: TaskSlackLog,
+	log: TaskChatLog,
 	ref: MessageRef,
 	card: TaskCard,
 ): Promise<boolean> {
@@ -170,7 +170,7 @@ export const parseTaskRecommendActionId = (actionId: string): string | undefined
 	taskIdOf(actionId, TASK_RECOMMEND_ACTION_PREFIX);
 
 /** What one click on `머지` does: the same as answering "머지해" in the thread. */
-export const MERGE_NOTE = "머지 = close → ff merge → push → 정리 · 재시작은 따로 승인";
+export const MERGE_NOTE = "머지 = close → ff merge → push → 정리 · 재시작은 포함 안 됨";
 /** What one click on `추천대로` does: the same as answering "추천대로" in the thread. */
 export const RECOMMEND_NOTE = "추천대로 = 위 추천 그대로 진행 · 다른 결정은 이 스레드에 답장";
 /** The recommendation a `추천대로` button carries in its `value` (redacted), so the click can say what it approved. */
@@ -321,11 +321,11 @@ export function checkBlockers(checks: readonly TaskCheck[]): string[] {
 }
 
 /**
- * The integrity warnings that hold a task's merge: all of them, except that an L0·L1 task is not held by an unproven
- * claim word in its summary alone (owner decision 11-16 — the re-run checks already stand behind the claim).
+ * The integrity warnings that hold a task's merge: all of them, except that an L0–L2 task is not held by an unproven
+ * claim word in its summary alone (owner decisions 11-16, 11-18 — the re-run checks already stand behind the claim).
  */
 export function holdingIntegrityWarnings(risk: TaskRisk, warnings: readonly string[]): string[] {
-	if (TASK_RISKS.indexOf(risk) > TASK_RISKS.indexOf("L1")) return [...warnings];
+	if (TASK_RISKS.indexOf(risk) > TASK_RISKS.indexOf("L2")) return [...warnings];
 	return warnings.filter((line) => !line.startsWith("무결성 unproven_claim_word:"));
 }
 
@@ -407,6 +407,8 @@ export function buildReachedCard(
 	ownerUserId: string,
 	link?: string,
 	autoLand?: ReachedAutoLandNote,
+	/** The dashboard's diff view of the task (`diffViewLink`); absent = no line. */
+	diffLink?: string,
 ): TaskCard {
 	const summary = [...summaryLines(row, judgement), ...workerLines(row)];
 	const lead = autoLand?.kind === "failed" ? [AUTO_LAND_FAILED_LINE] : [];
@@ -429,6 +431,7 @@ export function buildReachedCard(
 		judgement.checks.length === 0
 			? []
 			: [`✅ check ${passed}/${judgement.checks.length} 통과 — 봇이 워크트리에서 직접 다시 실행했습니다.`];
+	const changeLink = diffLink === undefined ? [] : [`변경 보기: ${diffLink}`];
 	const text = [
 		...lead,
 		`🔍 Outcome 도달 · ${row.title} — 수락기준 ${judgement.acChecked}/${row.acceptance.length}에 체크와 증거가 있습니다. 머지할지 정해 주세요. (${ownerTag(row)})${mention}`,
@@ -437,10 +440,11 @@ export function buildReachedCard(
 		...skipped,
 		...integrity,
 		...checks,
+		...changeLink,
 		...(warnings.length === 0 ? [] : ["", ...warnings]),
 		"",
 		`*질문*: 브랜치 \`${row.branch}\`를 main에 머지할까요?`,
-		'*답하는 법*: 이 스레드에 "머지해"라고 답하면 봇이 close→merge→push·워크트리 정리까지 하고, 서비스 반영(재시작)이 필요하면 그때 승인을 따로 요청합니다. 고칠 점이 있으면 그 내용을 적어 주세요.',
+		'*답하는 법*: 이 스레드에 "머지해"라고 답하면 봇이 close→merge→push·워크트리 정리까지 하고, 서비스 반영(재시작)은 머지에 포함되지 않습니다. 고칠 점이 있으면 그 내용을 적어 주세요.',
 		evidenceLine(row),
 		...boardFooter(link),
 	].join("\n");
@@ -453,6 +457,7 @@ export function buildReachedCard(
 			...summary,
 			...skipped,
 			...integrity,
+			...changeLink,
 			...(warnings.length === 0 ? [] : ["", ...warnings]),
 			"",
 			`${quiet ? "" : `${mentionToken(ownerUserId)} `}머지할지 정해 주세요. 고칠 점이 있으면 이 스레드에 적어 주세요.`,
@@ -469,13 +474,6 @@ export function buildReachedCard(
 		...(note === undefined ? {} : { note }),
 	};
 }
-
-export const formatReachedNotice = (
-	row: TaskRow,
-	judgement: TaskJudgement,
-	ownerUserId: string,
-	link?: string,
-): string => buildReachedCard(row, judgement, ownerUserId, link).text;
 
 /** One line for what a core landing (`landTask`) or a landing call came to: card notes and the auto-merge card lead. */
 export function taskLandNote(outcome: TaskLandOutcome): string {
@@ -610,13 +608,6 @@ export function buildBlockedSettledCard(row: TaskRow, note: string): TaskCard {
 	return { text: `${title}\n${note}`, title, body: row.title, fields: [branchField(row)], buttons: [], note };
 }
 
-export const formatBlockedNotice = (
-	row: TaskRow,
-	judgement: TaskJudgement,
-	ownerUserId: string,
-	link?: string,
-): string => buildBlockedCard(row, judgement, ownerUserId, link).text;
-
 export const formatSpecChangedNotice = (row: TaskRow): string =>
 	`⚠️ ${row.taskId} spec.md 수락기준이 등록 스냅샷과 다릅니다(개수·ID·문구). 고쳐질 때까지 Outcome에 도달하지 않습니다.`;
 
@@ -624,6 +615,21 @@ export const formatSpecChangedNotice = (row: TaskRow): string =>
 export const formatStaleNotice = (row: TaskRow, minutes: number, link?: string, askedOwner?: string): string =>
 	[
 		`⏰ ${row.title}: PROGRESS.md가 ${minutes}분 넘게 갱신되지 않았습니다. (${ownerTag(row)})${askedOwner === undefined ? "" : ` 워커가 질문하고 기다립니다. ${mentionToken(askedOwner)}`}`,
+		...boardFooter(link),
+	].join("\n");
+
+/** The worker is herdr-working but PROGRESS.md has not moved for `minutes`: told once, with the screen tail. */
+export const formatWorkingSilentNotice = (
+	row: TaskRow,
+	minutes: number,
+	screen: { ok: boolean; output?: string; error?: string },
+	link?: string,
+): string =>
+	[
+		`⏳ ${row.title}: 워커는 작업 중(herdr working)인데 PROGRESS.md가 ${minutes}분째 그대로입니다 — 긴 실행이거나 같은 일을 되풀이하고 있을 수 있습니다. (${ownerTag(row)})`,
+		...(screen.ok
+			? ["*화면 끝부분*:", "```", ...cardTailLines(screen.output ?? ""), "```"]
+			: [`*화면*: 읽지 못함 (${redact(screen.error ?? "unknown").slice(0, 120)})`]),
 		...boardFooter(link),
 	].join("\n");
 
@@ -769,13 +775,6 @@ export function buildAgentQuestionCard(row: TaskRow, question: string, ownerUser
 		...(note === undefined ? {} : { note }),
 	};
 }
-
-export const formatAgentWaitingNotice = (
-	row: TaskRow,
-	screen: { ok: boolean; output?: string; error?: string },
-	ownerUserId: string,
-	link?: string,
-): string => buildAgentWaitingCard(row, screen, ownerUserId, link).text;
 
 /** Unmet-condition nudges one task gets in a row before the owner resumes it (then the count starts over). */
 export const NUDGE_MAX = 4;

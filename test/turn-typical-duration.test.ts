@@ -77,7 +77,7 @@ describe("runningStatusText typical", () => {
 });
 
 describe("turn duration samples", () => {
-	const CHAT = "slack/dm/DTYP";
+	const CHAT = "discord/dm/200000000000000010";
 	let dir: string;
 	let store: Store;
 	let raw: Database;
@@ -147,7 +147,7 @@ describe("turn duration samples", () => {
 
 	test("AC-3: with 10+ samples of the origin only the origin counts", () => {
 		seedTurns(CHAT, 10, (i) => (i + 1) * 1000);
-		seedTurns("slack/dm/DOTHER", 10, () => 999_000);
+		seedTurns("discord/dm/200000000000000011", 10, () => 999_000);
 		expect(typicalTurnDuration(store, CHAT, log())).toEqual({ medianMs: 5000, p90Ms: 9000 });
 	});
 
@@ -243,7 +243,7 @@ describe("OriginMailbox first progress", () => {
 	});
 
 	test("AC-4: right after the turn starts, before any tool call, progress carries typical once", async () => {
-		const origin = "slack/dm/DFIRST";
+		const origin = "discord/dm/200000000000000012";
 		seedTen(origin);
 		const mailbox = mailboxOf(origin);
 		try {
@@ -260,7 +260,7 @@ describe("OriginMailbox first progress", () => {
 	test("AC-3: a monitor origin's turn starts without typical", async () => {
 		const origin = "monitor/typ";
 		seedTen(origin);
-		seedTen("slack/dm/DOTHER");
+		seedTen("discord/dm/200000000000000011");
 		const mailbox = mailboxOf(origin);
 		try {
 			await mailbox.enqueue(msg(origin));
@@ -272,7 +272,7 @@ describe("OriginMailbox first progress", () => {
 	});
 
 	test("AC-3: a throwing query logs once and the turn still starts", async () => {
-		const origin = "slack/dm/DFAIL";
+		const origin = "discord/dm/200000000000000013";
 		store.turnDurationSamples = () => {
 			throw new Error("disk I/O error");
 		};

@@ -8,22 +8,20 @@ import type { OmpbotConfig } from "../src/config";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
+import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 import { makeRepo } from "./helpers/git-fixtures";
-import type { FakeCall } from "./helpers/slack-fake-transport";
 
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = `discord/dm/${OWNER_DM}`;
 
 let home: TestHome;
-let transport: WaitingTransport;
+let transport: WaitingDiscordTransport;
 let daemon: Daemon | undefined;
 let repos: string[];
 
 beforeEach(() => {
 	home = makeHome("ompbot-turn-undo-daemon-");
-	transport = new WaitingTransport();
+	transport = new WaitingDiscordTransport();
 	daemon = undefined;
 	repos = [];
 });
@@ -43,7 +41,7 @@ async function boot(config: OmpbotConfig, driver: FakeOmpDriverOptions = {}): Pr
 	const instance = new FakeOmpDriver({ ...driver, sessionDir: join(home.dir, "s"), store: new FakeSessionStore() });
 	const d = new Daemon({
 		config,
-		channels: [new SlackBinding(new SlackChannel(transport))],
+		channels: [discordBinding(transport)],
 		clock: { now: () => Date.now() },
 		log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact: (text) => text }),
 		ompVersion: "omp-test 0",
@@ -60,19 +58,18 @@ async function boot(config: OmpbotConfig, driver: FakeOmpDriverOptions = {}): Pr
 
 /** Approve buttons the transport received; the card's buttons go up with the edit that follows its post. */
 function approveButtons(): string[] {
-	return transport.calls.flatMap((call: FakeCall) => {
-		if (call.method !== "postMessage" && call.method !== "updateMessage") return [];
-		return (call.blocks ?? []).flatMap((block) => {
-			if (typeof block !== "object" || block === null || !("elements" in block)) return [];
-			const elements = block.elements;
-			if (!Array.isArray(elements)) return [];
-			return elements.flatMap((element: unknown) =>
-				typeof element === "object" &&
-				element !== null &&
-				"action_id" in element &&
-				typeof element.action_id === "string" &&
-				element.action_id.includes(":approve:")
-					? [element.action_id]
+	return transport.calls.flatMap((call: FakeDiscordCall) => {
+		if (call.method !== "createMessage" && call.method !== "editMessage") return [];
+		return (call.components ?? []).flatMap((row) => {
+			if (typeof row !== "object" || row === null || !("components" in row) || !Array.isArray(row.components))
+				return [];
+			return row.components.flatMap((button: unknown) =>
+				typeof button === "object" &&
+				button !== null &&
+				"custom_id" in button &&
+				typeof button.custom_id === "string" &&
+				button.custom_id.includes(":approve:")
+					? [button.custom_id]
 					: [],
 			);
 		});
@@ -94,15 +91,18 @@ async function until(ready: () => boolean, what: string, hops = 2000): Promise<v
 async function approveUndoCard(): Promise<string> {
 	await until(() => approveButtons().length > 0, "the undo card's approve button");
 	const actionId = approveButtons()[0] ?? "";
-	const [, , , channel, ts] = actionId.split(":");
-	const key = `${channel}:${ts}`;
-	await transport.emitBlockAction({
+	const [, , , channel = "", card = ""] = actionId.split(":");
+	await transport.emitInteraction({
+		id: "800000000000000001",
+		application_id: "600000000000000000",
+		type: 3,
+		token: "token-1",
+		channel_id: channel,
 		user: { id: OWNER },
-		...(channel === undefined ? {} : { channel: { id: channel } }),
-		...(ts === undefined ? {} : { message: { ts } }),
-		actions: [{ action_id: actionId, value: "approve" }],
+		data: { custom_id: actionId, component_type: 2 },
+		message: { id: card, channel_id: channel },
 	});
-	return key;
+	return `${channel}:${card}`;
 }
 
 const turnSnapshots = (d: Daemon) => d.store.listTurnSnapshots({ originKey: ORIGIN });
@@ -113,7 +113,7 @@ describe("AC-4: turnUndo is wired into the mailbox", () => {
 		const spawn = spyOn(Bun, "spawn");
 		try {
 			await d.inject({ origin: ORIGIN, asOwner: true, text: "고쳐줘" });
-			await transport.waitForPosts((text) => text === "ECHO 고쳐줘");
+			await transport.waitForPosts((text) => text.startsWith("ECHO 고쳐줘"));
 			await d.inject({ origin: ORIGIN, asOwner: true, text: "!undo" });
 			await transport.waitForPosts((text) => text.includes("설정되지 않았습니다"));
 			const gitRuns = spawn.mock.calls.filter(([cmd]) => Array.isArray(cmd) && cmd[0] === "git");
@@ -134,7 +134,7 @@ describe("AC-4: turnUndo is wired into the mailbox", () => {
 			},
 		});
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "고쳐줘" });
-		await transport.waitForPosts((text) => text === "고쳤습니다");
+		await transport.waitForPosts((text) => text.startsWith("고쳤습니다"));
 		await until(() => turnSnapshots(d).length > 0, "the turn's snapshot row");
 		expect(turnSnapshots(d).map((row) => row.repo)).toEqual([repo]);
 		expect(existsSync(join(repo, "changed.txt"))).toBe(true);
@@ -160,7 +160,7 @@ describe("AC-4: turnUndo is wired into the mailbox", () => {
 			},
 		});
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "고쳐줘" });
-		await transport.waitForPosts((text) => text === "답 1");
+		await transport.waitForPosts((text) => text.startsWith("답 1"));
 		expect(turnSnapshots(d)).toEqual([]);
 
 		// A reload re-reads config.json: write the repository list there, the way the owner would.
@@ -169,7 +169,7 @@ describe("AC-4: turnUndo is wired into the mailbox", () => {
 		await Bun.write(join(home.dir, "config.json"), JSON.stringify(raw));
 		d.reloadConfig("ipc");
 		await d.inject({ origin: ORIGIN, asOwner: true, text: "또 고쳐줘" });
-		await transport.waitForPosts((text) => text === "답 2");
+		await transport.waitForPosts((text) => text.startsWith("답 2"));
 		await until(() => turnSnapshots(d).length > 0, "the post-reload turn's snapshot row");
 		expect(turnSnapshots(d).map((row) => row.repo)).toEqual([repo]);
 	});

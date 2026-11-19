@@ -122,7 +122,9 @@ function attentionLines(snapshot: DashboardSnapshot): string[] {
 		}
 	}
 	if (snapshot.approvals.ok) {
-		for (const approval of snapshot.approvals.items) lines.push(`승인 대기 ${esc(redact(approval.title))}`);
+		for (const approval of snapshot.approvals.items) {
+			lines.push(`승인 대기 ${esc(redact(approval.title))}${waitedFor(snapshot, approval.createdAt)}`);
+		}
 	}
 	if (snapshot.turns.ok) {
 		for (const turn of snapshot.turns.items) {
@@ -136,7 +138,9 @@ function attentionLines(snapshot: DashboardSnapshot): string[] {
 	}
 	for (const task of openTasks(snapshot)) {
 		if (task.status !== "blocked" && task.error === undefined) continue;
-		lines.push(`TASK ${esc(redact(`${task.taskId} ${task.title}`))} · ${esc(redact(task.status))}`);
+		lines.push(
+			`TASK ${esc(redact(`${task.taskId} ${task.title}`))} · ${esc(redact(task.status))}${waitedFor(snapshot, task.updatedAt)}`,
+		);
 	}
 	// Last, so the bot's own lines above keep their places under the line cap; counts only, never a check's words.
 	const hosts = snapshot.hostChecks;
@@ -234,6 +238,16 @@ function footerLines(snapshot: DashboardSnapshot): string[] {
 	const generated = Date.parse(snapshot.generatedAt);
 	parts.push(`기준 ${Number.isNaN(generated) ? redact(snapshot.generatedAt) : minuteOf(generated, snapshot.timezone)}`);
 	return parts.map((line) => esc(redact(line)));
+}
+
+/**
+ * ` · 3시간 10분째`: how long an owner-facing item has waited at the snapshot's time, so the morning picture shows
+ * where decisions pile up, not only that they exist. A TASK's `updatedAt` moves only on a status change, so it is
+ * the time in its current status. Empty when either stamp does not parse.
+ */
+function waitedFor(snapshot: DashboardSnapshot, since: string): string {
+	const waited = Date.parse(snapshot.generatedAt) - Date.parse(since);
+	return Number.isNaN(waited) ? "" : ` · ${duration(waited)}째`;
 }
 
 function threadTitle(thread: { originKey: string; threadRef: string | null }): string {

@@ -1,9 +1,13 @@
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { renderDashboardMain, renderDashboardPage, renderItemDetail } from "../src/dashboard/html";
+import { renderDashboardMain, renderDashboardPage, renderDetailTabs, renderItemDetail } from "../src/dashboard/html";
+import { startDashboardServer } from "../src/dashboard/server";
 import { buildSnapshot, type DashboardSnapshot, type JobInfo, type SnapshotDeps } from "../src/dashboard/snapshot";
+import { readCardTrace, readCwdTrace, readJobTrace, readJobTraceByName, type TurnTrace } from "../src/dashboard/trace";
+import { ompSessionDirFor } from "../src/omp/session-dir";
 import { openStore } from "../src/store/db";
 
 const NOW = Date.parse("2026-11-04T13:50:00Z");
@@ -348,5 +352,551 @@ describe("dashboard jobs from systemd-run units", () => {
 			["audit", "ok"],
 		]);
 		expect(jobs[0]?.detail).toContain("Failed to connect to bus");
+	});
+});
+
+interface ThreadSeed {
+	origin: string;
+	threadRef: string;
+	state: string;
+	text: string;
+	createdAt: number;
+	dispatchedAt?: number | null;
+	lastEventAt?: number | null;
+}
+
+function seedThreads(rows: ThreadSeed[]): void {
+	const dbPath = join(home, "ompbot.db");
+	openStore({ timezone: "Asia/Seoul", path: dbPath, clock: { now: () => NOW }, redact: (text) => text }).close();
+	const db = new Database(dbPath, { strict: true });
+	for (const origin of new Set(rows.map((row) => row.origin))) {
+		db.run("INSERT INTO origins (origin_key, epoch, session_dir, updated_at) VALUES (?, 1, ?, ?)", [
+			origin,
+			join(home, "sessions", encodeURIComponent(origin)),
+			NOW,
+		]);
+	}
+	for (const [index, row] of rows.entries()) {
+		db.run(
+			`INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at, thread_ref)
+			 VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?)`,
+			[
+				`msg-${index}`,
+				row.origin,
+				row.text,
+				row.state,
+				row.createdAt,
+				row.dispatchedAt ?? null,
+				row.lastEventAt ?? null,
+				row.threadRef,
+			],
+		);
+	}
+	db.close();
+}
+
+function hasNestedAnchors(html: string): boolean {
+	let depth = 0;
+	for (const tag of html.matchAll(/<\/?a(?:\s|>)/gi)) {
+		if (tag[0].startsWith("</")) depth = Math.max(0, depth - 1);
+		else {
+			if (depth > 0) return true;
+			depth += 1;
+		}
+	}
+	return false;
+}
+
+describe("dashboard jobs in thread board (AC-1, AC-2)", () => {
+	const HOUR = 60 * MINUTE;
+
+	test("AC-1: running ok/stale job moves done thread (even >24h old) to working with jobs[], keeps attention priority, and reverts on done/dead/failed", async () => {
+		seedThreads([
+			{
+				origin: "discord/ch/300000000000000001/t/100000000000000001",
+				threadRef: "300000000000000001:100000000000000001",
+				state: "answered",
+				text: "최근 끝난 스레드",
+				createdAt: NOW - 2 * HOUR,
+				dispatchedAt: NOW - 2 * HOUR,
+				lastEventAt: NOW - HOUR,
+			},
+			{
+				origin: "discord/ch/300000000000000002/t/100000000000000002",
+				threadRef: "300000000000000002:100000000000000002",
+				state: "answered",
+				text: "오래된 스레드",
+				createdAt: NOW - 30 * HOUR,
+				dispatchedAt: NOW - 30 * HOUR,
+				lastEventAt: NOW - 29 * HOUR,
+			},
+			{
+				origin: "discord/ch/300000000000000003/t/100000000000000003",
+				threadRef: "300000000000000003:100000000000000003",
+				state: "failed_notified",
+				text: "실패 스레드",
+				createdAt: NOW - 2 * HOUR,
+				dispatchedAt: NOW - 2 * HOUR,
+			},
+			{
+				origin: "discord/ch/300000000000000004/t/100000000000000004",
+				threadRef: "300000000000000004:100000000000000004",
+				state: "dispatched",
+				text: "정체 스레드",
+				createdAt: NOW - 25 * MINUTE,
+				dispatchedAt: NOW - 20 * MINUTE,
+			},
+			{
+				origin: "discord/ch/300000000000000005/t/100000000000000005",
+				threadRef: "300000000000000005:100000000000000005",
+				state: "answered",
+				text: "죽은 작업 스레드",
+				createdAt: NOW - HOUR,
+				dispatchedAt: NOW - HOUR,
+			},
+		]);
+		writeJob("ok-job.json", {
+			state: "running",
+			updatedAt: iso(NOW - MINUTE),
+			pid: LIVE_PID,
+			thread: "300000000000000001:100000000000000001",
+		});
+		writeJob("old-thread-job.json", {
+			state: "running",
+			updatedAt: iso(NOW - 11 * MINUTE), // stale, still running
+			pid: LIVE_PID,
+			thread: "300000000000000002:100000000000000002",
+		});
+		writeJob("failed-turn-job.json", {
+			state: "running",
+			updatedAt: iso(NOW - MINUTE),
+			pid: LIVE_PID,
+			thread: "300000000000000003:100000000000000003",
+		});
+		writeJob("stalled-turn-job.json", {
+			state: "running",
+			updatedAt: iso(NOW - MINUTE),
+			pid: LIVE_PID,
+			thread: "300000000000000004:100000000000000004",
+		});
+		writeJob("dead-job.json", {
+			state: "running",
+			updatedAt: iso(NOW - MINUTE),
+			pid: 9999,
+			thread: "300000000000000005:100000000000000005",
+		});
+
+		const snap1 = await buildSnapshot(deps());
+		expect(snap1.turns.ok).toBe(true);
+		const byCode = new Map(
+			(snap1.turns.ok ? snap1.turns.threads : []).map((t) => [`C${t.originKey.split("/")[2]?.slice(-1)}`, t]),
+		);
+		expect(byCode.get("C1")?.column).toBe("working");
+		expect(byCode.get("C1")?.jobs).toEqual(["ok-job"]);
+		// >24h thread included and placed in working by its running stale job
+		expect(byCode.get("C2")?.column).toBe("working");
+		expect(byCode.get("C2")?.jobs).toEqual(["old-thread-job"]);
+		// attention priority wins over running job
+		expect(byCode.get("C3")?.column).toBe("attention");
+		expect(byCode.get("C3")?.jobs).toEqual(["failed-turn-job"]);
+		expect(byCode.get("C4")?.column).toBe("attention");
+		// dead job does not promote to working
+		expect(byCode.get("C5")?.column).toBe("done");
+		expect(byCode.get("C5")?.jobs).toBeUndefined();
+
+		// When ok-job becomes done (or failed), thread returns to done
+		writeJob("ok-job.json", {
+			state: "done",
+			updatedAt: iso(NOW),
+			pid: LIVE_PID,
+			thread: "300000000000000001:100000000000000001",
+		});
+		writeJob("old-thread-job.json", {
+			state: "failed",
+			updatedAt: iso(NOW),
+			thread: "300000000000000002:100000000000000002",
+		});
+		const snap2 = await buildSnapshot(deps());
+		const byCode2 = new Map(
+			(snap2.turns.ok ? snap2.turns.threads : []).map((t) => [`C${t.originKey.split("/")[2]?.slice(-1)}`, t]),
+		);
+		expect(byCode2.get("C1")?.column).toBe("done");
+		expect(byCode2.get("C1")?.jobs).toBeUndefined();
+		expect(byCode2.get("C2")).toBeUndefined(); // >24h old and no active job -> drops out again
+
+		// If jobs section fails, turns section still builds as usual
+		rmSync(join(home, "jobs"), { recursive: true, force: true });
+		writeFileSync(join(home, "jobs"), "not-a-dir");
+		const snap3 = await buildSnapshot(deps());
+		expect(snap3.jobs.ok).toBe(false);
+		expect(snap3.turns.ok).toBe(true);
+		if (snap3.turns.ok) {
+			const c1 = snap3.turns.threads.find((t) => t.originKey === "discord/ch/300000000000000001/t/100000000000000001");
+			expect(c1?.column).toBe("done");
+			expect(c1?.jobs).toBeUndefined();
+		}
+	});
+
+	test("AC-2: thread card renders 백그라운드 작업 N badge linking to newest job without nested <a>, and counts thread in head", async () => {
+		seedThreads([
+			{
+				origin: "discord/ch/300000000000000001/t/100000000000000001",
+				threadRef: "300000000000000001:100000000000000001",
+				state: "answered",
+				text: "단일 작업 스레드",
+				createdAt: NOW - 2 * HOUR,
+				dispatchedAt: NOW - 2 * HOUR,
+			},
+			{
+				origin: "discord/ch/300000000000000002/t/100000000000000002",
+				threadRef: "300000000000000002:100000000000000002",
+				state: "answered",
+				text: "다중 작업 스레드",
+				createdAt: NOW - 2 * HOUR,
+				dispatchedAt: NOW - 2 * HOUR,
+			},
+		]);
+		writeJob("solo.json", {
+			state: "running",
+			updatedAt: iso(NOW - 2 * MINUTE),
+			pid: LIVE_PID,
+			thread: "300000000000000001:100000000000000001",
+		});
+		writeJob("older-job.json", {
+			state: "running",
+			updatedAt: iso(NOW - 5 * MINUTE),
+			pid: LIVE_PID,
+			thread: "300000000000000002:100000000000000002",
+		});
+		writeJob("newer-job.json", {
+			state: "running",
+			updatedAt: iso(NOW - MINUTE),
+			pid: LIVE_PID,
+			thread: "300000000000000002:100000000000000002",
+		});
+
+		const snapshot = await buildSnapshot(deps());
+		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
+		expect(html).toContain("진행 중 스레드 <b>2</b>");
+		expect(hasNestedAnchors(html)).toBe(false);
+
+		const card1 =
+			/<article class="card[^"]*"[^>]*data-row="discord\/ch\/300000000000000001\/t\/100000000000000001"[\s\S]*?<\/article>/.exec(
+				html,
+			)?.[0] ?? "";
+		expect(card1).toContain('data-item="job:solo"');
+		expect(card1).toContain('href="?view=turns&amp;item=job%3Asolo"');
+		expect(card1).toContain(">백그라운드 작업 1<");
+
+		const card2 =
+			/<article class="card[^"]*"[^>]*data-row="discord\/ch\/300000000000000002\/t\/100000000000000002"[\s\S]*?<\/article>/.exec(
+				html,
+			)?.[0] ?? "";
+		expect(card2).toContain('data-item="job:newer-job"');
+		expect(card2).toContain('href="?view=turns&amp;item=job%3Anewer-job"');
+		expect(card2).toContain('title="newer-job, older-job"');
+		expect(card2).toContain(">백그라운드 작업 2<");
+
+		// List layout also has the badge link without nested anchors
+		const listHtml = renderDashboardMain(snapshot, undefined, NOW, { view: "turns", layout: "list" });
+		expect(hasNestedAnchors(listHtml)).toBe(false);
+		expect(listHtml).toContain('data-item="job:newer-job"');
+		expect(listHtml).toContain(">백그라운드 작업 2<");
+
+		// Client renderer matches SSR
+		expect(clientRender(snapshot)(snapshot, undefined, NOW, { view: "turns" })).toBe(html);
+	});
+});
+
+describe("job progress tail & security checks (AC-3)", () => {
+	test("AC-3: reads masked last 40 lines from tail 64KiB inside allowed roots; blocks outside, secrets, symlinks, non-regular", async () => {
+		const userRoot = mkdtempSync(join(tmpdir(), "ompbot-user-home-"));
+		const outside = mkdtempSync(join(tmpdir(), "ompbot-outside-"));
+		try {
+			const workDir = join(userRoot, "work", "proj");
+			const altHome = join(userRoot, ".ompbot-alt");
+			const secretsInHome = join(home, "secrets");
+			const secretsInAlt = join(altHome, "secrets");
+			mkdirSync(workDir, { recursive: true });
+			mkdirSync(secretsInAlt, { recursive: true });
+			mkdirSync(secretsInHome, { recursive: true });
+
+			// 50 lines in allowed workDir with a token to mask
+			const allowedProgress = join(workDir, "progress.log");
+			const fifty = Array.from({ length: 50 }, (_, i) =>
+				i === 45 ? `line-${i + 1} token=xoxb-TEST-0` : `line-${i + 1}`,
+			).join("\n");
+			writeFileSync(allowedProgress, `${fifty}\n`);
+
+			// >64KiB file where head has marker that must NOT be read
+			const largeProgress = join(home, "large.log");
+			const headMarker = "HEAD_PAST_64K_MUST_NOT_READ_xoxb-HEAD-SECRET";
+			const headPad = `${headMarker}\n${"a".repeat(40 * 1024)}\n`;
+			const tailLines = Array.from({ length: 80 }, (_, i) => `tail-${i + 1} ${"b".repeat(900)}`).join("\n");
+			writeFileSync(largeProgress, `${headPad}${tailLines}\n`);
+
+			const outsideFile = join(outside, "progress.log");
+			writeFileSync(outsideFile, "outside-secret-line\n");
+
+			const secretFile = join(secretsInHome, "token.log");
+			writeFileSync(secretFile, "secret-dir-line\n");
+			const altSecretFile = join(secretsInAlt, "token.log");
+			writeFileSync(altSecretFile, "alt-secret-line\n");
+
+			const symToSecret = join(workDir, "sym-secret.log");
+			symlinkSync(secretFile, symToSecret);
+			const symToOutside = join(workDir, "sym-outside.log");
+			symlinkSync(outsideFile, symToOutside);
+			const dirAsProgress = join(workDir, "subdir");
+			mkdirSync(dirAsProgress);
+
+			writeJob("ok-progress.json", {
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				progress: allowedProgress,
+			});
+			writeJob("large-progress.json", {
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				progress: largeProgress,
+			});
+			writeJob("outside.json", {
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				progress: outsideFile,
+			});
+			writeJob("in-secrets.json", {
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				progress: secretFile,
+			});
+			writeJob("in-alt-secrets.json", {
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				progress: altSecretFile,
+			});
+			writeJob("sym-secret.json", {
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				progress: symToSecret,
+			});
+			writeJob("sym-outside.json", {
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				progress: symToOutside,
+			});
+			writeJob("dir-progress.json", {
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				progress: dirAsProgress,
+			});
+
+			const snapshot = await buildSnapshot(deps({ userHome: userRoot }));
+			const byName = new Map((snapshot.jobs.ok ? snapshot.jobs.items : []).map((j) => [j.name, j]));
+
+			const okJob = byName.get("ok-progress");
+			expect(okJob?.progressLines).toHaveLength(40);
+			expect(okJob?.progressLines?.[0]).toBe("line-11");
+			expect(okJob?.progressLines?.[35]).toBe("line-46 token=[REDACTED]");
+			expect(okJob?.progressLines?.[39]).toBe("line-50");
+
+			const detailOk = renderItemDetail(snapshot, "turns", "job:ok-progress");
+			expect(detailOk).toContain("진행 기록 (최근 40줄)");
+			expect(detailOk).toContain("line-46 token=[REDACTED]");
+			expect(detailOk).not.toContain("xoxb-TEST-0");
+			expect(detailOk).not.toContain("line-10\n");
+
+			const largeJob = byName.get("large-progress");
+			expect(largeJob?.progressLines).toHaveLength(40);
+			expect(largeJob?.progressLines?.join("\n")).not.toContain(headMarker);
+			expect(largeJob?.progressLines?.[39]).toStartWith("tail-80 ");
+
+			for (const blocked of ["outside", "in-secrets", "in-alt-secrets", "sym-secret", "sym-outside", "dir-progress"]) {
+				expect(byName.get(blocked)?.progressLines).toBeUndefined();
+				expect(byName.get(blocked)?.progress).toBeDefined();
+				const detail = renderItemDetail(snapshot, "turns", `job:${blocked}`);
+				expect(detail).not.toContain("진행 기록");
+				expect(detail).not.toContain("outside-secret-line");
+				expect(detail).not.toContain("secret-dir-line");
+				expect(detail).not.toContain("alt-secret-line");
+			}
+		} finally {
+			rmSync(userRoot, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("job trace API and detail tabs (AC-4)", () => {
+	let stop: (() => void) | undefined;
+	afterEach(() => stop?.());
+
+	test("AC-4: api/job/trace returns 200 ok, 400 invalid name, 404 unknown_job/no_session/trace_disabled, live:false for dead/done, shares readCwdTrace", async () => {
+		const userRoot = mkdtempSync(join(tmpdir(), "ompbot-job-trace-user-"));
+		const outside = mkdtempSync(join(tmpdir(), "ompbot-job-trace-out-"));
+		try {
+			const sessionsRoot = join(userRoot, "sessions");
+			const workDir = join(userRoot, "work", "fable");
+			mkdirSync(workDir, { recursive: true });
+			const sessDir = ompSessionDirFor(workDir, userRoot, sessionsRoot);
+			mkdirSync(sessDir, { recursive: true });
+			const sessFile = join(sessDir, "s.jsonl");
+			const base0 = Date.parse("2026-11-18T02:00:00Z");
+			const at = (ms: number) => new Date(base0 + ms).toISOString();
+			appendFileSync(
+				sessFile,
+				`${JSON.stringify({ type: "message", id: "u1", timestamp: at(0), message: { role: "user", content: [] } })}\n`,
+			);
+			appendFileSync(
+				sessFile,
+				`${JSON.stringify({
+					type: "message",
+					id: "a1",
+					timestamp: at(800),
+					message: {
+						role: "assistant",
+						model: "opus",
+						timestamp: base0 + 100,
+						completedAt: base0 + 800,
+						stopReason: "stop",
+						content: [],
+					},
+				})}\n`,
+			);
+
+			// Shared readCwdTrace matches readCardTrace and readJobTrace
+			const direct = readCwdTrace(workDir, true, { userHome: userRoot, sessionsRoot, now: base0 + 5_000 });
+			expect(direct.ok).toBe(true);
+			expect(
+				readCardTrace(
+					{ local: true, agent: "omp", cwd: workDir, status: "working" },
+					{ userHome: userRoot, sessionsRoot, now: base0 + 5_000 },
+				),
+			).toEqual(direct);
+			expect(
+				readJobTrace(
+					{ state: "running", health: "ok", cwd: workDir },
+					{ userHome: userRoot, sessionsRoot, now: base0 + 5_000, homeDir: home },
+				),
+			).toEqual(direct);
+
+			// Outside cwd & secrets cwd blocked when homeDir is checked
+			mkdirSync(outside, { recursive: true });
+			expect(
+				readJobTrace(
+					{ state: "running", health: "ok", cwd: outside },
+					{ userHome: userRoot, sessionsRoot, now: base0 + 5_000, homeDir: home },
+				),
+			).toEqual({ ok: false, error: "no_session" });
+			expect(
+				readJobTrace(
+					{ state: "running", health: "ok", cwd: join(home, "secrets", "x") },
+					{ userHome: userRoot, sessionsRoot, now: base0 + 5_000, homeDir: home },
+				),
+			).toEqual({ ok: false, error: "no_session" });
+
+			writeJob("live-job.json", {
+				title: "실행 중 작업",
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+				cwd: workDir,
+			});
+			writeJob("dead-job.json", {
+				title: "죽은 작업",
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: 9999,
+				cwd: workDir,
+			});
+			writeJob("done-job.json", {
+				title: "끝난 작업",
+				state: "done",
+				updatedAt: iso(NOW - MINUTE),
+				pid: 9999,
+				cwd: workDir,
+			});
+			writeJob("no-cwd.json", {
+				title: "cwd 없음",
+				state: "running",
+				updatedAt: iso(NOW - MINUTE),
+				pid: LIVE_PID,
+			});
+
+			const snapshot = await buildSnapshot(deps({ userHome: userRoot }));
+			const server = startDashboardServer({
+				port: 0,
+				hostname: "127.0.0.1",
+				snapshot: async () => snapshot,
+				jobTrace: (name) =>
+					readJobTraceByName(home, name, {
+						userHome: userRoot,
+						sessionsRoot,
+						now: base0 + 5_000,
+						isAlive: (pid) => pid === LIVE_PID,
+						timezone: "Asia/Seoul",
+					}),
+			});
+			stop = () => server.stop(true);
+			const base = `http://127.0.0.1:${server.port}`;
+
+			const okRes = await fetch(`${base}/api/job/trace?name=live-job`);
+			expect(okRes.status).toBe(200);
+			const okBody = (await okRes.json()) as Extract<TurnTrace, { ok: true }>;
+			expect(okBody).toMatchObject({ ok: true, live: true, startedAt: base0 });
+
+			const deadRes = await fetch(`${base}/api/job/trace?name=dead-job`);
+			expect(deadRes.status).toBe(200);
+			expect((await deadRes.json()) as Extract<TurnTrace, { ok: true }>).toMatchObject({ ok: true, live: false });
+
+			const doneRes = await fetch(`${base}/api/job/trace?name=done-job`);
+			expect(doneRes.status).toBe(200);
+			expect((await doneRes.json()) as Extract<TurnTrace, { ok: true }>).toMatchObject({ ok: true, live: false });
+
+			for (const badName of ["", "Upper", "../etc", "bad name"]) {
+				const badRes = await fetch(`${base}/api/job/trace?name=${encodeURIComponent(badName)}`);
+				expect(badRes.status).toBe(400);
+			}
+
+			const missingRes = await fetch(`${base}/api/job/trace?name=missing-job`);
+			expect([missingRes.status, await missingRes.json()]).toEqual([404, { ok: false, error: "unknown_job" }]);
+
+			const noCwdRes = await fetch(`${base}/api/job/trace?name=no-cwd`);
+			expect([noCwdRes.status, await noCwdRes.json()]).toEqual([404, { ok: false, error: "no_session" }]);
+
+			// SSR job detail page renders job tabs (개요, 트레이스) with 개요 selected
+			expect(renderDetailTabs("job", "head")).toContain('data-tab="trace"');
+			expect(renderDetailTabs("job", "head")).not.toContain('data-tab="conv"');
+			const page = await (await fetch(`${base}/?view=turns&item=job%3Alive-job`)).text();
+			const tabStrip = /<div id="detail-tabs"([^>]*)>([\s\S]*?)<\/div>/.exec(page);
+			expect(tabStrip?.[1]).not.toContain("hidden");
+			expect(tabStrip?.[2]).toContain('id="tab-head"');
+			expect(tabStrip?.[2]).toContain('id="tab-trace"');
+			expect(tabStrip?.[2]).not.toContain('id="tab-conv"');
+			expect(page).toContain("api/job/trace?name=");
+			expect(page).toContain("trace.reload()");
+
+			// Without jobTrace option -> 404 trace_disabled
+			stop();
+			const offServer = startDashboardServer({
+				port: 0,
+				hostname: "127.0.0.1",
+				snapshot: async () => snapshot,
+			});
+			stop = () => offServer.stop(true);
+			const offRes = await fetch(`http://127.0.0.1:${offServer.port}/api/job/trace?name=live-job`);
+			expect([offRes.status, await offRes.json()]).toEqual([404, { error: "trace_disabled" }]);
+		} finally {
+			rmSync(userRoot, { recursive: true, force: true });
+			rmSync(outside, { recursive: true, force: true });
+		}
 	});
 });

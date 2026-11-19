@@ -31,7 +31,7 @@ import {
 import { evaluateTask } from "./evaluate";
 import { type HostResult, resolveTaskHost, type TaskHostOps, type TaskResumeOps } from "./host";
 import type { TaskLedger, TaskRow } from "./ledger";
-import { buildAcceptedCard, postToThread, setStatusReaction, type TaskSlackLog } from "./notify";
+import { buildAcceptedCard, postToThread, setStatusReaction, type TaskChatLog } from "./notify";
 import { buildTaskPrompt, resumeCheckLines } from "./prompt";
 import { checkResume, type ResumeCheck, restatedHash } from "./resume-check";
 import { agyModelOf, agySecretsDirs, agyWorkerArgs, type WorkerTier, withWorkerModel, workerLine } from "./worker-tier";
@@ -64,12 +64,12 @@ export interface TaskDispatchDeps {
 	boardLink?: BoardLinkResolver;
 	/** Keeps a prompt herdr took for the dashboard's 마지막 지시 (`Store.recordHerdrPrompt`); absent → nothing kept. */
 	recordPrompt?: (input: HerdrPromptInput) => void;
-	log: TaskSlackLog & { info(event: string, fields?: Record<string, unknown>): void };
+	log: TaskChatLog & { info(event: string, fields?: Record<string, unknown>): void };
 }
 
 /** Keeps a prompt herdr took; a failed write is only logged, the dispatch result stays as it is. */
 export function notePrompt(
-	deps: { recordPrompt?: (input: HerdrPromptInput) => void; log: TaskSlackLog },
+	deps: { recordPrompt?: (input: HerdrPromptInput) => void; log: TaskChatLog },
 	input: HerdrPromptInput,
 ): void {
 	if (deps.recordPrompt === undefined) return;
@@ -133,6 +133,8 @@ async function startAgent(
 		cwd: row.worktree,
 		options,
 		closeOnPromptFailure,
+		// The worker's session note would repeat the brief; the result note (`src/wiki`) is written by the core instead.
+		env: { OMP_WIKI_NOTE_DISABLE: "1" },
 		...(agentArgs ? { agentArgs } : {}),
 	};
 	const started =
@@ -155,7 +157,7 @@ async function cardLink(deps: TaskDispatchDeps, row: TaskRow, paneId: string): P
 }
 
 /** Permalink of the task thread root; the bare thread ref when the platform cannot resolve it. */
-async function threadLink(channels: ChannelRegistry, log: TaskSlackLog, threadRef: string): Promise<string> {
+async function threadLink(channels: ChannelRegistry, log: TaskChatLog, threadRef: string): Promise<string> {
 	const target = parseThreadRef(threadRef);
 	if (target === undefined) return threadRef;
 	try {
@@ -181,7 +183,7 @@ export async function startTask(
 	const threadRef = deps.threadRef();
 	const parsed = threadRef === undefined ? undefined : parseThreadRef(threadRef);
 	if (threadRef === undefined || parsed === undefined || parsed.threadTs === TOP_LEVEL_TS) {
-		throw new Error("taskSpec은 [TASK] 요청이 온 Slack 스레드 안에서만 쓸 수 있습니다(현재 스레드를 알 수 없음)");
+		throw new Error("taskSpec은 [TASK] 요청이 온 채팅 스레드 안에서만 쓸 수 있습니다(현재 스레드를 알 수 없음)");
 	}
 	hostEntryOf(deps, host); // unknown host fails before anything is reserved
 	if (host === null) {
@@ -203,7 +205,12 @@ export async function startTask(
 		host,
 		repo: spec.repo,
 		acceptance: acceptanceItems(spec.acceptance),
-		worker: { tier: worker.tier, tierReason: worker.tierReason, model: worker.model },
+		worker: {
+			tier: worker.tier,
+			tierReason: worker.tierReason,
+			model: worker.model,
+			...(spec.tierConfidence === undefined ? {} : { tierConfidence: spec.tierConfidence }),
+		},
 	});
 	const git = { repo: row.repo, worktree: row.worktree, branch: row.branch };
 	let worktreeCreated = false;

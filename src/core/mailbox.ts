@@ -32,8 +32,8 @@ import {
 	messageCost,
 	sessionWindowCost,
 	TURN_STOP_RATIO,
-	turnCapSteerText,
 	turnCapStopReason,
+	turnCapWarnText,
 } from "../ops/cost-cap";
 import {
 	applyUndo,
@@ -110,7 +110,7 @@ export interface ProviderLimitInfo {
 	attempt: number;
 	/** 0 when the limit arrived on `auto_retry_end` (no `auto_retry_start` carried it). */
 	maxAttempts: number;
-	/** Raw provider error text; redact before it reaches Slack. */
+	/** Raw provider error text; redact before it reaches the chat. */
 	errorMessage: string;
 }
 
@@ -153,7 +153,7 @@ export function isProviderLimit(message: string): boolean {
 
 /**
  * Fired when consecutive failed turns reach `escalateAfter` and on every failure past it (repeat suppression is the
- * caller's — the daemon counts incidents in the store). Called on the actor chain, so it must never await Slack.
+ * caller's — the daemon counts incidents in the store). Called on the actor chain, so it must never await the platform.
  */
 export interface TurnFailureEscalation {
 	originKey: string;
@@ -161,7 +161,7 @@ export interface TurnFailureEscalation {
 	threadRef: string;
 	/** Consecutive failures counted when this fired. */
 	failures: number;
-	/** Last failure sign (raw error text); redact before it reaches Slack. */
+	/** Last failure sign (raw error text); redact before it reaches the chat. */
 	reason: string;
 	/** True when the live session's stale model was just switched because the sign matched a removed model. */
 	modelHealed: boolean;
@@ -222,13 +222,12 @@ export interface MailboxDeps {
 	/** `!distill` answer for an origin: starts a skill review of its session and says so (or why not); absent = not wired. */
 	distillProvider?: (originKey: string) => Promise<string>;
 	/**
-	 * `!budget` answer: today's ledger total, both ceilings and the day's off switch. The argument is the trimmed text
-	 * after the command (`""`, `off`, `on`); absent = not wired.
+	 * `!budget` answer: today's ledger total, top origins and both ceilings; absent = not wired.
 	 */
-	budgetProvider?: (arg: string) => Promise<string>;
+	budgetProvider?: () => Promise<string>;
 	/** Read on every new turn: whether its prompt may carry channel-scoped recall. Absent = never. */
 	recallEnabled?: () => boolean;
-	/** Read when a child starts: whether it gets ompbot host tools (an omp child; agy and claude get none). Absent = yes. */
+	/** Read when a child starts: whether it gets ompbot host tools (an omp child; agy gets none). Absent = yes. */
 	hostTools?: () => boolean;
 	/**
 	 * Live `costCap` from config, read per assistant call: `turnUsd` steers a turn at the ceiling and stops it at
@@ -263,16 +262,16 @@ export interface MailboxDeps {
 	onStall?: (info: { originKey: string; threadRef: string; stalled: boolean; silentMs: number }) => void;
 	/**
 	 * The running turn's progress changed (a tool started, a todo result, a steer delivered, a model retry); `progress`
-	 * is a snapshot of the whole summary. Raw texts: redact before they reach Slack.
+	 * is a snapshot of the whole summary. Raw texts: redact before they reach the chat.
 	 */
 	onProgress?: (info: { originKey: string; threadRef: string; progress: TurnProgress }) => void;
 	/** Owner escalation for a run of failed turns: the bot reporting "나 망가짐" by itself. */
 	onEscalate?: (info: TurnFailureEscalation) => void;
-	/** A turn's omp retry reported a provider usage limit; once per turn, on the actor chain (never await Slack). */
+	/** A turn's omp retry reported a provider usage limit; once per turn, on the actor chain (never await the platform). */
 	onProviderLimit?: (info: ProviderLimitInfo) => void;
 	/**
 	 * A `child_restart`/`unexplained` prompt cache miss of `CACHE_MISS_NOTIFY_TOKENS`+ in a conversation turn; at most
-	 * once per origin per `CACHE_MISS_NOTIFY_MS` (memory only), never for a monitor. On the actor chain: never await Slack.
+	 * once per origin per `CACHE_MISS_NOTIFY_MS` (memory only), never for a monitor. On the actor chain: never await the platform.
 	 */
 	onCacheMiss?: (info: CacheMissInfo) => void;
 	/** A new conversation turn starts on a cold cache (`isColdCache`); once per baseline, never for a monitor. */
@@ -304,9 +303,14 @@ export interface MailboxDeps {
 	onSessionMismatch?: (info: SessionMismatchInfo) => void;
 	/**
 	 * A turn is being aborted for a tool repeat loop; at most once per turn, only when the abort still owns the turn
-	 * (a final that settled it first sends nothing). Called on the actor chain, so it must never await Slack.
+	 * (a final that settled it first sends nothing). Called on the actor chain, so it must never await the platform.
 	 */
 	onStuckLoop?: (info: StuckLoopInfo) => void;
+	/**
+	 * A turn first reached `costCap.turnUsd` (once per turn): a warning for the turn's thread, the turn keeps running.
+	 * Called on the actor chain, so it must never await the platform.
+	 */
+	onTurnCostCap?: (info: { originKey: string; threadRef: string; text: string }) => void;
 	/** omp dialogs (select/confirm/input/editor/ask cards) waiting on the owner; absent: messages never answer one. */
 	dialogs?: OpenDialogs;
 	/**
@@ -354,6 +358,16 @@ export interface TurnUndoDeps {
 	}) => Promise<"approved" | "denied" | "timeout">;
 	/** Git runner (tests inject one that counts or fails); absent = the real git. */
 	run?: GitRunner;
+	/**
+	 * A turn left a repository at another head (it committed): the ledger rows it wrote for those repositories. The
+	 * wiki result notes (`src/wiki`) keep the turn from here. Must not throw; a failure never costs the turn anything.
+	 */
+	onCommitted?: (turn: {
+		originKey: string;
+		opRef: string;
+		threadRef: string;
+		rows: readonly TurnSnapshotRow[];
+	}) => Promise<void>;
 }
 
 /** One turn's `!undo` card: the per-repository plans, the card text, and the answer when nothing can be reverted. */
@@ -372,7 +386,7 @@ interface OpenDialogs {
 	 * was not exactly one open or it closed before reading the text (the message must then take the normal path).
 	 */
 	answer(originKey: string, text: string): Promise<boolean>;
-	/** A plain message arrived while 2+ dialogs wait: tell the owner where to answer (never awaits Slack). */
+	/** A plain message arrived while 2+ dialogs wait: tell the owner where to answer (never awaits the platform). */
 	ambiguous(info: { originKey: string; threadRef: string }): void;
 }
 
@@ -454,11 +468,11 @@ interface ActiveTurn {
 	startedAt: number;
 	/** Priced cost of this turn's assistant calls so far (`costCap.turnUsd` reads it); sub-agents are not counted. */
 	costUsd: number;
-	/** The turn reached `turnUsd` and got the wrap-up steer: once per turn. */
+	/** The turn reached `turnUsd` and its thread got the warning: once per turn. */
 	costSoftSent: boolean;
 	/**
-	 * Set when the turn was aborted at 1.5x `turnUsd`: its own `aborted` final settles the turn with this reason
-	 * (`cost_cap: …`) and no failure count. No second abort, no steer.
+	 * Set when the turn was aborted at 3x `turnUsd`: its own `aborted` final settles the turn with this reason
+	 * (`cost_cap: …`) and no failure count. No second abort.
 	 */
 	costStopReason: string | undefined;
 	/** The turn's spend is already in `usage_daily` (`#recordDailyCost`): a turn is charged once, by its final or its exit. */
@@ -669,7 +683,7 @@ const MAX_THREAD_ANSWERS = 5;
 const THREAD_ANSWER_LINE = "- 이 스레드에 이미 올린 봇 답";
 /** Newest ledger rows of the conversation space a recall ranks (`Store.listRecallCandidates`). */
 const RECALL_CANDIDATE_LIMIT = 2000;
-/** How long a turn waits for the Slack thread read behind `#slackThreadContext` before going on without it. */
+/** How long a turn waits for the thread read behind `#threadContext` before going on without it. */
 const THREAD_CONTEXT_TIMEOUT_MS = 10_000;
 
 /**
@@ -731,23 +745,23 @@ function previewLine(text: string): string {
 	return truncateUtf8(text, THREAD_ANSWER_PREVIEW_CHARS).replace(/\s+/g, " ").trim();
 }
 
-/** One Slack message of a thread as the mailbox reads it (`MailboxDeps.threadSource`). */
-export interface SlackThreadMessage {
+/** One message of a thread as the mailbox reads it (`MailboxDeps.threadSource`). */
+export interface ThreadMessage {
 	ts: string;
 	text: string;
-	/** Slack user id of the author (this bot's own posts carry its bot user id). */
+	/** User id of the author (this bot's own posts carry its bot user id). */
 	user?: string | undefined;
 	botId?: string | undefined;
-	/** When it was posted (epoch ms), for a platform whose `ts` is no time (a Discord id); absent: `ts` is Slack seconds. */
+	/** When it was posted (epoch ms), for a platform whose `ts` is no time (a Discord id); absent: `ts` is epoch seconds. */
 	at?: number | undefined;
 }
 
-/** Read-only view of a Slack thread, supplied by the daemon: the mailbox itself never talks to Slack. */
+/** Read-only view of a thread, supplied by the daemon: the mailbox itself never talks to the platform. */
 export interface ThreadSource {
-	/** This bot's Slack user id; undefined before the adapter has started. */
+	/** This bot's user id; undefined before the adapter has started. */
 	botUserId(): string | undefined;
-	/** Messages of a thread oldest-first with the root leading; `limit` 1 reads the root only. Throws on a Slack failure. */
-	replies(channel: string, threadTs: string, limit?: number): Promise<SlackThreadMessage[]>;
+	/** Messages of a thread oldest-first with the root leading; `limit` 1 reads the root only. Throws on a platform failure. */
+	replies(channel: string, threadTs: string, limit?: number): Promise<ThreadMessage[]>;
 	/** How long a turn waits for `replies` before going on without context. Default `THREAD_CONTEXT_TIMEOUT_MS`. */
 	timeoutMs?: number;
 	/** The platform's mention syntax: a failed peer turn's notice addresses the peer bot (and this bot) with it. */
@@ -761,7 +775,7 @@ const PEER_CONTEXT_MESSAGE_CHARS = 4000;
 
 /**
  * Whether message `a` was posted before `b`: two integer strings (Discord snowflakes, past 2^53) compare exactly as
- * BigInt; Slack `<sec>.<usec>` ts compare as numbers.
+ * BigInt; `<sec>.<usec>` ts compare as numbers.
  */
 function tsBefore(a: string, b: string): boolean {
 	return /^[0-9]+$/.test(a) && /^[0-9]+$/.test(b) ? BigInt(a) < BigInt(b) : Number(a) < Number(b);
@@ -774,7 +788,7 @@ function tsBefore(a: string, b: string): boolean {
  * request opens the thread or nothing else is there.
  */
 export function peerThreadContextBlock(
-	messages: readonly SlackThreadMessage[],
+	messages: readonly ThreadMessage[],
 	selfUserId: string,
 	currentTs: string,
 	threadRef: string,
@@ -789,7 +803,7 @@ export function peerThreadContextBlock(
 	const picked = [root, ...messages.slice(Math.max(lastSelf + 1, 1))].filter(
 		(m, i) => i === 0 || (m.user !== selfUserId && tsBefore(m.ts, currentTs)),
 	);
-	const render = (m: SlackThreadMessage): string => {
+	const render = (m: ThreadMessage): string => {
 		const who = m.user === selfUserId ? "이 봇" : (m.user ?? m.botId ?? "알 수 없음").replace(/[^A-Za-z0-9_]/g, "");
 		const ms = m.at ?? Number(m.ts) * 1000;
 		const when = Number.isFinite(ms) ? new Date(ms).toISOString() : m.ts;
@@ -804,7 +818,7 @@ export function peerThreadContextBlock(
 }
 
 /** Context line of an owner reply's thread whose root is this bot's own post; starts with `THREAD_ANSWER_LINE` so it is scanned. */
-function ownerThreadRootBlock(root: SlackThreadMessage, threadRef: string): string {
+function ownerThreadRootBlock(root: ThreadMessage, threadRef: string): string {
 	const ms = root.at ?? Number(root.ts) * 1000;
 	const when = Number.isFinite(ms) ? new Date(ms).toISOString() : root.ts;
 	const preview = truncateUtf8(redact(root.text), MAX_THREAD_ROOT_CHARS).replace(/\s+/g, " ").trim();
@@ -818,7 +832,7 @@ function ownerThreadRootBlock(root: SlackThreadMessage, threadRef: string): stri
 /**
  * Serial actor for one origin. Every inbound message, driver final and driver exit is processed on one
  * promise chain, so the ledger writes never interleave. It talks to omp only through the injected driver and
- * to Slack never: replies become delivery rows in the store.
+ * to the chat never: replies become delivery rows in the store.
  */
 export class OriginMailbox {
 	readonly #deps: MailboxDeps;
@@ -1087,7 +1101,7 @@ export class OriginMailbox {
 
 	/**
 	 * Adds one assistant call's price to the running turn and applies `costCap.turnUsd`: on reaching the ceiling the
-	 * turn gets one steer to wrap up, on reaching 1.5x it is aborted and settled as `cost_cap`. The total is kept even
+	 * thread gets one warning (the turn goes on), on reaching 3x it is aborted and settled as `cost_cap`. The total is kept even
 	 * when no turn ceiling is set: the daily ledger falls back to it when the session file cannot be read. Sub-agent
 	 * spend is not part of a turn's total (only the daily ledger counts it).
 	 */
@@ -1110,10 +1124,10 @@ export class OriginMailbox {
 			cost: turn.costUsd,
 			cap,
 		});
-		this.#background("cost_cap_steer_failed", async () => {
-			// Real omp starts a run when steered while idle: only steer the turn that is still running.
-			if (this.#turn !== turn || !this.#driver) return;
-			await this.#driver.steer(turnCapSteerText(cap));
+		this.#deps.onTurnCostCap?.({
+			originKey: this.#deps.originKey,
+			threadRef: turn.threadRef,
+			text: turnCapWarnText(cap, turn.costUsd),
 		});
 	}
 
@@ -1190,7 +1204,7 @@ export class OriginMailbox {
 	}
 
 	/**
-	 * Aborts a turn that passed 1.5x its ceiling and settles it through the normal final path with the `cost_cap`
+	 * Aborts a turn that passed 3x its ceiling and settles it through the normal final path with the `cost_cap`
 	 * reason (a failure notice to the thread, but no failure count: `#onFinal` skips `#noteTurnFailure`). A final that
 	 * settled the turn first wins; this then does nothing.
 	 */
@@ -1210,8 +1224,8 @@ export class OriginMailbox {
 	}
 
 	/**
-	 * Feeds a tool event to the turn's loop detector. Only `tool_execution_end` carries the result, so the claude
-	 * driver (it reports `tool_execution_start` only) never trips it — a known limit of that driver.
+	 * Feeds a tool event to the turn's loop detector. Only `tool_execution_end` carries the result, so a driver that
+	 * reports `tool_execution_start` only never trips it.
 	 */
 	#observeTool(turn: ActiveTurn, event: OmpEvent): void {
 		const hit = turn.stuck.observe(event);
@@ -1344,7 +1358,6 @@ export class OriginMailbox {
 				this.#reportProgress(turn);
 			}
 		}
-		// The claude driver reports `tool_execution_start` only, so its turns show the tool lines and nothing else.
 		if (event.type === "tool_execution_end" && event.toolName === "todo" && event.isError !== true && this.#turn) {
 			const todo = todoProgress(event.result);
 			if (todo !== undefined) {
@@ -1687,7 +1700,7 @@ export class OriginMailbox {
 		if (turn && this.#driver) {
 			// The owner's first reply in a thread opened by this bot carries that root even when it is steered: the
 			// thread's later replies no longer qualify, so this is its only chance. Peer rows are never steered.
-			const context = row.peerUserId === null ? await this.#slackContextBlock(row) : null;
+			const context = row.peerUserId === null ? await this.#threadContextBlock(row) : null;
 			// The fetch awaited: the turn may have ended meanwhile, and steering an idle child would start a run.
 			if (this.#turn !== turn || !this.#driver) return this.#dispatch(row, text);
 			// Written before the turn's last answer reached the owner (still pending, or its interim delivery came after
@@ -1836,6 +1849,11 @@ export class OriginMailbox {
 			};
 			const written = await recordTurn({ store, originKey, opRef: turn.opRef, capture, run: turnUndo.run, log });
 			if (written > 0) log.info("turn_snapshot", { origin: originKey, opRef: turn.opRef, repos: written });
+			const committed = written === 0 ? [] : store.listTurnSnapshots({ originKey, opRef: turn.opRef });
+			const heads = committed.filter((row) => row.headBefore !== row.headAfter);
+			if (heads.length > 0) {
+				await turnUndo.onCommitted?.({ originKey, opRef: turn.opRef, threadRef: turn.threadRef, rows: heads });
+			}
 		} catch (error) {
 			log.warn("turn_snapshot_failed", { origin: originKey, opRef: turn.opRef, error: String(error) });
 		}
@@ -1913,7 +1931,7 @@ export class OriginMailbox {
 
 	/**
 	 * Prompt of a new turn (never a steer): the first prompt of a freshly created thread session is preceded by the
-	 * thread context it never saw, and a Slack conversation's turn by channel-scoped recall when `buildRecallBlock`
+	 * thread context it never saw, and a chat conversation's turn by channel-scoped recall when `buildRecallBlock`
 	 * finds the text points at the past (or a fresh session shares rare words). Bot answers quoted in either block
 	 * are scanned for instruction-like passages; a hit puts a warning line in front of that block. `peerNotice` puts
 	 * the peer-taint notice first: a block, so the prompt still ends with the request (`isTurnPromptFor`). `boardLine`
@@ -1943,8 +1961,8 @@ export class OriginMailbox {
 				.filter((line) => line.startsWith(THREAD_ANSWER_LINE) || line.startsWith(OWN_ANSWER_LINE));
 			blocks.push(this.#withInjectionWarning(context, answers, "스레드 맥락의 봇 답"));
 		}
-		const slackContext = await this.#slackContextBlock(row);
-		if (slackContext !== null) blocks.push(slackContext);
+		const threadContext = await this.#threadContextBlock(row);
+		if (threadContext !== null) blocks.push(threadContext);
 		const channel = parseChatOrigin(originKey)?.conversationId;
 		// A peer bot's request never pulls recall: its fixed header would match other peer rows as rare words.
 		if (channel !== undefined && row.peerUserId === null && this.#deps.recallEnabled?.() === true) {
@@ -1991,21 +2009,21 @@ export class OriginMailbox {
 		return platform === undefined ? undefined : this.#deps.threadSource?.get(platform);
 	}
 
-	/** The Slack thread context of `row` ready to prepend (injection-scanned), or null. */
-	async #slackContextBlock(row: InboundRow): Promise<string | null> {
-		const context = await this.#slackThreadContext(row);
+	/** The thread context of `row` ready to prepend (injection-scanned), or null. */
+	async #threadContextBlock(row: InboundRow): Promise<string | null> {
+		const context = await this.#threadContext(row);
 		if (context === null) return null;
 		const answers = context.split("\n").filter((line) => line.startsWith(THREAD_ANSWER_LINE));
 		return this.#withInjectionWarning(context, answers, "스레드 맥락의 봇 글");
 	}
 
 	/**
-	 * Slack-side thread context of a turn, read through `threadSource`: for a peer bot's request the root plus
+	 * Platform-side thread context of a turn, read through `threadSource`: for a peer bot's request the root plus
 	 * what followed this bot's last post; for the owner's first reply in a thread (no earlier inbound row of the
-	 * thread, in any origin) the root when it is this bot's own post. A Slack failure or a read slower than
+	 * thread, in any origin) the root when it is this bot's own post. A platform failure or a read slower than
 	 * `THREAD_CONTEXT_TIMEOUT_MS` is logged and the turn goes on without context.
 	 */
-	async #slackThreadContext(row: InboundRow): Promise<string | null> {
+	async #threadContext(row: InboundRow): Promise<string | null> {
 		const { store, originKey, log } = this.#deps;
 		const threadSource = this.#threadSource();
 		if (threadSource === undefined) return null;
@@ -2015,7 +2033,7 @@ export class OriginMailbox {
 		if (!peer && store.hasInboundThreadBefore(row.threadRef, row.platformMessageId)) return null;
 		const self = threadSource.botUserId();
 		if (self === undefined) return null;
-		// The Slack client retries a failing call for up to ~30 minutes; this runs inside the origin's serial chain, so
+		// The platform client retries a failing call for up to ~30 minutes; this runs inside the origin's serial chain, so
 		// a slow fetch gives up and the turn goes on without context.
 		const timeoutMs = threadSource.timeoutMs ?? THREAD_CONTEXT_TIMEOUT_MS;
 		const { promise: deadline, reject } = Promise.withResolvers<never>();
@@ -2708,7 +2726,7 @@ export class OriginMailbox {
 				return await this.#deps.distillProvider(this.#deps.originKey);
 			case "budget":
 				if (this.#deps.budgetProvider === undefined) return "비용 장부가 연결되지 않았습니다";
-				return await this.#deps.budgetProvider(arg);
+				return await this.#deps.budgetProvider();
 			case "btw":
 				// A question with a turn and a capable driver was started by `#runCommand`; without a turn it never
 				// reaches here (it becomes a plain message).
@@ -2751,8 +2769,7 @@ export class OriginMailbox {
 		const { originKey, restartProvider } = this.#deps;
 		if (this.#deps.isDraining?.()) return RESTART_DRAINING_TEXT;
 		const platform = platformOfThreadRef(threadRef);
-		if (originKey.startsWith(MONITOR_ORIGIN_PREFIX) || (platform !== "slack" && platform !== "discord"))
-			return RESTART_REFUSED_TEXT;
+		if (originKey.startsWith(MONITOR_ORIGIN_PREFIX) || platform !== "discord") return RESTART_REFUSED_TEXT;
 		if (restartProvider === undefined) return "재시작이 연결되지 않았습니다";
 		return await restartProvider(originKey, threadRef);
 	}

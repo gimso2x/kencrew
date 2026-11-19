@@ -38,8 +38,12 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { gcSessions, LEDGER_RETENTION_DAYS } from "../src/ops/gc";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
+import { OWNER, OWNER_DM } from "./helpers/bot-home";
 
-const OWNER = "UOWNER";
+const OWNER_DM_ORIGIN = `discord/dm/${OWNER_DM}`;
+const CHANNEL_A = "300000000000000002";
+const COPY_CHANNEL = "300000000000000003";
+const COPY_CHANNEL_2 = "300000000000000004";
 const T0 = Date.UTC(2026, 5, 1, 0, 0, 0);
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -73,7 +77,6 @@ let drivers: FakeOmpDriver[];
 let behavior: Behavior;
 let logLines: string[];
 let frozenState: { since: string; reason: string; by: string } | undefined;
-let budgetState: { day: string; cost: number; cap: number } | undefined;
 
 const scriptsRoot = () => join(dir, "scripts");
 
@@ -86,10 +89,10 @@ beforeEach(() => {
 	drivers = [];
 	behavior = {};
 	frozenState = undefined;
-	budgetState = undefined;
 	const sessions = new FakeSessionStore();
 	const log = createLogger({ sink: (line) => logLines.push(line), clock, redact });
-	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock, redact, slackOwnerUserId: OWNER });
+	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock, redact });
+	store.ensureOrigin(OWNER_DM_ORIGIN, "sess/owner-dm");
 	router = new OriginRouter({
 		timezone: "Asia/Seoul",
 		store,
@@ -118,7 +121,6 @@ beforeEach(() => {
 		workspaceDir: join(dir, "workspace"),
 		homeDir: dir,
 		frozen: () => frozenState,
-		budgetExceeded: () => budgetState,
 	});
 	scheduler.start();
 });
@@ -208,94 +210,6 @@ describe("monitors: cron cursor", () => {
 		expect((await run()).claimed).toBe(1);
 		expect(cursorOf()).toBe(clock.now());
 		expect(store.monitors.listSlots(monitor.id)).toHaveLength(2);
-	});
-});
-
-describe("monitors: daily cost ceiling", () => {
-	const BUDGET = { day: "20260601", cost: 12, cap: 10 };
-
-	test("a script monitor held by the ceiling keeps its schedule current instead of looking stalled (qa50b M-14)", async () => {
-		const script = writeScript("held.sh", "#!/bin/sh\nexit 1\n");
-		const monitor = store.monitors.addMonitor({
-			name: "held",
-			trigger: { kind: "script", command: [script], intervalMs: MINUTE },
-			instruction: "x",
-			overlap: "queue",
-			enabled: true,
-		});
-		budgetState = BUDGET;
-		clock.advance(20 * MINUTE);
-		await run();
-		const row = store.monitors.getMonitor(monitor.id);
-		expect(row?.cursorAt).toBe(clock.now());
-		expect(row === undefined ? null : nextFireOf(row)).toBe(clock.now() + MINUTE);
-		// Nothing ran while held.
-		expect(logLines.some((line) => line.includes("event=monitor_script"))).toBe(false);
-	});
-
-	test("due slots become skipped `budget` events with nothing dispatched; lifting it fires again without replaying", async () => {
-		const monitor = cronMonitor("* * * * *");
-		budgetState = BUDGET;
-		clock.advance(3 * MINUTE);
-		const held = await run();
-		expect(held).toMatchObject({ claimed: 0, skippedBudget: 3, dispatched: 0 });
-		expect(stages()).toEqual(["skipped", "skipped", "skipped"]);
-		expect(store.monitors.listEvents().every((event) => event.payload?.startsWith("budget"))).toBe(true);
-		expect(prompts()).toHaveLength(0);
-
-		budgetState = undefined;
-		clock.advance(MINUTE);
-		const resumed = await run();
-		expect(resumed.claimed).toBe(1);
-		await until(() => store.monitors.listEvents().filter(answered).length === 1);
-		expect(prompts()).toHaveLength(1);
-		// The three held minutes stay skipped: only the new minute runs.
-		expect(store.monitors.listEvents()).toHaveLength(4);
-		expect(store.monitors.getMonitor(monitor.id)?.cursorAt).toBe(clock.now());
-	});
-
-	test("an event admitted before the ceiling is reached is skipped, not queued for a burst after midnight", async () => {
-		const monitor = cronMonitor("0 0 1 1 *");
-		const claim = store.monitors.claimSlot({ monitorId: monitor.id, slotAt: clock.now(), manual: true });
-		if (claim.status !== "admitted") throw new Error("expected an admitted event");
-		budgetState = BUDGET;
-		await run();
-		const event = store.monitors.getEvent(claim.event.eventId);
-		expect(event?.stage).toBe("skipped");
-		expect(event?.error).toBe("budget");
-		expect(logLines.filter((line) => line.includes("event=monitor_budget_skip"))).toHaveLength(1);
-		budgetState = undefined;
-		await run();
-		expect(prompts()).toHaveLength(0);
-	});
-
-	test("a script check does not run while the ceiling stands, and the freeze reason wins when both hold", async () => {
-		const script = join(scriptsRoot(), "c.sh");
-		writeFileSync(script, "#!/bin/sh\necho met\nexit 0\n", { mode: 0o755 });
-		const monitor = store.monitors.addMonitor({
-			name: "check",
-			trigger: { kind: "script", command: [script], intervalMs: MINUTE },
-			instruction: "act",
-			overlap: "queue",
-			enabled: true,
-		});
-		budgetState = BUDGET;
-		clock.advance(MINUTE);
-		expect(await run()).toMatchObject({ claimed: 0, dispatched: 0 });
-		expect(store.monitors.listEvents()).toHaveLength(0);
-		// A held check never starts a turn; its due time is skipped like a cron slot (qa50b M-14), never replayed.
-		expect(store.monitors.getMonitor(monitor.id)?.cursorAt).toBe(T0 + MINUTE);
-		expect(store.monitors.getMonitor(monitor.id)?.lastScriptState).toBeNull();
-
-		// Both holds at once: the freeze switch names the skip, so a frozen tick keeps its own reason.
-		const cron = cronMonitor("* * * * *");
-		frozenState = { since: "2026-06-01T00:00:00.000Z", reason: "점검", by: "cli" };
-		clock.advance(MINUTE);
-		const both = await run();
-		expect(both).toMatchObject({ claimed: 0, skippedFrozen: 1, skippedBudget: 0 });
-		const events = store.monitors.listEvents().filter((event) => event.monitorId === cron.id);
-		expect(events).toHaveLength(1);
-		expect(events[0]?.payload?.startsWith("frozen")).toBe(true);
 	});
 });
 
@@ -546,7 +460,7 @@ describe("monitors: answers and delivery", () => {
 		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.body).toBe("⏰ disk\ndisk 91%");
-		expect(rows[0]?.threadRef).toBe(`${OWNER}:-`);
+		expect(rows[0]?.threadRef).toBe(`${OWNER_DM}:-`);
 
 		for (const row of store.claimDue()) store.confirmDelivery(row.deliveryId);
 		await run();
@@ -555,48 +469,50 @@ describe("monitors: answers and delivery", () => {
 
 	test("output goes to the owner's known DM channel when there is one", async () => {
 		behavior.respond = () => "hello";
-		store.ensureOrigin("slack/dm/D9", sessionDirFor(join(dir, "sessions"), "slack/dm/D9", 1));
+		clock.advance(MINUTE);
+		const otherDm = "discord/dm/200000000000000009";
+		store.ensureOrigin(otherDm, sessionDirFor(join(dir, "sessions"), otherDm, 1));
 		cronMonitor("* * * * *");
 		clock.advance(MINUTE);
 		await run();
 		await until(() => stages().includes("authored"));
-		expect(store.listDeliveries()[0]?.threadRef).toBe("D9:-");
+		expect(store.listDeliveries()[0]?.threadRef).toBe("200000000000000009:-");
 	});
 
 	test("a channel monitor delivers to `<channel>:-` while a DM monitor keeps the owner DM ref", async () => {
 		behavior.respond = () => "report";
-		const withChannel = cronMonitor("* * * * *", { name: "brief", channel: "C0123456789" });
+		const withChannel = cronMonitor("* * * * *", { name: "brief", channel: CHANNEL_A });
 		const dmMonitor = cronMonitor("* * * * *", { name: "plain" });
-		expect(store.monitors.getMonitor(withChannel.id)?.channel).toBe("C0123456789");
+		expect(store.monitors.getMonitor(withChannel.id)?.channel).toBe(CHANNEL_A);
 		expect(dmMonitor.channel).toBeNull();
 		clock.advance(MINUTE);
 		await run();
 		await until(() => stages().filter((s) => s === "authored").length === 2);
-		expect(store.listDeliveries({ originKey: monitorOrigin(withChannel.id) })[0]?.threadRef).toBe("C0123456789:-");
-		expect(store.listDeliveries({ originKey: monitorOrigin(dmMonitor.id) })[0]?.threadRef).toBe(`${OWNER}:-`);
+		expect(store.listDeliveries({ originKey: monitorOrigin(withChannel.id) })[0]?.threadRef).toBe(`${CHANNEL_A}:-`);
+		expect(store.listDeliveries({ originKey: monitorOrigin(dmMonitor.id) })[0]?.threadRef).toBe(`${OWNER_DM}:-`);
 	});
 
 	test("copyChannel: a delivered answer is copied top-level with the same body; the primary delivery is unchanged", async () => {
 		behavior.respond = () => "disk 91%";
-		const monitor = cronMonitor("* * * * *", { name: "disk", copyChannel: "C0COPYCHAN1" });
-		expect(store.monitors.getMonitor(monitor.id)?.copyChannel).toBe("C0COPYCHAN1");
+		const monitor = cronMonitor("* * * * *", { name: "disk", copyChannel: COPY_CHANNEL });
+		expect(store.monitors.getMonitor(monitor.id)?.copyChannel).toBe(COPY_CHANNEL);
 		clock.advance(MINUTE);
 		await run();
 		await until(() => stages().includes("authored"));
 		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
 		expect(rows.map((row) => [row.threadRef, row.body])).toEqual([
-			[`${OWNER}:-`, "⏰ disk\ndisk 91%"],
-			["C0COPYCHAN1:-", "⏰ disk\ndisk 91%"],
+			[`${OWNER_DM}:-`, "⏰ disk\ndisk 91%"],
+			[`${COPY_CHANNEL}:-`, "⏰ disk\ndisk 91%"],
 		]);
 		// Settling the same answer again is idempotent: still exactly one copy.
-		expect(rows.filter((row) => row.threadRef === "C0COPYCHAN1:-")).toHaveLength(1);
+		expect(rows.filter((row) => row.threadRef === `${COPY_CHANNEL}:-`)).toHaveLength(1);
 	});
 
 	test("copyChannel: a silent answer is copied without its marker line, or as `알릴 내용 없음` when nothing remains", async () => {
 		const answers = ["NO_REPORT", "[SILENT]\n디스크 정상, 변화 없음", "점검 결과 이상 없음\n[SILENT]"];
 		let next = 0;
 		behavior.respond = () => answers[next++ % answers.length] ?? "NO_REPORT";
-		const monitor = cronMonitor("* * * * *", { name: "disk", copyChannel: "C0COPYCHAN1" });
+		const monitor = cronMonitor("* * * * *", { name: "disk", copyChannel: COPY_CHANNEL });
 		for (let i = 0; i < answers.length; i++) {
 			clock.advance(MINUTE);
 			await run();
@@ -606,9 +522,9 @@ describe("monitors: answers and delivery", () => {
 			.listDeliveries({ originKey: monitorOrigin(monitor.id) })
 			.map((row) => [row.threadRef, row.body]);
 		expect(bodies).toEqual([
-			["C0COPYCHAN1:-", "⏰ disk\n알릴 내용 없음"],
-			["C0COPYCHAN1:-", "⏰ disk\n디스크 정상, 변화 없음"],
-			["C0COPYCHAN1:-", "⏰ disk\n점검 결과 이상 없음"],
+			[`${COPY_CHANNEL}:-`, "⏰ disk\n알릴 내용 없음"],
+			[`${COPY_CHANNEL}:-`, "⏰ disk\n디스크 정상, 변화 없음"],
+			[`${COPY_CHANNEL}:-`, "⏰ disk\n점검 결과 이상 없음"],
 		]);
 	});
 
@@ -621,7 +537,7 @@ describe("monitors: answers and delivery", () => {
 		expect(store.listDeliveries()).toHaveLength(0);
 
 		behavior.startFails = true;
-		const failing = cronMonitor("0 0 1 1 *", { name: "failing", copyChannel: "C0COPYCHAN1" });
+		const failing = cronMonitor("0 0 1 1 *", { name: "failing", copyChannel: COPY_CHANNEL });
 		store.monitors.admitManual(failing.id);
 		await run();
 		for (const backoff of [BACKOFF_1, BACKOFF_2, BACKOFF_3]) {
@@ -631,7 +547,7 @@ describe("monitors: answers and delivery", () => {
 		const rows = store.listDeliveries({ originKey: monitorOrigin(failing.id) });
 		expect(rows).toHaveLength(1);
 		expect(rows[0]?.body).toContain("failed_no_retry");
-		expect(rows[0]?.threadRef).toBe(`${OWNER}:-`);
+		expect(rows[0]?.threadRef).toBe(`${OWNER_DM}:-`);
 	});
 
 	test("script payload reaches the prompt as fenced data", async () => {
@@ -694,7 +610,7 @@ describe("monitors: verbatim delivery", () => {
 			...(extra.copyChannel === undefined ? {} : { copyChannel: extra.copyChannel }),
 		});
 	};
-	const PAYLOAD = "*네이버 세션 만료*\n<@UOWNER> 재로그인 필요\n- `run:all` 대기 중 _2건_";
+	const PAYLOAD = `*네이버 세션 만료*\n<@${OWNER}> 재로그인 필요\n- \`run:all\` 대기 중 _2건_`;
 
 	test("a fired verbatim monitor posts `⏰ <name>\\n<payload>` without a turn, then the event becomes delivered", async () => {
 		const { routed, runOnce } = withRouter();
@@ -704,7 +620,7 @@ describe("monitors: verbatim delivery", () => {
 		expect(routed).toEqual([]);
 		expect(store.listInbound().filter((row) => row.originKey === monitorOrigin(monitor.id))).toHaveLength(0);
 		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
-		expect(rows.map((row) => [row.threadRef, row.body])).toEqual([[`${OWNER}:-`, `⏰ relay\n${PAYLOAD}`]]);
+		expect(rows.map((row) => [row.threadRef, row.body])).toEqual([[`${OWNER_DM}:-`, `⏰ relay\n${PAYLOAD}`]]);
 		const [event] = store.monitors.listEvents({ monitorId: monitor.id });
 		expect([event?.stage, event?.answer, event?.deliveryId]).toEqual(["authored", PAYLOAD, rows[0]?.deliveryId]);
 
@@ -736,22 +652,22 @@ describe("monitors: verbatim delivery", () => {
 
 	test("copyChannel gets one `<opRef>:copy` of the post", async () => {
 		const { runOnce } = withRouter();
-		const monitor = verbatimMonitor(PAYLOAD, { copyChannel: "C0COPYCHAN1" });
+		const monitor = verbatimMonitor(PAYLOAD, { copyChannel: COPY_CHANNEL });
 		clock.advance(MINUTE);
 		await runOnce();
 		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
 		const [event] = store.monitors.listEvents({ monitorId: monitor.id });
 		const opRef = `monitor:${monitor.id}:${event?.eventId}:1:verbatim`;
 		expect(rows.map((row) => [row.opRef, row.threadRef, row.body])).toEqual([
-			[opRef, `${OWNER}:-`, `⏰ relay\n${PAYLOAD}`],
-			[`${opRef}:copy`, "C0COPYCHAN1:-", `⏰ relay\n${PAYLOAD}`],
+			[opRef, `${OWNER_DM}:-`, `⏰ relay\n${PAYLOAD}`],
+			[`${opRef}:copy`, `${COPY_CHANNEL}:-`, `⏰ relay\n${PAYLOAD}`],
 		]);
 		expect(event?.deliveryId).toBe(rows[0]?.deliveryId);
 	});
 
 	test("an empty payload ends as no_report with no post and no copy", async () => {
 		const { routed, runOnce } = withRouter();
-		const monitor = verbatimMonitor("", { copyChannel: "C0COPYCHAN1" });
+		const monitor = verbatimMonitor("", { copyChannel: COPY_CHANNEL });
 		clock.advance(MINUTE);
 		await runOnce();
 		expect(routed).toEqual([]);
@@ -844,7 +760,7 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 		);
 		return store.monitors.addMonitor(spec);
 	};
-	const PAYLOAD = "*아침 브리핑*\n<@UOWNER> 확인 필요\n- `run:all` _2건_ [링크](https://example.com)";
+	const PAYLOAD = `*아침 브리핑*\n<@${OWNER}> 확인 필요\n- \`run:all\` _2건_ [링크](https://example.com)`;
 	const logged = (name: string) => logLines.filter((line) => line.includes(`event=${name} `));
 	const bodies = (monitorId: string) =>
 		store.listDeliveries({ originKey: monitorOrigin(monitorId) }).map((row) => row.body);
@@ -883,7 +799,7 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 		writeFileSync(out, PAYLOAD);
 		const monitor = commandMonitor('#!/bin/sh\necho run >> "$2"\ncat "$1"\n', {
 			args: [out, runs],
-			copyChannel: "C0COPYCHAN1",
+			copyChannel: COPY_CHANNEL,
 		});
 		const seen: EventStage[] = [];
 		const off = store.monitors.subscribe((event) => {
@@ -899,8 +815,8 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 		const opRef = `monitor:${monitor.id}:${event?.eventId}:1:verbatim`;
 		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
 		expect(rows.map((row) => [row.opRef, row.threadRef, row.body])).toEqual([
-			[opRef, `${OWNER}:-`, `⏰ brief\n${PAYLOAD}`],
-			[`${opRef}:copy`, "C0COPYCHAN1:-", `⏰ brief\n${PAYLOAD}`],
+			[opRef, `${OWNER_DM}:-`, `⏰ brief\n${PAYLOAD}`],
+			[`${opRef}:copy`, `${COPY_CHANNEL}:-`, `⏰ brief\n${PAYLOAD}`],
 		]);
 		expect([event?.stage, event?.payload, event?.answer, event?.deliveryId]).toEqual([
 			"authored",
@@ -979,7 +895,7 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 		expect([event?.stage, event?.attempts, event?.nextAttemptAt]).toEqual(["failed_no_retry", 1, null]);
 		expect(event?.error).toBe("[command failed] agy quota exhausted");
 		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
-		expect(rows.map((row) => row.threadRef)).toEqual([`${OWNER}:-`]);
+		expect(rows.map((row) => row.threadRef)).toEqual([`${OWNER_DM}:-`]);
 		expect(rows[0]?.body).toBe(
 			"⏰ brief\n⚠️ 모니터 실행이 1번 실패해 재시도를 멈췄습니다 (failed_no_retry): agy quota exhausted",
 		);
@@ -1032,7 +948,7 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 
 	test('exit 0 with empty output or a closing `{"wakeAgent": false}` is no_report with no post and no copy; [SILENT] is posted as is', async () => {
 		const out = join(dir, "out.txt");
-		const monitor = commandMonitor('#!/bin/sh\ncat "$1"\n', { args: [out], copyChannel: "C0COPYCHAN1" });
+		const monitor = commandMonitor('#!/bin/sh\ncat "$1"\n', { args: [out], copyChannel: COPY_CHANNEL });
 		writeFileSync(out, "");
 		clock.advance(MINUTE);
 		await run();
@@ -1126,7 +1042,6 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 			path: join(dir, "ompbot.db"),
 			clock,
 			redact,
-			slackOwnerUserId: OWNER,
 		});
 		const restarted = new MonitorScheduler({
 			store: reopened,
@@ -1247,7 +1162,7 @@ describe("monitors: failure backoff", () => {
 		expect(notices).toHaveLength(1);
 		expect(notices[0]?.body).toContain("failed_no_retry");
 		expect(notices[0]?.body.startsWith("⏰ watch\n")).toBe(true);
-		expect(notices[0]?.threadRef).toBe(`${OWNER}:-`);
+		expect(notices[0]?.threadRef).toBe(`${OWNER_DM}:-`);
 	});
 
 	test("an empty answer counts as a failed attempt, not a delivered report", async () => {
@@ -1327,9 +1242,19 @@ describe("monitors: failure backoff", () => {
 
 describe("monitors: schema migration", () => {
 	test("opening a database that predates monitors keeps its data and adds the tables", () => {
-		store.ensureOrigin("slack/dm/D1", "sess/e1");
-		store.recordInbound({ originKey: "slack/dm/D1", platformMessageId: "D1:1.1", textRef: "old", threadRef: "D1:1.1" });
-		store.recordAnswer({ originKey: "slack/dm/D1", opRef: "x", threadRef: "D1:1.1", parts: ["old answer"] });
+		store.ensureOrigin(OWNER_DM_ORIGIN, "sess/e1");
+		store.recordInbound({
+			originKey: OWNER_DM_ORIGIN,
+			platformMessageId: `${OWNER_DM}:1001`,
+			textRef: "old",
+			threadRef: `${OWNER_DM}:1001`,
+		});
+		store.recordAnswer({
+			originKey: OWNER_DM_ORIGIN,
+			opRef: "x",
+			threadRef: `${OWNER_DM}:1001`,
+			parts: ["old answer"],
+		});
 		const path = join(dir, "ompbot.db");
 		cronMonitor("* * * * *");
 		store.close();
@@ -1343,7 +1268,7 @@ describe("monitors: schema migration", () => {
 		const reopened = openStore({ timezone: "Asia/Seoul", path, clock, redact });
 		try {
 			expect(reopened.listDeliveries().map((row) => row.body)).toEqual(["old answer"]);
-			expect(reopened.getInbound("D1:1.1")?.textRef).toBe("old");
+			expect(reopened.getInbound(`${OWNER_DM}:1001`)?.textRef).toBe("old");
 			expect(reopened.monitors.listMonitors()).toEqual([]);
 			reopened.monitors.addMonitor({
 				name: "fresh",
@@ -1408,14 +1333,14 @@ describe("monitors: schema migration", () => {
 			overlap: "queue" as const,
 			enabled: true,
 		};
-		const added = store.monitors.addMonitor({ ...spec, copyChannel: "C0COPYCHAN1" });
-		expect(added.copyChannel).toBe("C0COPYCHAN1");
+		const added = store.monitors.addMonitor({ ...spec, copyChannel: COPY_CHANNEL });
+		expect(added.copyChannel).toBe(COPY_CHANNEL);
 		expect(store.monitors.addMonitor({ ...spec, name: "plain" }).copyChannel).toBeNull();
-		expect(store.monitors.updateMonitor(added.id, { ...spec, copyChannel: "C0COPYCHAN2" })?.copyChannel).toBe(
-			"C0COPYCHAN2",
+		expect(store.monitors.updateMonitor(added.id, { ...spec, copyChannel: COPY_CHANNEL_2 })?.copyChannel).toBe(
+			COPY_CHANNEL_2,
 		);
 		expect(store.monitors.updateMonitor(added.id, spec)?.copyChannel).toBeNull();
-		store.monitors.updateMonitor(added.id, { ...spec, copyChannel: "C0COPYCHAN1" });
+		store.monitors.updateMonitor(added.id, { ...spec, copyChannel: COPY_CHANNEL });
 		const path = join(dir, "ompbot.db");
 		store.close();
 		const raw = new Database(path);
@@ -1431,8 +1356,8 @@ describe("monitors: schema migration", () => {
 			["copied", null],
 			["plain", null],
 		]);
-		expect(store.monitors.addMonitor({ ...spec, name: "after", copyChannel: "C0COPYCHAN1" }).copyChannel).toBe(
-			"C0COPYCHAN1",
+		expect(store.monitors.addMonitor({ ...spec, name: "after", copyChannel: COPY_CHANNEL }).copyChannel).toBe(
+			COPY_CHANNEL,
 		);
 	});
 
@@ -1756,7 +1681,6 @@ describe("monitors: script edge triggering", () => {
 			path: join(dir, "ompbot.db"),
 			clock,
 			redact,
-			slackOwnerUserId: OWNER,
 		});
 		const restarted = new MonitorScheduler({
 			store: reopened,
@@ -1861,7 +1785,7 @@ describe("monitors: script edge triggering", () => {
 		await interval();
 		expect(row()?.checkErrorStreak).toBe(3);
 		expect(notices()).toHaveLength(1);
-		expect(notices()[0]?.threadRef).toBe(`${OWNER}:-`);
+		expect(notices()[0]?.threadRef).toBe(`${OWNER_DM}:-`);
 		expect(notices()[0]?.body.startsWith("⏰ flagwatch\n")).toBe(true);
 		expect(notices()[0]?.body).toContain("3번 연속");
 		await interval();
@@ -1885,7 +1809,8 @@ describe("monitors: script edge triggering", () => {
 		raw.run("ALTER TABLE monitors DROP COLUMN last_check_error_at");
 		raw.run("ALTER TABLE monitors DROP COLUMN check_error_streak");
 		raw.close();
-		store = openStore({ timezone: "Asia/Seoul", path, clock, redact, slackOwnerUserId: OWNER });
+		store = openStore({ timezone: "Asia/Seoul", path, clock, redact });
+		store.ensureOrigin(OWNER_DM_ORIGIN, "sess/owner-dm");
 		const migrated = store.monitors.getMonitor(monitor.id);
 		expect([migrated?.checkErrorStreak, migrated?.lastCheckError, migrated?.lastCheckErrorAt]).toEqual([0, null, null]);
 	});
@@ -1962,27 +1887,35 @@ describe("monitors: spec validation", () => {
 
 	test("channel: valid ids kept, malformed rejected, update keeps or clears it", () => {
 		const base = { name: "n", trigger: { kind: "cron", schedule: "0 9 * * *" }, instruction: "x" };
-		expect(parseMonitorSpec({ ...base, channel: "C0123456789" }, ctx()).channel).toBe("C0123456789");
-		expect(parseMonitorSpec({ ...base, channel: "G0123456789" }, ctx()).channel).toBe("G0123456789");
+		expect(parseMonitorSpec({ ...base, channel: CHANNEL_A }, ctx()).channel).toBe(CHANNEL_A);
 		expect("channel" in parseMonitorSpec(base, ctx())).toBe(false);
-		for (const bad of ["", "D0123456789", "c0123456789", "C123", "C0123456789 ", 5, true]) {
+		for (const bad of [
+			"",
+			"C0123456789",
+			"G0123456789",
+			"3000000000000002",
+			"3000000000000000000002",
+			`${CHANNEL_A} `,
+			5,
+			true,
+		]) {
 			expect(() => parseMonitorSpec({ ...base, channel: bad }, ctx())).toThrow(MonitorSpecError);
 		}
-		expect(() => parseMonitorSpec({ ...base, chanel: "C0123456789" }, ctx())).toThrow(MonitorSpecError);
-		const current = parseMonitorSpec({ ...base, channel: "C0123456789" }, ctx());
-		expect(mergeMonitorSpec(current, { name: "m" }, ctx()).channel).toBe("C0123456789");
+		expect(() => parseMonitorSpec({ ...base, chanel: CHANNEL_A }, ctx())).toThrow(MonitorSpecError);
+		const current = parseMonitorSpec({ ...base, channel: CHANNEL_A }, ctx());
+		expect(mergeMonitorSpec(current, { name: "m" }, ctx()).channel).toBe(CHANNEL_A);
 		expect("channel" in mergeMonitorSpec(current, { channel: null }, ctx())).toBe(false);
 	});
 
 	test("copyChannel: valid ids kept, malformed rejected, update keeps or clears it", () => {
 		const base = { name: "n", trigger: { kind: "cron", schedule: "0 9 * * *" }, instruction: "x" };
-		expect(parseMonitorSpec({ ...base, copyChannel: "C0123456789" }, ctx()).copyChannel).toBe("C0123456789");
+		expect(parseMonitorSpec({ ...base, copyChannel: CHANNEL_A }, ctx()).copyChannel).toBe(CHANNEL_A);
 		expect("copyChannel" in parseMonitorSpec(base, ctx())).toBe(false);
-		for (const bad of ["", "D0123456789", "c0123456789", "C123", 5, true]) {
+		for (const bad of ["", "C0123456789", "3000000000000002", `${CHANNEL_A}x`, 5, true]) {
 			expect(() => parseMonitorSpec({ ...base, copyChannel: bad }, ctx())).toThrow(MonitorSpecError);
 		}
-		const current = parseMonitorSpec({ ...base, copyChannel: "C0123456789" }, ctx());
-		expect(mergeMonitorSpec(current, { name: "m" }, ctx()).copyChannel).toBe("C0123456789");
+		const current = parseMonitorSpec({ ...base, copyChannel: CHANNEL_A }, ctx());
+		expect(mergeMonitorSpec(current, { name: "m" }, ctx()).copyChannel).toBe(CHANNEL_A);
 		expect("copyChannel" in mergeMonitorSpec(current, { copyChannel: null }, ctx())).toBe(false);
 	});
 

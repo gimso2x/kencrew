@@ -4,18 +4,20 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { DiscordChannel } from "../src/discord/channel";
+import { mrkdwnToDiscord } from "../src/discord/format";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
-import { SlackChannel } from "../src/slack/channel";
 import { checkTask, digest } from "../src/tasks/checker";
 import { acceptanceItems, docsDirOf, parseSpec, renderProgress, renderSpec } from "../src/tasks/docs";
 import { evaluateTask, runWorktreeChecks, type TaskCheckCache } from "../src/tasks/evaluate";
 import { createTaskHostOps, type TaskHostOps } from "../src/tasks/host";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
-import { formatReachedNotice } from "../src/tasks/notify";
+import { buildReachedCard } from "../src/tasks/notify";
 import type { SignalCheck } from "../src/tasks/signals";
 import { BLOCKED_CHECKS_PASS_HEAD, TaskSweeper } from "../src/tasks/sweeper";
+import { OWNER } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
+import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const T0 = Date.parse("2026-11-04T01:00:00Z");
 /** The sweeper's in-memory check results; a fresh one per evaluation unless a test shares it. */
@@ -39,8 +41,8 @@ function task(acceptance: string[], repo = "/r/repo"): Task {
 	const row = ledger.register({
 		title: "check",
 		risk: "L2",
-		originKey: "slack/ch/C1/t/100.1",
-		threadRef: "C1:100.1",
+		originKey: "discord/ch/111111111111111111/t/222222222222222222",
+		threadRef: "111111111111111111:222222222222222222",
 		host: null,
 		repo,
 		acceptance: acceptanceItems(acceptance),
@@ -128,25 +130,27 @@ function fakeHost(
 	return { ops, runs, heads, diffs };
 }
 
-/** A sweeper over the real `evaluateTask` and `host`; the agent is idle, Slack is a fake. */
-function sweeperFor(t: Task, host: Pick<FakeHost, "ops">): { sweeper: TaskSweeper; transport: FakeSlackTransport } {
-	const transport = new FakeSlackTransport();
+/** A sweeper over the real `evaluateTask` and `host`; the agent is idle, Discord is a fake. */
+function sweeperFor(t: Task, host: Pick<FakeHost, "ops">): { sweeper: TaskSweeper; transport: FakeDiscordTransport } {
+	const transport = new FakeDiscordTransport();
 	const sweeper = new TaskSweeper({
 		ledger: t.ledger,
 		evaluate: (row, checks) => evaluateTask(row, host.ops, checks),
 		remind: async () => ({ ok: true }),
 		agentStatus: async () => ({ ok: true, status: "idle" }),
 		readAgent: async () => ({ ok: true, output: "" }),
-		channels: registryOf(new SlackChannel(transport)),
-		ownerUserId: "UOWN",
+		channels: registryOf(new DiscordChannel(transport, { ownerUserId: OWNER })),
+		ownerUserId: OWNER,
 		now: () => T0,
 		log: { info() {}, warn() {} },
 	});
 	return { sweeper, transport };
 }
 
-const posted = (transport: FakeSlackTransport): string[] =>
-	transport.calls.flatMap((call) => (call.method === "postMessage" && "text" in call ? [call.text] : []));
+const posted = (transport: FakeDiscordTransport): string[] =>
+	transport.calls.flatMap((call) =>
+		call.method === "createMessage" && call.content !== undefined ? [call.content] : [],
+	);
 
 describe("[check: …] signals in the judgement", () => {
 	test("AC-3: a check that exits 1 or whose stdout misses the regex keeps the task short of the outcome", async () => {
@@ -158,7 +162,7 @@ describe("[check: …] signals in the judgement", () => {
 		const failedProblems = failed.ok ? failed.judgement.problems : [];
 		expect(failedProblems).toHaveLength(1);
 		expect(failedProblems[0]).toStartWith("check AC-1 실패: ");
-		expect(exit1.runs).toEqual([{ worktree: row.worktree, argv: ["bun", "test"], timeoutMs: 300_000 }]);
+		expect(exit1.runs).toEqual([{ worktree: row.worktree, argv: ["bun", "test"], timeoutMs: 900_000 }]);
 
 		const mismatch = fakeHost(files, { run: () => ({ code: 0, output: "3 pass\n 2 fail\n" }) });
 		const unmatched = await evaluateTask(row, mismatch.ops, cache());
@@ -276,8 +280,8 @@ describe("[check: …] signals in the judgement", () => {
 			},
 			agentStatus: async () => ({ ok: true, status: "idle" }),
 			readAgent: async () => ({ ok: true, output: "" }),
-			channels: registryOf(new SlackChannel(new FakeSlackTransport())),
-			ownerUserId: "UOWN",
+			channels: registryOf(new DiscordChannel(new FakeDiscordTransport(), { ownerUserId: OWNER })),
+			ownerUserId: OWNER,
 			now: () => T0,
 			log: { info() {}, warn() {} },
 		});
@@ -322,7 +326,7 @@ describe("[check: …] signals in the judgement", () => {
 					id: "AC-3",
 					signal: 'command ["slow"]',
 					ok: false,
-					detail: "300초 안에 끝나지 않았습니다(확인 불가)",
+					detail: "900초 안에 끝나지 않았습니다(확인 불가)",
 					inconclusive: true,
 				},
 			],
@@ -641,10 +645,25 @@ describe("diff integrity of the task branch", () => {
 		expect(result.judgement).toMatchObject({ reached: true, problems: [], integrityWarnings: warnings });
 		const card = posted(transport).find((text) => text.includes("Outcome 도달")) ?? "";
 		const lines = card.split("\n");
-		const head = lines.indexOf("*⚠️ 무결성 경고*");
+		const head = lines.indexOf("**⚠️ 무결성 경고**");
 		// Right after the summary line, one bullet per warning.
 		expect(lines[head - 1]).toBe("• 회전을 고쳤고 모두 통과했습니다.");
 		expect(lines.slice(head + 1, head + 3)).toEqual(warnings.map((line) => `• ${line}`));
+	});
+
+	test("AC-2: an undeclared feature removal only warns; the outcome is still reached", async () => {
+		const t = task(["하나"]);
+		const diff = ["--- a/src/rotate.ts", "+++ b/src/rotate.ts", "@@ -3 +2,0 @@", "-export function rotate() {"].join(
+			"\n",
+		);
+		const { sweeper } = sweeperFor(t, fakeHost(t.files, { diff: { ok: true, value: diff } }));
+		const result = await sweeper.check(t.row);
+		expect(result.status).toBe("review");
+		expect(result.judgement).toMatchObject({
+			reached: true,
+			problems: [],
+			integrityWarnings: ["무결성 undeclared_feature_removal: src/rotate.ts: export function rotate() {"],
+		});
 	});
 
 	test("AC-2: a clean diff leaves the judgement and the card exactly as without the integrity read", async () => {
@@ -670,7 +689,9 @@ describe("diff integrity of the task branch", () => {
 		const { sweeper, transport } = sweeperFor(t, host);
 		await sweeper.check(t.row);
 		const card = posted(transport).find((text) => text.includes("Outcome 도달")) ?? "";
-		expect(card).toBe(formatReachedNotice(t.row, without, "UOWN").replace("{{mention:UOWN}}", "<@UOWN>"));
+		expect(card).toBe(
+			mrkdwnToDiscord(buildReachedCard(t.row, without, OWNER).text.replace(`{{mention:${OWNER}}}`, `<@${OWNER}>`)),
+		);
 		expect(card).not.toContain("무결성");
 	});
 

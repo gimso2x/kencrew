@@ -44,7 +44,10 @@ export const exhaustedReason = (kind: GateKind): string =>
 	`${kind === "review" ? REVIEW_INCONCLUSIVE : QA_INCONCLUSIVE}(재시도 ${GATE_STARTS_MAX}회 소진)`;
 
 /** The task's branch tip and the base branch it lands on (`landTask`'s); `undefined` when git cannot tell. */
-export async function taskTip(git: GitRunner, row: TaskRow): Promise<{ sha: string; baseBranch: string } | undefined> {
+export async function taskTip(
+	git: GitRunner,
+	row: Pick<TaskRow, "repo" | "branch">,
+): Promise<{ sha: string; baseBranch: string } | undefined> {
 	const tip = await git(["-C", row.repo, "rev-parse", "--verify", "-q", `refs/heads/${row.branch}^{commit}`]);
 	const baseBranch = await baseBranchOf(git, row.repo);
 	if (tip.code !== 0 || baseBranch === undefined) return undefined;

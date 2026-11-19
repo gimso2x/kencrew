@@ -1,6 +1,7 @@
 // Discord inbound (doc/plans/discord-channel.md §7): the owner gate, addressing, thread creation, 👀 and the ⏳ status,
 // all on FakeDiscordTransport.
 import { beforeEach, describe, expect, test } from "bun:test";
+import { PEER_HOP_NOTICE } from "../src/channel/inbound";
 import type {
 	CoreSink,
 	DeliverySource,
@@ -21,7 +22,6 @@ import {
 } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
-import { PEER_HOP_NOTICE } from "../src/slack/adapter";
 import { PendingDiscordTransport } from "./helpers/bot-home";
 import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
@@ -137,7 +137,7 @@ describe("owner DM", () => {
 		expect(logged("event=inbound_duplicate")).toBe(true);
 	});
 
-	test("ingestOwner on a DM the daemon calls `ch` (its kind comes from Slack id shapes): taken as a DM, no bot mention in the text", async () => {
+	test("ingestOwner on a DM the daemon calls `ch`: taken as a DM, no bot mention in the text", async () => {
 		const made = await adapter();
 		transport.setChannel({ id: DM, type: 1 });
 		const marker = nextId();
@@ -565,7 +565,11 @@ describe("peer bots (doc/plans/discord-peer-bots.md B)", () => {
 		const cursors = new Map<string, string>([[`dc:${CH}`, "1"]]);
 		const made = await peerAdapter(undefined, {
 			recovery: {
-				cursors: { getCursor: (key) => cursors.get(key), setCursor: (key, value) => void cursors.set(key, value) },
+				cursors: {
+					getCursor: (key) => cursors.get(key),
+					setCursor: (key, value) => void cursors.set(key, value),
+					deleteCursor: (key) => void cursors.delete(key),
+				},
 				targets: () => [{ channelId: CH, dm: false }],
 			},
 		});
@@ -1058,7 +1062,11 @@ describe("start without a first Ready (qa-q #19)", () => {
 		const made = await adapter({
 			startWaitMs: 10,
 			recovery: {
-				cursors: { getCursor: (key) => cursors.get(key), setCursor: (key, value) => void cursors.set(key, value) },
+				cursors: {
+					getCursor: (key) => cursors.get(key),
+					setCursor: (key, value) => void cursors.set(key, value),
+					deleteCursor: (key) => void cursors.delete(key),
+				},
 				targets: () => [{ channelId: CH, dm: false }],
 			},
 		});

@@ -1,17 +1,8 @@
-import { accessSync, constants, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { type AuthTestResponse, WebClient } from "@slack/web-api";
-import {
-	ConfigError,
-	HOME_MODE,
-	loadConfig,
-	type OmpbotConfig,
-	readDiscordToken,
-	readSlackTokens,
-	SECRET_MODE,
-} from "../config";
+import { ConfigError, HOME_MODE, loadConfig, type OmpbotConfig, readDiscordToken, SECRET_MODE } from "../config";
 import { DiscordRest } from "../discord/rest";
 import { DEFAULT_COMPLETION_NUDGES } from "../lanes/manager";
 import { buildChildEnv, withOmpProfile } from "../omp/env";
@@ -75,35 +66,8 @@ export async function countOmpModels(
 	}
 }
 
-/** Config errors that only concern the Slack token files; doctor reports those per file and keeps going. */
-const TOKEN_FILE_ERRORS: Record<string, true> = { secret_missing: true, secret_permissions: true, token_prefix: true };
-
-/**
- * What is wrong with one token file, with the command that fixes it, or undefined when it is fine. Only the first
- * characters are compared; the value is never printed.
- */
-export function secretProblem(path: string, prefix: string): string | undefined {
-	let mode: number;
-	try {
-		const stat = statSync(path);
-		// A FIFO or device in the file's place would block the read below for good.
-		if (!stat.isFile()) return `not a regular file (replace it: umask 077; cat > ${path})`;
-		mode = stat.mode & 0o777;
-	} catch {
-		return `missing (write it: umask 077; cat > ${path})`;
-	}
-	if (mode !== SECRET_MODE) return `mode=${octal(mode)} expected=${octal(SECRET_MODE)} (fix: chmod 600 ${path})`;
-	let head: string;
-	try {
-		head = readFileSync(path, "utf8").trimStart().slice(0, prefix.length);
-	} catch {
-		return `unreadable (fix: chmod 600 ${path} as the account that runs ompbot)`;
-	}
-	if (head !== prefix) {
-		return `does not start with ${prefix} (the bot token is xoxb-…, the app-level token is xapp-…; paste the right one)`;
-	}
-	return undefined;
-}
+/** Config errors that only concern the token files; doctor reports those per file and keeps going. */
+const TOKEN_FILE_ERRORS: Record<string, true> = { secret_missing: true, secret_permissions: true };
 
 /** `\uXXXX` for every control and format character, so a value read from a file cannot start a new doctor line. */
 export const escapeControl = (text: string): string =>
@@ -242,22 +206,21 @@ export function checkCodeRollbackJournal(repoDir: string, warn: (name: string, d
 	);
 }
 
-/** The network calls `runDoctor` makes; tests pass fakes so the report never reaches Slack or Discord. */
+/** The network calls `runDoctor` makes; tests pass fakes so the report never reaches Discord. */
 export interface DoctorNetwork {
-	slackAuthTest?: (botToken: string) => Promise<AuthTestResponse>;
 	fetchImpl?: typeof fetch;
 }
 
 /**
  * Prints one `ok`/`fail` line per check (`warn` lines never count as failures). Only paths, modes, token *prefixes* and public ids are printed; token values
- * never leave `readSlackTokens`. Returns 0 when every check passed. With `repoDir` (the checkout the daemon runs),
+ * never leave the config readers. Returns 0 when every check passed. With `repoDir` (the checkout the daemon runs),
  * a code rollback journal there is a warning.
  */
 export async function runDoctor(
 	homeDir: string,
 	write: (line: string) => void,
 	repoDir?: string,
-	{ slackAuthTest = (botToken) => new WebClient(botToken).auth.test(), fetchImpl = fetch }: DoctorNetwork = {},
+	{ fetchImpl = fetch }: DoctorNetwork = {},
 ): Promise<number> {
 	let failures = 0;
 	const report = (ok: boolean, name: string, detail: string): void => {
@@ -279,7 +242,6 @@ export async function runDoctor(
 	}
 	// A token file problem is reported on its own `secret …` line below, so it must not hide every later check: the
 	// config is loaded again without the token files and the report goes on.
-	let tokensOk = true;
 	try {
 		config = loadConfig(homeDir);
 		report(true, "config", config.configPath);
@@ -296,25 +258,6 @@ export async function runDoctor(
 		}
 	}
 	if (config) {
-		// Slack off: one line says so, and no Slack token file or auth.test line follows.
-		if (config.slack === undefined) report(true, "slack", "off (channels.slack not set)");
-		const slackTokenFiles =
-			config.slack === undefined
-				? []
-				: ([
-						["slack-bot-token", config.slack.botTokenFile, "xoxb-"],
-						["slack-app-token", config.slack.appTokenFile, "xapp-"],
-					] as const);
-		for (const [name, path, prefix] of slackTokenFiles) {
-			const problem = secretProblem(path, prefix);
-			if (problem !== undefined) tokensOk = false;
-			report(
-				problem === undefined,
-				`secret ${name}`,
-				problem ?? `mode=${octal(SECRET_MODE)} expected=${octal(SECRET_MODE)} prefix=${prefix}`,
-			);
-		}
-
 		try {
 			accessSync(config.ompExecutable, constants.X_OK);
 			const version = await readVersion([config.ompExecutable, "--version"]);
@@ -329,7 +272,7 @@ export async function runDoctor(
 
 		// The same check the RPC driver runs before every spawn, so a fresh install with the standalone binary or a
 		// too-old bun fails here instead of on the first DM. Skipped when omp or bun is missing (reported elsewhere)
-		// and for agents "claude"/"agy", which never spawn omp; an unreadable launcher (a directory, no permission) is a
+		// and for agent "agy", which never spawns omp; an unreadable launcher (a directory, no permission) is a
 		// failed line, not an exception that ends the whole report.
 		const runtimeBun = Bun.which("bun");
 		if ((config.agent ?? "omp") === "omp" && runtimeBun !== null && existsSync(config.ompExecutable)) {
@@ -378,34 +321,6 @@ export async function runDoctor(
 		const nudges = config.lanes?.completionNudges ?? DEFAULT_COMPLETION_NUDGES;
 		report(true, "lane nudges", nudges === 0 ? "off (lanes.completionNudges=0)" : `completionNudges=${nudges}`);
 
-		// agent "claude": the CLI must exist, and auth must come from ~/.claude credentials or a key env
-		// (names only — values are never read here).
-		if (config.agent === "claude") {
-			const given = config.claudeExecutable ?? "claude";
-			try {
-				const executable = given.includes("/") ? given : (Bun.which(given) ?? "");
-				if (executable === "") throw new Error("not on PATH");
-				accessSync(executable, constants.X_OK);
-				const version = await readVersion([executable, "--version"]);
-				report(version !== "unknown", "claude", `${executable} ${version}`);
-			} catch {
-				report(false, "claude", `${given} not executable`);
-			}
-			const configDir = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude");
-			const credentials = join(configDir, ".credentials.json");
-			if (existsSync(credentials)) {
-				report(true, "claude auth", `${credentials} present`);
-			} else if (process.env.ANTHROPIC_API_KEY !== undefined || process.env.CLAUDE_CODE_OAUTH_TOKEN !== undefined) {
-				report(true, "claude auth", "key env present");
-			} else {
-				report(
-					false,
-					"claude auth",
-					`no ${credentials} and no ANTHROPIC_API_KEY/CLAUDE_CODE_OAUTH_TOKEN (run: claude /login)`,
-				);
-			}
-		}
-
 		// agent "agy": the Antigravity CLI must exist, and its Google login must be on disk (presence only).
 		if (config.agent === "agy") {
 			const given = config.agyExecutable ?? "agy";
@@ -438,37 +353,6 @@ export async function runDoctor(
 	checkInjectedFiles(homeDir, warn);
 	if (repoDir !== undefined) checkCodeRollbackJournal(repoDir, warn);
 
-	if (config && !tokensOk) {
-		report(false, "slack auth.test", "skipped: fix the secret lines above first");
-	} else if (config?.slack !== undefined) {
-		const slack = config.slack;
-		try {
-			const { botToken } = readSlackTokens(config);
-			const auth = await slackAuthTest(botToken);
-			const idMatches = slack.botUserId === undefined || slack.botUserId === auth.user_id;
-			report(
-				auth.ok === true && idMatches,
-				"slack auth.test",
-				`bot_user_id=${auth.user_id ?? "?"} team_id=${auth.team_id ?? "?"}`,
-			);
-		} catch (error) {
-			const code =
-				error instanceof Error &&
-				"data" in error &&
-				typeof error.data === "object" &&
-				error.data !== null &&
-				"error" in error.data
-					? String(error.data.error)
-					: "request_failed";
-			report(
-				false,
-				"slack auth.test",
-				code === "invalid_auth" || code === "token_revoked" || code === "account_inactive"
-					? `${code} (Slack refused the bot token: copy the xoxb- token again from the app's Install App page; reinstalling the app issues a new one)`
-					: code,
-			);
-		}
-	}
 	if (config) await checkDiscord(config, report, fetchImpl);
 	return failures === 0 ? 0 : 1;
 }

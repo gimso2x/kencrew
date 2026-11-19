@@ -1,10 +1,12 @@
 import { Database } from "bun:sqlite";
-import { existsSync, lstatSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, realpathSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { isThreadOrigin } from "../core/normalize";
 import { sessionDirFor } from "../core/origin";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { removeTurnRefsSync, TURN_SNAPSHOT_RETENTION_DAYS } from "./turn-snapshot";
+
+const REMOVED_SLACK_THREAD = /^slack\/ch\/[^/]+\/t\/[^/]+$/;
 
 export const DEFAULT_SESSION_RETENTION_DAYS = 30;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -47,6 +49,15 @@ export const TEAMS_QA_RETENTION_DAYS = 30;
 
 /** How long finished inbound, delivery and monitor-event rows stay in the ledger. */
 export const LEDGER_RETENTION_DAYS = 90;
+
+/** The real path of an existing path; a path that is not there is only resolved. */
+function realpathOrResolve(path: string): string {
+	try {
+		return realpathSync(path);
+	} catch {
+		return resolve(path);
+	}
+}
 
 /** Newest modification time of a directory tree (symlinks are not followed). */
 function newestMtimeMs(path: string): number {
@@ -106,6 +117,8 @@ export function gcSessions(options: GcOptions): GcResult {
 		db.close();
 	}
 	const cutoff = options.now - options.retentionDays * DAY_MS;
+	// Thread sessions of the removed Slack channel no longer parse as a chat origin, but still expire like any thread.
+	const expiresWhole = (key: string) => isThreadOrigin(key) || REMOVED_SLACK_THREAD.test(key);
 	const isOrphanMonitor = (key: string) =>
 		monitorIds !== undefined &&
 		key.startsWith(MONITOR_ORIGIN_PREFIX) &&
@@ -114,7 +127,7 @@ export function gcSessions(options: GcOptions): GcResult {
 	// to now, which would otherwise make every origin with a pruned epoch look freshly active.
 	const originActivity = new Map<string, number>();
 	for (const origin of origins) {
-		if (!isOrphanMonitor(origin.origin_key) && !isThreadOrigin(origin.origin_key)) continue;
+		if (!isOrphanMonitor(origin.origin_key) && !expiresWhole(origin.origin_key)) continue;
 		const originDir = dirname(sessionDirFor(sessionsRoot, origin.origin_key, 1));
 		// A missing directory (the row was made, the first turn has not written yet) ages by the row's updated_at.
 		const exists = lstatSync(originDir, { throwIfNoEntry: false }) !== undefined;
@@ -129,7 +142,8 @@ export function gcSessions(options: GcOptions): GcResult {
 			if (epoch === undefined || Number(epoch) >= origin.epoch) continue;
 			const path = join(originDir, name);
 			// `/resume-ompbot` can make an older epoch's directory the live one again.
-			if (resolve(path) === resolve(origin.session_dir)) continue;
+			// Compared by real path: a symlinked home must not make the live directory look like another one.
+			if (realpathOrResolve(path) === realpathOrResolve(origin.session_dir)) continue;
 			if (!lstatSync(path).isDirectory()) continue;
 			if (newestMtimeMs(path) >= cutoff) {
 				result.retained.push(path);
@@ -149,7 +163,7 @@ export function gcSessions(options: GcOptions): GcResult {
 	try {
 		for (const origin of origins) {
 			const orphanMonitor = isOrphanMonitor(origin.origin_key);
-			if (!orphanMonitor && !isThreadOrigin(origin.origin_key)) continue;
+			if (!orphanMonitor && !expiresWhole(origin.origin_key)) continue;
 			const originDir = dirname(sessionDirFor(sessionsRoot, origin.origin_key, 1));
 			const activity = originActivity.get(origin.origin_key);
 			if (activity !== undefined && activity >= cutoff) {

@@ -1,6 +1,5 @@
-// One daemon with Slack and Discord side by side (doc/plans/discord-channel.md TASK 4): each platform's question is
-// answered on its own platform only, the ledger tells them apart by thread_ref, and a fatal Discord gateway leaves
-// Slack running.
+// One daemon on Discord (doc/plans/discord-channel.md TASK 4): a question is answered on Discord, the ledger keeps its
+// thread_ref, and a fatal or late Discord gateway never takes the daemon down.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ChannelBinding } from "../src/channel/adapter";
 import type { OmpbotConfig } from "../src/config";
@@ -11,22 +10,10 @@ import { DiscordGatewayFatalError, type DiscordHandlers } from "../src/discord/t
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import {
-	DISCORD_OWNER,
-	makeHome,
-	OWNER,
-	PendingDiscordTransport,
-	type TestHome,
-	WaitingDiscordTransport,
-	WaitingTransport,
-	withDiscord,
-} from "./helpers/bot-home";
+import { makeHome, OWNER, PendingDiscordTransport, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
 const DISCORD_DM = "123456789012345678"; // gitleaks:allow (fake snowflake)
 const QUESTION = "700000000000000001";
-const SLACK_DM = "D1";
 const clock = { now: () => Date.now() };
 
 /** A Discord transport whose gateway closes with 4014 (Message Content Intent off) before Ready. */
@@ -38,7 +25,6 @@ class FatalDiscordTransport extends WaitingDiscordTransport {
 
 let home: TestHome;
 let daemon: Daemon | undefined;
-let slack: WaitingTransport;
 let logs: string[];
 
 const logWaiters = new Set<() => void>();
@@ -68,11 +54,10 @@ async function boot(
 	discord: WaitingDiscordTransport | undefined,
 	discordOptions: { startWaitMs?: number } = {},
 ): Promise<void> {
-	slack = new WaitingTransport();
 	const sessions = new FakeSessionStore();
-	const channels: ChannelBinding[] = [new SlackBinding(new SlackChannel(slack))];
+	const channels: ChannelBinding[] = [];
 	if (discord !== undefined) {
-		channels.push(new DiscordBinding(new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER }), discordOptions));
+		channels.push(new DiscordBinding(new DiscordChannel(discord, { ownerUserId: OWNER }), discordOptions));
 	}
 	daemon = new Daemon({
 		config,
@@ -92,10 +77,6 @@ async function boot(
 	await daemon.start();
 }
 
-function slackQuestion(text: string, ts: string): Promise<void> {
-	return slack.emitMessage({ type: "message", channel: SLACK_DM, channel_type: "im", user: OWNER, text, ts });
-}
-
 beforeEach(() => {
 	home = makeHome("ompbot-discord-daemon-");
 	logs = [];
@@ -107,17 +88,16 @@ afterEach(async () => {
 	home.remove();
 });
 
-describe("Slack and Discord in one daemon", () => {
-	test("a Discord DM is answered on Discord only, a Slack DM on Slack only; thread_ref tells the rows apart", async () => {
+describe("Discord in one daemon", () => {
+	test("a Discord DM is answered on Discord; the ledger row keeps its thread_ref", async () => {
 		const discord = new WaitingDiscordTransport();
-		await boot(withDiscord(home), discord);
+		await boot(home.config, discord);
 		expect(logs.some((line) => line.includes("event=daemon_ready") && line.includes("discord=on"))).toBe(true);
 
-		const slackBefore = slack.calls.length;
 		await discord.emitMessage({
 			id: QUESTION,
 			channel_id: DISCORD_DM,
-			author: { id: DISCORD_OWNER },
+			author: { id: OWNER },
 			content: "디스코드 질문",
 			type: 0,
 		});
@@ -127,35 +107,25 @@ describe("Slack and Discord in one daemon", () => {
 		const answer = discord.posts((text) => text.includes("ECHO 디스코드 질문"))[0];
 		expect(answer?.channelId).toBe(DISCORD_DM);
 		expect(answer?.messageReference).toEqual({ messageId: QUESTION });
-		expect(slack.calls.slice(slackBefore)).toHaveLength(0);
-
-		const discordBefore = discord.calls.length;
-		await slackQuestion("슬랙 질문", "1700.000001");
-		await slack.waitForPosts((text) => text.includes("ECHO 슬랙 질문"));
-		await daemon?.pump();
-		expect(discord.calls.slice(discordBefore)).toHaveLength(0);
 		expect(discord.calls.map((call) => call.method)).toContain("addReaction");
 
 		const rows = daemon?.store.listDeliveries().map((row) => [row.originKey, row.threadRef, row.state]);
 		expect(rows).toContainEqual([`discord/dm/${DISCORD_DM}`, `${DISCORD_DM}:${QUESTION}`, "confirmed"]);
-		expect(rows).toContainEqual([`slack/dm/${SLACK_DM}`, `${SLACK_DM}:1700.000001`, "confirmed"]);
 	});
 
-	test("a fatal gateway close (4014) stops Discord only: the daemon starts and Slack keeps answering", async () => {
-		await boot(withDiscord(home), new FatalDiscordTransport());
+	test("a fatal gateway close (4014) is logged and, with no other adapter, refuses the start", async () => {
+		await expect(boot(home.config, new FatalDiscordTransport())).rejects.toThrow(
+			"every chat adapter failed to start: discord",
+		);
 		expect(logs.some((line) => line.includes("event=discord_start_failed") && line.includes("4014"))).toBe(true);
-		await slackQuestion("디스코드가 죽어도", "1700.000002");
-		await slack.waitForPosts((text) => text.includes("ECHO 디스코드가 죽어도"));
+		expect(logged("event=daemon_ready")).toBe(false);
 	});
 
-	test("a gateway that never reaches Ready does not hold the daemon: pending, Slack answers, silence armed after the late Ready (qa-q #19)", async () => {
+	test("a gateway that never reaches Ready does not hold the daemon: pending, silence armed after the late Ready (qa-q #19)", async () => {
 		const discord = new PendingDiscordTransport();
-		await boot(withDiscord(home), discord, { startWaitMs: 10 });
+		await boot(home.config, discord, { startWaitMs: 10 });
 		expect(logged("event=discord_start_pending")).toBe(true);
 		expect(logged("event=daemon_ready")).toBe(true);
-		expect(logged("event=peer_silence_armed")).toBe(false);
-		await slackQuestion("디스코드 대기 중", "1700.000003");
-		await slack.waitForPosts((text) => text.includes("ECHO 디스코드 대기 중"));
 		expect(logged("event=peer_silence_armed")).toBe(false);
 
 		discord.release();
@@ -168,7 +138,7 @@ describe("Slack and Discord in one daemon", () => {
 
 	test("a fatal close (4004) after Ready drops Discord: the pump claims no more Discord rows and none turns undelivered (qa-q #20)", async () => {
 		const discord = new WaitingDiscordTransport();
-		await boot(withDiscord(home), discord);
+		await boot(home.config, discord);
 		discord.emitFatal(new DiscordGatewayFatalError(4004, "Authentication failed"));
 		await waitForLog("event=adapter_detached");
 
@@ -184,21 +154,19 @@ describe("Slack and Discord in one daemon", () => {
 		expect(discord.calls.slice(before)).toHaveLength(0);
 		const state = daemon?.store.listDeliveries().find((r) => r.opRef === "op-after-fatal")?.state;
 		expect(state).toBe("pending");
-		await slackQuestion("슬랙은 계속", "1700.000004");
-		await slack.waitForPosts((text) => text.includes("ECHO 슬랙은 계속"));
 	});
 
-	test("a fatal close (4004) on the first connection leaves the daemon running on Slack", async () => {
+	test("a fatal close (4004) on the first connection is a failed adapter start, not a detach", async () => {
 		class AuthFailedTransport extends WaitingDiscordTransport {
 			override async start(_handlers: DiscordHandlers): Promise<{ botUserId: string; applicationId: string }> {
 				throw new DiscordGatewayFatalError(4004, "Authentication failed");
 			}
 		}
-		await boot(withDiscord(home), new AuthFailedTransport());
+		await expect(boot(home.config, new AuthFailedTransport())).rejects.toThrow(
+			"every chat adapter failed to start: discord",
+		);
 		expect(logged("event=adapter_start_failed")).toBe(true);
 		expect(logged("event=adapter_detached")).toBe(false);
-		await slackQuestion("첫 연결 4004", "1700.000005");
-		await slack.waitForPosts((text) => text.includes("ECHO 첫 연결 4004"));
 	});
 
 	test("without channels.discord the daemon logs discord=off", async () => {

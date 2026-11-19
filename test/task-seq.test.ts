@@ -6,8 +6,8 @@ import { TaskLedger } from "../src/tasks/ledger";
 const base = {
 	title: "번호",
 	risk: "L2" as const,
-	originKey: "slack/ch/C1",
-	threadRef: "C1:100.1",
+	originKey: "discord/ch/111111111111111111",
+	threadRef: "111111111111111111:700000000000000001",
 	host: null,
 	repo: "/r/repo",
 	acceptance: acceptanceItems(["하나"]),

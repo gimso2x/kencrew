@@ -78,7 +78,7 @@ function seedSource(h: TestHome): void {
 		name: "morning/brief",
 		trigger: { kind: "cron", schedule: "30 9 * * *" },
 		instruction: "summarize",
-		channel: "C0123456789",
+		channel: "300000000000000001",
 		model: "provider/model-a",
 		thinking: "low",
 		procedureFiles: [join(h.config.workspaceDir, "procedure.md"), join(h.dir, "scripts", "steps.md"), "procedure.md"],

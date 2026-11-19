@@ -126,3 +126,14 @@ describe("Teams owner gate and addressing (AC-B4)", () => {
 		expect(ms.calls).toEqual([]);
 	});
 });
+
+describe("ompbot inject on a Teams-only daemon", () => {
+	test("a discord origin is refused as not configured and nothing is recorded or posted", async () => {
+		await boot();
+		await expect(
+			daemon?.inject({ origin: "discord/dm/200000000000000001", asOwner: true, text: "안녕" }),
+		).rejects.toThrow("discord is not configured");
+		expect(daemon?.store.listInbound()).toEqual([]);
+		expect(ms.calls).toEqual([]);
+	});
+});

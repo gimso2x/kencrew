@@ -36,24 +36,20 @@ function mkfifo(path: string): void {
 
 describe("secret and journal reads refuse a FIFO (qa-j #2 #10)", () => {
 	test(
-		"#2 a FIFO in a token file's place is a config error and a doctor problem, not a hang",
+		"#2 a FIFO in a token file's place is a config error, not a hang",
 		async () => {
 			const home = makeHome("ompbot-qa-j-secret-");
 			try {
-				const token = join(home.dir, "secrets", "slack-bot-token");
+				const token = join(home.dir, "secrets", "discord-bot-token");
 				rmSync(token);
 				mkfifo(token);
 				chmodSync(token, 0o600);
 				const result = await runBounded(
 					`const { loadConfig } = await import(${mod("config.ts")});
-				 const { secretProblem } = await import(${mod("daemon/doctor.ts")});
-				 console.log(String(secretProblem(${JSON.stringify(token)}, "xoxb-")));
 				 try { loadConfig(${JSON.stringify(home.dir)}); console.log("loaded"); } catch (e) { console.log(e.code); }`,
 				);
 				expect(result.timedOut).toBe(false);
-				const [problem, code] = result.stdout.trim().split("\n");
-				expect(problem).toContain("not a regular file");
-				expect(code).toBe("secret_missing");
+				expect(result.stdout.trim()).toBe("secret_missing");
 			} finally {
 				home.remove();
 			}

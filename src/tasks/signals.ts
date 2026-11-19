@@ -3,12 +3,12 @@
  * in the task worktree itself before the outcome, so an agent's "bun test → 0 fail" line is never the only proof.
  * The grammar follows omp-dori's Done signals, `command` and `file` only (no network, no PR flow):
  *
- *   command ["argv","as","json"] [stdout~"regex"]     no shell, worktree cwd, 300 s
+ *   command ["argv","as","json"] [stdout~"regex"]     no shell, worktree cwd, 900 s
  *   file <worktree-relative path> [sha256=<hex>] [json:.a.b=<json value>]
  */
 import { createHash } from "node:crypto";
 
-export const CHECK_TIMEOUT_MS = 300_000;
+export const CHECK_TIMEOUT_MS = 900_000;
 
 export type Signal =
 	| { kind: "command"; argv: string[]; stdout?: RegExp }

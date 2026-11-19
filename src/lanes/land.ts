@@ -2,7 +2,14 @@ import { existsSync } from "node:fs";
 import { TASK_RISKS, type TaskRisk } from "../tasks/docs";
 import { type AutoLandPolicy, checkBlockers, type LaneReviewConfident } from "../tasks/notify";
 import { formatConfidence } from "./review";
-import { INCONCLUSIVE_APPROVED, INTEGRITY_APPROVED, type LaneQa, type LaneReview, type LaneRow } from "./status";
+import {
+	INCONCLUSIVE_APPROVED,
+	INTEGRITY_APPROVED,
+	type LaneQa,
+	type LaneReview,
+	type LaneRow,
+	OWNER_ACCEPTED,
+} from "./status";
 import { defaultGit, type GitResult, type GitRunner, gitRunner, hiddenChanges } from "./verify";
 import { DEFAULT_LANE_RISK } from "./worktree";
 
@@ -418,6 +425,27 @@ export async function externallyLanded(
 }
 
 /**
+ * Whether the work of a `merged-not-pushed` lane reached `origin/<baseBranch>` later (pushed by hand, or after a
+ * rebase onto a base branch someone else pushed): `sha` is in the local tracking ref as it is or by an equal patch.
+ * Only the tracking ref is read — nothing is fetched. Throws when git fails.
+ */
+export async function pushedOutside(
+	git: GitRunner,
+	input: { repo: string; baseBranch: string; sha: string },
+): Promise<boolean> {
+	const origin = `refs/remotes/origin/${input.baseBranch}`;
+	const run = async (args: string[], ok: readonly number[] = [0]): Promise<GitResult> => {
+		const result = await git(["-C", input.repo, ...args]);
+		if (!ok.includes(result.code)) throw new Error(`git ${args.join(" ")}: ${failureLine(result)}`);
+		return result;
+	};
+	if ((await run(["rev-parse", "--verify", "-q", `${origin}^{commit}`], [0, 1])).code !== 0) return false;
+	if ((await run(["cat-file", "-e", `${input.sha}^{commit}`], [0, 1, 128])).code !== 0) return false;
+	if ((await run(["merge-base", "--is-ancestor", input.sha, origin], [0, 1])).code === 0) return true;
+	return !(await run(["cherry", origin, input.sha])).stdout.split("\n").some((line) => line.startsWith("+"));
+}
+
+/**
  * `landLane` with the landings of one repository run one after the other: two lanes, or a lane and a [TASK] sharing
  * the daemon's one lander, never race for a base branch.
  */
@@ -535,8 +563,13 @@ export function laneLandBlockers(
 	if (checks.length === 0) blockers.push("재실행 검사 없음");
 	else blockers.push(...checkBlockers(checks));
 	const held = lane.meta.land?.autoLandHeld;
-	if (held !== undefined)
-		blockers.push(held === INTEGRITY_APPROVED || held === INCONCLUSIVE_APPROVED ? `${held}으로 통과` : held);
+	if (held !== undefined) {
+		blockers.push(
+			held === INTEGRITY_APPROVED || held === INCONCLUSIVE_APPROVED || held === OWNER_ACCEPTED
+				? `${held}으로 통과`
+				: held,
+		);
+	}
 	// The close's scope check (`checkLaneScope`): a check that could not list the files is no pass.
 	const { scopeError, scopeViolations, leftovers } = lane.meta;
 	if (scopeError !== undefined) blockers.push(`범위 검사 실패(${scopeError})`);

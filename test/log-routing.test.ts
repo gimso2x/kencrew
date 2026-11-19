@@ -2,15 +2,21 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DiscordAdapter } from "../src/discord/adapter";
+import { DiscordChannel } from "../src/discord/channel";
 import { createLogger } from "../src/log";
 import { monitorOrigin } from "../src/monitors/ledger";
 import { rotatingFileSink } from "../src/ops/logfile";
 import { redact } from "../src/redact";
-import { SlackAdapter } from "../src/slack/adapter";
 import { openStore, type Store } from "../src/store/db";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
+import { BOT, GUILD, OWNER } from "./helpers/bot-home";
+import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
-const LOG = "C0LOGCHAN01";
+const LOG = "678901234567890123";
+const WORK = "111111111111111111";
+const WORK_THREAD = "711111111111111111";
+const DM = "123456789012345678";
+const DM_MSG = "700000000000000001";
 const clock = { now: () => 1_000_000 };
 
 let dir: string;
@@ -18,7 +24,13 @@ let store: Store;
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "ompbot-log-routing-"));
-	store = openStore({ timezone: "Asia/Seoul", path: join(dir, "ompbot.db"), clock, redact, logChannel: LOG });
+	store = openStore({
+		timezone: "Asia/Seoul",
+		path: join(dir, "ompbot.db"),
+		clock,
+		redact,
+		logChannel: { discord: LOG },
+	});
 });
 
 afterEach(() => {
@@ -47,41 +59,53 @@ describe("completion copies to the log channel", () => {
 		"a first line starting `%s` is copied once",
 		(first) => {
 			const body = `${first}\n\n세부 내용`;
-			const written = answer("slack/ch/C0WORK00001", "C0WORK00001:1700.000001", body);
+			const written = answer(`discord/ch/${WORK}/t/${WORK_THREAD}`, `${WORK}:${WORK_THREAD}`, body);
 			expect(written).toHaveLength(1);
-			expect(written[0]).toBe(`📒 완료 보고 사본 · <#C0WORK00001>{{thread-link:C0WORK00001:1700.000001}}\n${body}`);
+			expect(written[0]).toBe(`📒 완료 보고 사본 · <#${WORK}>{{thread-link:${WORK}:${WORK_THREAD}}}\n${body}`);
 			// The original answer is delivered unchanged to its own thread.
-			expect(store.listDeliveries({ originKey: "slack/ch/C0WORK00001" }).map((row) => row.body)).toContain(body);
+			expect(
+				store.listDeliveries({ originKey: `discord/ch/${WORK}/t/${WORK_THREAD}` }).map((row) => row.body),
+			).toContain(body);
 		},
 	);
 
 	test("a DM answer is labelled DM; a top-level answer carries no thread link; the first non-empty line counts", () => {
-		expect(answer("slack/dm/D1", "D1:1700.000001", "\n\n✅ 완료\nok")[0]).toStartWith(
-			"📒 완료 보고 사본 · DM{{thread-link:D1:1700.000001}}\n",
+		expect(answer(`discord/dm/${DM}`, `${DM}:${DM_MSG}`, "\n\n✅ 완료\nok")[0]).toStartWith(
+			`📒 완료 보고 사본 · DM{{thread-link:${DM}:${DM_MSG}}}\n`,
 		);
-		expect(answer("slack/dm/D1", "D1:-", "✅ 완료\nok2", "op2")[1]).toStartWith("📒 완료 보고 사본 · DM\n");
+		expect(answer(`discord/dm/${DM}`, `${DM}:-`, "✅ 완료\nok2", "op2")[1]).toStartWith("📒 완료 보고 사본 · DM\n");
 	});
 
-	test("a work lane's answer is copied with the lane name", () => {
-		expect(answer("ompbot/work/demo", "D1:1700.000002", "✅ 완료: 레인 끝")[0]).toStartWith(
-			"📒 완료 보고 사본 · 작업 레인 demo{{thread-link:D1:1700.000002}}\n",
+	test("a work lane's answer is copied with the lane name, linking its Discord thread", () => {
+		expect(answer("ompbot/work/demo", `${WORK}:${WORK_THREAD}`, "✅ 완료: 레인 끝")[0]).toStartWith(
+			`📒 완료 보고 사본 · 작업 레인 demo{{thread-link:${WORK}:${WORK_THREAD}}}\n`,
 		);
 	});
 
 	test("the marker anywhere but the first line, or a different first line, is not copied", () => {
-		expect(answer("slack/dm/D1", "D1:1.1", "작업했습니다\n✅ 완료")).toEqual([]);
-		expect(answer("slack/dm/D1", "D1:2.2", "완료했습니다", "op2")).toEqual([]);
-		expect(answer("slack/dm/D1", "D1:3.3", "  ✅ 완료됨", "op3")).toHaveLength(1);
+		expect(answer(`discord/dm/${DM}`, `${DM}:1`, "작업합니다\n✅ 완료")).toEqual([]);
+		expect(answer(`discord/dm/${DM}`, `${DM}:2`, "완료했습니다", "op2")).toEqual([]);
+		expect(answer(`discord/dm/${DM}`, `${DM}:3`, "  ✅ 완료됨", "op3")).toHaveLength(1);
 	});
 
 	test("commands, notices and monitor answers are never copied", () => {
 		// A chat command's reply (op ref `new:…`) even if it starts with the marker.
-		expect(answer("slack/dm/D1", "D1:1.1", "✅ 완료 새 대화", "new:1")).toEqual([]);
+		expect(answer(`discord/dm/${DM}`, `${DM}:1`, "✅ 완료 초기화", "new:1")).toEqual([]);
 		// A turn failure notice.
-		store.ensureOrigin("slack/dm/D1", "sess");
-		store.recordInbound({ originKey: "slack/dm/D1", platformMessageId: "D1:4.4", textRef: "x", threadRef: "D1:4.4" });
-		store.markDispatched("D1:4.4", { opRef: "opf", entryCursor: null });
-		store.recordTurnFailure({ originKey: "slack/dm/D1", opRef: "opf", threadRef: "D1:4.4", notice: "✅ 완료 아님" });
+		store.ensureOrigin(`discord/dm/${DM}`, "sess");
+		store.recordInbound({
+			originKey: `discord/dm/${DM}`,
+			platformMessageId: `${DM}:4`,
+			textRef: "x",
+			threadRef: `${DM}:4`,
+		});
+		store.markDispatched(`${DM}:4`, { opRef: "opf", entryCursor: null });
+		store.recordTurnFailure({
+			originKey: `discord/dm/${DM}`,
+			opRef: "opf",
+			threadRef: `${DM}:4`,
+			notice: "✅ 완료 아님",
+		});
 		expect(copies()).toEqual([]);
 		// A monitor's answer.
 		const monitor = store.monitors.addMonitor({
@@ -92,94 +116,53 @@ describe("completion copies to the log channel", () => {
 			enabled: true,
 		});
 		expect(monitor.id).toBeTruthy();
-		expect(answer(monitorOrigin(monitor.id), "D1:-", "✅ 완료 모니터")).toEqual([]);
+		expect(answer(monitorOrigin(monitor.id), `${DM}:-`, "✅ 완료 모니터")).toEqual([]);
 	});
 
 	test("recording the same answer again adds no second copy; without logChannel nothing is copied", () => {
-		answer("slack/dm/D1", "D1:1.1", "✅ 완료 한 번");
-		store.recordAnswer({ originKey: "slack/dm/D1", opRef: "op1", threadRef: "D1:1.1", parts: ["✅ 완료 한 번"] });
+		answer(`discord/dm/${DM}`, `${DM}:${DM_MSG}`, "✅ 완료 한 번");
+		store.recordAnswer({
+			originKey: `discord/dm/${DM}`,
+			opRef: "op1",
+			threadRef: `${DM}:${DM_MSG}`,
+			parts: ["✅ 완료 한 번"],
+		});
 		expect(copies()).toHaveLength(1);
 
 		const plain = openStore({ timezone: "Asia/Seoul", path: join(dir, "plain.db"), clock, redact });
 		try {
-			plain.ensureOrigin("slack/dm/D1", "sess");
-			plain.recordAnswer({ originKey: "slack/dm/D1", opRef: "op1", threadRef: "D1:1.1", parts: ["✅ 완료"] });
+			plain.ensureOrigin(`discord/dm/${DM}`, "sess");
+			plain.recordAnswer({
+				originKey: `discord/dm/${DM}`,
+				opRef: "op1",
+				threadRef: `${DM}:${DM_MSG}`,
+				parts: ["✅ 완료"],
+			});
 			expect(plain.listDeliveries()).toHaveLength(1);
 		} finally {
 			plain.close();
 		}
 	});
-});
 
-describe("completion copies per platform: the Discord log channel (channels.discord.logChannelId)", () => {
-	const DLOG = "678901234567890123";
-	const DDM = "123456789012345678";
-	const DCH = "111111111111111111";
-	const DTHREAD = "711111111111111111";
-	const discordCopies = () =>
-		store
-			.listDeliveries()
-			.filter((row) => row.threadRef === `${DLOG}:-`)
-			.map((row) => row.body);
-	/** Reopens the shared store with `logChannel`. */
-	const reopen = (logChannel: { slack?: string; discord?: string }) => {
-		store.close();
-		store = openStore({ timezone: "Asia/Seoul", path: join(dir, "two.db"), clock, redact, logChannel });
-	};
-
-	test("a Discord DM's completion goes to the Discord log channel once, labelled DM, with its thread link", () => {
-		reopen({ slack: LOG, discord: DLOG });
-		answer(`discord/dm/${DDM}`, `${DDM}:700000000000000001`, "✅ 완료: 디스코드\n세부");
-		expect(discordCopies()).toEqual([
-			`📒 완료 보고 사본 · DM{{thread-link:${DDM}:700000000000000001}}\n✅ 완료: 디스코드\n세부`,
-		]);
-		expect(copies()).toEqual([]);
-		// A replay of the same answer adds nothing.
-		store.recordAnswer({
-			originKey: `discord/dm/${DDM}`,
-			opRef: "op1",
-			threadRef: `${DDM}:700000000000000001`,
-			parts: ["✅ 완료: 디스코드\n세부"],
-		});
-		expect(discordCopies()).toHaveLength(1);
-	});
-
-	test("a Discord server thread is labelled <#channel>; a Slack chat still goes to the Slack #log only", () => {
-		reopen({ slack: LOG, discord: DLOG });
-		answer(`discord/ch/${DCH}/t/${DTHREAD}`, `${DCH}:${DTHREAD}`, "✅ 완료 서버");
-		expect(discordCopies()).toEqual([`📒 완료 보고 사본 · <#${DCH}>{{thread-link:${DCH}:${DTHREAD}}}\n✅ 완료 서버`]);
-		answer("slack/ch/C0WORK00001", "C0WORK00001:1700.000001", "✅ 완료 슬랙", "op2");
-		expect(copies()).toEqual([
-			"📒 완료 보고 사본 · <#C0WORK00001>{{thread-link:C0WORK00001:1700.000001}}\n✅ 완료 슬랙",
-		]);
-		expect(discordCopies()).toHaveLength(1);
-	});
-
-	test("a lane copies to its thread's platform: a Discord lane thread to the Discord log channel", () => {
-		reopen({ slack: LOG, discord: DLOG });
-		answer("ompbot/work/demo", `${DCH}:${DTHREAD}`, "✅ 완료: 레인");
-		expect(discordCopies()).toEqual([
-			`📒 완료 보고 사본 · 작업 레인 demo{{thread-link:${DCH}:${DTHREAD}}}\n✅ 완료: 레인`,
-		]);
-		answer("ompbot/work/slack-lane", "D1:1700.000002", "✅ 완료: 슬랙 레인", "op2");
-		expect(copies()).toHaveLength(1);
-	});
-
-	test("no Discord log channel: a Discord completion is copied nowhere (never to the Slack #log)", () => {
-		reopen({ slack: LOG });
-		answer(`discord/dm/${DDM}`, `${DDM}:700000000000000001`, "✅ 완료");
-		expect(store.listDeliveries().filter((row) => row.body.startsWith("📒"))).toEqual([]);
-		store.setLogChannel({ discord: DLOG });
-		answer(`discord/dm/${DDM}`, `${DDM}:700000000000000002`, "✅ 완료 둘", "op2");
-		answer("slack/dm/D1", "D1:1700.000003", "✅ 완료 슬랙", "op3");
-		expect(discordCopies()).toHaveLength(1);
+	test("a past slack row's answer is never copied: the Slack platform has no log channel", () => {
+		answer("slack/dm/D1", "D1:1700.000001", "✅ 완료 지난 행");
+		answer("ompbot/work/slack-lane", "D1:1700.000002", "✅ 완료: 지난 레인", "op2");
 		expect(copies()).toEqual([]);
 	});
 });
 
-function makeAdapter(transport: FakeSlackTransport, recorded: string[]): SlackAdapter {
-	const adapter = new SlackAdapter({
-		transport,
+function makeAdapter(
+	transport: FakeDiscordTransport,
+	recorded: string[],
+	deliveries: ConstructorParameters<typeof DiscordAdapter>[0]["deliveries"] = {
+		claimDue: () => [],
+		confirm: () => undefined,
+		fail: () => undefined,
+		defer: () => undefined,
+	},
+): DiscordAdapter {
+	const adapter = new DiscordAdapter({
+		channel: new DiscordChannel(transport, { ownerUserId: OWNER }),
 		core: {
 			onInbound: (message) => {
 				recorded.push(message.text);
@@ -187,10 +170,11 @@ function makeAdapter(transport: FakeSlackTransport, recorded: string[]): SlackAd
 			},
 			onCommand: () => "",
 			onAction: () => undefined,
+			knowsThread: () => false,
 		},
-		deliveries: { claimDue: () => [], confirm: () => undefined, fail: () => undefined, defer: () => undefined },
-		ownerUserId: "UOWNER",
-		clock: { now: () => 1_000 },
+		deliveries,
+		ownerUserId: OWNER,
+		clock: { now: () => 1_800_000_000_000 },
 		log: createLogger({ sink: () => undefined, clock: { now: () => 0 }, redact }),
 		logChannel: LOG,
 	});
@@ -198,84 +182,56 @@ function makeAdapter(transport: FakeSlackTransport, recorded: string[]): SlackAd
 	return adapter;
 }
 
-describe("log channel in the Slack adapter", () => {
+describe("log channel in the Discord adapter", () => {
 	test("an owner message in the log channel never becomes a turn, even with a mention", async () => {
-		const transport = new FakeSlackTransport("UBOT");
+		const transport = new FakeDiscordTransport({ botUserId: BOT });
+		transport.setChannel({ id: LOG, type: 0, guildId: GUILD });
+		transport.setChannel({ id: WORK, type: 0, guildId: GUILD });
 		const recorded: string[] = [];
-		const adapter = makeAdapter(transport, recorded);
-		await adapter.handleMessage({
-			type: "message",
-			channel: LOG,
-			channel_type: "channel",
-			user: "UOWNER",
-			text: "<@UBOT> 이거 해줘",
-			ts: "1700.000001",
+		makeAdapter(transport, recorded);
+		const message = (id: string, content: string, channel: string) => ({
+			id,
+			channel_id: channel,
+			guild_id: GUILD,
+			author: { id: OWNER, username: "owner" },
+			content,
+			type: 0,
 		});
-		await adapter.handleMessage({
-			type: "message",
-			channel: LOG,
-			channel_type: "channel",
-			user: "UOWNER",
-			text: "답글",
-			ts: "1700.000002",
-			thread_ts: "1700.000001",
-		});
+		await transport.emitMessage(message("700000000000000011", `<@${BOT}> 이거 해줘`, LOG));
+		await transport.emitMessage(message("700000000000000012", "답글", LOG));
 		expect(recorded).toEqual([]);
 		// Other channels still work for a mention.
-		await adapter.handleMessage({
-			type: "message",
-			channel: "C0OTHER0001",
-			channel_type: "channel",
-			user: "UOWNER",
-			text: "<@UBOT> 이거 해줘",
-			ts: "1700.000003",
-		});
+		await transport.emitMessage(message("700000000000000013", `<@${BOT}> 이거 해줘`, WORK));
 		expect(recorded).toEqual(["이거 해줘"]);
 	});
 
-	test("the thread-link placeholder of a copy becomes a permalink when it is posted, and is dropped when none exists", async () => {
-		const transport = new FakeSlackTransport("UBOT");
+	test("the thread-link placeholder of a copy becomes a permalink when it is posted", async () => {
+		const transport = new FakeDiscordTransport({ botUserId: BOT });
+		transport.setChannel({ id: LOG, type: 0, guildId: GUILD });
+		transport.setChannel({ id: WORK, type: 0, guildId: GUILD });
+		transport.setChannel({ id: WORK_THREAD, type: 11, parentId: WORK, guildId: GUILD });
+		const body = `📒 완료 보고 사본 · <#${WORK}>{{thread-link:${WORK}:${WORK_THREAD}}}\n✅ 완료`;
 		const queue = [
 			{
 				deliveryId: 1,
-				originKey: "slack/ch/C0WORK00001",
+				originKey: `discord/ch/${WORK}/t/${WORK_THREAD}`,
 				threadRef: `${LOG}:-`,
-				body: "📒 완료 보고 사본 · <#C0WORK00001>{{thread-link:C0WORK00001:1700.000001}}\n✅ 완료",
+				body,
 				redelivered: false,
 				finishUntracked: false,
 			},
 		];
-		const adapter = new SlackAdapter({
-			transport,
-			core: { onInbound: () => ({}), onCommand: () => "", onAction: () => undefined },
-			deliveries: {
-				claimDue: () => queue.splice(0),
-				confirm: () => undefined,
-				fail: () => undefined,
-				defer: () => undefined,
-			},
-			ownerUserId: "UOWNER",
-			clock: { now: () => 1_000 },
-			log: createLogger({ sink: () => undefined, clock: { now: () => 0 }, redact }),
+		const adapter = makeAdapter(transport, [], {
+			claimDue: () => queue.splice(0),
+			confirm: () => undefined,
+			fail: () => undefined,
+			defer: () => undefined,
 		});
 		await adapter.pumpDeliveries();
-		const first = transport.calls.find((c) => c.method === "postMessage");
-		expect(first && "text" in first ? first.text : "").toBe(
-			"📒 완료 보고 사본 · <#C0WORK00001> · <https://slack.test/archives/C0WORK00001/p1700000001|스레드 보기>\n✅ 완료",
+		const first = transport.calls.find((c) => c.method === "createMessage");
+		expect(first && "content" in first ? first.content : "").toBe(
+			`📒 완료 보고 사본 · <#${WORK}> · [스레드 보기](https://discord.com/channels/${GUILD}/${WORK_THREAD}/${WORK_THREAD})\n✅ 완료`,
 		);
-		transport.failNext.getPermalink = [new Error("nope")];
-		queue.push({
-			deliveryId: 2,
-			originKey: "slack/ch/C0WORK00001",
-			threadRef: `${LOG}:-`,
-			body: "📒 완료 보고 사본 · <#C0WORK00001>{{thread-link:C0WORK00001:1700.000001}}\n✅ 완료",
-			redelivered: false,
-			finishUntracked: false,
-		});
-		await adapter.pumpDeliveries();
-		const posts = transport.calls.filter((c) => c.method === "postMessage");
-		const second = posts[1];
-		expect(second && "text" in second ? second.text : "").toBe("📒 완료 보고 사본 · <#C0WORK00001>\n✅ 완료");
 	});
 });
 

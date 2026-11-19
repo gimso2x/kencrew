@@ -77,8 +77,8 @@ const SNAPSHOT: DashboardSnapshot = {
 		items: [
 			{
 				inboundId: 7,
-				originKey: "slack/dm/U1",
-				threadRef: "D1:1.0",
+				originKey: "discord/dm/200000000000000001",
+				threadRef: "200000000000000001:300000000000000001",
 				state: "dispatched",
 				createdAt: "2026-11-04T09:50:00+09:00",
 				ageMs: 600_000,
@@ -94,8 +94,8 @@ const SNAPSHOT: DashboardSnapshot = {
 		],
 		threads: [
 			{
-				originKey: "slack/dm/U1",
-				threadRef: "D1:1.0",
+				originKey: "discord/dm/200000000000000001",
+				threadRef: "200000000000000001:300000000000000001",
 				kind: "message",
 				title: "인박스 셸 손봐 줘",
 				column: "working",
@@ -181,7 +181,8 @@ const SNAPSHOT: DashboardSnapshot = {
 				summary: "push to main",
 				createdAt: "2026-11-04T09:55:00+09:00",
 				expiresAt: "2026-11-04T10:55:00+09:00",
-				originKey: "slack/dm/U1",
+				originKey: "discord/dm/200000000000000001",
+				originThreadRef: null,
 				title: "push to main",
 				detail: null,
 				cardUrl: null,
@@ -473,7 +474,6 @@ describe("dashboard: Discord", () => {
 		const start = html.indexOf(`data-card="${id}"`);
 		return html.slice(start, html.indexOf("</section>", start));
 	};
-	const SOCKET = { state: "up", since: "2026-11-04T09:00:00+09:00" };
 
 	test("a Discord DM conversation is labelled DM on its card", () => {
 		const html = renderDashboardMain(
@@ -488,19 +488,19 @@ describe("dashboard: Discord", () => {
 		expect(html.slice(start, html.indexOf("</p>", start))).toContain("<span>DM</span>");
 	});
 
-	test("the system view has a Discord card showing up or down next to Slack's", () => {
+	test("the system view has a Discord card showing up or down right after the daemon's", () => {
 		const up = renderDashboardMain(
-			running({ socket: SOCKET, discord: { state: "up", since: "2026-11-04T09:30:00+09:00" } }),
+			running({ discord: { state: "up", since: "2026-11-04T09:30:00+09:00" } }),
 			BOARD,
 			NOW,
 			{ view: "system" },
 		);
-		expect(systemCards(up).slice(0, 3)).toEqual(["daemon", "slack", "discord"]);
+		expect(systemCards(up).slice(0, 2)).toEqual(["daemon", "discord"]);
 		expect(sysCard(up, "discord")).toContain("연결");
 		expect(sysCard(up, "discord")).toContain("is-success");
 
 		const down = renderDashboardMain(
-			running({ socket: SOCKET, discord: { state: "down", since: "2026-11-04T09:55:00+09:00" } }),
+			running({ discord: { state: "down", since: "2026-11-04T09:55:00+09:00" } }),
 			BOARD,
 			NOW,
 			{ view: "system" },
@@ -510,16 +510,9 @@ describe("dashboard: Discord", () => {
 	});
 
 	test("an install without Discord has no Discord card", () => {
-		const html = renderDashboardMain(running({ socket: SOCKET }), BOARD, NOW, { view: "system" });
+		const html = renderDashboardMain(running({}), BOARD, NOW, { view: "system" });
 		expect(systemCards(html)).not.toContain("discord");
-		expect(systemCards(html)).toContain("slack");
-	});
-
-	test("an install without Slack shows the Slack card as 꺼짐, not as a missing socket", () => {
-		const html = renderDashboardMain({ ...running({}), slackOff: true }, BOARD, NOW, { view: "system" });
-		expect(sysCard(html, "slack")).toContain("꺼짐");
-		expect(sysCard(html, "slack")).toContain("is-success");
-		expect(sysCard(html, "slack")).not.toContain("소켓 상태 기록");
+		expect(systemCards(html)).not.toContain("slack");
 	});
 });
 
@@ -606,7 +599,7 @@ describe("dashboard polish", () => {
 
 	test("UX QA fixes: sticky detail tabs/title, contextual Board/List, non-gate alert records, system search, closed task AC and nested markdown ol", () => {
 		// UX-001: sticky #detail-tabs and #detail-bar-title shown on non-head tabs (e.g. turns conversation tab).
-		const turnPage = markup(renderDashboardPage(SNAPSHOT, { view: "turns", item: "slack/dm/U1" }));
+		const turnPage = markup(renderDashboardPage(SNAPSHOT, { view: "turns", item: "discord/dm/200000000000000001" }));
 		expect(turnPage).toContain('<span id="detail-bar-title" class="detail-bar-title">인박스 셸 손봐 줘</span>');
 		const cardPage = markup(renderDashboardPage(SNAPSHOT, { board: BOARD, card: "w1:p1" }));
 		expect(cardPage).toContain('<span id="detail-bar-title" class="detail-bar-title" hidden>pane w1:p1</span>');

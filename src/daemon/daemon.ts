@@ -6,7 +6,6 @@ import { ChannelRegistry } from "../channel/registry";
 import { escapeMrkdwn } from "../channel/text";
 import type { CoreSink, DeliveryItem, DeliverySource, GuestInboundMessage, IngestOutcome } from "../channel/types";
 import {
-	DEPRECATED_KEYS,
 	LANE_REVIEW_TIMEOUT_MS,
 	loadConfig,
 	type OmpbotConfig,
@@ -20,9 +19,14 @@ import {
 	type ThreadSource,
 	type TurnFailureEscalation,
 } from "../core/mailbox";
-import { conversationKind, parseThreadRef, platformOfThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
+import { parseThreadRef, platformOfThreadRef, TOP_LEVEL_TS, threadRefOf } from "../core/normalize";
 import { OriginRouter, sessionDirFor } from "../core/origin";
-import { type ChatPlatform, parseChatOrigin, platformOfConversationId } from "../core/origin-key";
+import {
+	type ChatPlatform,
+	parseChatOrigin,
+	platformOfConversationId,
+	REMOVED_PLATFORM_PREFIX,
+} from "../core/origin-key";
 import { stuckStopText } from "../core/stuck";
 import {
 	COMMAND_OP_REF,
@@ -36,7 +40,7 @@ import { briefingFileName, briefingSummaryLine, renderBriefingHtml } from "../da
 import { snapshotReader } from "../dashboard/snapshot-assembly";
 import { escapeDiscordMarkdown } from "../discord/format";
 import { createDispatchAudit, installProcessAudit } from "../dispatch/audit";
-import { boardCardLink } from "../dispatch/board";
+import { boardCardLink, diffViewLink } from "../dispatch/board";
 import {
 	herdrAgentPane,
 	herdrAgentStatus,
@@ -62,6 +66,7 @@ import {
 	buildClosedLaneQuestion,
 	classifyClosedLaneMessage,
 	DISCORD_LANE_CHANNEL_MISSING,
+	isOwnerAcceptText,
 	type LaneTrigger,
 	parseLaneTrigger,
 } from "../lanes/trigger";
@@ -71,7 +76,6 @@ import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
 import { MonitorScheduler } from "../monitors/scheduler";
 import { buildMonitorTools, isPersonaOrigin } from "../monitors/tools";
 import { WebhookServer } from "../monitors/webhook";
-import type { ClaudeApprovalHook } from "../omp/claude-driver";
 import type { OmpDialogAnswerer, OmpSessionDriver } from "../omp/driver";
 import { lastAnswerOf, readLastAssistant } from "../omp/session-tail";
 import {
@@ -87,17 +91,7 @@ import {
 } from "../ops/apply";
 import { type BackupOptions, type BackupResult, readStamp, runBackup } from "../ops/backup";
 import { formatCacheMissNotice, formatColdCacheNotice } from "../ops/cache-monitor";
-import {
-	budgetBreach,
-	type DailyBudgetState,
-	dailyBudgetState,
-	dailyCapNotice,
-	dailyNoticeKey,
-	dailyOffKey,
-	ledgerDay,
-	renderBudget,
-	usd,
-} from "../ops/cost-cap";
+import { type DailyBudgetState, dailyBudgetState, ledgerDay, renderBudget } from "../ops/cost-cap";
 import { createFreezeProbe, type FreezeState } from "../ops/freeze";
 import { collectGates, type GateState, gateOptionsFromConfig } from "../ops/gates";
 import { HerdrHealthProbe } from "../ops/herdr-health";
@@ -116,7 +110,7 @@ import {
 	skillDirOf,
 } from "../review/skills";
 import { ApprovalBroker, type ApprovalOutcome, parseApprovalRetryActionId } from "../safety/approval";
-import { answerDialogOnSlack } from "../safety/choice";
+import { answerDialog } from "../safety/choice";
 import { buildHostTools, type HostToolDef, PEER_TOOL_DENIED } from "../safety/host-tools";
 import { buildFloorsPrompt, type FloorsSurface, teamsQaSystemPrompt } from "../safety/prompt";
 import {
@@ -131,6 +125,7 @@ import {
 	Store,
 } from "../store/db";
 import { notePrompt } from "../tasks/dispatch";
+import { docsDirOf } from "../tasks/docs";
 import { evaluateTask } from "../tasks/evaluate";
 import { type TaskGateHooks, TaskGateRunner } from "../tasks/gate";
 import { resolveTaskHost } from "../tasks/host";
@@ -152,6 +147,7 @@ import { repoMatchesCommonDir } from "../tasks/repo-match";
 import { TASK_SWEEP_MS, TaskSweeper, taskChangedPaths } from "../tasks/sweeper";
 import { TeamsGraphClient } from "../teams/graph";
 import { localIso, offsetLabel } from "../time";
+import { WikiNotes } from "../wiki/notes";
 import type { CrashPoint } from "./crash";
 import {
 	buildGuestPrompt,
@@ -199,6 +195,8 @@ import {
 } from "./status";
 
 const MEDIA_SWEEP_INTERVAL_MS = 60 * 60_000;
+/** How often the wiki note of a finished conversation day or turn is looked for (`WikiNotes.flushTurns`). */
+const WIKI_FLUSH_MS = 60_000;
 
 /** KV-cursor prefixes of a thread's peer hop cap: the last owner message and the notice already posted. */
 const PEER_HOP_RESET_CURSOR = "peerhop-reset:";
@@ -300,7 +298,7 @@ export interface DaemonOptions {
 	 * {@link STOP_DRAIN_MS}); 0 stops the children immediately.
 	 */
 	stopDrainMs?: number;
-	/** Test seam: how long a turn waits for the Slack thread read of its context (default 10s in the mailbox). */
+	/** Test seam: how long a turn waits for the thread read of its context (default 10s in the mailbox). */
 	threadContextTimeoutMs?: number;
 	/** Test seam for done-claim verification; default checks the real git repository. */
 	verifyClaim?: (evidence: ClaimEvidence, cwd: string) => Promise<VerifyResult>;
@@ -392,7 +390,6 @@ class DaemonStore extends Store {
 		private readonly crash: (point: CrashPoint) => void,
 		private readonly nudge: () => void,
 		log: Logger,
-		slackOwnerUserId: string | undefined,
 		logChannel: LogChannels,
 		timezone: string,
 	) {
@@ -401,7 +398,6 @@ class DaemonStore extends Store {
 			clock,
 			timezone,
 			redact,
-			...(slackOwnerUserId === undefined ? {} : { slackOwnerUserId }),
 			logChannel,
 			hooks: {
 				afterInboundAnswered: () => crash("after_final_before_answered"),
@@ -481,6 +477,8 @@ export class Daemon {
 	>();
 	#lastGateSweepAt = 0;
 	#taskSweeper: TaskSweeper | undefined;
+	#wikiNotes: WikiNotes | undefined;
+	#lastWikiFlushAt = 0;
 	/** `<task>:<reason>` of every overlap check a task was left out of, logged once each (memory only). */
 	readonly #overlapSkipped = new Set<string>();
 	/** Threads told "재시작 뒤에 처리" for an owner message held by the current drain: once per thread per drain. */
@@ -662,15 +660,10 @@ export class Daemon {
 			isPersonaOrigin(originKey) &&
 			this.#laneChannelOf(originKey, ref.conversationId) === undefined &&
 			!this.peerTouched(originKey);
-		// The peer bots of the conversation's platform, in that platform's mention syntax: Slack's are the top-level
-		// `peerBots`, Discord's `channels.discord.peerBots`; other platforms have none.
+		// The peer bots of the conversation's platform, in that platform's mention syntax: Discord's
+		// `channels.discord.peerBots`; other platforms have none.
 		const { config } = this.#options;
-		const peerBots =
-			ref?.platform === "slack"
-				? config.peerBots
-				: ref?.platform === "discord"
-					? config.channels.discord?.peerBots
-					: undefined;
+		const peerBots = ref?.platform === "discord" ? config.channels.discord?.peerBots : undefined;
 		const port = this.#options.channels.find((binding) => binding.port.platform === ref?.platform)?.port;
 		const peers =
 			peerBots === undefined || peerBots.length === 0 || port === undefined
@@ -789,16 +782,14 @@ export class Daemon {
 					workspaceDir: config.workspaceDir,
 					webhook: config.webhook,
 					timezone: config.timezone,
-					slackOff: config.channels.slack === undefined,
 					now: () => this.#clock.now(),
 					log: this.#log,
 				})
 			: [];
-		// Slack and Discord conversations get monitors (and lanes where a lane can open); another platform's the base set.
-		const otherPlatform =
-			chatOrigin !== undefined && chatOrigin.platform !== "slack" && chatOrigin.platform !== "discord";
+		// Discord conversations get monitors (and lanes where a lane can open); another platform's the base set.
+		const otherPlatform = chatOrigin !== undefined && chatOrigin.platform !== "discord";
 		const laneChannel = this.#laneChannelOf(originKey, channel);
-		// The lane board: lane sessions and Slack/Discord conversations (doc/plans/lane-board.md).
+		// The lane board: lane sessions and Discord conversations (doc/plans/lane-board.md).
 		const boardTools = store && (lane || chatOrigin) ? buildBoardTools(store, originKey) : [];
 		return peerTouched || otherPlatform
 			? base
@@ -810,35 +801,12 @@ export class Daemon {
 						? base
 						: laneChannel === undefined
 							? [...base, ...monitorTools, ...boardTools]
-							: [...base, buildWorkStartTool(lanes, laneChannel), ...monitorTools, ...boardTools];
-	}
-
-	/**
-	 * Owner approval bridge for the claude driver's dangerous-Bash asks: a Slack approval card on the
-	 * origin's channel. Undefined when the origin has no channel (or the daemon is not started) — the
-	 * driver then denies those commands outright.
-	 */
-	requestApprovalFor(originKey: string): ClaudeApprovalHook | undefined {
-		const broker = this.#broker;
-		if (broker === undefined) return undefined;
-		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
-		const channel = lane ? parseThreadRef(lane.threadRef)?.channel : parseChatOrigin(originKey)?.conversationId;
-		if (channel === undefined) return undefined;
-		return (request) => {
-			const ask = () =>
-				broker.ask(channel, request.description ?? request.command, {
-					detail: { action: request.command },
-					origin: { originKey, channel },
-				});
-			// Like host tools: the click can take minutes, so stall alerts rest and `drain` counts the wait.
-			const mailbox = this.#router?.mailbox(originKey);
-			return mailbox ? mailbox.trackHostTool(ask) : ask();
-		};
+							: [...base, buildWorkStartTool(lanes, laneChannel, originKey), ...monitorTools, ...boardTools];
 	}
 
 	/**
 	 * Owner answers to the omp child's dialogs (select/confirm/input/editor/ask) as choice cards in the thread of the
-	 * origin's running turn. Undefined when the origin has no Slack channel (monitors) — the driver then cancels them.
+	 * origin's running turn. Undefined when the origin has no chat channel (monitors) — the driver then cancels them.
 	 */
 	answerDialogsFor(originKey: string): OmpDialogAnswerer | undefined {
 		const lane = isLaneOrigin(originKey) ? this.#store?.getLaneByOrigin(originKey) : undefined;
@@ -849,7 +817,7 @@ export class Daemon {
 			const mailbox = this.#router?.mailbox(originKey);
 			const opRef = mailbox?.turnOpRef;
 			const ask = () =>
-				answerDialogOnSlack(
+				answerDialog(
 					this.#approval,
 					{
 						originKey,
@@ -930,21 +898,38 @@ export class Daemon {
 			crash,
 			() => this.#nudgePump(),
 			log,
-			config.channels.slack?.ownerUserId,
-			{ slack: config.logChannel, discord: config.channels.discord?.logChannelId },
+			{ discord: config.channels.discord?.logChannelId },
 			config.timezone,
 		);
 		store.setPeerCallPolicy(peerCallPolicyOf(config));
 		this.#store = store;
+		// The wiki result notes; `config.wikiNotes` is read on every use, so a reload turns them on or off.
+		const wikiNotes = new WikiNotes({
+			config: () => this.#options.config.wikiNotes,
+			store,
+			log,
+			clock: this.#clock,
+			timezone: config.timezone,
+			readTaskDoc: async (row, name) => {
+				try {
+					const read = await resolveTaskHost(row.host, this.#options.config.dispatchHosts).readFile(
+						`${docsDirOf(row.worktree, row.taskId)}/${name}`,
+					);
+					return read.ok ? read.value : undefined;
+				} catch {
+					return undefined;
+				}
+			},
+		});
+		this.#wikiNotes = wikiNotes;
 		this.#broker = new ApprovalBroker({
 			channels: this.#channels,
 			ownerUserId: primaryOwnerUserId(config.channels),
 			platformOwners: {
-				...(config.channels.slack === undefined ? {} : { slack: config.channels.slack.ownerUserId }),
 				...(config.channels.discord === undefined ? {} : { discord: config.channels.discord.ownerUserId }),
 				...(config.channels.teams === undefined ? {} : { teams: config.channels.teams.ownerAadObjectId }),
 			},
-			escalationChannel: { slack: config.escalationChannel, discord: config.channels.discord?.escalationChannelId },
+			escalationChannel: { discord: config.channels.discord?.escalationChannelId },
 			log,
 			store,
 			clock: this.#clock,
@@ -959,9 +944,17 @@ export class Daemon {
 			recovered_inflight: store.recoveredInflight,
 			requeued_ambiguous: requeued,
 		});
-		for (const key of config.deprecated ?? []) log.warn("config_deprecated_key", { key, use: DEPRECATED_KEYS[key] });
 		for (const { field, reason } of config.warnings ?? []) log.warn("config_warning", { field, reason });
 		this.#bootBackup();
+
+		// Rows of a removed platform (`slack/…`) have no adapter to answer on: close them without running a turn.
+		for (const state of ["pending", "dispatched"] as const) {
+			for (const row of store.listInbound({ state })) {
+				if (!row.originKey.startsWith(REMOVED_PLATFORM_PREFIX)) continue;
+				store.discard(row.platformMessageId);
+				log.info("inbound_discarded", { reason: "platform_removed", id: row.platformMessageId, origin: row.originKey });
+			}
+		}
 
 		// Rule (2): settle dispatched rows of the dead process before any new child is started.
 		const recovered = await recoverDispatched({
@@ -1013,7 +1006,7 @@ export class Daemon {
 			statusProvider: (originKey) => this.#statusText(originKey),
 			usageProvider: async (originKey) => {
 				const agent = this.#options.config.agent;
-				if (agent === "claude" || agent === "agy") return `${agent} 세션은 집계하지 않습니다`;
+				if (agent === "agy") return `${agent} 세션은 집계하지 않습니다`;
 				const sessionDir = store.getOrigin(originKey)?.sessionDir ?? sessionDirFor(sessionsRoot, originKey, 1);
 				const [conversation, overall] = await Promise.all([
 					summarizeSessionFiles(conversationSessionFiles(dirname(sessionDir))),
@@ -1024,15 +1017,15 @@ export class Daemon {
 			// Read on every turn: a reload replaces this.#options.config, a captured local config would not follow it.
 			recallEnabled: () => this.#options.config.recallEnabled !== false,
 			// Same test as the driver factory (run.ts): only an omp child gets the host tools.
-			hostTools: () => this.#options.config.agent !== "agy" && this.#options.config.agent !== "claude",
-			// Only where the board tools are (`#hostToolSet`): an omp child of a lane or a Slack/Discord conversation
+			hostTools: () => this.#options.config.agent !== "agy",
+			// Only where the board tools are (`#hostToolSet`): an omp child of a lane or a Discord conversation
 			// without a peer bot in it.
 			boardNotice: (originKey) =>
-				this.#options.config.agent === "agy" || this.#options.config.agent === "claude" || this.peerTouched(originKey)
+				this.#options.config.agent === "agy" || this.peerTouched(originKey)
 					? undefined
 					: boardNoticeFor(store, originKey),
 			costCap: () => this.#options.config.costCap,
-			budgetProvider: (arg) => this.#budgetCommand(arg),
+			budgetProvider: () => this.#budgetCommand(),
 			briefingProvider: (originKey, threadRef) => this.#brief(originKey, threadRef),
 			restartProvider: (originKey, threadRef) => restart.request(originKey, threadRef),
 			distillProvider: (originKey) => this.#distill(originKey),
@@ -1041,6 +1034,7 @@ export class Daemon {
 			turnUndo: {
 				repos: () => this.#options.config.turnSnapshot?.repos ?? [],
 				approve: (info) => this.#undoApproval(info.summary, info.threadRef, info.originKey),
+				onCommitted: (turn) => wikiNotes.recordTurn(turn),
 			},
 			threadSource: this.#threadSources(),
 			idleStopMs: config.idleTimeoutMinutes === undefined ? undefined : config.idleTimeoutMinutes * 60_000,
@@ -1063,6 +1057,11 @@ export class Daemon {
 			onStuckLoop: (info) => {
 				if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
 				this.#postThreadNotices([info.threadRef], redact(stuckStopText(info.toolName, info.count)));
+			},
+			// A monitor's turn has no thread to warn: the log line is its record.
+			onTurnCostCap: (info) => {
+				if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
+				this.#postThreadNotices([info.threadRef], redact(info.text));
 			},
 			// The registry row is the single source of a lane's hold: a paused lane's mailbox dispatches nothing; nor
 			// does one whose worktree the core is rebasing (a not-ff landing).
@@ -1122,6 +1121,8 @@ export class Daemon {
 			land: (row) => this.#landAuto(row),
 		});
 		this.#lanes = new LaneManager({
+			wikiNotes,
+			boardUrl: () => this.#options.config.herdrBoard?.url,
 			store,
 			channels: this.#channels,
 			clock: this.#clock,
@@ -1143,8 +1144,7 @@ export class Daemon {
 			// An apply that reverted the code holds auto-merge until the next ok apply (`<home>/autoland.hold`).
 			autoLandHold: () => readAutoLandHold(config.homeDir),
 			// Cards mention the owner on the platform of the lane's thread.
-			ownerUserId: (platform) =>
-				platform === "discord" ? config.channels.discord?.ownerUserId : config.channels.slack?.ownerUserId,
+			ownerUserId: (platform) => (platform === "discord" ? config.channels.discord?.ownerUserId : undefined),
 			laneBusy: (originKey) => this.#router?.mailbox(originKey).state.busy ?? false,
 			// A live setting: `ompbot reload` changes it for the next lane turn end.
 			completionNudges: () => this.#options.config.lanes?.completionNudges ?? DEFAULT_COMPLETION_NUDGES,
@@ -1169,10 +1169,6 @@ export class Daemon {
 			homeDir: config.homeDir,
 			watcherRoots: config.watcherRoots,
 			frozen: this.#frozen,
-			budgetExceeded: () => {
-				const state = this.#dailyBudget();
-				return state === undefined ? undefined : budgetBreach(state);
-			},
 		});
 		this.#monitors.start();
 		if (config.webhook !== undefined) {
@@ -1233,6 +1229,10 @@ export class Daemon {
 					const refusal = closedAs === "reopen" ? this.#lanes?.reopenRefusal(lane) : undefined;
 					if (closedAs === "land" || closedAs === "discard") {
 						void this.#settleLaneCommand(row, lane.name, { kind: closedAs });
+						return {};
+					}
+					if (lane.status === "not-done" && isOwnerAcceptText(message.text)) {
+						void this.#settleLaneCommand(row, lane.name, { kind: "accept" });
 						return {};
 					}
 					if (refusal !== undefined) {
@@ -1316,7 +1316,7 @@ export class Daemon {
 			onPeerSeen: (seen) => void store.notePeerSeen(seen),
 			onCommand: ({ command, arg, originKey, channel }) => {
 				if (command === "status") return this.#statusText(originKey);
-				// A slash command leaves no Slack message to thread under, so it is recorded as an owner message at the
+				// A slash command leaves no message to thread under, so it is recorded as an owner message at the
 				// top level of the conversation it was typed in: the answer lands right there as the only trace (empty
 				// ack — no placeholder root post, no "see the thread" redirect).
 				core.onInbound({
@@ -1520,6 +1520,10 @@ export class Daemon {
 						onError: (error) => log.warn("task_board_link_failed", { task: row.taskId, error }),
 					});
 				},
+				diffLink: (row) => {
+					const board = this.#options.config.herdrBoard;
+					return board === undefined || row.host !== null ? undefined : diffViewLink(board, `task:${row.taskId}`);
+				},
 				// taskAutoLand is live as well: `ompbot reload` turns auto-merge on or off for the next reach.
 				autoLandPolicy: () => this.#autoLandPolicy(),
 				repoMatches: (row, repos) => this.repoMatches(row, repos),
@@ -1539,6 +1543,7 @@ export class Daemon {
 					return policy !== undefined && (this.#taskGates?.pending(row, policy) ?? false);
 				},
 				autoLandHold: () => readAutoLandHold(config.homeDir),
+				autoLandReady: () => this.#landReady(),
 				channels: this.#channels,
 				ownerUserId: primaryOwnerUserId(config.channels),
 				now: () => this.#clock.now(),
@@ -1555,6 +1560,8 @@ export class Daemon {
 		for (const originKey of new Set(store.listInbound({ state: "pending" }).map((row) => row.originKey))) {
 			this.#dispatchPending(originKey);
 		}
+		// A [TASK] closed `done` while the daemon was down gets its note now.
+		await wikiNotes.backfillTasks();
 		this.#timer = setInterval(() => void this.sweep(), this.#options.sweepMs ?? DEFAULT_SWEEP_MS);
 		this.#nudgePump();
 		// Proof of life from the very first moment: a fresh stamp means the sweep_stalled gate starts closed.
@@ -1563,7 +1570,6 @@ export class Daemon {
 			socket: this.socketPath,
 			driver: config.agent ?? "omp",
 			herdr: config.herdr === undefined ? "off" : "on",
-			slack: this.#adapters.has("slack") ? "on" : "off",
 			discord: this.#adapters.has("discord") ? "on" : "off",
 			teams: this.#adapters.has("teams") ? "on" : "off",
 		});
@@ -1585,7 +1591,7 @@ export class Daemon {
 					throw new LaneInputError(DISCORD_LANE_CHANNEL_MISSING);
 				}
 				if (!this.#lanes || channel === undefined) throw new Error("lanes unavailable");
-				const lane = await this.#lanes.start({ ...trigger, channel });
+				const lane = await this.#lanes.start({ ...trigger, channel, parentOrigin: row.originKey });
 				const link = await this.#lanes.threadLink(lane);
 				const reply =
 					link === undefined
@@ -1621,20 +1627,22 @@ export class Daemon {
 	}
 
 	/**
-	 * `머지해` / `폐기해` in a closed lane's thread (or a `!reopen` the lane cannot take: `refusal`): settled with the
-	 * core's own answer like a lane start — the lane's omp session never sees it. The answer is recorded once the
-	 * landing ended; a landing cut off by a restart is finished by the lane tick and shown on the lane's card.
+	 * `머지해` / `폐기해` in a closed lane's thread, `닫아` in a `not-done` lane's thread (or a `!reopen` the lane
+	 * cannot take: `refusal`): settled with the core's own answer like a lane start — the lane's omp session never
+	 * sees it. The answer is recorded once the landing ended; a landing cut off by a restart is finished by the lane
+	 * tick and shown on the lane's card.
 	 */
 	async #settleLaneCommand(
 		row: InboundRow,
 		name: string,
-		command: { kind: "land" | "discard" } | { kind: "refused"; text: string },
+		command: { kind: "land" | "discard" | "accept" } | { kind: "refused"; text: string },
 	): Promise<void> {
 		await this.#settleOwn("lane", "lane_command", row, async () => {
 			try {
 				const lanes = this.#lanes;
 				if (!lanes) throw new Error("lanes unavailable");
 				if (command.kind === "refused") return `⚠️ ${command.text}`;
+				if (command.kind === "accept") return (await lanes.acceptByOwner(name)).text;
 				return (command.kind === "land" ? await lanes.requestLand(name, "owner") : await lanes.discard(name)).text;
 			} catch (error) {
 				this.#log.error("lane_command_failed", { lane: name, command: command.kind, error: String(error) });
@@ -2046,16 +2054,12 @@ export class Daemon {
 			}
 			this.#startIdleSweep();
 			this.#maybeSweepTasks();
+			this.#maybeFlushWikiTurns();
 			this.#sweepPendingDispatch();
 			try {
 				await this.#sweepGates();
 			} catch (error) {
 				this.#log.error("gate_sweep_failed", { error: String(error) });
-			}
-			try {
-				this.#sweepCostCap();
-			} catch (error) {
-				this.#log.warn("cost_cap_sweep_failed", { error: String(error) });
 			}
 			try {
 				this.#sweepPeerSilence();
@@ -2109,7 +2113,6 @@ export class Daemon {
 		if (heartbeat === undefined) return;
 		try {
 			const loopMs = heartbeat.beat(this.#clock.now(), {
-				socket: this.#adapters.get("slack")?.connectionState(),
 				discord: this.#adapters.get("discord")?.connectionState(),
 				draining: this.#router?.draining === true,
 			});
@@ -2268,9 +2271,8 @@ export class Daemon {
 	}
 
 	/**
-	 * The day's cost state: ledger total, the configured ceiling and both of today's flags. Read on every monitor tick
-	 * and `!budget`, so a `!budget off`, a `ompbot reload` of `costCap.dailyUsd` and the bot zone's midnight all take effect
-	 * without a restart. `undefined` before the daemon has a store (a construction-time probe).
+	 * The day's cost state: ledger total and the configured ceiling. Read on every `!budget`, so a `ompbot reload` of
+	 * `costCap.dailyUsd` and the bot zone's midnight take effect without a restart. `undefined` before the daemon has a store (a construction-time probe).
 	 */
 	#dailyBudget(now = this.#clock.now()): DailyBudgetState | undefined {
 		const store = this.#store;
@@ -2289,27 +2291,6 @@ export class Daemon {
 		if (alerts === 0) return;
 		this.#log.info("peer_silence_alerted", { count: alerts });
 		this.#nudgePump();
-	}
-
-	/**
-	 * Owner notice of the day's first breach, once a day: the ledger key `cost-cap-daily:<day>` is set before posting,
-	 * so a restart (or a second breach the same day) stays quiet. Called from the sweep, not from a monitor tick.
-	 */
-	#sweepCostCap(): void {
-		const store = this.#store;
-		const state = this.#dailyBudget();
-		if (store === undefined || state === undefined) return;
-		const breach = budgetBreach(state);
-		if (breach === undefined || state.notified) return;
-		// No owner home: the breach is not marked notified, so the next sweep tries again.
-		const owner = this.#ownerTarget("cost_cap_daily");
-		if (owner === undefined) return;
-		store.setCursor(dailyNoticeKey(state.day), String(this.#clock.now()));
-		this.#log.warn("cost_cap_daily_stop", { day: state.day, cost: breach.cost, cap: breach.cap });
-		void owner.adapter.postNotice(
-			owner.channel,
-			dailyCapNotice(breach.cap, breach.cost, this.#options.config.timezone),
-		);
 	}
 
 	/**
@@ -2370,43 +2351,27 @@ export class Daemon {
 		});
 	}
 
-	/**
-	 * `!budget`: no argument answers today's totals and both ceilings; `off` lifts the day's daily ceiling
-	 * (`cost-cap-off:<day>`, kept in the ledger so a restart keeps it and the bot zone's midnight drops it); `on` removes it
-	 * early. Owner turns are never blocked by the daily ceiling — only monitor fires are.
-	 */
-	async #budgetCommand(arg: string): Promise<string> {
+	/** `!budget`: today's totals, top origins and both ceilings. The ceilings only warn; nothing is stopped by them. */
+	async #budgetCommand(): Promise<string> {
 		const store = this.#store;
 		if (store === undefined) return "비용 장부가 아직 열리지 않았습니다.";
 		const state = this.#dailyBudget();
 		if (state === undefined) return "비용 장부가 아직 열리지 않았습니다.";
-		if (arg === "off") {
-			if (state.cap === undefined) return "하루 상한이 설정되어 있지 않습니다(config.json `costCap.dailyUsd`).";
-			store.setCursor(dailyOffKey(state.day), String(this.#clock.now()));
-			this.#log.info("cost_cap_daily_off", { day: state.day, cost: state.cost, cap: state.cap });
-			return `오늘(${state.day}) 하루 상한을 껐습니다. 자정(${this.#options.config.timezone})에 다시 켜집니다. 지금 켜려면 \`${COMMAND_TEXT.budget} on\`.`;
-		}
-		if (arg === "on") {
-			const wasOff = store.getCursor(dailyOffKey(state.day)) !== undefined;
-			store.deleteCursor(dailyOffKey(state.day));
-			this.#log.info("cost_cap_daily_on", { day: state.day, was_off: wasOff, cost: state.cost });
-			if (state.cap === undefined) return "하루 상한이 설정되어 있지 않습니다(config.json `costCap.dailyUsd`).";
-			if (state.cost >= state.cap) {
-				return `오늘(${state.day}) 하루 상한을 다시 켰습니다. 이미 ${usd(state.cost)}로 상한 ${usd(state.cap)}를 넘어 모니터가 다시 멈춥니다(알림은 그날 한 번만 갑니다).`;
-			}
-			return `오늘(${state.day}) 하루 상한을 켰습니다(지금 ${usd(state.cost)} / ${usd(state.cap)}).`;
-		}
-		if (arg !== "") {
-			return `사용법: \`${COMMAND_TEXT.budget}\` (오늘 합계) · \`${COMMAND_TEXT.budget} off\` (오늘 하루만 끄기) · \`${COMMAND_TEXT.budget} on\``;
-		}
 		return renderBudget({
 			day: state.day,
 			total: state.cost,
 			top: store.topDailyOrigins(state.day, 3),
 			turnCap: this.#options.config.costCap?.turnUsd,
 			dailyCap: state.cap,
-			off: state.off,
 		});
+	}
+
+	/** Once a minute, in the background: the wiki notes of conversation turns whose day (or turn) is over. */
+	#maybeFlushWikiTurns(): void {
+		const now = this.#clock.now();
+		if (this.#wikiNotes === undefined || now - this.#lastWikiFlushAt < WIKI_FLUSH_MS) return;
+		this.#lastWikiFlushAt = now;
+		void this.#wikiNotes.flushTurns();
 	}
 
 	/** Every `taskSweepMs`, in the background: remote reads can take seconds and must not stall the sweep chain. */
@@ -2513,7 +2478,7 @@ export class Daemon {
 		this.#lastCandidatePassAt = now;
 		const dmOrigin = this.#store === undefined ? undefined : this.#ownerDmOrigin(this.#store);
 		const ownerChannel = dmOrigin === undefined ? undefined : parseChatOrigin(dmOrigin)?.conversationId;
-		const logChannel = config.logChannel ?? config.channels.discord?.logChannelId;
+		const logChannel = config.channels.discord?.logChannelId;
 		this.#proposingCandidates = true;
 		void runCandidateProposals(
 			{
@@ -2703,21 +2668,10 @@ export class Daemon {
 		const plan = planReload(current, fresh);
 		this.#options.config = plan.next;
 		// `channels` is a restart key, so `plan.next` still carries the Discord values the daemon started with.
-		this.#store?.setLogChannel({ slack: plan.next.logChannel, discord: plan.next.channels.discord?.logChannelId });
+		this.#store?.setLogChannel({ discord: plan.next.channels.discord?.logChannelId });
 		if (plan.changed.includes("peerSilenceAlert")) this.#store?.setPeerCallPolicy(peerCallPolicyOf(plan.next));
-		this.#broker?.setEscalationChannel({
-			slack: plan.next.escalationChannel,
-			discord: plan.next.channels.discord?.escalationChannelId,
-		});
-		// The inbound policy keys are Slack's config fields.
-		this.#adapters.get("slack")?.setChannelPolicy({
-			...(plan.next.mentionFreeChannels === undefined ? {} : { mentionFreeChannels: plan.next.mentionFreeChannels }),
-			...(plan.next.logChannel === undefined ? {} : { logChannel: plan.next.logChannel }),
-			...(plan.next.peerBots === undefined ? {} : { peerBots: plan.next.peerBots }),
-			...(plan.next.requireMention === undefined ? {} : { requireMention: plan.next.requireMention }),
-			...(plan.next.peerHopLimit === undefined ? {} : { peerHopLimit: plan.next.peerHopLimit }),
-		});
-		// Of the top-level keys only the peer hop cap is Discord's too (its own policy is under `channels.discord`).
+		this.#broker?.setEscalationChannel({ discord: plan.next.channels.discord?.escalationChannelId });
+		// Of the top-level keys only the peer hop cap reaches the adapter (its own policy is under `channels.discord`).
 		this.#adapters
 			.get("discord")
 			?.setChannelPolicy(plan.next.peerHopLimit === undefined ? {} : { peerHopLimit: plan.next.peerHopLimit });
@@ -2834,22 +2788,14 @@ export class Daemon {
 	async inject(request: InjectRequest): Promise<InjectResult> {
 		if (this.#adapters.size === 0) throw new Error("daemon not started");
 		if (request.asOwner !== true) throw new Error("inject requires --as-owner");
-		// Owner DM (`slack/dm/D…`, `discord/dm/<id>`) or a channel the bot is in (`slack/ch/C…`, `discord/ch/<id>`); no
-		// thread origins.
+		// Owner DM (`discord/dm/<id>`) or a channel the bot is in (`discord/ch/<id>`); no thread origins.
 		const ref = parseChatOrigin(request.origin);
-		if (ref === undefined || (ref.platform !== "slack" && ref.platform !== "discord") || ref.threadId !== undefined)
-			throw new Error(
-				`inject origin must be slack/dm/<id>, slack/ch/<id>, discord/dm/<id> or discord/ch/<id>: ${request.origin}`,
-			);
+		if (ref === undefined || ref.platform !== "discord" || ref.threadId !== undefined)
+			throw new Error(`inject origin must be discord/dm/<id> or discord/ch/<id>: ${request.origin}`);
 		if (!this.#adapters.has(ref.platform)) throw new Error(`${ref.platform} is not configured`);
-		// A Slack id's first letter names its kind (D = DM, C/G = channel); `slack/dm/U…` is a member id Slack cannot post to.
-		if (ref.platform === "slack" && !(ref.kind === "dm" ? /^D/ : /^[CG]/).test(ref.conversationId))
-			throw new Error(
-				`inject origin ${request.origin}: a Slack ${ref.kind} id starts with ${ref.kind === "dm" ? "D" : "C or G"}`,
-			);
 		const channel = ref.conversationId;
-		// A Slack thread is a message ts, a Discord one a message id (snowflake).
-		if (request.thread !== undefined && !(ref.platform === "slack" ? /^\d+\.\d+$/ : /^\d{17,20}$/).test(request.thread))
+		// A Discord thread is a message id (snowflake).
+		if (request.thread !== undefined && !/^\d{17,20}$/.test(request.thread))
 			throw new Error(`inject thread is not a message id: ${request.thread}`);
 		const nonce = randomBytes(6).toString("hex");
 		// The marker is all the owner sees of the injected message, so it carries the text's first line — masked before it
@@ -2893,8 +2839,8 @@ export class Daemon {
 		const { origin, thread } = request;
 		const ref = parseChatOrigin(origin);
 		if (ref === undefined || !isReportOrigin(origin))
-			return { ok: false, error: `notify origin must be slack|discord/(dm|ch)/<id>: ${origin}` };
-		if (thread !== undefined && !reportThreadPattern(origin).test(thread))
+			return { ok: false, error: `notify origin must be discord/(dm|ch)/<id>: ${origin}` };
+		if (thread !== undefined && !reportThreadPattern().test(thread))
 			return { ok: false, error: `notify thread is not a message id: ${thread}` };
 		if (!this.#adapters.has(ref.platform)) return { ok: false, error: `${ref.platform} is not configured` };
 		const text = request.text.trim();
@@ -2969,6 +2915,11 @@ export class Daemon {
 		return repoMatchesCommonDir(row.repo, repos);
 	}
 
+	/** Whether the daemon can land now: started, with a channel, and not draining for a restart. */
+	#landReady(): boolean {
+		return this.#router?.draining !== true && this.#adapters.size > 0 && this.#store !== undefined;
+	}
+
 	/**
 	 * Auto-merge of a reached task (`taskAutoLand`). A local task is landed by the core (`landTask`); only its `handoff`
 	 * — and every remote task — has the bot answer "머지해" in the task thread as the owner, under a `🤖 자동 머지`
@@ -2979,7 +2930,7 @@ export class Daemon {
 	 */
 	async autoLand(row: TaskRow, gate?: TaskGateHooks): Promise<TaskLandOutcome> {
 		const log = this.#log;
-		if (this.#router?.draining === true || this.#adapters.size === 0 || this.#store === undefined) {
+		if (!this.#landReady()) {
 			log.info("task_autoland_ignored", { task: row.taskId, reason: "not_ready" });
 			return { state: "not_accepted" };
 		}
@@ -3015,7 +2966,7 @@ export class Daemon {
 			if (result.state !== "handoff") return result;
 			const posted: { ts?: string } = {};
 			const { outcome } = await this.#ingestOwnerText(
-				{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
+				{ channel: thread.channel, threadTs: thread.threadTs, kind: "ch" },
 				AUTO_LAND_TEXT,
 				AUTO_LAND_MARKER,
 				undefined,
@@ -3048,8 +2999,14 @@ export class Daemon {
 		const land = this.#lander;
 		if (store === undefined || land === undefined) throw new Error("daemon not started");
 		const homeDir = this.#options.config.homeDir;
+		const wikiNotes = this.#wikiNotes;
 		const result = await (this.#options.taskLand ?? landTask)(row, {
-			land,
+			mode,
+			// The worktree and branch go with the landing: the note's content is collected right before it starts.
+			land: async (request, hooks) => {
+				await wikiNotes?.taskDraft(row);
+				return land(request, hooks);
+			},
 			judge: (task) => evaluateTask(task, resolveTaskHost(null, undefined), new Map()),
 			holdReason: () => {
 				const fresh = store.tasks.get(row.taskId);
@@ -3062,6 +3019,16 @@ export class Daemon {
 			ledger: store.tasks,
 			afterDone: (task) => this.#afterTaskLanded(task),
 		});
+		if (result.state === "landed" || result.state === "merged-not-pushed") {
+			await wikiNotes?.taskDone(row.taskId, [
+				`${result.baseBranch}에 머지 (${result.sha.slice(0, 12)})`,
+				result.state === "landed" && result.pushed !== undefined
+					? `push ${result.pushed}`
+					: result.state === "landed"
+						? "push 없음(origin 원격 없음)"
+						: `push 안 됨: ${result.reason}`,
+			]);
+		} else wikiNotes?.taskDropDraft(row);
 		const fields = { task: row.taskId, mode, ...result };
 		if (result.state === "landed") log.info("task_land_landed", fields);
 		else log.warn(`task_land_${result.state.replace(/-/g, "_")}`, fields);
@@ -3218,7 +3185,7 @@ export class Daemon {
 			const posted: { ts?: string } = {};
 			try {
 				const { outcome } = await this.#ingestOwnerText(
-					{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
+					{ channel: thread.channel, threadTs: thread.threadTs, kind: "ch" },
 					button.ownerText,
 					button.marker,
 					undefined,
@@ -3286,7 +3253,7 @@ export class Daemon {
 		const posted: { ts?: string } = {};
 		try {
 			const { outcome } = await this.#ingestOwnerText(
-				{ channel: thread.channel, threadTs: thread.threadTs, kind: conversationKind(thread.channel) },
+				{ channel: thread.channel, threadTs: thread.threadTs, kind: "ch" },
 				`다시 요청: ${firstLine.slice(0, 200)}\n(방금 시간 초과로 거부된 승인 요청입니다. 같은 요청을 ompbot_request_approval로 다시 올려 주세요.)`,
 				"🔘 다시 요청 (버튼)",
 				undefined,
@@ -3402,6 +3369,8 @@ export class Daemon {
 		if (request.op === "tasks_check" || request.op === "tasks_sync") {
 			const id = "id" in request ? request.id : undefined;
 			const row = typeof id === "string" ? this.#store?.tasks.get(id) : undefined;
+			// `tasks close --as done` changed the ledger in the CLI process: this is where the daemon learns of it.
+			if (request.op === "tasks_sync" && row !== undefined) await this.#wikiNotes?.taskDone(row.taskId);
 			if (row === undefined || this.#taskSweeper === undefined) return { ok: false, error: "task not found" };
 			if (request.op === "tasks_sync") return { ok: await this.#taskSweeper.syncReaction(row.taskId) };
 			return { ok: true, ...(await this.#taskSweeper.check(row)) };

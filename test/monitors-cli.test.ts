@@ -8,9 +8,14 @@ import { openMonitorLedger } from "../src/monitors/ledger";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { clearFreeze, writeFreeze } from "../src/ops/freeze";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	CHANNEL,
+	discordBinding,
+	makeHome,
+	OWNER_DM,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { runBounded } from "./helpers/bounded-child";
 import { killSpawned, runCliCapture, runMain } from "./helpers/daemon-process";
 
@@ -132,7 +137,7 @@ describe("ompbot monitors (CLI)", () => {
 				name: "wake",
 				trigger: { kind: "at", at: "2026-10-19T15:05:00+09:00" },
 				instruction: "i",
-				copyChannel: "C0123456789",
+				copyChannel: CHANNEL,
 			}),
 		);
 		expect(added.code).toBe(0);
@@ -152,7 +157,7 @@ describe("ompbot monitors (CLI)", () => {
 		// Shared trigger rule: fire=every carries no state= suffix.
 		expect(text).toContain(`watch  [script ${script} every 60s fire=every]`);
 		// Shared option suffixes joined with the CLI's two-space separator.
-		expect(text).toContain("copyChannel=C0123456789  next=");
+		expect(text).toContain(`copyChannel=${CHANNEL}  next=`);
 	});
 
 	test("list shows the last check error with its time and streak; a healthy monitor shows none", async () => {
@@ -567,11 +572,11 @@ console.log(JSON.stringify({ code: r.exitCode, stderr: r.stderr.toString() }));`
 
 describe("daemon with monitors", () => {
 	test("an at monitor that is due posts exactly one top-level ⏰ message", async () => {
-		const transport = new WaitingTransport();
+		const transport = new WaitingDiscordTransport();
 		const sessions = new FakeSessionStore();
 		const daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: () => undefined, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -580,6 +585,7 @@ describe("daemon with monitors", () => {
 		});
 		try {
 			await daemon.start();
+			daemon.store.ensureOrigin(`discord/dm/${OWNER_DM}`, "sess/owner-dm");
 			const monitor = daemon.store.monitors.addMonitor({
 				name: "wake",
 				trigger: { kind: "at", at: new Date(Date.now() - 1_000).toISOString() },
@@ -595,9 +601,9 @@ describe("daemon with monitors", () => {
 
 			const posts = transport.posts((text) => text.startsWith("⏰ "));
 			expect(posts).toHaveLength(1);
-			expect(posts[0]?.text).toBe("⏰ wake\n시험 알림 nonce-42");
-			expect(posts[0]?.threadTs).toBeUndefined();
-			expect(posts[0]?.channel).toBe(home.config.ownerSlackUserId);
+			expect(posts[0]?.content).toBe("⏰ wake\n시험 알림 nonce-42");
+			expect(posts[0]?.messageReference).toBeUndefined();
+			expect(posts[0]?.channelId).toBe(OWNER_DM);
 			expect(daemon.store.monitors.listEvents().map((event) => event.stage)).toEqual(["delivered"]);
 			expect(daemon.store.monitors.getMonitor(monitor.id)?.enabled).toBe(false);
 			// No reactions or status messages were stamped for the monitor turn.

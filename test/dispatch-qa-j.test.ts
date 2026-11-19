@@ -7,7 +7,7 @@ const SIGNAL = { signal: new AbortController().signal };
 
 function toolWith(run: ProcessRunner, extra: Partial<DispatchToolDeps> = {}) {
 	return buildDispatchTool({
-		originKey: "slack/dm/D0123456789",
+		originKey: "discord/dm/200000000000000001",
 		ompExecutable: "omp",
 		homeDir: "/h",
 		workspaceDir: "/h/workspace",

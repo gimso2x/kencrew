@@ -36,7 +36,7 @@ describe("scanHandoffBrief: high_risk rules", () => {
 			"pm2 delete api",
 		],
 		disk_destructive: ["mkfs.ext4 /dev/sdb1", "dd if=/dev/zero of=/dev/sda bs=1M"],
-		secret_path: ["cat ~/.ompbot/secrets/slack.json"],
+		secret_path: ["cat ~/.ompbot/secrets/discord.json"],
 	};
 
 	for (const [rule, briefs] of Object.entries(POSITIVES)) {
@@ -159,10 +159,10 @@ describe("scanHandoffBrief: rule-name prefix, backslash continuation, secret pat
 
 	test("E-3: /./ and // between .ompbot and secrets are still secret_path", () => {
 		for (const brief of [
-			"cat ~/.ompbot/./secrets/slack.json",
-			"cat ~/.ompbot//secrets/slack.json",
-			"cat $HOME//.ompbot//secrets/slack.json",
-			"cat ~/.ompbot/.//./secrets/slack.json",
+			"cat ~/.ompbot/./secrets/discord.json",
+			"cat ~/.ompbot//secrets/discord.json",
+			"cat $HOME//.ompbot//secrets/discord.json",
+			"cat ~/.ompbot/.//./secrets/discord.json",
 		]) {
 			const scan = scanHandoffBrief(brief);
 			expect({ brief, verdict: scan.verdict }).toEqual({ brief, verdict: "high_risk" });
@@ -530,10 +530,10 @@ describe("scanHandoffBrief: qa-j low A", () => {
 
 	test("#43 secrets named through $OMPBOT_HOME or after a cd into the bot home", () => {
 		for (const brief of [
-			"cat $OMPBOT_HOME/secrets/slack.json",
-			`cat \${OMPBOT_HOME}/secrets/slack.json`,
-			"cd ~/.ompbot && cat secrets/slack.json",
-			"cd ~/.ompbot/; cp secrets/slack.json /tmp/",
+			"cat $OMPBOT_HOME/secrets/discord.json",
+			`cat \${OMPBOT_HOME}/secrets/discord.json`,
+			"cd ~/.ompbot && cat secrets/discord.json",
+			"cd ~/.ompbot/; cp secrets/discord.json /tmp/",
 			"cd $OMPBOT_HOME && cat secrets/x",
 		])
 			expect({ brief, rules: rulesOf(brief) }).toEqual({ brief, rules: ["secret_path"] });
@@ -625,14 +625,14 @@ describe("scanHandoffBrief: qa-j low A", () => {
 describe("qa-l low A: secrets reached through the bot home", () => {
 	test("#35 #71 cd options, pushd and env -C into the bot home before a relative secrets path", () => {
 		for (const brief of [
-			"cd -P ~/.ompbot && cat secrets/slack.json",
-			"cd -L ~/.ompbot && cat secrets/slack.json",
-			"cd -- ~/.ompbot && cat secrets/slack.json",
-			"cd -eP ~/.ompbot && cat secrets/slack.json",
-			"pushd ~/.ompbot && cat secrets/slack.json",
+			"cd -P ~/.ompbot && cat secrets/discord.json",
+			"cd -L ~/.ompbot && cat secrets/discord.json",
+			"cd -- ~/.ompbot && cat secrets/discord.json",
+			"cd -eP ~/.ompbot && cat secrets/discord.json",
+			"pushd ~/.ompbot && cat secrets/discord.json",
 			"pushd -n ~/.ompbot; cat secrets/x",
-			"env -C ~/.ompbot cat secrets/slack.json",
-			"env -C~/.ompbot cat secrets/slack.json",
+			"env -C ~/.ompbot cat secrets/discord.json",
+			"env -C~/.ompbot cat secrets/discord.json",
 			"env --chdir=$OMPBOT_HOME cat secrets/x",
 			"env -i --chdir ~/.ompbot cat secrets/x",
 		])
@@ -647,8 +647,8 @@ describe("qa-l low A: secrets reached through the bot home", () => {
 
 	test("#72 a .. inside the bot home that still lands in secrets", () => {
 		for (const brief of [
-			"cat ~/.ompbot/logs/../secrets/slack.json",
-			"cat ~/.ompbot/x/../secrets/slack.json",
+			"cat ~/.ompbot/logs/../secrets/discord.json",
+			"cat ~/.ompbot/x/../secrets/discord.json",
 			"cat ~/.ompbot/a/b/../../secrets/x",
 			"cat $OMPBOT_HOME/logs/../secrets/x",
 			"cat ~/.ompbot/logs/.././secrets",
@@ -670,12 +670,12 @@ describe("qa-q: safety heuristic holes", () => {
 
 	test("#6 a glob or brace under the bot home that can spell secrets is secret_path", () => {
 		high([
-			"cat ~/.ompbot/sec*/slack.json",
+			"cat ~/.ompbot/sec*/discord.json",
 			"cat ~/.ompbot/{secrets,logs}/x",
 			"cat $OMPBOT_HOME/s?crets/x",
 			"cat ~/.ompbot/[s]ecrets/x",
 		]);
-		expect(rulesOf("cat ~/.ompbot/sec*/slack.json")).toEqual(["secret_path"]);
+		expect(rulesOf("cat ~/.ompbot/sec*/discord.json")).toEqual(["secret_path"]);
 		clear(["ls ~/.ompbot/logs/*", "ls ~/.ompbot/{logs,db}/x", "cat ~/.ompbot/lo*/x"]);
 	});
 
@@ -732,9 +732,9 @@ describe("qa-q: safety heuristic holes", () => {
 
 	test("#24 a cd target is normalized before it is judged the bot home", () => {
 		high([
-			"cd ~/.ompbot/logs/..; cat secrets/slack.json",
-			"cd ~/.ompbot/. && cat secrets/slack.json",
-			"cd ~/.ompbot// && cat secrets/slack.json",
+			"cd ~/.ompbot/logs/..; cat secrets/discord.json",
+			"cd ~/.ompbot/. && cat secrets/discord.json",
+			"cd ~/.ompbot// && cat secrets/discord.json",
 			'cd "~/.ompbot/./" ; cat secrets/x',
 		]);
 		clear(["cd ~/.ompbot/..; cat secrets/x", "cd ~/.ompbot/logs; cat secrets/x"]);
@@ -742,7 +742,7 @@ describe("qa-q: safety heuristic holes", () => {
 
 	test("#26 a cd into the bot home carries over the line break", () => {
 		high([
-			"cd ~/.ompbot\ncat secrets/slack.json",
+			"cd ~/.ompbot\ncat secrets/discord.json",
 			"cd ~/.ompbot\n\nls\n./secrets",
 			"cd ~/.ompbot\nrm -rf secrets",
 			"cd ~/.ompbot\ncd .\ncat secrets/x",
@@ -783,14 +783,14 @@ describe("qa-r: handoff risk regressions of the qa-q fixes", () => {
 	});
 
 	test("#28 a fence line does not erase the bot home; a shell fence continues it", () => {
-		high(["cd ~/.ompbot\n```\ncat secrets/slack.json", "cd ~/.ompbot\n```bash\ncat secrets/x\n```"]);
+		high(["cd ~/.ompbot\n```\ncat secrets/discord.json", "cd ~/.ompbot\n```bash\ncat secrets/x\n```"]);
 		clear(["cd ~/.ompbot\n```diff\n- cat secrets/x\n```", "cd ~/.ompbot\n```json\n{}\n```\ncat secrets/x"]);
 	});
 
 	test("#25 cd into a bot home subdirectory keeps the shell inside the bot home", () => {
 		high([
-			"cd ~/.ompbot\ncd secrets\ncat slack.json",
-			"cd ~/.ompbot/secrets\ncat slack.json",
+			"cd ~/.ompbot\ncd secrets\ncat discord.json",
+			"cd ~/.ompbot/secrets\ncat discord.json",
 			"cd ~/.ompbot/logs\ncat ../secrets/x",
 		]);
 		clear([
@@ -802,12 +802,12 @@ describe("qa-r: handoff risk regressions of the qa-q fixes", () => {
 	});
 
 	test("#8 a path that leaves the bot home and comes back is still the bot home", () => {
-		high(["cd ~/.ompbot/../.ompbot\ncat secrets/slack.json"]);
+		high(["cd ~/.ompbot/../.ompbot\ncat secrets/discord.json"]);
 		clear(["cd ~/.ompbot/..; cat secrets/x"]);
 	});
 
 	test("#23 a rule line's own cd moves the shell, a quoted one does not", () => {
-		high(["- `note`: cd ~/.ompbot\ncat secrets/slack.json"]);
+		high(["- `note`: cd ~/.ompbot\ncat secrets/discord.json"]);
 		clear(["- `rule`: `cd ~/.ompbot` 금지\ncat secrets/x"]);
 	});
 

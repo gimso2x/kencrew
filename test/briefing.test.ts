@@ -9,8 +9,8 @@ const NOW = Date.parse("2026-11-10T22:30:00Z");
 
 const turn = (inboundId: number, extra: Partial<TurnInfo> = {}): TurnInfo => ({
 	inboundId,
-	originKey: "slack/dm/D1",
-	threadRef: "D1:1.0",
+	originKey: "discord/dm/200000000000000001",
+	threadRef: "200000000000000001:700000000000000001",
 	state: "dispatched",
 	createdAt: "2026-11-11T07:00:00+09:00",
 	ageMs: 30 * 60_000,
@@ -158,6 +158,7 @@ describe("AC-1: briefing render", () => {
 							createdAt: "2026-11-11T07:20:00+09:00",
 							expiresAt: "2026-11-11T07:35:00+09:00",
 							originKey: null,
+							originThreadRef: null,
 							title: "레인 L-1 머지",
 							detail: null,
 							cardUrl: null,
@@ -194,8 +195,9 @@ describe("AC-1: briefing render", () => {
 		expect(body).toContain("주의 4 · 진행 TASK 1 · 레인 0 · 승인 대기 1 · 게이트 열림 1 · 모니터 실패 0");
 		// The attention section names each of them.
 		expect(body).toContain("게이트 backup_age");
-		expect(body).toContain("승인 대기 레인 L-1 머지");
-		expect(body).toContain("TASK T-20261111-02 멈춘 작업 · blocked");
+		// Owner-facing waits carry their age at the snapshot's time (07:30): asked 07:20, blocked since 07:00.
+		expect(body).toContain("승인 대기 레인 L-1 머지 · 10분째");
+		expect(body).toContain("TASK T-20261111-02 멈춘 작업 · blocked · 30분째");
 		expect(body).toContain("턴 5 정체");
 		// Emphasis colour only when there is something to look at.
 		expect(html).toMatch(/class="[^"]*warn[^"]*"[^>]*>주의 4/);
@@ -249,6 +251,7 @@ describe("AC-1: briefing render", () => {
 							createdAt: "2026-11-11T07:20:00+09:00",
 							expiresAt: "2026-11-11T07:35:00+09:00",
 							originKey: null,
+							originThreadRef: null,
 							title: "레인 L-1 머지",
 							detail: null,
 							cardUrl: null,

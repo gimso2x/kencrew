@@ -33,9 +33,7 @@ import {
 	savePendingProposals,
 	skillDirOf,
 } from "../src/review/skills";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 import { killSpawned, runMain } from "./helpers/daemon-process";
 
 let dir: string;
@@ -482,10 +480,10 @@ describe("ompbot skills rollback (CLI)", () => {
 });
 
 describe("!distill (daemon)", () => {
-	const DM = "slack/dm/D1";
+	const DM = `discord/dm/${OWNER_DM}`;
 	let home: TestHome;
 	let daemon: Daemon | undefined;
-	let transport: WaitingTransport;
+	let transport: WaitingDiscordTransport;
 	let lines: string[];
 	let waiters: Array<() => void>;
 	/** Every omp child the daemon started, with its origin and session dir. */
@@ -497,7 +495,7 @@ describe("!distill (daemon)", () => {
 		const clock = { now: () => Date.now() };
 		const started = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			clock,
 			log: createLogger({
 				sink: (line) => {
@@ -547,7 +545,7 @@ describe("!distill (daemon)", () => {
 
 	beforeEach(() => {
 		home = makeHome("ompbot-distill-");
-		transport = new WaitingTransport();
+		transport = new WaitingDiscordTransport();
 		lines = [];
 		waiters = [];
 		built = [];

@@ -1,11 +1,10 @@
 // Discord files (doc/plans/discord-channel.md §11): `discord_send_file` uploads into the conversation (a thread, or a
-// reply in a DM) after the same refusal checks as Slack, and an owner's addressed message has its attachments
-// downloaded from the CDN without the bot token, within Slack's count/size/magic limits.
+// reply in a DM) after refusal checks, and an owner's addressed message has its attachments
+// downloaded from the CDN without the bot token, within the count/size/magic limits.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ChannelPort } from "../src/channel/port";
 import type { CoreSink, DeliverySource, InboundMessage } from "../src/channel/types";
 import { DiscordAdapter } from "../src/discord/adapter";
 import { downloadDiscordAttachment } from "../src/discord/attachments";
@@ -15,11 +14,9 @@ import { createLogger } from "../src/log";
 import { redact } from "../src/redact";
 import { ApprovalBroker } from "../src/safety/approval";
 import { buildHostTools, type HostToolDef } from "../src/safety/host-tools";
-import { SlackChannel } from "../src/slack/channel";
 import { openStore, type Store } from "../src/store/db";
 import { registryOf } from "./helpers/channels";
 import { type FakeDiscordCall, FakeDiscordTransport } from "./helpers/discord-fake-transport";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
 
 const OWNER = "100000000000000001";
 const STRANGER = "100000000000000002";
@@ -68,12 +65,8 @@ afterEach(() => {
 });
 
 describe("discord_send_file", () => {
-	function sendFile(
-		originKey: string,
-		threadTs: string | undefined,
-		port: ChannelPort = new DiscordChannel(transport, { ownerUserId: OWNER }),
-	): HostToolDef {
-		const channels = registryOf(port);
+	function sendFile(originKey: string, threadTs: string | undefined): HostToolDef {
+		const channels = registryOf(new DiscordChannel(transport, { ownerUserId: OWNER }));
 		const tools = buildHostTools({
 			originKey,
 			channels,
@@ -110,21 +103,6 @@ describe("discord_send_file", () => {
 		expect(upload?.channelId).toBe(DM);
 		expect(upload?.messageReference).toEqual({ messageId: QUESTION });
 		expect(upload?.content).toBe("여기");
-	});
-
-	test("the result line has the same shape as slack_send_file's", async () => {
-		writeFileSync(join(workspaceDir, "a.txt"), "a");
-		const shape = (text: string) => text.replace(/\(file id [^)]+\)/, "(file id ID)");
-		const slack = new FakeSlackTransport();
-		for (const threadTs of [QUESTION, undefined]) {
-			const discord = await sendFile(`discord/dm/${DM}`, threadTs).execute({ path: "a.txt" }, ctx);
-			const slackResult = await sendFile(
-				"slack/dm/D0OWNER",
-				threadTs === undefined ? undefined : "1.2",
-				new SlackChannel(slack),
-			).execute({ path: "a.txt" }, ctx);
-			expect(shape(discord)).toBe(shape(slackResult));
-		}
 	});
 
 	test("secret paths, token-bearing files and files over 25 MiB are refused before any upload", async () => {

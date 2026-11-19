@@ -214,11 +214,11 @@ describe("collectGates", () => {
 		writeHeartbeat(0);
 		seedDb((db) => {
 			db.run(
-				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at) VALUES ('C:1.1', 'slack/dm/D', 1, 't', 'answered', ?, ?)",
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at) VALUES ('C:1.1', 'discord/dm/200000000000000001', 1, 't', 'answered', ?, ?)",
 				[now, now],
 			);
 			db.run(
-				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES ('slack/dm/D', 'op1', 0, '1.1', 'b', 'confirmed', ?, ?)",
+				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES ('discord/dm/200000000000000001', 'op1', 0, '1.1', 'b', 'confirmed', ?, ?)",
 				[now, now],
 			);
 			db.run("INSERT INTO lanes (name, status, created_at, updated_at) VALUES ('l1', 'closed', ?, ?)", [now, now]);
@@ -226,7 +226,6 @@ describe("collectGates", () => {
 		for (const name of [
 			"backup_age",
 			"sweep_stalled",
-			"slack_disconnected",
 			"inbound_starved",
 			"deliveries_overdue",
 			"lanes_stuck",
@@ -269,7 +268,7 @@ describe("collectGates", () => {
 		expect(readSweepHeartbeat(home)).toBeUndefined();
 	});
 
-	/** Writes a heartbeat stamped now with extra raw fields (socket, draining). */
+	/** Writes a heartbeat stamped now with extra raw fields (discord, draining). */
 	function writeFields(fields: string): void {
 		writeFileSync(join(home, "sweep-heartbeat"), `ts=${new Date(now).toISOString()} loop_ms=0 ${fields}\n`, {
 			mode: 0o600,
@@ -280,63 +279,35 @@ describe("collectGates", () => {
 		rmSync(join(home, "ompbot.db"), { force: true });
 	}
 
-	test("heartbeat round-trip: socket and draining fields parse; malformed or absent fields stay undefined", () => {
-		writeFields(`socket=down socket_since=${new Date(now - 5_000).toISOString()} draining=1`);
+	test("heartbeat round-trip: discord and draining fields parse; malformed or absent fields stay undefined", () => {
+		writeFields(`discord=down discord_since=${new Date(now - 5_000).toISOString()} draining=1`);
 		const parsed = readSweepHeartbeat(home);
-		expect(parsed?.socket).toEqual({ state: "down", since: new Date(now - 5_000) });
+		expect(parsed?.discord).toEqual({ state: "down", since: new Date(now - 5_000) });
 		expect(parsed?.draining).toBe(true);
-		writeFields(`socket=up socket_since=${new Date(now).toISOString()} draining=0`);
-		expect(readSweepHeartbeat(home)).toMatchObject({ socket: { state: "up" }, draining: false });
-		writeFields("socket=weird socket_since=nope draining=2");
+		writeFields(`discord=up discord_since=${new Date(now).toISOString()} draining=0`);
+		expect(readSweepHeartbeat(home)).toMatchObject({ discord: { state: "up" }, draining: false });
+		writeFields("discord=weird discord_since=nope draining=2");
 		const bad = readSweepHeartbeat(home);
-		expect(bad?.socket).toBeUndefined();
+		expect(bad?.discord).toBeUndefined();
 		expect(bad?.draining).toBeUndefined();
 		writeHeartbeat(0);
-		expect(readSweepHeartbeat(home)?.socket).toBeUndefined();
+		expect(readSweepHeartbeat(home)?.discord).toBeUndefined();
 		expect(readSweepHeartbeat(home)?.draining).toBeUndefined();
 	});
 
-	test("heartbeat round-trip: the Discord gateway state is written beside Slack's and only when given", () => {
+	test("heartbeat round-trip: the Discord gateway state is written only when given", () => {
 		const writer = new SweepHeartbeatWriter(home);
 		try {
-			writer.beat(now, {
-				socket: { state: "up", since: now - 9_000 },
-				discord: { state: "down", since: now - 4_000 },
-				draining: false,
-			});
+			writer.beat(now, { discord: { state: "down", since: now - 4_000 }, draining: false });
 			expect(readSweepHeartbeat(home)).toMatchObject({
-				socket: { state: "up", since: new Date(now - 9_000) },
 				discord: { state: "down", since: new Date(now - 4_000) },
 				draining: false,
 			});
-			writer.beat(now, { socket: { state: "up", since: now }, draining: false });
+			writer.beat(now, { draining: false });
 			expect(readSweepHeartbeat(home)?.discord).toBeUndefined();
 		} finally {
 			writer.stop();
 		}
-	});
-
-	test("slack_disconnected: exactly 10 minutes down opens, 1 ms less is closed; up and an old stamp are closed; no stamp is unknown", () => {
-		writeStamp(0);
-		expect(gateState("slack_disconnected")).toEqual({ state: "unknown", detail: "stamp=missing" });
-		const down = (ageMs: number) =>
-			writeFields(`socket=down socket_since=${new Date(now - ageMs).toISOString()} draining=0`);
-		down(SOCKET_DOWN_MS);
-		expect(gateState("slack_disconnected")).toEqual({ state: "open", detail: "socket=down minutes=10" });
-		down(SOCKET_DOWN_MS - 1);
-		expect(gateState("slack_disconnected").state).toBe("closed");
-		writeFields(`socket=up socket_since=${new Date(now - 3 * SOCKET_DOWN_MS).toISOString()} draining=0`);
-		expect(gateState("slack_disconnected").state).toBe("closed");
-		writeHeartbeat(0);
-		expect(gateState("slack_disconnected")).toEqual({ state: "closed", detail: "socket=unknown" });
-	});
-
-	test("slack_disconnected: a down socket whose socket_since is in the future opens as ts_in_future (J-3)", () => {
-		writeFields(`socket=down socket_since=${new Date(now + 2 * 60 * 60_000).toISOString()} draining=0`);
-		expect(gateState("slack_disconnected")).toEqual({ state: "open", detail: "socket=down ts_in_future" });
-		// Within the clock tolerance it is still the ordinary "just went down" closed state.
-		writeFields(`socket=down socket_since=${new Date(now + 1_000).toISOString()} draining=0`);
-		expect(gateState("slack_disconnected").state).toBe("closed");
 	});
 
 	test("discord_disconnected (UX-22): only with channels.discord; no discord field is unknown, 10 minutes down opens, a future since opens", () => {
@@ -345,9 +316,7 @@ describe("collectGates", () => {
 				(g) => g.name === "discord_disconnected",
 			);
 		const down = (sinceMs: number) =>
-			writeFields(
-				`socket=up socket_since=${new Date(now).toISOString()} discord=down discord_since=${new Date(sinceMs).toISOString()} draining=0`,
-			);
+			writeFields(`discord=down discord_since=${new Date(sinceMs).toISOString()} draining=0`);
 		down(now - 3 * SOCKET_DOWN_MS);
 		expect(discordGate()).toBeUndefined();
 		expect(discordGate(false)).toBeUndefined();
@@ -373,7 +342,7 @@ describe("collectGates", () => {
 		writeFields(`discord=up discord_since=${new Date(now - 3 * SOCKET_DOWN_MS).toISOString()} draining=0`);
 		expect(discordGate(true)).toEqual({ name: "discord_disconnected", state: "closed", detail: "discord=up" });
 		// A stamp without the discord field: the gateway never reported, nothing to judge.
-		writeFields(`socket=up socket_since=${new Date(now).toISOString()} draining=0`);
+		writeFields("draining=0");
 		expect(discordGate(true)).toEqual({ name: "discord_disconnected", state: "unknown", detail: "discord=missing" });
 		rmSync(join(home, "sweep-heartbeat"));
 		expect(discordGate(true)).toEqual({ name: "discord_disconnected", state: "unknown", detail: "stamp=missing" });
@@ -465,7 +434,7 @@ describe("collectGates", () => {
 		writeStamp(0);
 		seedDb((db) => {
 			db.run(
-				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at) VALUES ('C:2.1', 'slack/dm/D', 1, 't', 'dispatched', ?, ?)",
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at) VALUES ('C:2.1', 'discord/dm/200000000000000001', 1, 't', 'dispatched', ?, ?)",
 				[now - 60_000, now - 11 * 60_000],
 			);
 		});
@@ -476,7 +445,7 @@ describe("collectGates", () => {
 		writeStamp(0);
 		seedDb((db) => {
 			const insert =
-				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES (?, 'slack/dm/D', 1, 't', 'dispatched', ?, ?, ?)";
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES (?, 'discord/dm/200000000000000001', 1, 't', 'dispatched', ?, ?, ?)";
 			db.run(insert, ["C:3.1", now - 36 * 60_000, now - 35 * 60_000, now - 9 * 60_000]);
 		});
 		expect(gateState("inbound_starved")).toEqual({ state: "closed", detail: "silent_old=0" });
@@ -495,7 +464,7 @@ describe("collectGates", () => {
 		test("a message pending 15 minutes opens it; one minute younger does not; monitor rows never count", () => {
 			writeStamp(0);
 			seedDb((db) => {
-				pending(db, "C:10.1", "slack/dm/D", ORIGIN_SILENT_MS - 60_000);
+				pending(db, "C:10.1", "discord/dm/200000000000000001", ORIGIN_SILENT_MS - 60_000);
 				pending(db, "C:10.2", "monitor/m1", 2 * ORIGIN_SILENT_MS);
 			});
 			expect(gateState("origin_silent")).toEqual({ state: "closed", detail: "waiting=0" });
@@ -506,9 +475,9 @@ describe("collectGates", () => {
 		test("queued behind a turn still emitting events is closed; behind a hung turn it opens", () => {
 			writeStamp(0);
 			seedDb((db) => {
-				pending(db, "C:11.1", "slack/dm/D", 20 * 60_000);
+				pending(db, "C:11.1", "discord/dm/200000000000000001", 20 * 60_000);
 				db.run(
-					"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES ('C:11.0', 'slack/dm/D', 1, 't', 'dispatched', ?, ?, ?)",
+					"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES ('C:11.0', 'discord/dm/200000000000000001', 1, 't', 'dispatched', ?, ?, ?)",
 					[now - 30 * 60_000, now - 30 * 60_000, now - 60_000],
 				);
 			});
@@ -519,7 +488,7 @@ describe("collectGates", () => {
 
 		test("a restart drain holds pending rows on purpose: closed while draining", () => {
 			writeStamp(0);
-			seedDb((db) => pending(db, "C:12.1", "slack/dm/D", 2 * ORIGIN_SILENT_MS));
+			seedDb((db) => pending(db, "C:12.1", "discord/dm/200000000000000001", 2 * ORIGIN_SILENT_MS));
 			writeFields("draining=1");
 			expect(gateState("origin_silent")).toEqual({ state: "closed", detail: "draining" });
 			writeFields("draining=0");
@@ -531,14 +500,14 @@ describe("collectGates", () => {
 		writeStamp(0);
 		seedDb((db) => {
 			db.run(
-				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES ('C:4.1', 'slack/ch/C/t/1.1', 1, 't', 'dispatched', ?, ?, ?)",
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, last_event_at) VALUES ('C:4.1', 'discord/ch/300000000000000001/t/1700000000000000001', 1, 't', 'dispatched', ?, ?, ?)",
 				[now - 21 * 60_000, now - 20 * 60_000, now - 20 * 60_000],
 			);
 			db.run(
 				"CREATE TABLE approvals (approval_id TEXT PRIMARY KEY, status TEXT NOT NULL, origin_key TEXT, created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL)",
 			);
 			db.run(
-				"INSERT INTO approvals VALUES ('E:5.5', 'pending', 'slack/ch/C/t/1.1', ?, ?), ('E:6.6', 'pending', NULL, ?, ?)",
+				"INSERT INTO approvals VALUES ('E:5.5', 'pending', 'discord/ch/300000000000000001/t/1700000000000000001', ?, ?), ('E:6.6', 'pending', NULL, ?, ?)",
 				[now - 20 * 60_000, now + 10 * 60_000, now - 20 * 60_000, now + 10 * 60_000],
 			);
 		});
@@ -679,8 +648,8 @@ describe("collectGates", () => {
 				laneLedger(db)("approval", old());
 				pendingApproval(db, "ompbot/work/approval", now - 60_000);
 				// A chat turn hung behind the same kind of stale card.
-				turn(db, "slack/ch/C/t/1.1", now - 20 * 60_000, now - 20 * 60_000);
-				pendingApproval(db, "slack/ch/C/t/1.1", now - 60_000);
+				turn(db, "discord/ch/300000000000000001/t/1700000000000000001", now - 20 * 60_000, now - 20 * 60_000);
+				pendingApproval(db, "discord/ch/300000000000000001/t/1700000000000000001", now - 60_000);
 			});
 			expect(gateState("sweep_stalled").state).toBe("closed");
 			expect(gateState("lanes_stuck")).toEqual({ state: "open", detail: "working_old=1 running=0 approval_wait=0" });
@@ -721,7 +690,7 @@ describe("collectGates", () => {
 		writeStamp(0);
 		seedDb((db) => {
 			const insert =
-				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES ('slack/dm/D', ?, 0, 't', ?, 'confirmed', ?, ?)";
+				"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES ('discord/dm/200000000000000001', ?, 0, 't', ?, 'confirmed', ?, ?)";
 			db.run(insert, ["op0", "ECHO fine", now, now - 5 * 60_000]);
 			db.run(insert, ["op1", "[turn failed] rpc_error — 다시 보내 주세요", now, now - 10 * 60_000]);
 			db.run(insert, ["op2", "[turn failed] rpc_error — 다시 보내 주세요", now, now - 20 * 60_000]);
@@ -741,8 +710,13 @@ describe("collectGates", () => {
 			db.run(
 				"CREATE TABLE usage_daily (day TEXT NOT NULL, origin_key TEXT NOT NULL, cost REAL NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(day, origin_key))",
 			);
-			db.run("INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES (?, 'slack/dm/D', 12.5, 3)", [day]);
-			db.run("INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES ('20200101', 'slack/dm/D', 99, 1)");
+			db.run(
+				"INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES (?, 'discord/dm/200000000000000001', 12.5, 3)",
+				[day],
+			);
+			db.run(
+				"INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES ('20200101', 'discord/dm/200000000000000001', 99, 1)",
+			);
 		});
 		const capGate = (dailyCapUsd: number | undefined) =>
 			collectGates({
@@ -754,24 +728,6 @@ describe("collectGates", () => {
 		expect(capGate(10)).toEqual({ name: "cost_cap", state: "open", detail: "today=12.50 cap=10.00" });
 		expect(capGate(12.5)?.state).toBe("open");
 		expect(capGate(12.51)).toMatchObject({ state: "closed", detail: "today=12.50 cap=12.51" });
-	});
-
-	test("cost_cap closes for a day the owner switched off with !budget off", () => {
-		const day = localDay(now, "Asia/Seoul");
-		seedDb((db) => {
-			db.run(
-				"CREATE TABLE usage_daily (day TEXT NOT NULL, origin_key TEXT NOT NULL, cost REAL NOT NULL, calls INTEGER NOT NULL, PRIMARY KEY(day, origin_key))",
-			);
-			db.run(
-				"CREATE TABLE slack_cursors (cursor_key TEXT PRIMARY KEY, last_ts TEXT NOT NULL, updated_at INTEGER NOT NULL)",
-			);
-			db.run("INSERT INTO usage_daily (day, origin_key, cost, calls) VALUES (?, 'slack/dm/D', 12.5, 3)", [day]);
-			db.run("INSERT INTO slack_cursors (cursor_key, last_ts, updated_at) VALUES (?, '0', 0)", [`cost-cap-off:${day}`]);
-		});
-		const gate = collectGates({ homeDir: home, now, dailyCap: { usd: 10, timezone: "Asia/Seoul" } }).find(
-			(g) => g.name === "cost_cap",
-		);
-		expect(gate).toEqual({ name: "cost_cap", state: "closed", detail: "today=12.50 cap=10.00 off=today" });
 	});
 
 	test("cost_cap reads zero spend on a ledger without usage_daily (an older bot) instead of judging unknown", () => {
@@ -829,38 +785,35 @@ describe("ompbot gates: open, closed and unknown (판정불가)", () => {
 	}
 	const lastLine = (out: string) => out.trimEnd().split("\n").pop();
 
-	test("a home no daemon ever ran in (fresh backup stamp only): exit 0, unknown=9; --strict exits 1; --json counts unknown", () => {
+	test("a home no daemon ever ran in (fresh backup stamp only): exit 0, unknown=8; --strict exits 1; --json counts unknown", () => {
 		writeStamp(0);
 		const plain = runGates([]);
 		expect(plain.code).toBe(0);
 		expect(lastLine(plain.out)).toBe(
-			"gates_done open=0 unknown=9 total=13 unknown_gates=sweep_stalled,slack_disconnected,inbound_starved,origin_silent,deliveries_overdue,lanes_stuck,monitors_failed,monitors_stalled,turns_failing",
+			"gates_done open=0 unknown=8 total=12 unknown_gates=sweep_stalled,inbound_starved,origin_silent,deliveries_overdue,lanes_stuck,monitors_failed,monitors_stalled,turns_failing",
 		);
 		expect(runGates(["--strict"]).code).toBe(1);
 		const json = runGates(["--json"]);
 		expect(json.code).toBe(0);
 		const parsed = JSON.parse(json.out) as { open: number; unknown: number; gates: Array<{ state: string }> };
-		expect(parsed).toMatchObject({ open: 0, unknown: 9 });
-		expect(parsed.gates.filter((gate) => gate.state === "unknown")).toHaveLength(9);
+		expect(parsed).toMatchObject({ open: 0, unknown: 8 });
+		expect(parsed.gates.filter((gate) => gate.state === "unknown")).toHaveLength(8);
 		expect(runGates(["--json", "--strict"]).code).toBe(1);
 	});
 
 	test("a healthy home passes --strict; a corrupt ledger still opens ledger_unreadable with exit 1", () => {
 		writeStamp(0);
-		writeFileSync(
-			join(home, "sweep-heartbeat"),
-			`ts=${new Date(now).toISOString()} loop_ms=0 socket=up socket_since=${new Date(now).toISOString()} draining=0\n`,
-		);
+		writeFileSync(join(home, "sweep-heartbeat"), `ts=${new Date(now).toISOString()} loop_ms=0 draining=0\n`);
 		seedDb(() => {});
 		const strict = runGates(["--strict"]);
-		expect(lastLine(strict.out)).toBe("gates_done open=0 unknown=0 total=13");
+		expect(lastLine(strict.out)).toBe("gates_done open=0 unknown=0 total=12");
 		expect(strict.code).toBe(0);
 
 		writeFileSync(join(home, "ompbot.db"), "not a database at all\n".repeat(500));
 		const corrupt = runGates([]);
 		expect(corrupt.code).toBe(1);
 		expect(corrupt.out).toContain("gate=ledger_unreadable state=open");
-		expect(lastLine(corrupt.out)).toStartWith("gates_done open=1 unknown=0 total=7 opened=ledger_unreadable(");
+		expect(lastLine(corrupt.out)).toStartWith("gates_done open=1 unknown=0 total=6 opened=ledger_unreadable(");
 		expect(runGates(["--strict"]).code).toBe(1);
 	});
 });
@@ -956,7 +909,7 @@ describe("gateOptionsFromConfig: the sweep, /status, `ompbot status` and the das
 			gateOptionsFromConfig({
 				timezone: "Asia/Seoul",
 				ompExecutable,
-				agent: "claude",
+				agent: "agy",
 				ompProfile: "work",
 				offsite: { ssh: "backup", remoteDir: "/b" },
 				channels: { discord: { guildIds: ["1"] } },

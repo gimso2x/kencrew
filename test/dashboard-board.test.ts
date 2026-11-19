@@ -1,8 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
-import { readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type BoardCard,
 	type BoardPromptRef,
 	BoardSource,
 	type BoardTaskRef,
@@ -10,10 +12,18 @@ import {
 	boardView,
 	deepLink,
 } from "../src/dashboard/board";
-import { renderConversation, renderDashboardMain, renderDetailHead, renderPlan } from "../src/dashboard/html";
+import {
+	renderConversation,
+	renderDashboardMain,
+	renderDetailHead,
+	renderDetailTabs,
+	renderPlan,
+} from "../src/dashboard/html";
 import { renderMarkdown } from "../src/dashboard/markdown";
 import { type DashboardBoardOptions, startDashboardServer } from "../src/dashboard/server";
 import { buildSnapshot, type DashboardSnapshot, readBoardPrompts, readBoardTasks } from "../src/dashboard/snapshot";
+import { readCardTrace, type TurnTrace } from "../src/dashboard/trace";
+import { ompSessionDirFor } from "../src/omp/session-dir";
 import { openStore } from "../src/store/db";
 import { makeHome, type TestHome } from "./helpers/bot-home";
 
@@ -238,7 +248,13 @@ afterEach(() => {
 
 /** Fake herdr-web-ui, a board source on it and a dashboard on a temporary port; the machines list is sent. */
 async function setup(
-	options: { tasks?: BoardTaskRef[]; prompts?: BoardPromptRef[]; herdrWebUrl?: string; sendList?: boolean } = {},
+	options: {
+		tasks?: BoardTaskRef[];
+		prompts?: BoardPromptRef[];
+		herdrWebUrl?: string;
+		sendList?: boolean;
+		cardTrace?: (card: BoardCard) => TurnTrace;
+	} = {},
 ): Promise<{ base: string; upstream: FakeHerdrWeb; source: BoardSource }> {
 	const fake = new FakeHerdrWeb();
 	fake.start();
@@ -256,6 +272,7 @@ async function setup(
 		hostname: "127.0.0.1",
 		snapshot: async () => SNAPSHOT,
 		board: boardOptions,
+		...(options.cardTrace === undefined ? {} : { cardTrace: options.cardTrace }),
 	});
 	board.start();
 	await fake.streamOpen();
@@ -401,6 +418,86 @@ describe("agent board", () => {
 			expect(failed.status).toBe(502);
 			expect(await failed.json()).toMatchObject({ error: "upstream" });
 		}
+	});
+
+	test("api/pane/trace: a local omp card's last turn from its worktree's newest session; the rest 404", async () => {
+		const root = mkdtempSync(join(tmpdir(), "ompbot-card-trace-"));
+		try {
+			const sessionsRoot = join(root, "sessions");
+			const dir = ompSessionDirFor(LOCAL_CWD, root, sessionsRoot);
+			mkdirSync(dir, { recursive: true });
+			const file = join(dir, "s.jsonl");
+			const base0 = Date.parse("2026-11-18T01:00:00Z");
+			const at = (ms: number) => new Date(base0 + ms).toISOString();
+			const user = (id: string, ms: number) => ({
+				type: "message",
+				id,
+				timestamp: at(ms),
+				message: { role: "user", content: [] },
+			});
+			const model = (id: string, from: number, to: number) => ({
+				type: "message",
+				id,
+				timestamp: at(to),
+				message: {
+					role: "assistant",
+					model: "opus",
+					timestamp: base0 + from,
+					completedAt: base0 + to,
+					stopReason: "stop",
+					content: [],
+				},
+			});
+			for (const entry of [user("u1", 0), model("a1", 100, 900), user("u2", 5_000), model("a2", 5_100, 5_900)]) {
+				appendFileSync(file, `${JSON.stringify(entry)}\n`);
+			}
+			const { base } = await setup({
+				cardTrace: (card) => readCardTrace(card, { userHome: root, sessionsRoot, now: base0 + 60_000 }),
+			});
+			const ok = await fetch(`${base}/api/pane/trace?card=${encodeURIComponent("w1:p1")}`);
+			expect(ok.status).toBe(200);
+			const body = (await ok.json()) as Extract<TurnTrace, { ok: true }>;
+			// Only the second user message's turn: one model span, counted from that message.
+			expect(body).toMatchObject({ ok: true, live: true, startedAt: base0 + 5_000 });
+			expect(body.root.children?.map((span) => [span.id, span.start, span.end])).toEqual([["a2", 100, 900]]);
+			const no = async (card: string) => {
+				const response = await fetch(`${base}/api/pane/trace?card=${encodeURIComponent(card)}`);
+				return [response.status, await response.json()];
+			};
+			expect(await no("nope:p1")).toEqual([404, { error: "unknown_pane" }]);
+			expect(await no("w1:p3")).toEqual([404, { ok: false, error: "unsupported_card" }]);
+			expect(await no("m-ssh:w9:p1")).toEqual([404, { ok: false, error: "unsupported_card" }]);
+			expect(await no("w1:p2")).toEqual([404, { ok: false, error: "no_session" }]);
+			// A session folder with no user message has no turn either.
+			writeFileSync(file, `${JSON.stringify(model("a1", 100, 900))}\n`);
+			expect(await no("w1:p1")).toEqual([404, { ok: false, error: "no_session" }]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("api/pane/trace without a trace option is 404 trace_disabled", async () => {
+		const { base } = await setup();
+		const off = await fetch(`${base}/api/pane/trace?card=w1:p1`);
+		expect([off.status, await off.json()]).toEqual([404, { error: "trace_disabled" }]);
+	});
+
+	test("the 트레이스 tab is only in a local omp card's tab strip", () => {
+		expect(renderDetailTabs("card", "head")).not.toContain("트레이스");
+		const withTrace = renderDetailTabs("card", "head", true);
+		expect(withTrace.match(/data-tab="/g)?.length).toBe(4);
+		expect(withTrace).toContain('data-tab="trace"');
+	});
+
+	test("the server-drawn page has the 트레이스 tab on a local omp card only", async () => {
+		const { base } = await setup();
+		const strip = async (card: string) =>
+			/<div id="detail-tabs"[^>]*>([\s\S]*?)<\/div>/.exec(
+				await (await fetch(`${base}/?card=${encodeURIComponent(card)}`)).text(),
+			)?.[1];
+		expect(await strip("w1:p1")).toContain('data-tab="trace"');
+		expect(await strip("w1:p3")).not.toContain('data-tab="trace"');
+		expect(await strip("m-ssh:w9:p1")).not.toContain('data-tab="trace"');
 	});
 
 	test("AC-5: every request the dashboard sends upstream is a GET", async () => {
@@ -607,11 +704,11 @@ describe("agent board", () => {
 
 describe("board stream watchdog", () => {
 	/** A board source with a short idle limit on a fresh fake herdr-web-ui, after its first machines list. */
-	async function watched(idleMs: number): Promise<{ fake: FakeHerdrWeb; board: BoardSource }> {
+	async function watched(idleMs: number, now?: () => number): Promise<{ fake: FakeHerdrWeb; board: BoardSource }> {
 		const fake = new FakeHerdrWeb();
 		fake.start();
 		upstream = fake;
-		const board = new BoardSource({ origin: fake.origin, retryMs: 10, idleMs });
+		const board = new BoardSource({ origin: fake.origin, retryMs: 10, idleMs, now });
 		source = board;
 		board.start();
 		await fake.connected(1);
@@ -632,24 +729,27 @@ describe("board stream watchdog", () => {
 		expect(fake.connections).toBeGreaterThanOrEqual(2);
 	});
 
+	/** Waits (bounded macrotask hops, no clock) for `check`; silent chunks fire no board change to listen on. */
+	async function hopsUntil(check: () => boolean, what: string, hops = 400): Promise<void> {
+		for (let hop = 0; hop < hops && !check(); hop += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+		if (!check()) throw new Error(`the board never reached ${what}`);
+	}
+
 	test("comment lines inside idleMs keep the stream and the board", async () => {
-		const { fake, board } = await watched(200);
+		let t = Date.parse("2026-11-11T07:00:00Z");
+		const { fake, board } = await watched(200, () => t);
 		let dropped = false;
 		board.onChange(() => {
 			if (board.current() === undefined) dropped = true;
 		});
-		// The heartbeats are the traffic under test: 24 of them 25 ms apart span three idle limits.
-		const { promise: sent, resolve } = Promise.withResolvers<void>();
-		let beats = 0;
-		const timer = setInterval(() => {
+		// The heartbeats are the traffic under test: 24 of them 25 clock-ms apart span three idle limits. Each beat is
+		// awaited until the watchdog has counted its chunk, and the idle decision reads the injected clock, so a busy
+		// event loop cannot cut the stream between beats.
+		for (let beats = 0; beats < 24; beats += 1) {
+			t += 25;
 			fake.comment();
-			beats += 1;
-			if (beats >= 24) {
-				clearInterval(timer);
-				resolve();
-			}
-		}, 25);
-		await sent;
+			await hopsUntil(() => board.trafficAt === t, `heartbeat ${beats + 1}`);
+		}
 		expect([dropped, board.current() !== undefined, fake.connections]).toEqual([false, true, 1]);
 	});
 });

@@ -7,6 +7,9 @@ import { openStore, type Store } from "../src/store/db";
 
 const DISCORD_CH = "111111111111111111";
 const DISCORD_THREAD = "222222222222222222";
+/** Teams conversation alias (the ledger's stand-in for a Teams conversation id) and an Activity id. */
+const TEAMS_A = "t0123456789abcdef";
+const TEAMS_B = "tfedcba9876543210";
 
 let dir: string;
 let now: number;
@@ -33,10 +36,16 @@ function answer(originKey: string, threadRef: string, messageId: string, body: s
 
 describe("claimDue by platform", () => {
 	beforeEach(() => {
-		answer("slack/ch/C1/t/1.2", "C1:1.2", "C1:1.2", "slack thread");
-		answer("slack/dm/D1", "D1:-", "D1:9.9", "slack top level");
-		// A monitor answer: its origin is no chat key, its thread ref is the owner's Slack DM.
-		store.recordInterim({ originKey: "monitor/x", opRef: "mon-1", threadRef: "D1:-", index: 0, body: "monitor" });
+		answer(`teams/ch/${TEAMS_A}/t/1.2`, `${TEAMS_A}:1.2`, `${TEAMS_A}:1.2`, "teams thread");
+		answer(`teams/dm/${TEAMS_B}`, `${TEAMS_B}:-`, `${TEAMS_B}:9.9`, "teams top level");
+		// A monitor answer: its origin is no chat key, its thread ref is the owner's Teams DM.
+		store.recordInterim({
+			originKey: "monitor/x",
+			opRef: "mon-1",
+			threadRef: `${TEAMS_B}:-`,
+			index: 0,
+			body: "monitor",
+		});
 		answer(
 			`discord/ch/${DISCORD_CH}/t/${DISCORD_THREAD}`,
 			`${DISCORD_CH}:${DISCORD_THREAD}`,
@@ -48,11 +57,11 @@ describe("claimDue by platform", () => {
 	const bodies = (rows: Array<{ body: string }>) => rows.map((row) => row.body);
 	const states = () => Object.fromEntries(store.listDeliveries().map((row) => [row.body, row.state]));
 
-	test("slack takes the Slack thread refs (the monitor delivery included) and leaves the Discord one pending", () => {
-		expect(bodies(store.claimDue(20, "slack"))).toEqual(["slack thread", "slack top level", "monitor"]);
+	test("teams takes the Teams thread refs (the monitor delivery included) and leaves the Discord one pending", () => {
+		expect(bodies(store.claimDue(20, "teams"))).toEqual(["teams thread", "teams top level", "monitor"]);
 		expect(states()).toEqual({
-			"slack thread": "inflight",
-			"slack top level": "inflight",
+			"teams thread": "inflight",
+			"teams top level": "inflight",
 			monitor: "inflight",
 			"discord thread": "pending",
 		});
@@ -61,8 +70,8 @@ describe("claimDue by platform", () => {
 	test("discord takes only the Discord thread ref", () => {
 		expect(bodies(store.claimDue(20, "discord"))).toEqual(["discord thread"]);
 		expect(states()).toEqual({
-			"slack thread": "pending",
-			"slack top level": "pending",
+			"teams thread": "pending",
+			"teams top level": "pending",
 			monitor: "pending",
 			"discord thread": "inflight",
 		});
@@ -70,14 +79,14 @@ describe("claimDue by platform", () => {
 
 	test("the limit counts only the platform's rows; without a platform every due row is claimed as before", () => {
 		expect(bodies(store.claimDue(1, "discord"))).toEqual(["discord thread"]);
-		expect(bodies(store.claimDue())).toEqual(["slack thread", "slack top level", "monitor"]);
+		expect(bodies(store.claimDue())).toEqual(["teams thread", "teams top level", "monitor"]);
 	});
 
 	test("without a platform every due row of every platform is claimed, in delivery order", () => {
-		expect(bodies(store.claimDue())).toEqual(["slack thread", "slack top level", "monitor", "discord thread"]);
+		expect(bodies(store.claimDue())).toEqual(["teams thread", "teams top level", "monitor", "discord thread"]);
 		expect(states()).toEqual({
-			"slack thread": "inflight",
-			"slack top level": "inflight",
+			"teams thread": "inflight",
+			"teams top level": "inflight",
 			monitor: "inflight",
 			"discord thread": "inflight",
 		});
@@ -86,8 +95,8 @@ describe("claimDue by platform", () => {
 
 describe("ledger reads by platform", () => {
 	beforeEach(() => {
-		answer("slack/dm/D1", "D1:1.1", "D1:1.1", "slack dm answer");
-		answer("slack/ch/C1/t/1.2", "C1:1.2", "C1:1.2", "slack thread answer");
+		answer(`teams/dm/${TEAMS_B}`, `${TEAMS_B}:1.1`, `${TEAMS_B}:1.1`, "teams dm answer");
+		answer(`teams/ch/${TEAMS_A}/t/1.2`, `${TEAMS_A}:1.2`, `${TEAMS_A}:1.2`, "teams thread answer");
 		answer(`discord/dm/${DISCORD_CH}`, `${DISCORD_CH}:333333333333333333`, `${DISCORD_CH}:333`, "discord dm answer");
 		answer(
 			`discord/ch/${DISCORD_CH}/t/${DISCORD_THREAD}`,
@@ -103,7 +112,7 @@ describe("ledger reads by platform", () => {
 			`discord/ch/${DISCORD_CH}/t/${DISCORD_THREAD}`,
 			`discord/dm/${DISCORD_CH}`,
 		]);
-		expect(store.listOrigins("slack")).toEqual(["slack/ch/C1/t/1.2", "slack/dm/D1"]);
+		expect(store.listOrigins("teams")).toEqual([`teams/ch/${TEAMS_A}/t/1.2`, `teams/dm/${TEAMS_B}`]);
 	});
 
 	test("listThreadTargets returns the platform's answered threads only", () => {
@@ -113,10 +122,10 @@ describe("ledger reads by platform", () => {
 			`${DISCORD_CH}:${DISCORD_THREAD}`,
 			`${DISCORD_CH}:333333333333333333`,
 		]);
-		expect(sorted(store.listThreadTargets("slack", 0, 50))).toEqual(["C1:1.2", "D1:1.1"]);
+		expect(sorted(store.listThreadTargets("teams", 0, 50))).toEqual([`${TEAMS_A}:1.2`, `${TEAMS_B}:1.1`]);
 	});
 
-	test("listRecallCandidates of a Discord conversation reads its Discord rows and no Slack row", () => {
+	test("listRecallCandidates of a Discord conversation reads its Discord rows and no Teams row", () => {
 		const candidates = store.listRecallCandidates(DISCORD_CH, "none", 50);
 		expect(candidates.length).toBeGreaterThan(0);
 		for (const candidate of candidates) expect(candidate.originKey.startsWith(`discord/`)).toBe(true);
@@ -124,14 +133,13 @@ describe("ledger reads by platform", () => {
 			new Set([`discord/dm/${DISCORD_CH}`, `discord/ch/${DISCORD_CH}/t/${DISCORD_THREAD}`]),
 		);
 		expect(candidates.map((c) => c.text)).toContain("discord thread answer");
-		const slack = store.listRecallCandidates("D1", "none", 50);
-		expect(slack.map((c) => c.originKey)).toEqual(["slack/dm/D1", "slack/dm/D1"]);
+		const teams = store.listRecallCandidates(TEAMS_B, "none", 50);
+		expect(teams.map((c) => c.originKey)).toEqual([`teams/dm/${TEAMS_B}`, `teams/dm/${TEAMS_B}`]);
 	});
 
-	test("ownerDmOrigin reads the platform's DM origin; Slack stays the default", () => {
-		expect(store.ownerDmOrigin()).toBe("slack/dm/D1");
+	test("ownerDmOrigin reads the platform's DM origin", () => {
 		expect(store.ownerDmOrigin("discord")).toBe(`discord/dm/${DISCORD_CH}`);
-		expect(store.ownerChannel()).toBe("D1");
+		expect(store.ownerDmOrigin("teams")).toBe(`teams/dm/${TEAMS_B}`);
 	});
 });
 
@@ -140,7 +148,7 @@ describe("expired rows go back to their platform's adapter", () => {
 	const bodies = (rows: Array<{ body: string }>) => rows.map((row) => row.body);
 
 	test("a row the sweep expired is handed once to the adapter of its platform, whichever adapter swept", () => {
-		answer("slack/dm/D1", "D1:1.1", "D1:1.1", "slack answer");
+		answer(`teams/dm/${TEAMS_B}`, `${TEAMS_B}:1.1`, `${TEAMS_B}:1.1`, "teams answer");
 		answer(
 			`discord/ch/${DISCORD_CH}/t/${DISCORD_THREAD}`,
 			`${DISCORD_CH}:${DISCORD_THREAD}`,
@@ -148,21 +156,21 @@ describe("expired rows go back to their platform's adapter", () => {
 			"discord answer",
 		);
 		now += DAY;
-		expect(store.claimDue(20, "slack")).toEqual([]);
+		expect(store.claimDue(20, "teams")).toEqual([]);
 		expect(store.listDeliveries().map((row) => row.state)).toEqual(["expired", "expired"]);
-		expect(bodies(store.takeExpired("slack"))).toEqual(["slack answer"]);
-		expect(store.takeExpired("slack")).toEqual([]);
+		expect(bodies(store.takeExpired("teams"))).toEqual(["teams answer"]);
+		expect(store.takeExpired("teams")).toEqual([]);
 		expect(bodies(store.takeExpired("discord"))).toEqual(["discord answer"]);
 		expect(store.takeExpired("discord")).toEqual([]);
 	});
 
 	test("a failed send that expires is not handed over again: the pump already finished it", () => {
-		answer("slack/dm/D1", "D1:1.1", "D1:1.1", "slack answer");
-		const [claimed] = store.claimDue(20, "slack");
+		answer(`teams/dm/${TEAMS_B}`, `${TEAMS_B}:1.1`, `${TEAMS_B}:1.1`, "teams answer");
+		const [claimed] = store.claimDue(20, "teams");
 		if (claimed === undefined) throw new Error("nothing claimed");
 		now += DAY;
 		expect(store.failDelivery(claimed.deliveryId, "channel_not_found").state).toBe("expired");
-		expect(store.claimDue(20, "slack")).toEqual([]);
-		expect(store.takeExpired("slack")).toEqual([]);
+		expect(store.claimDue(20, "teams")).toEqual([]);
+		expect(store.takeExpired("teams")).toEqual([]);
 	});
 });

@@ -17,7 +17,7 @@ import { type FreezeState, frozenMessage } from "../ops/freeze";
 import { redact } from "../redact";
 import type { Store } from "../store/db";
 import { type TaskCheck, type TaskChecksRun, taskChecksOf } from "../tasks/checker";
-import { worktreePathOf } from "../tasks/docs";
+import { oneLine, parseTierConfidence, worktreePathOf } from "../tasks/docs";
 import { runWorktreeChecks } from "../tasks/evaluate";
 import { createTaskHostOps, type TaskHostOps } from "../tasks/host";
 import { type AutoLandPolicy, cardMessage, type LaneQaPolicy } from "../tasks/notify";
@@ -26,6 +26,7 @@ import { applyRiskFloor } from "../tasks/risk-floor";
 import { CHECK_TIMEOUT_MS, type SignalCheck } from "../tasks/signals";
 import { resolveWorkerTier } from "../tasks/worker-tier";
 import { localDay } from "../time";
+import type { WikiNotes } from "../wiki/notes";
 import { changedFilesSince, fileSize, headOf, sessionDelta } from "./attach";
 import {
 	buildLaneOutcomeCard,
@@ -54,6 +55,7 @@ import {
 	type LandResult,
 	laneLandBlockers,
 	laneQaRisk,
+	pushedOutside,
 } from "./land";
 import { cleanQaWorktrees, createGateSlot, type GateSlot, qaDepsOf, runLaneQa, untilAborted } from "./qa";
 import { formatConfidence, type LaneReviewDeps, reviewLane } from "./review";
@@ -73,6 +75,7 @@ import {
 	type LaneRow,
 	type LaneStatus,
 	laneOriginKey,
+	OWNER_ACCEPTED,
 	OWNER_PAUSE_HELD,
 } from "./status";
 import {
@@ -192,7 +195,15 @@ const OVERLAP_REPLY = "검증이 돌고 있어 끝나는 대로 새 클레임을
 const STOPPED_REPLY = "코어가 멈춰 검사를 중단했습니다. 다시 시작한 뒤 코어가 다시 판정합니다.";
 const CHECK_DETAIL_MAX = 120;
 
+function failedChecksOf(lane: LaneRow): TaskCheck[] {
+	const checks = lane.meta.checks;
+	if (checks === undefined || checks.head === "") return [];
+	return checks.results.filter((result) => !result.ok && !result.inconclusive);
+}
+
 export interface LaneManagerDeps {
+	/** `herdrBoard.url` as of now (live config); the owner-facing cards link the dashboard's diff view under it. */
+	boardUrl?(): string | undefined;
 	store: Store;
 	channels: ChannelRegistry;
 	clock: MailboxClock;
@@ -261,6 +272,11 @@ export interface LaneManagerDeps {
 	 * Absent: nothing is written.
 	 */
 	followupsFile?: string;
+	/**
+	 * The wiki result note of a landed lane (`src/wiki`): the draft is kept when a landing begins and the note is written
+	 * once the lane is `landed`. Absent: no note. Never throws.
+	 */
+	wikiNotes?: Pick<WikiNotes, "laneDraft" | "laneDropDraft" | "laneLanded">;
 	/** Git for the core's rebase of a lane whose landing was not fast-forward (test seam; default `defaultGit`). */
 	rebaseGit?: GitRunner;
 	/**
@@ -320,8 +336,8 @@ function slugify(title: string): string {
 }
 
 /**
- * Work lanes: one omp session per long task with its own Slack thread, a registry row and a verified end.
- * The Slack root message reads `🔄 title` while the lane is open and `✅ title` once a done claim passed the
+ * Work lanes: one omp session per long task with its own thread, a registry row and a verified end.
+ * The root message reads `🔄 title` while the lane is open and `✅ title` once a done claim passed the
  * core's own git check; `⏳ title · mm:ss` in the thread is the status message edited in place.
  */
 export class LaneManager {
@@ -484,6 +500,12 @@ export class LaneManager {
 		scope?: unknown;
 		/** A `lanes.models` tier; absent: the bot's default model. */
 		model?: unknown;
+		/** One line on why that tier (masked, one line); blank or absent keeps the default wording. */
+		tierReason?: unknown;
+		/** The judge's confidence in the tier, 0..1; anything else is a refusal. */
+		tierConfidence?: unknown;
+		/** The conversation that started the lane (`meta.parentOrigin`, read by the request trace). */
+		parentOrigin?: string;
 	}): Promise<LaneRow & { startNote?: string }> {
 		const { store, channels, clock, log } = this.#deps;
 		const frozen = this.#deps.frozen?.();
@@ -500,6 +522,11 @@ export class LaneManager {
 		const scope = parseLaneScope(input.scope);
 		if (!scope.ok) throw new LaneInputError(scope.problem);
 		const requestedTier = this.#laneTier(input.model);
+		const tierConfidence = parseTierConfidence(input.tierConfidence);
+		if (tierConfidence === null) throw new LaneInputError("tierConfidence는 0 이상 1 이하의 숫자여야 합니다.");
+		if (input.tierReason !== undefined && typeof input.tierReason !== "string")
+			throw new LaneInputError("tierReason은 문자열이어야 합니다.");
+		const givenReason = input.tierReason === undefined ? "" : redact(oneLine(input.tierReason));
 		// Kept for the independent review: the spec it reads first. A cut one says so inside, so the review knows the
 		// rest is missing; the lane itself gets the whole brief.
 		const fullBrief = redact(input.brief?.trim() ?? "");
@@ -512,7 +539,11 @@ export class LaneManager {
 		// The tier follows the final risk (floor applied; a lane nobody rated counts as DEFAULT_LANE_RISK).
 		const worker = resolveWorkerTier(
 			floored.risk,
-			{ tier: requestedTier, tierReason: requestedTier === undefined ? `위험 ${floored.risk} 기본` : "요청" },
+			{
+				tier: requestedTier,
+				tierReason:
+					givenReason !== "" ? givenReason : requestedTier === undefined ? `위험 ${floored.risk} 기본` : "요청",
+			},
 			this.#deps.laneModels?.(),
 		);
 		const model = splitModelThinking(worker.model);
@@ -591,6 +622,7 @@ export class LaneManager {
 					steerSeq: 0,
 					baseSha,
 					laneId,
+					...(input.parentOrigin === undefined ? {} : { parentOrigin: input.parentOrigin }),
 					repo,
 					worktree,
 					branch,
@@ -600,6 +632,7 @@ export class LaneManager {
 					...(input.risk === undefined && floored.risk === risk.value ? {} : { risk: floored.risk }),
 					tier: worker.tier,
 					tierReason: worker.tierReason,
+					...(tierConfidence === undefined ? {} : { tierConfidence }),
 					...(worker.model === null ? {} : { workerModel: worker.model }),
 					acceptance: acceptance.value,
 					...(scope.value.length === 0 ? {} : { scope: scope.value }),
@@ -1278,7 +1311,7 @@ export class LaneManager {
 			}
 			// The owner may have answered (back to working) while git ran: that claim is void.
 			if (store.getLane(name)?.status !== "done-claimed") return { text: "claim superseded by the owner" };
-			if (!result.ok) return this.#heldByFreeze(name, fromTick) ?? this.#notDone(lane, result.reasons);
+			if (!result.ok) return this.#heldByFreeze(name, fromTick) ?? (await this.#notDone(lane, result.reasons));
 			// Git proved the commit; the claim's own text and diff still have to read as finished work.
 			const refusals = await this.#integrityRefusals(lane, claim, result.sha);
 			// Awaited here: the `finally` must not clear `#settling` while the checks or the approval card still run.
@@ -1472,7 +1505,7 @@ export class LaneManager {
 		// either way this claim is void.
 		const superseded = this.#claimSuperseded(lane);
 		if (superseded !== undefined) return superseded;
-		if (reasons.length > 0) return this.#heldByFreeze(lane.name, fromTick) ?? this.#notDone(lane, reasons);
+		if (reasons.length > 0) return this.#heldByFreeze(lane.name, fromTick) ?? (await this.#notDone(lane, reasons));
 		if (tries !== undefined) return this.#inconclusive(lane, sha, inconclusive, tries.runs, capped, fromTick, held);
 		return this.#close(lane, sha, held);
 	}
@@ -1538,11 +1571,17 @@ export class LaneManager {
 	}
 
 	/**
-	 * `closed`: the claim is proven (`held`: the owner let it through, `INTEGRITY_APPROVED` or `INCONCLUSIVE_APPROVED`). A worktree lane now waits for its merge (`meta.land` pending): the Outcome card
-	 * goes up in the background and, when `taskAutoLand` has no objection, the core lands it. A lane without a
-	 * worktree (an older row) is simply done.
+	 * `closed`: the claim is proven (`held`: the owner let it through, `INTEGRITY_APPROVED`, `INCONCLUSIVE_APPROVED`
+	 * or `OWNER_ACCEPTED`). A worktree lane now waits for its merge (`meta.land` pending): the Outcome card goes up in
+	 * the background and, when `taskAutoLand` has no objection, the core lands it. A lane without a worktree (an older
+	 * row) is simply done.
 	 */
-	async #close(lane: LaneRow, sha: string, held: string | undefined): Promise<SettleOutcome> {
+	async #close(
+		lane: LaneRow,
+		sha: string,
+		held: string | undefined,
+		expected: { status: "done-claimed" | "not-done"; detail?: string } = { status: "done-claimed" },
+	): Promise<SettleOutcome> {
 		const { repo, worktree, branch, baseBranch } = lane.meta;
 		const lands = repo !== undefined && worktree !== undefined && branch !== undefined && baseBranch !== undefined;
 		const land: LaneLand = {
@@ -1557,12 +1596,25 @@ export class LaneManager {
 			this.#deps.log.warn("lane_scope_check_failed", { lane: lane.name, error: scope.scopeError });
 		}
 		// The owner may have paused or answered, or the lane claimed again, while git ran.
-		const superseded = lands ? this.#claimSuperseded(lane) : undefined;
-		if (superseded !== undefined) return superseded;
+		if (expected.status === "not-done") {
+			const current = this.#deps.store.getLane(lane.name);
+			if (current?.status !== "not-done") {
+				return { text: `닫을 상태가 아닙니다 (${current?.status ?? "레인 없음"}).` };
+			}
+			if (current.meta.checks?.head !== sha || failedChecksOf(current).length === 0) {
+				return { text: "그사이 검사 상태가 바뀌어 닫지 않았습니다." };
+			}
+			if (this.#deps.laneBusy?.(current.originKey) === true) {
+				return { text: '레인이 아직 작업 중입니다. 끝난 뒤 다시 "닫아"라고 해 주세요.' };
+			}
+		} else {
+			const superseded = lands ? this.#claimSuperseded(lane) : undefined;
+			if (superseded !== undefined) return superseded;
+		}
 		const closed = this.#deps.store.transitionLane(
 			lane.name,
 			"closed",
-			{ event: "closed", sha },
+			{ event: "closed", sha, ...(expected.detail === undefined ? {} : { detail: expected.detail }) },
 			{ sha, milestone: undefined, ...(lands ? { land, ...scope } : {}) },
 		);
 		this.#deps.log.info("lane_closed", { lane: lane.name, sha });
@@ -1572,8 +1624,9 @@ export class LaneManager {
 			.stopWhenIdle(lane.originKey)
 			.catch((error: unknown) => this.#deps.log.error("lane_stop_failed", { lane: lane.name, error: String(error) }));
 		if (lands) this.#spawn(lane.name, () => this.#announce(lane.name));
+		const prefix = held === OWNER_ACCEPTED ? `오너 수락으로 닫았습니다: 커밋 ${sha}.` : `검증 통과: 커밋 ${sha}.`;
 		return {
-			text: `검증 통과: 커밋 ${sha}. 레인 ${lane.name}을 닫았습니다.${lands ? ` ${branch}를 ${baseBranch}에 합치는 일은 코어와 오너가 합니다(스레드의 Outcome 카드).` : ""}`,
+			text: `${prefix} 레인 ${lane.name}을 닫았습니다.${lands ? ` ${branch}를 ${baseBranch}에 합치는 일은 코어와 오너가 합니다(스레드의 Outcome 카드).` : ""}`,
 			row: rendered,
 		};
 	}
@@ -2033,6 +2086,8 @@ export class LaneManager {
 		// An auto-merge speaks up when it fails (nobody clicked anything); so does a landing the tick resumed.
 		const unattended = by === "auto" || resumed;
 		log.info("lane_land_started", { lane: name, by, push, resumed });
+		// Before the landing removes the worktree and branch: the note's content is collected while they exist.
+		await this.#deps.wikiNotes?.laneDraft(lane);
 		let result: LandResult;
 		try {
 			// An idle child of this lane (it answered a question after closing) still has the worktree as its cwd.
@@ -2053,6 +2108,7 @@ export class LaneManager {
 		const short = sha.slice(0, 12);
 		if (result.state === "not-ff") {
 			const attempts = land.attempts + 1;
+			this.#deps.wikiNotes?.laneDropDraft(lane);
 			if (attempts < LAND_ATTEMPTS_MAX) return this.#backToWork(lane, attempts, result.reason);
 			result = {
 				state: "blocked",
@@ -2061,6 +2117,7 @@ export class LaneManager {
 			this.#patchLand(name, { attempts });
 		}
 		if (result.state === "blocked") {
+			this.#deps.wikiNotes?.laneDropDraft(lane);
 			const row = this.#patchLand(
 				name,
 				{ state: "blocked", reason: result.reason, requestedBy: undefined, errors: undefined },
@@ -2103,6 +2160,7 @@ export class LaneManager {
 			{ event: "landed", sha, ...(result.pushed === undefined ? {} : { detail: `push ${result.pushed}` }) },
 		);
 		log.info("lane_landed", { lane: name, sha, pushed: result.pushed ?? "none", by });
+		await this.#deps.wikiNotes?.laneLanded(row);
 		this.#dropReviewFiles(row);
 		await this.#showResult(await this.#sync(row, "transition"), false);
 		await this.#recordFollowups(row);
@@ -2271,6 +2329,90 @@ export class LaneManager {
 		}
 	}
 
+	/**
+	 * Closes a `not-done` lane whose `[check: …]` failed (e.g. a criterion deferred by plan) when the owner writes
+	 * `닫아` in its thread: sets `autoLandHeld = OWNER_ACCEPTED` so auto-merge skips it and the owner decides `머지해` /
+	 * `폐기해` on the Outcome card. Never accepts a lane whose HEAD moved past the checked commit or has dirty work.
+	 */
+	async acceptByOwner(name: string): Promise<LaneRequestOutcome> {
+		const { store, log } = this.#deps;
+		const lane = store.getLane(name);
+		if (lane?.status !== "not-done") {
+			return { handled: false, text: `닫을 상태가 아닙니다 (${lane?.status ?? "레인 없음"}).` };
+		}
+		const worktree = lane.meta.worktree;
+		if (worktree === undefined) {
+			return { handled: false, text: "worktree가 없는 레인입니다." };
+		}
+		const checksHead = lane.meta.checks?.head;
+		const failed = failedChecksOf(lane);
+		if (checksHead === undefined || checksHead === "" || failed.length === 0) {
+			return { handled: false, text: "실패한 검사가 없습니다 — 닫을 이유가 검사 실패가 아닙니다." };
+		}
+		if (this.#settling.has(name)) {
+			return { handled: false, text: "레인의 완료 검증이 진행 중입니다. 끝난 뒤 다시 시도해 주세요." };
+		}
+		if (this.#landing.has(name)) {
+			return { handled: false, text: "이미 닫기 또는 머지 처리가 진행 중입니다." };
+		}
+		if (this.#coreRebasing.has(lane.originKey)) {
+			return { handled: false, text: "코어 rebase가 진행 중입니다. 끝난 뒤 다시 시도해 주세요." };
+		}
+		if (this.#deps.laneBusy?.(lane.originKey) === true) {
+			return { handled: false, text: '레인이 아직 작업 중입니다. 끝난 뒤 다시 "닫아"라고 해 주세요.' };
+		}
+		this.#landing.add(name);
+		let closedLands = false;
+		try {
+			let head: { sha: string; clean: boolean };
+			try {
+				head = await this.#ops.headOf(worktree);
+			} catch (error) {
+				return {
+					handled: false,
+					text: `worktree 상태를 확인하지 못했습니다: ${error instanceof Error ? error.message : String(error)}`,
+				};
+			}
+			if (head.sha !== checksHead) {
+				return { handled: false, text: "HEAD가 마지막 검사 커밋이 아닙니다 — 레인이 새 커밋을 냈습니다." };
+			}
+			if (!head.clean) {
+				return {
+					handled: false,
+					text: "worktree에 커밋하지 않은 변경이 있습니다 — 모두 커밋한 뒤 다시 시도해 주세요.",
+				};
+			}
+			const current = store.getLane(name);
+			if (current?.status !== "not-done") {
+				return { handled: false, text: `닫을 상태가 아닙니다 (${current?.status ?? "레인 없음"}).` };
+			}
+			const currentFailed = failedChecksOf(current);
+			if (current.meta.checks?.head !== checksHead || currentFailed.length === 0) {
+				return { handled: false, text: "그사이 검사 상태가 바뀌어 닫지 않았습니다." };
+			}
+			if (
+				this.#settling.has(name) ||
+				this.#coreRebasing.has(current.originKey) ||
+				this.#deps.laneBusy?.(current.originKey) === true
+			) {
+				return { handled: false, text: '레인이 아직 작업 중입니다. 끝난 뒤 다시 "닫아"라고 해 주세요.' };
+			}
+			const failedIds = currentFailed.map((check) => check.id).join(", ");
+			const outcome = await this.#close(current, checksHead, OWNER_ACCEPTED, {
+				status: "not-done",
+				detail: `오너 수락 · 실패 검사 ${failedIds}`,
+			});
+			if (outcome.row === undefined) return { handled: false, text: outcome.text };
+			closedLands = outcome.row.meta.land !== undefined;
+			log.warn("lane_owner_accepted", { lane: name, sha: checksHead, checks: failedIds });
+			return { handled: true, text: outcome.text };
+		} finally {
+			this.#landing.delete(name);
+			// `#close` spawned `#announce` while `#landing` held `name`, so it returned early; post the Outcome card now.
+			if (closedLands) this.#spawn(name, () => this.#announce(name));
+		}
+	}
+
 	/** The owner to mention on the lane's cards: the one configured for the platform of the lane's thread. */
 	#ownerOf(lane: LaneRow): string | undefined {
 		const owner = this.#deps.ownerUserId;
@@ -2281,7 +2423,7 @@ export class LaneManager {
 
 	/**
 	 * Link to the lane's thread where it is not the conversation the lane was asked from (a platform whose threads are
-	 * opened apart, Discord); `undefined` on Slack or when the lookup fails (logged).
+	 * opened apart, Discord); `undefined` when the platform has none or when the lookup fails (logged).
 	 */
 	async threadLink(lane: LaneRow): Promise<string | undefined> {
 		const parsed = parseThreadRef(lane.threadRef);
@@ -2305,7 +2447,7 @@ export class LaneManager {
 		const route = this.#deps.channels.forThreadRef(lane.threadRef);
 		if (route === undefined) return undefined;
 		try {
-			const card = buildLaneOutcomeCard(lane, view, route.port.platform);
+			const card = buildLaneOutcomeCard(lane, view, this.#deps.boardUrl?.());
 			return (await route.port.post(route.target, cardMessage(card, route.port))).messageId;
 		} catch (error) {
 			this.#deps.log.warn("lane_card_post_failed", { lane: lane.name, error: String(error) });
@@ -2318,7 +2460,7 @@ export class LaneManager {
 		const route = this.#deps.channels.forThreadRef(lane.threadRef);
 		if (route === undefined) return;
 		try {
-			const card = buildLaneOutcomeCard(lane, view, route.port.platform);
+			const card = buildLaneOutcomeCard(lane, view, this.#deps.boardUrl?.());
 			await route.port.edit(
 				{
 					platform: route.port.platform,
@@ -2357,7 +2499,7 @@ export class LaneManager {
 		return { text: "held while frozen" };
 	}
 
-	#notDone(lane: LaneRow, reasons: string[]): SettleOutcome {
+	async #notDone(lane: LaneRow, reasons: string[]): Promise<SettleOutcome> {
 		// The owner paused while the verdict ran: not-done cannot land now (paused takes no transition, no steer).
 		if (this.#deps.store.getLane(lane.name)?.status === "paused") {
 			this.#deps.log.warn("lane_notdone_held_paused", { lane: lane.name });
@@ -2370,18 +2512,19 @@ export class LaneManager {
 			{},
 		);
 		this.#deps.log.info("lane_not_done", { lane: lane.name, reasons: reasons.length });
+		const rendered = await this.#sync(row, "transition");
 		// Frozen: no autonomous re-prompt into a running lane. The lane stays not-done; the next verdict after unfreeze steers.
 		if (this.#deps.frozen?.() !== undefined) this.#deps.log.warn("lane_send_held_frozen", { lane: lane.name });
 		else this.#send(lane.name, "not-done", buildNotDonePrompt(reasons));
 		return {
 			text: `[not-done] 완료 주장이 검증을 통과하지 못했습니다:\n${reasons.map((r) => `- ${r}`).join("\n")}`,
-			row,
+			row: rendered,
 		};
 	}
 
 	/**
 	 * Periodic work: start the verdict of claims older than the grace period (not awaited — a check or an approval card
-	 * of one lane never holds the others), then reconcile the Slack messages of every lane not being judged. The rows
+	 * of one lane never holds the others), then reconcile the messages of every lane not being judged. The rows
 	 * `listLanes` parsed are reused for the reconcile, so one sweep parses each lane's history once. A lane being judged
 	 * is left alone this tick: its verdict draws its own transition, and the next tick reconciles the rest.
 	 */
@@ -2414,6 +2557,7 @@ export class LaneManager {
 				await this.#sync(lane, "tick");
 				await this.#tickLanding(lane);
 				if (lane.status === "not-done") await this.#closeIfLandedOutside(lane.name);
+				if (lane.meta.land?.state === "merged-not-pushed") await this.#markPushedOutside(lane.name);
 			} catch (error) {
 				this.#deps.log.error("lane_tick_failed", { lane: lane.name, error: String(error) });
 			}
@@ -2506,6 +2650,9 @@ export class LaneManager {
 			{ sha, milestone: undefined, land },
 		);
 		log.info("lane_landed_outside", { lane: name, sha, pushed: pushed ? `origin/${baseBranch}` : "none" });
+		// Before the worktree and branch go.
+		const landed = store.getLane(name);
+		if (landed !== undefined) await this.#deps.wikiNotes?.laneLanded(landed);
 		// An idle child of this lane still has the worktree as its cwd.
 		await this.#deps.stopWhenIdle(lane.originKey);
 		await this.#ops.removeWorktree({ repo, worktree, branch });
@@ -2523,6 +2670,42 @@ export class LaneManager {
 		if (row !== undefined) await this.#sync(row, "transition");
 	}
 
+	/**
+	 * A `merged-not-pushed` lane whose merge reached `origin/<baseBranch>` afterwards (`pushedOutside`): becomes
+	 * `landed` with `pushed`, so its root and card stop showing ⚠️. A git call that fails changes nothing and is logged.
+	 */
+	async #markPushedOutside(name: string): Promise<void> {
+		const { store, log } = this.#deps;
+		const lane = store.getLane(name);
+		const { repo, baseBranch, sha } = lane?.meta ?? {};
+		if (
+			lane?.status !== "closed" ||
+			lane.meta.land?.state !== "merged-not-pushed" ||
+			repo === undefined ||
+			baseBranch === undefined ||
+			sha === undefined ||
+			this.#landing.has(name)
+		) {
+			return;
+		}
+		let pushed: boolean;
+		try {
+			pushed = await pushedOutside(defaultGit, { repo, baseBranch, sha });
+		} catch (error) {
+			log.warn("lane_pushed_outside_check_failed", { lane: name, error: String(error).slice(0, 300) });
+			return;
+		}
+		if (!pushed) return;
+		const row = this.#patchLand(
+			name,
+			{ state: "landed", reason: undefined, pushed: `origin/${baseBranch}` },
+			{ event: "landed", sha, detail: `push origin/${baseBranch} · 레인 밖에서 push됨` },
+		);
+		log.info("lane_pushed_outside", { lane: name, sha, pushed: `origin/${baseBranch}` });
+		await this.#deps.wikiNotes?.laneLanded(row);
+		await this.#showResult(await this.#sync(row, "transition"), false);
+	}
+
 	#requireLane(originKey: string): LaneRow {
 		const lane = this.#deps.store.getLaneByOrigin(originKey);
 		if (!lane) throw new Error(`no work lane for origin ${originKey}`);
@@ -2530,10 +2713,10 @@ export class LaneManager {
 	}
 
 	/**
-	 * Brings the root and status messages to what the registry says. `meta.rendered*` remembers what Slack shows, so a
+	 * Brings the root and status messages to what the registry says. `meta.rendered*` remembers what the chat shows, so a
 	 * failed edit is simply retried by the next tick. Working status edits follow the 15-minute cadence unless the
 	 * reason is a milestone or a transition. Callers pass the row they already hold (the tick reuses its `listLanes`
-	 * read; a transition passes the row its write returned) so no lane row is parsed a second time; the row as Slack
+	 * read; a transition passes the row its write returned) so no lane row is parsed a second time; the row as the chat
 	 * now shows it is returned for the caller to keep using.
 	 */
 	async #sync(lane: LaneRow, reason: "transition" | "milestone" | "tick"): Promise<LaneRow> {
@@ -2542,7 +2725,7 @@ export class LaneManager {
 		const parsed = parseThreadRef(lane.threadRef);
 		if (parsed === undefined) return lane;
 		const { channel, threadTs: rootTs } = parsed;
-		// Its platform is off (e.g. Slack disabled): nothing to draw on. The row keeps what was last shown, so the first
+		// Its platform is off (e.g. Discord disabled): nothing to draw on. The row keeps what was last shown, so the first
 		// draw after the channel registers again brings it up to date.
 		if (channels.forConversation(channel) === undefined) {
 			if (!this.#unroutableWarned.has(name)) {
@@ -2556,24 +2739,30 @@ export class LaneManager {
 		const now = clock.now();
 		// A closed lane is ✅ only once its work is in the base branch (or it never had a branch of its own).
 		const [mark, waiting] = !closed ? ["🔄", ""] : CLOSED_MARKS[lane.meta.land?.state ?? "landed"];
-		// The title and milestone are the model's words: Slack mention syntax in them stays text.
+		// The title and milestone are the model's words: mention syntax in them stays text.
 		const title = escapeMrkdwn(lane.title);
 		const rootText = `${mark} ${title}`;
 		const milestone = lane.meta.milestone === undefined ? "" : `\n↳ ${escapeMrkdwn(lane.meta.milestone)}`;
 		// Paused pins its status (no elapsed clock) and is drawn at the transition, never on the 15-minute tick.
 		const attached = lane.meta.attach !== undefined;
+		const acceptHint =
+			!closed && !attached && !paused && lane.status === "not-done" && failedChecksOf(lane).length > 0
+				? ' · 계획대로 보류한 검사면 "닫아"'
+				: "";
 		const statusText = closed
 			? `${mark} ${title}${waiting === "" ? "" : ` · ${waiting}`}`
 			: attached
 				? `🖥 ${title} · 터미널에서 작업 중`
 				: paused
 					? `⏸ ${title} · 멈춤`
-					: `⏳ ${title} · ${formatElapsed(now - lane.meta.startedAt)}${milestone}`;
+					: `⏳ ${title} · ${formatElapsed(now - lane.meta.startedAt)}${milestone}${acceptHint}`;
 		const statusDue = closed
 			? lane.meta.renderedStatus !== statusText
 			: paused
 				? lane.meta.renderedStatus !== statusText // drawn once; a tick only retries a draw that failed
-				: reason !== "tick" || now - lane.meta.lastProgressAt >= PROGRESS_INTERVAL_MS;
+				: reason !== "tick" ||
+					(acceptHint !== "" && !(lane.meta.renderedStatus ?? "").endsWith(acceptHint)) ||
+					now - lane.meta.lastProgressAt >= PROGRESS_INTERVAL_MS;
 		// The owner holds or resumes the lane from the status message itself (closed lanes have their Outcome card).
 		// Attached: the terminal hands the lane back, so no button would do anything.
 		const statusButtons: readonly ActionButton[] =

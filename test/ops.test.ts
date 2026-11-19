@@ -12,11 +12,12 @@ import {
 	rmSync,
 	statSync,
 	symlinkSync,
+	unlinkSync,
 	utimesSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { STALL_STATUS_TEXT } from "../src/channel/text";
 import { doctorCommand } from "../src/cli/index";
 import {
@@ -40,6 +41,7 @@ import { Daemon, type DaemonOptions, GATE_RESOLVE_CLOSED_SWEEPS } from "../src/d
 import { checkBackupBundle, runDoctor } from "../src/daemon/doctor";
 import { SWEEP_HEARTBEAT_FILE } from "../src/daemon/heartbeat";
 import { renderStatusText } from "../src/daemon/status";
+import type { EditMessageArgs } from "../src/discord/transport";
 import { herdrSshArgv, type ProcessRunner, type RunProcessResult } from "../src/dispatch/omp";
 import { createLogger } from "../src/log";
 import { MONITOR_SCHEMA } from "../src/monitors/ledger";
@@ -51,16 +53,24 @@ import { gcSessions } from "../src/ops/gc";
 import { IDLE_HOST_LOAD } from "../src/ops/host-resources";
 import { LOG_FILES, LOG_MAX_BYTES, LogDirError, openLogSink, rotatingFileSink } from "../src/ops/logfile";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import type { SlackTransport } from "../src/slack/transport";
 import { ALERT_INCIDENT_REPEAT_MS, type Store } from "../src/store/db";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	BOT,
+	CHANNEL,
+	discordBinding,
+	GUILD,
+	makeHome,
+	OWNER,
+	OWNER_DM,
+	ownerMessage,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { killSpawned, runMain, spawnDaemon } from "./helpers/daemon-process";
-import { OFFLINE_DOCTOR, slackAuthOk } from "./helpers/doctor-network";
+import { OFFLINE_DOCTOR } from "./helpers/doctor-network";
 import { isRoot } from "./helpers/privileges";
 
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = `discord/dm/${OWNER_DM}`;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 class FakeClock {
@@ -193,16 +203,16 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		await router.mailbox(ORIGIN).sweepIdle(); // runs behind the exit handler on the actor's chain
 
 		expect(lines.find((l) => l.includes("event=turn_start"))).toMatch(
-			/ level=info event=turn_start origin=slack\/dm\/D1 epoch=1 opRef=\S+$/,
+			/ level=info event=turn_start origin=discord\/dm\/200000000000000001 epoch=1 opRef=\S+$/,
 		);
 		expect(lines.find((l) => l.includes("event=steer_delivered"))).toMatch(
-			/ level=info event=steer_delivered origin=slack\/dm\/D1 id=m\d+ opRef=\S+$/,
+			/ level=info event=steer_delivered origin=discord\/dm\/200000000000000001 id=m\d+ opRef=\S+$/,
 		);
 		expect(lines.find((l) => l.includes("event=steer_failed"))).toMatch(
-			/ level=warn event=steer_failed origin=slack\/dm\/D1 id=m\d+ action=defer error=/,
+			/ level=warn event=steer_failed origin=discord\/dm\/200000000000000001 id=m\d+ action=defer error=/,
 		);
 		expect(lines.find((l) => l.includes("event=omp_exit"))).toMatch(
-			/ level=warn event=omp_exit origin=slack\/dm\/D1 code=137 expected=false stderr="fake crash"$/,
+			/ level=warn event=omp_exit origin=discord\/dm\/200000000000000001 code=137 expected=false stderr="fake crash"$/,
 		);
 	});
 
@@ -220,7 +230,9 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		expect(router.sweepStalls()).toBe(1);
 		const alert = lines.filter((l) => l.includes("event=stall_alert"));
 		expect(alert).toHaveLength(1);
-		expect(alert[0]).toMatch(/ level=warn event=stall_alert origin=slack\/dm\/D1 silentMs=120000 opRef=\S+$/);
+		expect(alert[0]).toMatch(
+			/ level=warn event=stall_alert origin=discord\/dm\/200000000000000001 silentMs=120000 opRef=\S+$/,
+		);
 		expect(stalls).toEqual([
 			{ originKey: ORIGIN, threadRef: turn?.threadRef ?? "missing", stalled: true, silentMs: STALL_MS },
 		]);
@@ -348,7 +360,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 			originKey: origin,
 			ownerVerified: true,
 			text: "check",
-			threadRef: threadRefOf(store.ownerChannel(), TOP_LEVEL_TS),
+			threadRef: threadRefOf(OWNER_DM, TOP_LEVEL_TS),
 		});
 		await untilLine(() => lines.some((l) => l.includes("event=turn_start")));
 		const driver = drivers[0];
@@ -389,7 +401,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 			originKey: origin,
 			ownerVerified: true,
 			text: "check",
-			threadRef: threadRefOf(store.ownerChannel(), TOP_LEVEL_TS),
+			threadRef: threadRefOf(OWNER_DM, TOP_LEVEL_TS),
 		});
 		await untilLine(() => lines.some((l) => l.includes("event=turn_start")));
 		store.recordTurnFailure = () => {
@@ -422,7 +434,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 				originKey: origin,
 				ownerVerified: true,
 				text: "check",
-				threadRef: threadRefOf(store.ownerChannel(), TOP_LEVEL_TS),
+				threadRef: threadRefOf(OWNER_DM, TOP_LEVEL_TS),
 			});
 		};
 		await fire();
@@ -670,27 +682,27 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 
 	test("toolActivityText prefers naming keys, keeps at most two scalars and degrades to the tool name", () => {
 		expect(toolActivityText("bash", { command: "git status", cwd: "/tmp" })).toBe("bash command=git status");
-		expect(toolActivityText("web", { q: "omp slack", depth: 2 })).toBe("web q=omp slack depth=2"); // no naming key: first two
+		expect(toolActivityText("web", { q: "omp discord", depth: 2 })).toBe("web q=omp discord depth=2"); // no naming key: first two
 		expect(toolActivityText("mcp", { payload: { nested: true } })).toBe("mcp"); // non-scalar args are not shown
 		expect(toolActivityText("bash", "git push --force")).toBe("bash git push --force");
 		expect(toolActivityText("bash", undefined)).toBe("bash");
 		// omp's intent (or an `i` left in the args) names the call better than a heredoc's first characters.
-		expect(toolActivityText("bash", { command: "cat > /tmp/a.js <<'EOF'" }, "Reading  Slack\nthread")).toBe(
-			"bash · Reading Slack thread",
+		expect(toolActivityText("bash", { command: "cat > /tmp/a.js <<'EOF'" }, "Reading  Discord\nthread")).toBe(
+			"bash · Reading Discord thread",
 		);
 		expect(toolActivityText("read", { path: "a.ts", i: "Reading config" })).toBe("read · Reading config");
 		expect(toolActivityText("bash", { command: "git status" }, "  ")).toBe("bash command=git status");
 	});
 });
 
-/** Records every chat.update text so a test can await the one it expects. */
-class UpdateWatchingTransport extends WaitingTransport {
+/** Records every message edit's text so a test can await the one it expects. */
+class UpdateWatchingTransport extends WaitingDiscordTransport {
 	readonly updates: string[] = [];
 	readonly #waiters = new Set<() => void>();
 
-	override async updateMessage(args: Parameters<WaitingTransport["updateMessage"]>[0]): Promise<void> {
-		await super.updateMessage(args);
-		this.updates.push(args.text);
+	override async editMessage(args: EditMessageArgs): Promise<void> {
+		await super.editMessage(args);
+		this.updates.push(args.content ?? "");
 		for (const waiter of [...this.#waiters]) waiter();
 	}
 
@@ -744,7 +756,7 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -843,65 +855,84 @@ describe("daemon surface: status text, stall status, delivery_state", () => {
 		);
 	});
 
-	test("/status-ompbot answers this conversation's context line, then exactly what `ompbot status` prints", async () => {
+	test("!status answers this conversation's context line, then exactly what `ompbot status` prints", async () => {
 		await startDaemon(false);
 		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "hello" });
 		await transport.waitForPosts((text) => text.includes("ECHO hello"));
 		await daemon.pump();
-		const ack = await transport.emitSlash({ command: "/status-ompbot", user_id: OWNER, channel_id: "D1" });
+		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "!status" });
+		await transport.waitForPosts((text) => text.startsWith("이 대화 컨텍스트:"));
+		const ack = transport.posts((text) => text.startsWith("이 대화 컨텍스트:"))[0];
 		const cli = await runMain(home.dir, ["status"]);
 		expect(cli.code, cli.stderr).toBe(0);
-		const [first, ...rest] = (ack?.text ?? "").split("\n");
+		const [first, ...rest] = (ack?.content ?? "").split("\n");
 		// The fake child reports no context use: the line says so instead of a made-up 0.
 		expect(first).toBe("이 대화 컨텍스트: 알 수 없음 · 모델 fake/alpha");
 		const body = rest.join("\n");
 		expect(body).toContain("데몬 실행 중");
 		// host_pressure reads this machine's live load and memory at each call: its numbers may move between the reads.
+		// The typed `!status` is itself a ledger row, so the reply was cut while it was still dispatched: only the two
+		// ledger lines differ from the CLI read taken after it was answered.
 		const steady = (text: string | undefined) =>
-			text?.replace(/host_pressure load15=\S+ cpus=\d+ mem_avail_pct=\S+/, "host_pressure <live>");
+			text
+				?.replace(/host_pressure load15=\S+ cpus=\d+ mem_avail_pct=\S+/, "host_pressure <live>")
+				.split("\n")
+				.filter((line) => !line.startsWith("장부 ") && !line.startsWith("입수 "))
+				.join("\n");
 		expect(steady(cli.stdout)).toBe(`${steady(body)}\n`);
-		expect(steady(body)).toBe(steady(renderStatusText(daemon.status())));
+		expect(steady(renderStatusText(daemon.status()))).toBe(steady(body));
 	});
 
-	test("!status and /status-ompbot start with the asking conversation's context: use, idle session, unreadable child", async () => {
+	test("!status starts with the asking conversation's context: use, idle session, unreadable child", async () => {
 		await startDaemon(false, undefined, { tokens: 123000, window: 1000000, percent: 12.3 });
-		const failing = "slack/dm/D3";
+		const failing = "discord/dm/200000000000000003";
 		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "hello" });
 		await daemon.inject({ origin: failing, asOwner: true, text: "hi" });
 		await transport.waitForPosts((text) => text.startsWith("ECHO"), 2);
 		const [, broken] = drivers;
-		if (!broken) throw new Error("no driver for D3");
+		if (!broken) throw new Error("no driver for the failing origin");
 		broken.failState = true;
 		const used = "이 대화 컨텍스트: 123k / 1,000k (12%) · 모델 fake/alpha";
 
 		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "!status" });
 		await transport.waitForPosts((text) => text.startsWith("이 대화 컨텍스트:"));
 		const typed = transport.posts((text) => text.startsWith("이 대화 컨텍스트:"));
-		expect(typed.map((post) => [post.channel, post.text.split("\n")[0]])).toEqual([["D1", used]]);
-		expect(typed[0]?.text).toContain("데몬 실행 중");
+		expect(typed.map((post) => [post.channelId, post.content?.split("\n")[0]])).toEqual([[OWNER_DM, used]]);
+		expect(typed[0]?.content).toContain("데몬 실행 중");
 
-		const firstLine = async (channel: string) =>
-			(await transport.emitSlash({ command: "/status-ompbot", user_id: OWNER, channel_id: channel }))?.text?.split(
-				"\n",
-			)[0];
-		expect(await firstLine("D1")).toBe(used);
-		expect(await firstLine("D2")).toBe("이 대화 컨텍스트: 세션 쉬는 중(다음 메시지 때 다시 읽음)");
-		expect(await firstLine("D3")).toBe("이 대화 컨텍스트: 알 수 없음");
+		const firstLine = async (origin: string) => {
+			const isContext = (text: string) => text.startsWith("이 대화 컨텍스트:");
+			const known = transport.posts(isContext).length;
+			await daemon.inject({ origin, asOwner: true, text: "!status" });
+			await transport.waitForPosts(isContext, known + 1);
+			return transport.posts(isContext).at(-1)?.content?.split("\n")[0];
+		};
+		expect(await firstLine(ORIGIN)).toBe(used);
+		expect(await firstLine("discord/dm/200000000000000002")).toBe(
+			"이 대화 컨텍스트: 세션 쉬는 중(다음 메시지 때 다시 읽음)",
+		);
+		expect(await firstLine(failing)).toBe("이 대화 컨텍스트: 알 수 없음");
 		expect(lines.some((line) => line.includes("event=status_context_failed"))).toBe(true);
 	});
 
-	test("/model-ompbot answers at the top level where it was typed: empty ack, no placeholder root post", async () => {
+	test("!model typed in a DM and in a channel answers in the conversation where it was typed: no thread, no placeholder root post", async () => {
 		await startDaemon(false);
-		for (const [i, channel] of ["D1", "C1"].entries()) {
-			const ack = await transport.emitSlash({ command: "/model-ompbot", user_id: OWNER, channel_id: channel });
-			expect(ack).toBeUndefined();
+		transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
+		const typedInDm = ownerMessage("700000000000000001", "!model");
+		const typedInChannel = ownerMessage("700000000000000002", `<@${BOT}> !model`, {
+			channel_id: CHANNEL,
+			guild_id: GUILD,
+		});
+		for (const [i, event] of [typedInDm, typedInChannel].entries()) {
+			await transport.emitMessage(event);
 			await transport.waitForPosts((text) => text.includes("현재 모델:"), i + 1);
 		}
 		const answers = transport.posts((text) => text.includes("현재 모델:"));
-		expect(answers.map((post) => [post.channel, post.threadTs])).toEqual([
-			["D1", undefined],
-			["C1", undefined],
+		expect(answers.map((post) => [post.channelId, post.messageReference?.messageId])).toEqual([
+			[OWNER_DM, typedInDm.id],
+			[CHANNEL, typedInChannel.id],
 		]);
+		expect(transport.calls.filter((call) => call.method === "startThread")).toEqual([]);
 		expect(transport.posts((text) => text.startsWith("🧪 inject"))).toEqual([]);
 	});
 });
@@ -912,7 +943,7 @@ describe("alert incidents: owner-notice repeat suppression (store)", () => {
 		const clock = new FakeClock();
 		const store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
 		try {
-			const scope = "turns:slack/dm/D1";
+			const scope = "turns:discord/dm/200000000000000001";
 			expect(store.recordAlertIncident(scope, "Could not restore model: x", clock.now())).toMatchObject({
 				notify: true,
 				count: 1,
@@ -952,7 +983,7 @@ function writeBackupStamp(homeDir: string): void {
 describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () => {
 	let home: TestHome;
 	let clock: FakeClock;
-	let transport: WaitingTransport;
+	let transport: WaitingDiscordTransport;
 	let daemon: Daemon;
 	let drivers: OpsDriver[];
 	let lines: string[];
@@ -961,7 +992,7 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		home = makeHome("ompbot-ops-selfdiag-");
 		clock = new FakeClock();
 		clock.t = Date.now();
-		transport = new WaitingTransport();
+		transport = new WaitingDiscordTransport();
 		drivers = [];
 		lines = [];
 	});
@@ -983,7 +1014,7 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		const failPrompts = options.failPrompts ?? 0;
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			clock,
 			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -1002,6 +1033,8 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 			},
 		});
 		await daemon.start();
+		// Discord has no owner DM known from the config: the notices go to the home the owner has set.
+		daemon.store.setOwnerHome({ platform: "discord", conversationId: OWNER_DM });
 	}
 
 	test("a gate opening DMs the owner once, recovery reports, a quick re-open stays quiet (24h suppression)", async () => {
@@ -1044,24 +1077,6 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		expect(gateIncidentStatus("backup_age")).toBe("alerted");
 	});
 
-	test("a socket down for 10+ minutes DMs the owner once (self-report, fake clock)", async () => {
-		await startDaemon({ gateSweepMs: 5_000 });
-		writeBackupStamp(home.dir);
-		const downSince = clock.now();
-		(transport as { connectionState?: SlackTransport["connectionState"] }).connectionState = () => ({
-			state: "down",
-			since: downSince,
-		});
-		await daemon.sweep(); // the beat stamps socket=down
-		clock.advance(10 * 60_000 + 1_000);
-		const opened = transport.waitForPosts((text) => text.includes("게이트 slack_disconnected 열림"));
-		await daemon.sweep(); // the gate pass reads the stamp of the previous beat
-		await opened;
-		const posted = transport.posts((text) => text.includes("[자가진단] 게이트 slack_disconnected"));
-		expect(posted).toHaveLength(1);
-		expect(posted[0]?.text).toContain("🚨 [자가진단] 게이트 slack_disconnected 열림");
-	});
-
 	test("three failed turns DM the owner once, further failures stay quiet, /status lists the open gate", async () => {
 		await startDaemon({ failPrompts: 99 }); // every prompt fails with the stale-model sign
 		const dm = transport.waitForPosts((text) => text.includes("연속 실패"));
@@ -1071,9 +1086,9 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		await dm;
 		const posted = transport.posts((text) => text.includes("연속 실패"));
 		expect(posted).toHaveLength(1);
-		expect(posted[0]?.text).toContain(ORIGIN);
-		expect(posted[0]?.text).toContain("3번 연속 실패");
-		expect(posted[0]?.channel).toBe("D1"); // the owner DM, not the failing thread
+		expect(posted[0]?.content).toContain(ORIGIN);
+		expect(posted[0]?.content).toContain("3번 연속 실패");
+		expect(posted[0]?.channelId).toBe(OWNER_DM); // the owner DM, not the failing thread
 		expect(lines.some((line) => line.includes("event=turn_failures_notified"))).toBe(true);
 
 		await daemon.inject({ origin: ORIGIN, asOwner: true, text: "job 3" });
@@ -1253,17 +1268,16 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 	test("an unknown gate (nothing to judge) keeps its previous state: no notice, no resolve, recovery only on a real close", async () => {
 		await startDaemon({ gateSweepMs: 5_000 });
 		writeBackupStamp(home.dir);
-		await daemon.sweep(); // first observation: sweep_stalled and slack_disconnected closed
+		await daemon.sweep(); // first observation: sweep_stalled closed
 		const heartbeat = join(home.dir, SWEEP_HEARTBEAT_FILE);
 		const notices = (gate: string) => transport.posts((text) => text.includes(`[자가진단] 게이트 ${gate}`));
 
-		// (a) closed -> unknown: the stamp is gone, so both heartbeat gates cannot be judged; nothing is said.
+		// (a) closed -> unknown: the stamp is gone, so the heartbeat gate cannot be judged; nothing is said.
 		rmSync(heartbeat);
 		// (d) unknown is not an open gate for status.
 		expect(daemon.status().openGates.map((gate) => gate.name)).not.toContain("sweep_stalled");
 		await sweepOnce();
 		expect(notices("sweep_stalled")).toHaveLength(0);
-		expect(notices("slack_disconnected")).toHaveLength(0);
 
 		// sweep_stalled opens: the stamp written by the last sweep is older than three sweeps.
 		clock.advance(SWEEP_STALLED_MS + 6_000);
@@ -1285,7 +1299,6 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 		await sweepOnce();
 		await recovered;
 		expect(transport.posts((text) => text.includes("게이트 sweep_stalled 회복"))).toHaveLength(1);
-		expect(notices("slack_disconnected")).toHaveLength(0);
 	});
 
 	test("gateSweepMs=0 disables gate reporting entirely: an open gate never DMs, status still lists it", async () => {
@@ -1296,76 +1309,43 @@ describe("daemon self-diagnosis (무인 신뢰성 루프: 자가 보고)", () =>
 	});
 });
 
-describe("ompbot doctor claude agent checks", () => {
+describe("ompbot doctor agy agent", () => {
 	let dir: string;
-	const savedEnv = new Map<string, string | undefined>();
 
 	beforeEach(() => {
-		dir = mkdtempSync(join(tmpdir(), "ompbot-doctor-claude-"));
+		dir = mkdtempSync(join(tmpdir(), "ompbot-doctor-agy-"));
 		chmodSync(dir, 0o700);
 		mkdirSync(join(dir, "secrets"), { recursive: true });
-		for (const [name, prefix] of [
-			["slack-bot-token", "xoxb-TEST-0"],
-			["slack-app-token", "xapp-TEST-0"],
-		] as const) {
-			writeFileSync(join(dir, "secrets", name), `${prefix}\n`, { mode: 0o600 });
-		}
-		const fakeClaude = join(dir, "fake-claude");
-		writeFileSync(fakeClaude, "#!/bin/sh\necho '2.1.311 (Claude Code)'\n", { mode: 0o755 });
+		writeFileSync(join(dir, "secrets", "discord-bot-token"), "TEST-discord-0\n", { mode: 0o600 });
+		const fakeAgy = join(dir, "agy");
+		writeFileSync(fakeAgy, "#!/bin/sh\necho '1.0.0'\n", { mode: 0o755 });
 		writeFileSync(
 			join(dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				channels: { slack: { ownerUserId: "UOWNER0" } },
-				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+				channels: {
+					discord: {
+						ownerUserId: OWNER,
+						applicationId: "600000000000000000",
+						botTokenFile: "secrets/discord-bot-token",
+					},
+				},
 				ompExecutable: process.execPath,
 				workspaceDir: "workspace",
-				agent: "claude",
-				claudeExecutable: fakeClaude,
+				agent: "agy",
+				agyExecutable: fakeAgy,
 			}),
 			{ mode: 0o600 },
 		);
-		// Pin the credential lookup to the fixture (and away from this machine's real ~/.claude).
-		for (const key of ["CLAUDE_CONFIG_DIR", "ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"] as const) {
-			savedEnv.set(key, process.env[key]);
-			delete process.env[key];
-		}
-		process.env.CLAUDE_CONFIG_DIR = join(dir, ".claude");
 	});
-	afterEach(() => {
-		for (const [key, value] of savedEnv) {
-			if (value === undefined) delete process.env[key];
-			else process.env[key] = value;
-		}
-		rmSync(dir, { recursive: true, force: true });
-	});
+	afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-	async function claudeLines(): Promise<string[]> {
-		const lines: string[] = [];
-		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
-		return lines.filter((line) => /^(ok|fail) claude/.test(line));
-	}
-
-	test("credentials present: executable and auth pass", async () => {
-		mkdirSync(join(dir, ".claude"), { recursive: true });
-		writeFileSync(join(dir, ".claude", ".credentials.json"), "{}\n", { mode: 0o600 });
-		const lines = await claudeLines();
-		expect(lines[0]).toContain("ok claude: ");
-		expect(lines[1]).toContain("ok claude auth:");
-	}, 30_000); // the doctor spawns child probes: slow on a 2-core machine
-
-	test("no credentials and no key env: auth fails naming the path", async () => {
-		const lines = await claudeLines();
-		expect(lines[0]).toContain("ok claude: ");
-		expect(lines[1]).toContain("fail claude auth:");
-		expect(lines[1]).toContain(join(dir, ".claude", ".credentials.json"));
-	}, 30_000);
-
-	test("agent claude never spawns omp: no omp runtime line (its ompExecutable here is a standalone binary)", async () => {
+	test("agent agy never spawns omp: no omp runtime line (its ompExecutable here is a standalone binary)", async () => {
 		const lines: string[] = [];
 		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		expect(lines.filter((line) => line.includes("omp runtime"))).toEqual([]);
-		expect(lines.find((line) => line.includes("slack auth.test"))).toStartWith("fail slack auth.test: invalid_auth ");
+		// The rest of the report still runs: the offline network fails the Discord bot lookup.
+		expect(lines.find((line) => line.includes("discord users/@me"))).toStartWith("fail discord users/@me: ");
 	}, 30_000);
 });
 
@@ -1375,8 +1355,7 @@ describe("ompbot doctor omp runtime check", () => {
 	beforeEach(() => {
 		dir = mkdtempSync(join(tmpdir(), "ompbot-doctor-runtime-"));
 		mkdirSync(join(dir, "secrets"));
-		writeFileSync(join(dir, "secrets", "slack-bot-token"), "xoxb-TEST-0\n", { mode: 0o600 });
-		writeFileSync(join(dir, "secrets", "slack-app-token"), "xapp-TEST-0\n", { mode: 0o600 });
+		writeFileSync(join(dir, "secrets", "discord-bot-token"), "TEST-discord-0\n", { mode: 0o600 });
 	});
 	afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
@@ -1385,8 +1364,13 @@ describe("ompbot doctor omp runtime check", () => {
 			join(dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				channels: { slack: { ownerUserId: "UOWNER0" } },
-				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+				channels: {
+					discord: {
+						ownerUserId: OWNER,
+						applicationId: "600000000000000000",
+						botTokenFile: "secrets/discord-bot-token",
+					},
+				},
 				ompExecutable,
 				workspaceDir: "workspace",
 			}),
@@ -1418,46 +1402,38 @@ describe("ompbot doctor omp runtime check", () => {
 			join(dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				channels: { slack: { ownerUserId: "UOWNER0" } },
-				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+				channels: {
+					discord: {
+						ownerUserId: OWNER,
+						applicationId: "600000000000000000",
+						botTokenFile: "secrets/discord-bot-token",
+					},
+				},
 				ompExecutable: folder,
 				workspaceDir: "workspace",
 			}),
 			{ mode: 0o600 },
 		);
 		const lines: string[] = [];
-		await runDoctor(dir, (line) => lines.push(line), undefined, slackAuthOk("UBOT0"));
+		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		// checkOmpRuntime reports the directory as a problem (the same code the gate and the RPC driver give).
 		expect(lines.find((line) => line.includes("omp runtime"))).toStartWith(
 			`fail omp runtime: omp_launcher_unreadable ${folder} cannot be read`,
 		);
 		expect(lines.some((line) => line.includes("backup bundle"))).toBe(true);
-		expect(lines).toContain("ok slack auth.test: bot_user_id=UBOT0 team_id=T0TEST0");
+		expect(lines.some((line) => line.startsWith("fail discord users/@me: "))).toBe(true);
 	}, 30_000);
 
 	test("token file problems get one line each with the fix, and every later check still runs", async () => {
-		rmSync(join(dir, "secrets", "slack-bot-token"));
-		chmodSync(join(dir, "secrets", "slack-app-token"), 0o644);
+		chmodSync(join(dir, "secrets", "discord-bot-token"), 0o644);
 		await runtimeLine(process.execPath);
 		const lines: string[] = [];
 		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
-		const bot = join(dir, "secrets", "slack-bot-token");
-		const app = join(dir, "secrets", "slack-app-token");
 		expect(lines).toContain(`ok config: ${join(dir, "config.json")}`);
-		expect(lines).toContain(`fail secret slack-bot-token: missing (write it: umask 077; cat > ${bot})`);
-		expect(lines).toContain(`fail secret slack-app-token: mode=0644 expected=0600 (fix: chmod 600 ${app})`);
-		expect(lines).toContain("fail slack auth.test: skipped: fix the secret lines above first");
+		expect(lines).toContain("fail discord token: mode=0644 expected=0600");
+		expect(lines.some((line) => line.includes("discord users/@me"))).toBe(false); // no request with a loose token file
 		expect(lines.some((line) => /^(ok|fail) omp: /.test(line))).toBe(true);
 		expect(lines).toContain(FIRST_INSTALL_LINE);
-
-		writeFileSync(bot, "xapp-WRONG-0\n", { mode: 0o600 });
-		chmodSync(app, 0o600);
-		const swapped: string[] = [];
-		await runDoctor(dir, (line) => swapped.push(line), undefined, OFFLINE_DOCTOR);
-		expect(swapped.find((line) => line.startsWith("fail secret slack-bot-token"))).toContain(
-			"does not start with xoxb-",
-		);
-		for (const line of swapped) expect(line).not.toContain("WRONG");
 	});
 });
 
@@ -1478,7 +1454,7 @@ describe("ompbot doctor backup bundle check", () => {
 	});
 	afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
-	/** Only the `backup bundle` line matters here, so the rest of doctor (config, secrets, Slack) is out of scope. */
+	/** Only the `backup bundle` line matters here, so the rest of doctor (config, secrets, Discord) is out of scope. */
 	async function bundleLine(): Promise<string | undefined> {
 		const lines: string[] = [];
 		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
@@ -1730,9 +1706,9 @@ describe("ompbot backup bundle size cap (config maxBundleBytes + --max-bundle-by
 		const db = new Database(join(home.dir, "ompbot.db"), { create: true, strict: true });
 		db.run("CREATE TABLE origins (origin_key TEXT PRIMARY KEY)");
 		db.close();
-		mkdirSync(join(home.dir, "sessions", "slack-dm-D1", "e1"), { recursive: true });
+		mkdirSync(join(home.dir, "sessions", "discord-dm-200000000000000001", "e1"), { recursive: true });
 		writeFileSync(
-			join(home.dir, "sessions", "slack-dm-D1", "e1", "s.jsonl"),
+			join(home.dir, "sessions", "discord-dm-200000000000000001", "e1", "s.jsonl"),
 			'{"message":{"role":"user","content":"안녕"}}\n',
 		);
 	}
@@ -1742,8 +1718,13 @@ describe("ompbot backup bundle size cap (config maxBundleBytes + --max-bundle-by
 			join(home.dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				channels: { slack: { ownerUserId: OWNER } },
-				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+				channels: {
+					discord: {
+						ownerUserId: OWNER,
+						applicationId: "600000000000000000",
+						botTokenFile: "secrets/discord-bot-token",
+					},
+				},
 				ompExecutable: join(home.dir, "fake-omp"),
 				workspaceDir: "workspace",
 				maxBundleBytes: 10,
@@ -1772,8 +1753,13 @@ describe("ompbot backup bundle size cap (config maxBundleBytes + --max-bundle-by
 			join(home.dir, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				channels: { slack: { ownerUserId: OWNER } },
-				slack: { botTokenFile: "secrets/slack-bot-token", appTokenFile: "secrets/slack-app-token" },
+				channels: {
+					discord: {
+						ownerUserId: OWNER,
+						applicationId: "600000000000000000",
+						botTokenFile: "secrets/discord-bot-token",
+					},
+				},
 				ompExecutable: join(home.dir, "fake-omp"),
 				workspaceDir: "workspace",
 				maxBundleBytes: -5,
@@ -1878,13 +1864,13 @@ describe("ompbot gc", () => {
 		store.ensureOrigin(ORIGIN, sessionOf(ORIGIN, 1));
 		store.newEpoch(ORIGIN, sessionOf(ORIGIN, 2));
 		store.newEpoch(ORIGIN, sessionOf(ORIGIN, 3));
-		store.ensureOrigin("slack/dm/D2", sessionOf("slack/dm/D2", 1));
+		store.ensureOrigin("discord/dm/200000000000000002", sessionOf("discord/dm/200000000000000002", 1));
 		store.close();
 		makeSession(sessionOf(ORIGIN, 1), 60); // previous epoch, old: the only one to delete
 		makeSession(sessionOf(ORIGIN, 2), 60, 2); // previous epoch, directory old but a file written 2 days ago
 		makeSession(sessionOf(ORIGIN, 3), 60); // CURRENT epoch, old: never deleted
-		makeSession(sessionOf("slack/dm/D2", 1), 60); // current (only) epoch of another origin
-		makeSession(sessionOf("slack/dm/DX", 1), 60); // origin unknown to the ledger
+		makeSession(sessionOf("discord/dm/200000000000000002", 1), 60); // current (only) epoch of another origin
+		makeSession(sessionOf("discord/dm/200000000000000099", 1), 60); // origin unknown to the ledger
 		makeSession(join(dirname(sessionOf(ORIGIN, 1)), "notes"), 60); // not named e<N>
 	});
 	afterEach(() => {
@@ -1905,11 +1891,26 @@ describe("ompbot gc", () => {
 		for (const kept of [
 			sessionOf(ORIGIN, 2),
 			sessionOf(ORIGIN, 3),
-			sessionOf("slack/dm/D2", 1),
-			sessionOf("slack/dm/DX", 1),
+			sessionOf("discord/dm/200000000000000002", 1),
+			sessionOf("discord/dm/200000000000000099", 1),
 			join(dirname(sessionOf(ORIGIN, 1)), "notes"),
 		]) {
 			expect(existsSync(kept), kept).toBe(true);
+		}
+	});
+
+	test("a resumed older epoch stays live when the home is reached through a symlink", () => {
+		const link = join(home.dir, "..", `${basename(home.dir)}-link`);
+		symlinkSync(home.dir, link);
+		try {
+			const db = new Database(join(home.dir, "ompbot.db"));
+			db.run("UPDATE origins SET session_dir = ? WHERE origin_key = ?", [sessionOf(ORIGIN, 1), ORIGIN]);
+			db.close();
+			const result = gcSessions({ homeDir: link, retentionDays: 30, now: Date.now() });
+			expect(result.removed).toEqual([]);
+			expect(existsSync(sessionOf(ORIGIN, 1))).toBe(true);
+		} finally {
+			unlinkSync(link);
 		}
 	});
 
@@ -1970,15 +1971,15 @@ describe("ompbot gc: thread-scoped sessions", () => {
 	beforeEach(() => {
 		home = makeHome("ompbot-ops-gc-thread-");
 		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
-		store.ensureOrigin("slack/ch/C1", sessionOf("slack/ch/C1"));
-		store.ensureOrigin("slack/ch/C1/t/100.1", sessionOf("slack/ch/C1/t/100.1")); // fresh thread: kept
-		store.ensureOrigin("slack/ch/C1/t/50.9", sessionOf("slack/ch/C1/t/50.9")); // expired thread: removed
-		store.ensureOrigin("slack/dm/D1", sessionOf("slack/dm/D1"));
+		store.ensureOrigin(`discord/ch/${CHANNEL}`, sessionOf(`discord/ch/${CHANNEL}`));
+		store.ensureOrigin("discord/ch/300000000000000001/t/100", sessionOf("discord/ch/300000000000000001/t/100")); // fresh thread: kept
+		store.ensureOrigin("discord/ch/300000000000000001/t/50", sessionOf("discord/ch/300000000000000001/t/50")); // expired thread: removed
+		store.ensureOrigin(ORIGIN, sessionOf(ORIGIN));
 		store.close();
-		makeSession(sessionOf("slack/ch/C1"), 60);
-		makeSession(sessionOf("slack/ch/C1/t/100.1"), 1);
-		makeSession(sessionOf("slack/ch/C1/t/50.9"), 60);
-		makeSession(sessionOf("slack/dm/D1"), 1);
+		makeSession(sessionOf(`discord/ch/${CHANNEL}`), 60);
+		makeSession(sessionOf("discord/ch/300000000000000001/t/100"), 1);
+		makeSession(sessionOf("discord/ch/300000000000000001/t/50"), 60);
+		makeSession(sessionOf(ORIGIN), 1);
 	});
 	afterEach(() => {
 		killSpawned();
@@ -1988,21 +1989,21 @@ describe("ompbot gc: thread-scoped sessions", () => {
 	test("an expired thread origin loses directory and ledger row; fresh ones and channel/DM origins stay", () => {
 		const options = { homeDir: home.dir, retentionDays: 30, now: Date.now() };
 		const dry = gcSessions({ ...options, dryRun: true });
-		expect(dry.threadOriginsRemoved).toEqual(["slack/ch/C1/t/50.9"]);
-		expect(existsSync(sessionOf("slack/ch/C1/t/50.9"))).toBe(true);
+		expect(dry.threadOriginsRemoved).toEqual(["discord/ch/300000000000000001/t/50"]);
+		expect(existsSync(sessionOf("discord/ch/300000000000000001/t/50"))).toBe(true);
 
 		const result = gcSessions(options);
-		expect(result.threadOriginsRemoved).toEqual(["slack/ch/C1/t/50.9"]);
-		expect(existsSync(sessionOf("slack/ch/C1/t/50.9"))).toBe(false);
-		expect(existsSync(sessionOf("slack/ch/C1/t/100.1"))).toBe(true);
+		expect(result.threadOriginsRemoved).toEqual(["discord/ch/300000000000000001/t/50"]);
+		expect(existsSync(sessionOf("discord/ch/300000000000000001/t/50"))).toBe(false);
+		expect(existsSync(sessionOf("discord/ch/300000000000000001/t/100"))).toBe(true);
 		// Channel and DM origins are epoch-managed: gc only ever touches their previous epochs.
-		expect(existsSync(sessionOf("slack/ch/C1"))).toBe(true);
-		expect(existsSync(sessionOf("slack/dm/D1"))).toBe(true);
+		expect(existsSync(sessionOf(`discord/ch/${CHANNEL}`))).toBe(true);
+		expect(existsSync(sessionOf(ORIGIN))).toBe(true);
 		// The ledger row is gone; a later message simply opens a fresh origin.
 		const check = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
 		try {
-			expect(check.getOrigin("slack/ch/C1/t/50.9")).toBeUndefined();
-			expect(check.getOrigin("slack/ch/C1/t/100.1")).toBeDefined();
+			expect(check.getOrigin("discord/ch/300000000000000001/t/50")).toBeUndefined();
+			expect(check.getOrigin("discord/ch/300000000000000001/t/100")).toBeDefined();
 		} finally {
 			check.close();
 		}
@@ -2018,18 +2019,18 @@ describe("ompbot gc: thread-scoped sessions", () => {
 	};
 
 	test("an origin directory swapped for a symlink is skipped: nothing outside sessions/ is deleted (J-9)", () => {
-		// slack/dm/D1 moves to epoch 2, and its origin directory becomes a link to a tree whose e1 is old.
+		// the owner DM moves to epoch 2, and its origin directory becomes a link to a tree whose e1 is old.
 		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
-		store.newEpoch("slack/dm/D1", sessionOf("slack/dm/D1", 2));
+		store.newEpoch(ORIGIN, sessionOf(ORIGIN, 2));
 		store.close();
 		const outside = join(home.dir, "outside");
 		makeSession(join(outside, "e1"), 60);
-		rmSync(dirname(sessionOf("slack/dm/D1")), { recursive: true });
-		symlinkSync(outside, dirname(sessionOf("slack/dm/D1")));
+		rmSync(dirname(sessionOf(ORIGIN)), { recursive: true });
+		symlinkSync(outside, dirname(sessionOf(ORIGIN)));
 		// The expired thread origin's directory is a link too (backdated, so it reads as expired).
 		const threadOutside = join(home.dir, "thread-outside");
 		makeSession(join(threadOutside, "e1"), 60);
-		const threadDir = dirname(sessionOf("slack/ch/C1/t/50.9"));
+		const threadDir = dirname(sessionOf("discord/ch/300000000000000001/t/50"));
 		rmSync(threadDir, { recursive: true });
 		symlinkSync(threadOutside, threadDir);
 		const old = new Date(Date.now() - 60 * DAY_MS);
@@ -2039,29 +2040,141 @@ describe("ompbot gc: thread-scoped sessions", () => {
 		expect(existsSync(join(outside, "e1", "session.jsonl"))).toBe(true);
 		expect(result.removed).toEqual([]);
 		expect(existsSync(join(threadOutside, "e1", "session.jsonl"))).toBe(true);
-		expect(result.threadOriginsRemoved).not.toContain("slack/ch/C1/t/50.9");
-		expect(hasOrigin("slack/ch/C1/t/50.9")).toBe(true);
+		expect(result.threadOriginsRemoved).not.toContain("discord/ch/300000000000000001/t/50");
+		expect(hasOrigin("discord/ch/300000000000000001/t/50")).toBe(true);
 	});
 
 	test("a thread origin with no directory yet is kept while its ledger row is fresh (J-10)", () => {
 		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
-		store.ensureOrigin("slack/ch/C1/t/200.1", sessionOf("slack/ch/C1/t/200.1")); // row now, no directory yet
+		store.ensureOrigin("discord/ch/300000000000000001/t/200", sessionOf("discord/ch/300000000000000001/t/200")); // row now, no directory yet
 		store.close();
 		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: Date.now() });
-		expect(result.threadOriginsRemoved).toEqual(["slack/ch/C1/t/50.9"]);
-		expect(hasOrigin("slack/ch/C1/t/200.1")).toBe(true);
+		expect(result.threadOriginsRemoved).toEqual(["discord/ch/300000000000000001/t/50"]);
+		expect(hasOrigin("discord/ch/300000000000000001/t/200")).toBe(true);
 	});
 
 	test("an expired thread origin with pending inbound is kept whole (J-11)", () => {
 		const db = new Database(join(home.dir, "ompbot.db"), { strict: true });
 		db.run(
-			"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at) VALUES ('m1', 'slack/ch/C1/t/50.9', 1, 'x', 'pending', 0)",
+			"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at) VALUES ('m1', 'discord/ch/300000000000000001/t/50', 1, 'x', 'pending', 0)",
 		);
 		db.close();
 		const result = gcSessions({ homeDir: home.dir, retentionDays: 30, now: Date.now() });
 		expect(result.threadOriginsRemoved).toEqual([]);
-		expect(existsSync(sessionOf("slack/ch/C1/t/50.9"))).toBe(true);
-		expect(hasOrigin("slack/ch/C1/t/50.9")).toBe(true);
+		expect(existsSync(sessionOf("discord/ch/300000000000000001/t/50"))).toBe(true);
+		expect(hasOrigin("discord/ch/300000000000000001/t/50")).toBe(true);
+	});
+});
+
+describe("ompbot gc: rows left by the removed Slack channel", () => {
+	let home: TestHome;
+	const sessionOf = (origin: string, epoch = 1) => sessionDirFor(join(home.dir, "sessions"), origin, epoch);
+	const DM_KEY = "slack/dm/D1";
+	const THREAD_KEY = "slack/ch/C1/t/50.9";
+
+	/** A session directory with one file, backdated together with its origin directory. */
+	function makeSession(path: string, ageDays: number): void {
+		mkdirSync(path, { recursive: true });
+		const file = join(path, "session.jsonl");
+		writeFileSync(file, "{}\n");
+		const old = new Date(Date.now() - ageDays * DAY_MS);
+		utimesSync(file, old, old);
+		utimesSync(path, old, old);
+		utimesSync(dirname(path), old, old);
+	}
+
+	beforeEach(() => {
+		home = makeHome("ompbot-ops-gc-slack-");
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		store.ensureOrigin(DM_KEY, sessionOf(DM_KEY, 1));
+		store.newEpoch(DM_KEY, sessionOf(DM_KEY, 2));
+		store.ensureOrigin(THREAD_KEY, sessionOf(THREAD_KEY));
+		store.close();
+		makeSession(sessionOf(DM_KEY, 1), 60);
+		makeSession(sessionOf(DM_KEY, 2), 1);
+		makeSession(sessionOf(THREAD_KEY), 60);
+	});
+	afterEach(() => home.remove());
+
+	test("slack/ origins in the ledger do not stop gc: dry run and real finish, old epochs go, an expired slack thread goes whole", () => {
+		const options = { homeDir: home.dir, retentionDays: 30, now: Date.now() };
+		expect(() => gcSessions({ ...options, dryRun: true })).not.toThrow();
+		const result = gcSessions(options);
+		expect(result.removed).toEqual([sessionOf(DM_KEY, 1)]);
+		expect(result.threadOriginsRemoved).toEqual([THREAD_KEY]);
+		expect(existsSync(sessionOf(DM_KEY, 2))).toBe(true);
+		expect(existsSync(sessionOf(THREAD_KEY))).toBe(false);
+		const check = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		try {
+			expect(check.getOrigin(THREAD_KEY)).toBeUndefined();
+		} finally {
+			check.close();
+		}
+	});
+});
+
+describe("daemon start: open inbound rows of the removed Slack channel", () => {
+	let home: TestHome;
+	let daemon: Daemon | undefined;
+
+	beforeEach(() => {
+		home = makeHome("ompbot-ops-slack-rows-");
+	});
+	afterEach(async () => {
+		await daemon?.stop();
+		home.remove();
+	});
+
+	test("pending and dispatched slack/ rows are discarded at start with inbound_discarded reason=platform_removed, and no turn runs", async () => {
+		const seed = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		const dm = "slack/dm/D1";
+		const thread = "slack/ch/C1/t/10.1";
+		seed.ensureOrigin(dm, join(home.dir, "sessions", "slack-dm"));
+		seed.ensureOrigin(thread, join(home.dir, "sessions", "slack-thread"));
+		seed.recordInbound({ originKey: dm, platformMessageId: "D1:1.0", textRef: "pending", threadRef: "D1:1.0" });
+		seed.recordInbound({
+			originKey: thread,
+			platformMessageId: "C1:10.1",
+			textRef: "dispatched",
+			threadRef: "C1:10.1",
+		});
+		seed.markDispatched("C1:10.1", { opRef: "op-slack-1", entryCursor: null });
+		seed.close();
+
+		const lines: string[] = [];
+		const clock = new FakeClock();
+		clock.t = Date.now();
+		const prompts: string[] = [];
+		const sessions = new FakeSessionStore();
+		daemon = new Daemon({
+			config: home.config,
+			channels: [discordBinding(new WaitingDiscordTransport())],
+			clock,
+			log: createLogger({ sink: (line) => lines.push(line), clock, redact }),
+			ompVersion: "omp-test 0",
+			bootId: "boot",
+			driverFactory: (_origin, sessionDir) => {
+				const driver = new OpsDriver({ sessionDir, store: sessions });
+				const prompt = driver.prompt.bind(driver);
+				driver.prompt = async (text) => {
+					prompts.push(text);
+					return prompt(text);
+				};
+				return driver;
+			},
+		});
+		await daemon.start();
+
+		expect(daemon.store.getInbound("D1:1.0")?.state).toBe("discarded");
+		expect(daemon.store.getInbound("C1:10.1")?.state).toBe("discarded");
+		const discarded = lines.filter((line) => line.includes("event=inbound_discarded"));
+		expect(discarded).toHaveLength(2);
+		for (const line of discarded) expect(line).toContain("reason=platform_removed");
+		expect(discarded.some((line) => line.endsWith("origin=slack/dm/D1"))).toBe(true);
+		expect(discarded.some((line) => line.endsWith("origin=slack/ch/C1/t/10.1"))).toBe(true);
+		await daemon.sweep();
+		expect(prompts).toEqual([]);
+		expect(lines.some((line) => line.includes("event=turn_start"))).toBe(false);
 	});
 });
 
@@ -2091,7 +2204,7 @@ describe("ompbot gc: deleted-monitor origins", () => {
 	beforeEach(() => {
 		home = makeHome("ompbot-ops-gc-monitor-");
 		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
-		for (const key of ["monitor/mold", "monitor/mnew", "monitor/mlive", "slack/ch/C1/t/50.9"]) {
+		for (const key of ["monitor/mold", "monitor/mnew", "monitor/mlive", "discord/ch/300000000000000001/t/50"]) {
 			store.ensureOrigin(key, sessionOf(key));
 		}
 		store.close();
@@ -2104,7 +2217,7 @@ describe("ompbot gc: deleted-monitor origins", () => {
 		makeSession(sessionOf("monitor/mold"), 60); // deleted monitor, expired: removed
 		makeSession(sessionOf("monitor/mnew"), 1); // deleted monitor, recent: retained
 		makeSession(sessionOf("monitor/mlive"), 60); // live monitor: never touched
-		makeSession(sessionOf("slack/ch/C1/t/50.9"), 60);
+		makeSession(sessionOf("discord/ch/300000000000000001/t/50"), 60);
 	});
 	afterEach(() => home.remove());
 
@@ -2114,7 +2227,7 @@ describe("ompbot gc: deleted-monitor origins", () => {
 		expect(existsSync(sessionOf("monitor/mold"))).toBe(false);
 		expect(originRow("monitor/mold")).toBe(false);
 		// Thread origins keep their own list and behavior.
-		expect(result.threadOriginsRemoved).toEqual(["slack/ch/C1/t/50.9"]);
+		expect(result.threadOriginsRemoved).toEqual(["discord/ch/300000000000000001/t/50"]);
 	});
 
 	test("an orphan monitor origin newer than the cutoff is retained", () => {
@@ -2169,7 +2282,7 @@ describe("ompbot gc: deleted-monitor origins", () => {
 describe("ompbot gc: ledger retention", () => {
 	let home: TestHome;
 	const NOW = Date.UTC(2026, 10, 13);
-	const KEY = "slack/ch/C1/t/1.1";
+	const KEY = "discord/ch/300000000000000001/t/11";
 	const dbFile = () => join(home.dir, "ompbot.db");
 	/** Ids of rows the fixture made, by name. */
 	const ids = new Map<string, number>();
@@ -2180,7 +2293,13 @@ describe("ompbot gc: ledger retention", () => {
 		store.ensureOrigin(KEY, join(home.dir, "sessions", "t"));
 		store.close();
 		const db = new Database(dbFile(), { strict: true });
-		const inbound = (name: string, ageDays: number, state: string, opRef: string, threadRef = "C1:1.1") => {
+		const inbound = (
+			name: string,
+			ageDays: number,
+			state: string,
+			opRef: string,
+			threadRef = "300000000000000001:11",
+		) => {
 			const row = db
 				.query(
 					"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, state, created_at, op_ref, thread_ref) VALUES (?, ?, 1, 'x', ?, ?, ?, ?) RETURNING inbound_id",
@@ -2191,38 +2310,38 @@ describe("ompbot gc: ledger retention", () => {
 		const delivery = (name: string, ageDays: number, state: string, posts: number) => {
 			const row = db
 				.query(
-					"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES (?, ?, 0, 'C1:1.1', 'b', ?, 0, ?) RETURNING delivery_id",
+					"INSERT INTO deliveries (origin_key, op_ref, part, thread_ref, body, state, next_at, created_at) VALUES (?, ?, 0, '300000000000000001:11', 'b', ?, 0, ?) RETURNING delivery_id",
 				)
 				.get(KEY, `op-${name}`, state, NOW - ageDays * DAY_MS) as { delivery_id: number };
 			ids.set(name, row.delivery_id);
 			for (let i = 0; i < posts; i += 1) {
 				db.query(
-					"INSERT INTO delivery_posts (channel, ts, delivery_id, part, created_at) VALUES ('C1', ?, ?, ?, 0)",
+					"INSERT INTO delivery_posts (channel, ts, delivery_id, part, created_at) VALUES ('300000000000000001', ?, ?, ?, 0)",
 				).run(`${name}.${i}`, row.delivery_id, i);
 			}
 		};
 		const approval = (id: string, status: string, threadRef: string) =>
 			db
 				.query(
-					"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, origin_thread_ref) VALUES (?, 'C1', ?, 's', ?, 0, 0, ?, ?)",
+					"INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, origin_thread_ref) VALUES (?, '300000000000000001', ?, 's', ?, 0, 0, ?, ?)",
 				)
 				.run(id, id, status, KEY, threadRef);
 		inbound("in-old-answered", 91, "answered", "opA");
 		inbound("in-old-failed", 91, "failed_notified", "opA2");
 		inbound("in-old-discarded", 91, "discarded", "opA3");
-		inbound("in-approval-done", 91, "answered", "opA4", "C1:8.8");
+		inbound("in-approval-done", 91, "answered", "opA4", "300000000000000001:88");
 		inbound("in-89", 89, "answered", "opK");
 		inbound("in-old-pending", 91, "pending", "opK2");
 		inbound("in-old-dispatched", 91, "dispatched", "opK3");
-		inbound("in-approval-pending", 91, "answered", "opK6", "C1:7.7");
+		inbound("in-approval-pending", 91, "answered", "opK6", "300000000000000001:77");
 		delivery("d-old-confirmed", 91, "confirmed", 2);
 		delivery("d-old-expired", 91, "expired", 1);
 		delivery("d-old-ambiguous", 91, "failed_ambiguous", 0);
 		delivery("d-89", 89, "confirmed", 1);
 		delivery("d-old-pending", 91, "pending", 0);
 		delivery("d-old-inflight", 91, "inflight", 0);
-		approval("ap-pending", "pending", "C1:7.7");
-		approval("ap-done", "approved", "C1:8.8");
+		approval("ap-pending", "pending", "300000000000000001:77");
+		approval("ap-done", "approved", "300000000000000001:88");
 		db.close();
 	});
 	afterEach(() => {

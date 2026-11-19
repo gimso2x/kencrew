@@ -1,4 +1,4 @@
-// Cost ceiling (`costCap` in config): the ledger day totals and the texts of the brake, its owner notice and `!budget`.
+// Cost ceiling (`costCap` in config): the ledger day totals and the texts of the turn warning, the turn stop and `!budget`.
 // The numbers are omp's own price conversion (`usage.cost.total`), never the provider's bill — an OAuth subscription
 // turn is still priced here, so the ceiling is a runaway brake, not an accounting figure.
 import { existsSync } from "node:fs";
@@ -26,8 +26,7 @@ export function usd(value: number): string {
 
 /**
  * The `usage_daily` key of `ms`: the calendar day (`YYYYMMDD`) in the bot's zone (`config.timezone`). The daily
- * ceiling and its `!budget off` flag both key on it, so that zone's midnight clears the day's spend and any off flag
- * together.
+ * ceiling keys on it, so that zone's midnight clears the day's spend.
  */
 export function ledgerDay(ms: number, timezone: string): string {
 	return localDay(ms, timezone);
@@ -145,77 +144,37 @@ export function messageCost(message: unknown): number {
 	return num(costs.total);
 }
 
-/** Multiple of `turnUsd` at which the turn is stopped instead of steered. */
-export const TURN_STOP_RATIO = 1.5;
+/** Multiple of `turnUsd` at which the turn is stopped; below it the cap only warns. */
+export const TURN_STOP_RATIO = 3;
 
 /** Failure-reason prefix of that stop; `#onFinal` reads it as a spend brake, not a broken turn. */
 export const COST_CAP_STOP_PREFIX = "cost_cap: ";
 
-/** The steer omp receives when a turn reaches the turn ceiling: wrap up and answer now. */
-export function turnCapSteerText(cap: number): string {
-	return `비용 상한(${usd(cap)})에 닿았습니다. 지금까지 한 일과 남은 일을 정리해 바로 답하고 끝내세요.`;
+/** The thread notice when a turn first reaches `turnUsd`: the turn goes on, it is only stopped at the multiple. */
+export function turnCapWarnText(cap: number, spent: number): string {
+	return `⚠️ 이번 턴 비용 ${usd(spent)}이 턴 상한 ${usd(cap)}을 넘었습니다. ${usd(cap * TURN_STOP_RATIO)}에서 멈춥니다.`;
 }
 
-/** The failure reason of a turn stopped at 1.5x the ceiling (`cost_cap`, beside `stuck-loop`). */
+/** The failure reason of a turn stopped at 3x the ceiling (`cost_cap`, beside `stuck-loop`). */
 export function turnCapStopReason(cap: number, spent: number): string {
 	return `${COST_CAP_STOP_PREFIX}비용 상한 ${usd(cap)}의 ${TURN_STOP_RATIO}배를 넘어 턴을 멈췄습니다(이번 턴 ${usd(spent)})`;
 }
 
-/** The owner notice of the first daily-cap breach; the key `cost-cap-daily:<day>` keeps it to one a day. */
-export function dailyCapNotice(cap: number, cost: number, timezone: string): string {
-	return [
-		`⛔ 오늘 비용(정가 환산) ${usd(cost)}가 하루 상한 ${usd(cap)}를 넘어 모니터를 멈췄습니다.`,
-		`자정(${timezone})에 풀립니다. 지금 풀려면 \`!budget off\`.`,
-	].join("\n");
-}
-
-/** Ledger key of the day's breach notice (set once, so the owner hears it once a day). */
-export function dailyNoticeKey(day: string): string {
-	return `cost-cap-daily:${day}`;
-}
-
-/** Ledger key of the day's `!budget off` flag; the day inside the key is why the bot zone's midnight lifts it by itself. */
-export function dailyOffKey(day: string): string {
-	return `cost-cap-off:${day}`;
-}
-
-/** The day's ceiling and what the ledger says about it: the one state both the scheduler hook and `!budget` read. */
+/** The day's ceiling and what the ledger says about it: what `!budget` reads. */
 export interface DailyBudgetState {
 	day: string;
 	cost: number;
 	/** `costCap.dailyUsd`; undefined = no daily ceiling configured. */
 	cap: number | undefined;
-	/** `!budget off` for this day. */
-	off: boolean;
-	/** The day's breach notice already went out. */
-	notified: boolean;
 }
 
-/**
- * Reads the day's total and both flags from the ledger alone, so a restarted daemon sees the same state (and a
- * `!budget off` typed before the restart still holds).
- */
+/** Reads the day's total from the ledger alone, so a restarted daemon sees the same state. */
 export function dailyBudgetState(input: {
-	store: Pick<Store, "getCursor" | "dailyCost">;
+	store: Pick<Store, "dailyCost">;
 	day: string;
 	cap: number | undefined;
 }): DailyBudgetState {
-	return {
-		day: input.day,
-		cost: input.store.dailyCost(input.day),
-		cap: input.cap,
-		off: input.store.getCursor(dailyOffKey(input.day)) !== undefined,
-		notified: input.store.getCursor(dailyNoticeKey(input.day)) !== undefined,
-	};
-}
-
-/**
- * The scheduler's `budgetExceeded` value: set while the day's total has reached the ceiling and the day is not
- * switched off. `undefined` (no ceiling, still under it, or `!budget off`) lets monitors fire as usual.
- */
-export function budgetBreach(state: DailyBudgetState): { day: string; cost: number; cap: number } | undefined {
-	if (state.cap === undefined || state.off) return undefined;
-	return state.cost >= state.cap ? { day: state.day, cost: state.cost, cap: state.cap } : undefined;
+	return { day: input.day, cost: input.store.dailyCost(input.day), cap: input.cap };
 }
 
 /** `!budget` with no argument: today's total, its top origins and both ceilings. */
@@ -225,7 +184,6 @@ export function renderBudget(input: {
 	top: ReadonlyArray<{ originKey: string; cost: number }>;
 	turnCap: number | undefined;
 	dailyCap: number | undefined;
-	off: boolean;
 }): string {
 	const cap = (value: number | undefined): string => (value === undefined ? "꺼짐" : usd(value));
 	const lines = [
@@ -237,13 +195,11 @@ export function renderBudget(input: {
 		lines.push("상위 오리진: 오늘 집계된 턴이 없습니다");
 	}
 	if (input.dailyCap === undefined) {
-		lines.push("하루 상한이 꺼져 있어 모니터를 멈추지 않습니다.");
-	} else if (input.off) {
-		lines.push("오늘은 하루 상한을 껐습니다(자정에 풀립니다). 다시 켜려면 `!budget on`.");
+		lines.push("하루 상한이 꺼져 있습니다.");
 	} else if (input.total >= input.dailyCap) {
-		lines.push("하루 상한을 넘어 모니터가 멈춰 있습니다. 지금 풀려면 `!budget off`.");
+		lines.push("하루 상한을 넘었습니다. 알림만 갈 뿐 모니터는 멈추지 않습니다.");
 	} else {
-		lines.push(`하루 상한까지 ${usd(input.dailyCap - input.total)} 남았습니다. 하루 상한을 끄려면 \`!budget off\`.`);
+		lines.push(`하루 상한까지 ${usd(input.dailyCap - input.total)} 남았습니다.`);
 	}
 	return lines.join("\n");
 }

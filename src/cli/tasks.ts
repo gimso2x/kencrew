@@ -68,7 +68,7 @@ async function askDaemon(
 	}
 }
 
-/** `ompbot tasks ...` against the ledger file directly; Slack side effects go through the running daemon. */
+/** `ompbot tasks ...` against the ledger file directly; chat side effects go through the running daemon. */
 export async function tasksCommand(
 	args: string[],
 	homeDir: string,
@@ -130,11 +130,11 @@ export async function tasksCommand(
 			out({ closed: closed.taskId, status: closed.status, closedAt: closed.closedAt });
 			const synced = await askDaemon(homeDir, { op: "tasks_sync", id: row.taskId });
 			if (synced === "no_response")
-				process.stderr.write("tasks close: no daemon answer — 응답 지연 — Slack reaction update unknown\n");
+				process.stderr.write("tasks close: no daemon answer — 응답 지연 — reaction update unknown\n");
 			else if (synced === "unreachable")
-				process.stderr.write("tasks close: daemon not reachable — Slack reaction not updated\n");
+				process.stderr.write("tasks close: daemon not reachable — reaction not updated\n");
 			else if (synced.ok !== true)
-				process.stderr.write(`tasks close: daemon refused: ${String(synced.error)} — Slack reaction not updated\n`);
+				process.stderr.write(`tasks close: daemon refused: ${String(synced.error)} — reaction not updated\n`);
 			return 0;
 		}
 		if (sub === "pause" || sub === "resume") {

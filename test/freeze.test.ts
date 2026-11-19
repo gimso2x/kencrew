@@ -14,9 +14,7 @@ import { clearFreeze, createFreezeProbe, freezePath, readFreeze, writeFreeze } f
 import { collectGates } from "../src/ops/gates";
 import { redact } from "../src/redact";
 import { SKILL_REVIEW_ORIGIN } from "../src/review/skills";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 import { isRoot } from "./helpers/privileges";
 
 let dir: string;
@@ -138,7 +136,7 @@ describe("dispatch audit", () => {
 		});
 		// Assembled at runtime so secret scanners (gitleaks) do not flag the fixture; the value is unchanged.
 		const token = ["xoxb", "1234567890", "abcdefghijklmnop"].join("-");
-		auditContext.run({ origin: "slack/dm/D1" }, () =>
+		auditContext.run({ origin: `discord/dm/${OWNER_DM}` }, () =>
 			audit.record(
 				["ssh", "-o", "BatchMode=yes", "wsl", "--", "echo", token, "x".repeat(1_000)],
 				{ code: 7, timedOut: false },
@@ -153,7 +151,7 @@ describe("dispatch audit", () => {
 			argv0: "ssh",
 			rc: 7,
 			ms: 42,
-			origin: "slack/dm/D1",
+			origin: `discord/dm/${OWNER_DM}`,
 		});
 		expect(first.cmd).not.toContain(token);
 		expect(first.cmd.length).toBeLessThanOrEqual(301);
@@ -189,7 +187,7 @@ describe("ompbot_dispatch under freeze", () => {
 	function tool(frozen: () => ReturnType<typeof readFreeze>) {
 		const calls: string[][] = [];
 		const built = buildDispatchTool({
-			originKey: "slack/dm/D1",
+			originKey: `discord/dm/${OWNER_DM}`,
 			ompExecutable: "omp",
 			homeDir: dir,
 			workspaceDir: dir,
@@ -294,17 +292,17 @@ describe("daemon under freeze", () => {
 	test("owner conversation turns still get answered and status reports FROZEN", async () => {
 		writeFreeze(home.dir, { reason: "test", by: "cli", now: Date.now() });
 		const sessions = new FakeSessionStore();
-		const transport = new WaitingTransport();
+		const transport = new WaitingDiscordTransport();
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: () => undefined, clock: { now: () => Date.now() }, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
 			driverFactory: (_origin, sessionDir) => new FakeOmpDriver({ sessionDir, store: sessions }),
 		});
 		await daemon.start();
-		await daemon.inject({ origin: "slack/dm/D1", asOwner: true, text: "안녕" });
+		await daemon.inject({ origin: `discord/dm/${OWNER_DM}`, asOwner: true, text: "안녕" });
 		await transport.waitForPosts((posted) => posted.includes("ECHO 안녕"));
 		expect(daemon.status().frozen?.reason).toBe("test");
 	});
@@ -315,13 +313,13 @@ describe("daemon under freeze", () => {
 	 */
 	async function reviewAfterOneTurn(): Promise<{ origins: string[]; lines: string[] }> {
 		const sessions = new FakeSessionStore();
-		const transport = new WaitingTransport();
+		const transport = new WaitingDiscordTransport();
 		const lines: string[] = [];
 		const origins: string[] = [];
 		const clock = { now: () => Date.now() };
 		daemon = new Daemon({
 			config: { ...home.config, skillReviewTurns: 1 },
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			clock,
 			log: createLogger({ sink: (line) => void lines.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
@@ -336,7 +334,7 @@ describe("daemon under freeze", () => {
 		});
 		await daemon.start();
 		const answer = async (text: string) => {
-			await daemon?.inject({ origin: "slack/dm/D1", asOwner: true, text });
+			await daemon?.inject({ origin: `discord/dm/${OWNER_DM}`, asOwner: true, text });
 			await transport.waitForPosts((posted) => posted.includes(`ECHO ${text}`));
 		};
 		await answer("하나");
@@ -403,7 +401,7 @@ describe("autonomous rows under freeze", () => {
 		const clock = { now: () => t };
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			clock,
 			log: createLogger({
 				sink: (line) => {
@@ -445,7 +443,7 @@ describe("autonomous rows under freeze", () => {
 	};
 	const stateOf = (id: string) => daemon?.store.getInbound(id)?.state;
 	const MONITOR = { originKey: "monitor/m1", id: "monitor:m1:1", text: "tick" };
-	const LANE = { originKey: "slack/dm/D1", id: "lane:l1:nudge:1", text: "자동 재촉" };
+	const LANE = { originKey: `discord/dm/${OWNER_DM}`, id: "lane:l1:nudge:1", text: "자동 재촉" };
 
 	test("AC-1/AC-5: start frozen leaves monitor and lane rows pending with no turn and no retry or alert; after the unfreeze the first sweep dispatches them even under 60s old", async () => {
 		writeFreeze(home.dir, { reason: "hold", by: "cli", now: t });

@@ -2,7 +2,7 @@
 // become one embed, cut to Discord's embed limits instead of being refused (doc/plans/discord-channel.md §10).
 import type { CardChild } from "chat";
 import { type CardElement, type CardTone, chartToAscii, tableToAscii, toneColorInt } from "../channel/card";
-import { cutCodePointSafe } from "../channel/text";
+import { cutCodePointSafe, fenceCloseRun, fenceOpenRun } from "../channel/text";
 
 /** Embed limits (Embed Limits table): title, description, field count, field name and value, all text together. */
 export const EMBED_LIMITS = {
@@ -36,8 +36,8 @@ const EMPTY = "\u200b";
 function openFenceRun(part: string): number {
 	let open = 0;
 	for (const line of part.split("\n")) {
-		if (open === 0) open = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length ?? 0;
-		else if ((/^ {0,3}(`+)[ \t]*\r?$/.exec(line)?.[1]?.length ?? 0) >= open) open = 0;
+		if (open === 0) open = fenceOpenRun(line) ?? 0;
+		else if ((fenceCloseRun(line) ?? 0) >= open) open = 0;
 	}
 	return open;
 }

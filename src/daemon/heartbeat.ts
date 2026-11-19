@@ -19,8 +19,6 @@ export interface SweepHeartbeat {
 	ts: Date;
 	/** Max observed event-loop delay since the previous sweep, milliseconds (`loop_ms=` in the stamp). */
 	loopMs: number | undefined;
-	/** Slack socket state (`socket=` + `socket_since=`); absent when the transport reports none or an old daemon wrote the stamp. */
-	socket?: { state: "up" | "down"; since: Date } | undefined;
 	/** Discord gateway state (`discord=` + `discord_since=`); absent when Discord is off or its transport reports none. */
 	discord?: { state: "up" | "down"; since: Date } | undefined;
 	/** `draining=0|1`; absent when an older daemon (before this field) wrote the stamp. */
@@ -29,7 +27,6 @@ export interface SweepHeartbeat {
 
 /** What one beat records besides the loop delay. */
 export interface BeatState {
-	socket?: { state: "up" | "down"; since: number } | undefined;
 	discord?: { state: "up" | "down"; since: number } | undefined;
 	draining: boolean;
 }
@@ -51,13 +48,11 @@ export function readSweepHeartbeat(homeDir: string): SweepHeartbeat | undefined 
 		ts,
 		loopMs: loopMs !== undefined && /^\d+$/.test(loopMs) ? Number(loopMs) : undefined,
 	};
-	for (const name of ["socket", "discord"] as const) {
-		const state = fields.get(name);
-		const sinceText = fields.get(`${name}_since`);
-		if ((state === "up" || state === "down") && sinceText !== undefined) {
-			const since = new Date(sinceText);
-			if (!Number.isNaN(since.getTime())) result[name] = { state, since };
-		}
+	const discordState = fields.get("discord");
+	const discordSince = fields.get("discord_since");
+	if ((discordState === "up" || discordState === "down") && discordSince !== undefined) {
+		const since = new Date(discordSince);
+		if (!Number.isNaN(since.getTime())) result.discord = { state: discordState, since };
 	}
 	const draining = fields.get("draining");
 	if (draining === "0" || draining === "1") result.draining = draining === "1";
@@ -89,14 +84,10 @@ export class SweepHeartbeatWriter {
 	beat(now: number, state: BeatState = { draining: false }): number {
 		const loopMs = Math.round(this.#histogram.max / 1e6);
 		this.#histogram.reset();
-		const connections = (["socket", "discord"] as const)
-			.map((name) => {
-				const connection = state[name];
-				return connection === undefined
-					? ""
-					: ` ${name}=${connection.state} ${name}_since=${new Date(connection.since).toISOString()}`;
-			})
-			.join("");
+		const connections =
+			state.discord === undefined
+				? ""
+				: ` discord=${state.discord.state} discord_since=${new Date(state.discord.since).toISOString()}`;
 		writeHeartbeatAtomic(
 			join(this.#homeDir, SWEEP_HEARTBEAT_FILE),
 			`ts=${new Date(now).toISOString()} loop_ms=${loopMs}${connections} draining=${state.draining ? 1 : 0}\n`,

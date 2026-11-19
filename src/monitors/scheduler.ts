@@ -52,21 +52,6 @@ export interface MonitorSchedulerDeps {
 	 * do not run, and a due one-shot `at` monitor is held (not claimed, still enabled) so it fires once after unfreeze.
 	 */
 	frozen?: (() => FreezeState | undefined) | undefined;
-	/**
-	 * Daily cost ceiling (`costCap.dailyUsd`). While it returns a value no monitor fires and no watched or admitted
-	 * event is dispatched: due slots are recorded as skipped events with reason `budget` and queued events are skipped,
-	 * so the day's ceiling lifting at midnight never replays a burst. Script checks do not run either (a check that
-	 * fires would start a turn). Unlike `frozen` a due one-shot `at` monitor is not held: the day's spend is not a
-	 * temporary stop the owner can lift for it, and keeping it pending for a day would fire it late anyway.
-	 */
-	budgetExceeded?: (() => BudgetBreach | undefined) | undefined;
-}
-
-/** The daily ceiling and what the ledger counts for it; only rendered into logs, the scheduler reads the fact. */
-export interface BudgetBreach {
-	day: string;
-	cost: number;
-	cap: number;
 }
 
 export interface TickSummary {
@@ -75,16 +60,11 @@ export interface TickSummary {
 	skippedCatchUp: number;
 	/** Fires recorded as skipped (`frozen`) instead of claimed while the freeze switch is on. */
 	skippedFrozen: number;
-	/** Fires recorded as skipped (`budget`) instead of claimed while the day's cost ceiling stands. */
-	skippedBudget: number;
 	dispatched: number;
 }
 
 /** Reason prefix of events a frozen tick records instead of firing. */
 const FROZEN_SKIP = "frozen";
-
-/** Reason prefix of events a tick over the daily cost ceiling records instead of firing. */
-const BUDGET_SKIP = "budget";
 
 /**
  * The procedure files of one fire, read from disk now (an edit between fires applies to the next one): one block per
@@ -266,12 +246,11 @@ export class MonitorScheduler {
 			skippedOverlap: 0,
 			skippedCatchUp: 0,
 			skippedFrozen: 0,
-			skippedBudget: 0,
 			dispatched: 0,
 		};
 		store.monitors.reconcileDeliveries();
 		const monitors = store.monitors.listMonitors();
-		// The freeze names its reason `frozen`; the day's ceiling `budget`. Both only skip, never replay.
+		// The freeze records skipped events and never replays them.
 		const skip = this.#skipReason();
 		if (skip !== FROZEN_SKIP) this.#heldAt.clear();
 		// The CLI edits the ledger from another process: watches follow the rows, not an in-process registry.
@@ -285,14 +264,6 @@ export class MonitorScheduler {
 					this.#claimWatcher(monitor, monitor.trigger.debounceMs, now, summary, skip);
 				else if (monitor.trigger.kind === "script" && skip === undefined)
 					this.#kickScript(monitor, monitor.trigger, now);
-				// The day's ceiling skips a due check like a cron slot: its schedule moves on, so monitors_stalled
-				// does not read the held monitor as overdue.
-				else if (
-					monitor.trigger.kind === "script" &&
-					skip === BUDGET_SKIP &&
-					now >= monitor.cursorAt + monitor.trigger.intervalMs
-				)
-					store.monitors.setCursor(monitor.id, now);
 				// webhook events are admitted by the listener (monitors/webhook), not claimed on a schedule.
 			} catch (error) {
 				this.#deps.log.error("monitor_tick_failed", { monitor: monitor.id, error: String(error) });
@@ -302,21 +273,16 @@ export class MonitorScheduler {
 		return summary;
 	}
 
-	/**
-	 * Why this tick fires nothing at all: `frozen` (the freeze switch) takes precedence over `budget` (the day's cost
-	 * ceiling), so a frozen tick keeps its own skip reason. `undefined` means nothing is holding the monitors.
-	 */
+	/** Why this tick fires nothing at all: `frozen` (the freeze switch). `undefined` means nothing is holding the monitors. */
 	#skipReason(): string | undefined {
-		if (this.#deps.frozen?.() !== undefined) return FROZEN_SKIP;
-		return this.#deps.budgetExceeded?.() === undefined ? undefined : BUDGET_SKIP;
+		return this.#deps.frozen?.() === undefined ? undefined : FROZEN_SKIP;
 	}
 
-	/** A claim made while held is a forced skip (`frozen`/`budget`), so it counts as held back, not as claimed. */
+	/** A claim made while held is a forced skip (`frozen`), so it counts as held back, not as claimed. */
 	#count(claim: ClaimResult, summary: TickSummary, skip: string | undefined): void {
 		if (skip !== undefined) {
 			if (claim.status !== "skipped_overlap") return;
-			if (skip === FROZEN_SKIP) summary.skippedFrozen += 1;
-			else summary.skippedBudget += 1;
+			summary.skippedFrozen += 1;
 		} else if (claim.status === "admitted") summary.claimed += 1;
 		else if (claim.status === "skipped_overlap") summary.skippedOverlap += 1;
 	}
@@ -507,7 +473,7 @@ export class MonitorScheduler {
 			if (skip !== undefined) {
 				// Held back for good: an event kept queued would fire as a burst the moment the hold is lifted.
 				if (store.monitors.skipEvent(event.eventId, skip)) {
-					log.info(skip === FROZEN_SKIP ? "monitor_frozen_skip" : "monitor_budget_skip", {
+					log.info("monitor_frozen_skip", {
 						monitor: monitor.id,
 						event: event.eventId,
 					});

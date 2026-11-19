@@ -12,10 +12,8 @@ import { createLogger } from "../src/log";
 import type { OmpEvent } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
 import { clearSecretIndex, indexSecretValue, redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import type { Store } from "../src/store/db";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
 const clock = {
 	t: 1_000_000,
@@ -177,7 +175,7 @@ class LiveDriver extends FakeOmpDriver {
 }
 
 describe("OriginMailbox live view", () => {
-	const ORIGIN = "slack/dm/DLIVE";
+	const ORIGIN = "discord/dm/200000000000000002";
 	let dir: string;
 	let store: Store;
 	let drivers: LiveDriver[];
@@ -299,7 +297,7 @@ describe("OriginMailbox live view", () => {
 });
 
 describe("daemon live op", () => {
-	const ORIGIN = "slack/dm/D1";
+	const ORIGIN = `discord/dm/${OWNER_DM}`;
 	let home: TestHome;
 	let daemon: Daemon | undefined;
 
@@ -318,7 +316,7 @@ describe("daemon live op", () => {
 		const sessions = new FakeSessionStore();
 		daemon = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			log: createLogger({
 				sink: (line) => {
 					if (line.includes("event=turn_start")) started.resolve();
@@ -341,7 +339,7 @@ describe("daemon live op", () => {
 
 		const running = await callDaemon(daemon.socketPath, { op: "live", origin: ORIGIN });
 		expect(running).toMatchObject({ ok: true, live: { text: "소켓으로 본다", seq: 1 } });
-		expect(await callDaemon(daemon.socketPath, { op: "live", origin: "slack/dm/NOPE" })).toEqual({
+		expect(await callDaemon(daemon.socketPath, { op: "live", origin: "discord/dm/200000000000000099" })).toEqual({
 			ok: true,
 			live: null,
 		});

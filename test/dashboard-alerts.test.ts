@@ -34,7 +34,6 @@ const GATE_NAMES = [
 	"backup_age",
 	"offsite_age",
 	"sweep_stalled",
-	"slack_disconnected",
 	"frozen",
 	"omp_runtime",
 	"inbound_starved",
@@ -46,7 +45,7 @@ const GATE_NAMES = [
 	"turns_failing",
 ];
 
-/** Thirteen gates; the named ones are open, `turns_failing` carries a token in its detail. */
+/** Twelve gates; the named ones are open, `turns_failing` carries a token in its detail. */
 const gatesWith = (...open: string[]): Gate[] =>
 	GATE_NAMES.map((name) => ({
 		name,
@@ -58,7 +57,7 @@ const STATUS: StatusReport = {
 	ompVersion: "omp 9.9.9",
 	timezone: "Asia/Seoul",
 	daemonRunning: true,
-	origins: [{ originKey: "slack/dm/U1", epoch: 1, ompPid: 42, busy: false }],
+	origins: [{ originKey: "discord/dm/200000000000000001", epoch: 1, ompPid: 42, busy: false }],
 	ledger: { pending: 0, inflight: 0, confirmed: 5, ambiguous: 0, expired: 0 },
 	inbound: { pending: 0, dispatched: 0, answered: 1, failed_notified: 0, discarded: 0 },
 	monitors: { count: 0, next: null },
@@ -81,7 +80,7 @@ function seedAlerts(): void {
 		);
 	add("gate:turns_failing", SIG, "alerted", 12, NOW - 30 * HOUR, NOW - 20 * HOUR);
 	add("gate:lanes_stuck", "open", "alerted", 2, NOW - 3 * HOUR, NOW - HOUR);
-	add("turns:slack/dm/U1", "turn_failed", "alerted", 4, NOW - 2 * HOUR, NOW - 2 * HOUR);
+	add("turns:discord/dm/200000000000000001", "turn_failed", "alerted", 4, NOW - 2 * HOUR, NOW - 2 * HOUR);
 	add("gate:frozen", "open", "resolved", 1, NOW - 50 * HOUR, NOW - 49 * HOUR);
 	db.close();
 }
@@ -175,7 +174,7 @@ describe("dashboard alerts & system snapshot", () => {
 			},
 		]);
 		if (!snapshot.gates.ok) throw new Error(snapshot.gates.error);
-		expect(snapshot.gates.items).toHaveLength(13);
+		expect(snapshot.gates.items).toHaveLength(12);
 		expect(snapshot.gates.items.find((gate) => gate.name === "turns_failing")).toEqual({
 			name: "turns_failing",
 			state: "closed",
@@ -209,7 +208,7 @@ describe("dashboard alerts & system snapshot", () => {
 		const snapshot = await buildSnapshot(deps());
 		expect(alertOf(snapshot, "gate:turns_failing").gateState).toBe("closed");
 		expect(alertOf(snapshot, "gate:lanes_stuck").gateState).toBe("open");
-		expect(alertOf(snapshot, "turns:slack/dm/U1").gateState).toBeUndefined();
+		expect(alertOf(snapshot, "turns:discord/dm/200000000000000001").gateState).toBeUndefined();
 		if (!snapshot.alerts.ok) throw new Error(snapshot.alerts.error);
 		expect(snapshot.alerts.items.map((item) => item.scope)).not.toContain("gate:frozen");
 
@@ -274,7 +273,7 @@ describe("dashboard alerts & system screens", () => {
 		expect(main).not.toContain(SIG);
 		expect(main).toContain(`최근 ${TURNS_FAILING_WINDOW_MS / HOUR}시간 턴 실패가 ${TURNS_FAILING_THRESHOLD}회 이상`);
 		expect(main).toContain(`레인이 ${LANE_STUCK_MS / HOUR}시간 넘게 멈춤`);
-		expect(main).toContain("대화 턴 연속 실패 · slack/dm/U1");
+		expect(main).toContain("대화 턴 연속 실패 · discord/dm/200000000000000001");
 		expect(main).toContain("<code>turn_failed</code>");
 		const id = String(alertOf(snapshot, "gate:turns_failing").incidentId);
 		const detail = renderItemDetail(snapshot, "alerts", id);
@@ -334,7 +333,7 @@ describe("dashboard alerts & system screens", () => {
 		expect(calm).toContain("지금은 닫힘 · 기록만 남음");
 	});
 
-	test("AC-5: seven system cards, fifteen gate lines (real collectGates), backup past its age is a warning", async () => {
+	test("AC-5: six system cards, fourteen gate lines (real collectGates), backup past its age is a warning", async () => {
 		stamp(STAMP_FILE, BACKUP_MAX_AGE_MS + HOUR);
 		stamp(OFFSITE_STAMP_FILE, HOUR);
 		const offsite = { offsite: { ssh: "backup-host", remoteDir: "/b" } };
@@ -345,8 +344,8 @@ describe("dashboard alerts & system screens", () => {
 		});
 		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "system" });
 		const cards = [...html.matchAll(/class="sys-card[^"]*" data-card="([a-z]+)"/g)].map((match) => match[1]);
-		expect(cards).toEqual(["daemon", "slack", "sweep", "ledger", "backup", "gates", "monitors"]);
-		expect(html.match(/class="gate-row/g)).toHaveLength(15);
+		expect(cards).toEqual(["daemon", "sweep", "ledger", "backup", "gates", "monitors"]);
+		expect(html.match(/class="gate-row/g)).toHaveLength(14);
 		const backup = sysCard(html, "backup");
 		expect(backup).toContain("주의");
 		expect(backup).toContain("is-warning");

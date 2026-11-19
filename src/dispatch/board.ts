@@ -24,6 +24,11 @@ interface BoardMachine {
 /** Resolves a link from a dispatch host (`null` = this host) and an agent's pane id. */
 export type BoardLinkResolver = (host: string | null, paneId: string | undefined) => Promise<string>;
 
+/** The dashboard's diff view of a lane (`lane:<name>`) or a TASK (`task:<id>`) under the board address. */
+export function diffViewLink(board: Pick<HerdrBoardConfig, "url">, subject: string): string {
+	return `${board.url}${board.url.includes("?") ? "&" : "?"}diff=${encodeURIComponent(subject)}`;
+}
+
 /**
  * The card link of `paneId` on `host` (`null` = the web UI's local machine, any other value = the machine of that
  * name). Falls back to the board root when the pane is unknown or the machine list cannot be read; `onError` hears

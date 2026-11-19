@@ -12,7 +12,7 @@ import { REQUIRED_RPC_METHODS, RpcOmpDriver } from "../src/omp/rpc-driver";
 import { redact } from "../src/redact";
 import type { Store } from "../src/store/db";
 
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = "discord/dm/200000000000000001";
 const clock = { now: () => 1_000_000 };
 
 /** A fake driver that supports side questions: every `btw` call stays open until the test settles it. */

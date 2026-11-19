@@ -6,39 +6,62 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TOP_LEVEL_TS } from "../src/core/normalize";
 import { Daemon } from "../src/daemon/daemon";
+import { DiscordCallError } from "../src/discord/transport";
 import { dispatchEnv, type ProcessRunner, type RunProcessResult } from "../src/dispatch/omp";
 import { createGateSlot } from "../src/lanes/qa";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { SlackCallError } from "../src/slack/transport";
 import type { TaskCheck, TaskJudgement } from "../src/tasks/checker";
 import { acceptanceItems } from "../src/tasks/docs";
 import type { TaskGateEnd, TaskGateHooks } from "../src/tasks/gate";
 import { landTask, type TaskLandResult } from "../src/tasks/land";
 import { migrateTaskSchema, TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { autoLandBlockers, buildReachedCard, holdingIntegrityWarnings } from "../src/tasks/notify";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { discordBinding, GUILD, makeHome, OWNER, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
-const CHANNEL = "C1";
-const THREAD = "1700.000100";
+const CHANNEL = "111111111111111111";
+const THREAD = "222222222222222222";
+
+/** A Discord transport that knows the task's server channel and its thread. */
+function threadTransport(): WaitingDiscordTransport {
+	const discord = new WaitingDiscordTransport();
+	discord.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
+	discord.setChannel({ id: THREAD, type: 11, parentId: CHANNEL, guildId: GUILD });
+	return discord;
+}
+
+let interactionSeq = 0n;
+/** The owner presses the button `customId` of the card `card` in the task thread. */
+function click(discord: WaitingDiscordTransport, customId: string, card: string): Promise<void> {
+	interactionSeq += 1n;
+	return discord.emitInteraction({
+		id: String(800_000_000_000_000_000n + interactionSeq),
+		application_id: "600000000000000000",
+		type: 3,
+		token: `token-${interactionSeq}`,
+		channel_id: THREAD,
+		guild_id: GUILD,
+		member: { user: { id: OWNER } },
+		data: { custom_id: customId, component_type: 2 },
+		message: { id: card, channel_id: THREAD },
+	});
+}
 const clock = { now: () => Date.now() };
 
 let home: TestHome;
 let daemon: Daemon;
-let transport: WaitingTransport;
+let transport: WaitingDiscordTransport;
 let logs: string[];
 
 beforeEach(async () => {
 	home = makeHome("ompbot-autoland-");
 	logs = [];
-	transport = new WaitingTransport();
+	transport = threadTransport();
 	const sessions = new FakeSessionStore();
 	daemon = new Daemon({
 		config: home.config,
-		channels: [new SlackBinding(new SlackChannel(transport))],
+		channels: [discordBinding(transport)],
 		log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
@@ -58,7 +81,7 @@ function seedTask(over: { threadRef?: string; repo?: string } = {}): TaskRow {
 	const row = tasks.register({
 		title: "로그 회전",
 		risk: "L2",
-		originKey: `slack/ch/${CHANNEL}/t/${THREAD}`,
+		originKey: `discord/ch/${CHANNEL}/t/${THREAD}`,
 		threadRef: over.threadRef ?? `${CHANNEL}:${THREAD}`,
 		host: null,
 		repo: over.repo ?? "/r/repo",
@@ -68,7 +91,7 @@ function seedTask(over: { threadRef?: string; repo?: string } = {}): TaskRow {
 	return tasks.require(row.taskId);
 }
 
-const markers = () => transport.posts((text) => text === "🤖 자동 머지");
+const markers = () => transport.posts((text: string) => text === "🤖 자동 머지");
 const mergeInbounds = () => daemon.store.listInbound().filter((row) => row.textRef.trim().startsWith("머지해"));
 
 describe("daemon repoMatches (git common directory)", () => {
@@ -116,7 +139,7 @@ describe("daemon autoLand", () => {
 		const row = seedTask();
 		expect(await daemon.autoLand(row)).toMatchObject({ state: "handoff", reason: expect.stringContaining("worktree") });
 		expect(markers()).toHaveLength(1);
-		expect(markers()[0]).toMatchObject({ channel: CHANNEL, threadTs: THREAD });
+		expect(markers()[0]).toMatchObject({ channelId: THREAD });
 		const inbound = mergeInbounds();
 		expect(inbound).toHaveLength(1);
 		expect(inbound[0]).toMatchObject({ threadRef: `${CHANNEL}:${THREAD}` });
@@ -150,7 +173,9 @@ describe("daemon autoLand", () => {
 
 	test("AC-7: a failed attempt (marker post throws) releases the lock: the next call goes in", async () => {
 		const row = seedTask();
-		transport.failNext.postMessage = [new SlackCallError("definitive", "slack_platform_error:channel_not_found")];
+		transport.failNext.createMessage = [
+			new DiscordCallError("definitive", "discord_http_404:10003 Unknown Channel", 404, 10003),
+		];
 		await expect(daemon.autoLand(row)).rejects.toThrow();
 		expect(mergeInbounds()).toHaveLength(0);
 		expect(await daemon.autoLand(row)).toMatchObject({ state: "handoff" });
@@ -160,7 +185,7 @@ describe("daemon autoLand", () => {
 
 describe("daemon autoLand: core landing seam (task-core-land)", () => {
 	let gated: Daemon;
-	let gatedTransport: WaitingTransport;
+	let gatedTransport: WaitingDiscordTransport;
 	let gatedHome: TestHome;
 	let drivers: FakeOmpDriver[];
 	let landCalls: TaskRow[];
@@ -171,7 +196,7 @@ describe("daemon autoLand: core landing seam (task-core-land)", () => {
 
 	beforeEach(async () => {
 		gatedHome = makeHome("ompbot-coreland-");
-		gatedTransport = new WaitingTransport();
+		gatedTransport = threadTransport();
 		drivers = [];
 		landCalls = [];
 		answer = { state: "handoff", reason: "재판정 문제: check AC-1 실패" };
@@ -180,7 +205,7 @@ describe("daemon autoLand: core landing seam (task-core-land)", () => {
 		const sessions = new FakeSessionStore();
 		gated = new Daemon({
 			config: gatedHome.config,
-			channels: [new SlackBinding(new SlackChannel(gatedTransport))],
+			channels: [discordBinding(gatedTransport)],
 			log: createLogger({ sink: () => {}, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -211,7 +236,7 @@ describe("daemon autoLand: core landing seam (task-core-land)", () => {
 		const row = tasks.register({
 			title: "로그 회전",
 			risk: "L2",
-			originKey: `slack/ch/${CHANNEL}/t/${THREAD}`,
+			originKey: `discord/ch/${CHANNEL}/t/${THREAD}`,
 			threadRef: `${CHANNEL}:${THREAD}`,
 			host,
 			repo: "/r/repo",
@@ -224,19 +249,14 @@ describe("daemon autoLand: core landing seam (task-core-land)", () => {
 	const inbounds = () => gated.store.listInbound().filter((row) => row.textRef.trim().startsWith("머지해"));
 
 	async function clickMerge(taskId: string): Promise<string> {
-		const card = await gatedTransport.postMessage({ channel: CHANNEL, threadTs: THREAD, text: "🔍 머지 대기 카드" });
-		await gatedTransport.emitBlockAction({
-			user: { id: OWNER },
-			channel: { id: CHANNEL },
-			message: { ts: card.ts },
-			actions: [{ action_id: `ompbot:task:merge:${taskId}`, value: taskId }],
-		});
-		return card.ts;
+		const card = await gatedTransport.createMessage({ channelId: THREAD, content: "🔍 머지 대기 카드" });
+		await click(gatedTransport, `ompbot:task:merge:${taskId}`, card.id);
+		return card.id;
 	}
 
 	const editsOf = (ts: string): string[] =>
 		gatedTransport.calls.flatMap((call) =>
-			call.method === "updateMessage" && call.ts === ts ? [JSON.stringify(call.blocks ?? call.text)] : [],
+			call.method === "editMessage" && call.messageId === ts ? [JSON.stringify(call.embeds ?? call.content)] : [],
 		);
 
 	test("AC-4: a remote host task never reaches landTask: only '머지해' goes in, as before", async () => {
@@ -298,7 +318,7 @@ describe("autoLandBlockers: re-run checks", () => {
 		id: "AC-3",
 		signal: 'command ["bun","test"]',
 		ok: false,
-		detail: "300초 안에 끝나지 않았습니다(확인 불가)",
+		detail: "900초 안에 끝나지 않았습니다(확인 불가)",
 		inconclusive: true,
 	};
 
@@ -314,19 +334,21 @@ describe("autoLandBlockers: re-run checks", () => {
 		]);
 	});
 
-	test("an unproven claim word alone holds an L2 task but not an L0·L1 one; other warnings hold every risk", () => {
+	test("an unproven claim word alone holds an L3 task but not an L0–L2 one; other warnings hold every risk", () => {
 		const claim = "무결성 unproven_claim_word: summary: 테스트가 모두 통과했습니다";
 		const guard = "무결성 guard_deletion: test/x.test.ts";
 		const warned = (warnings: string[]): TaskJudgement => ({ ...judgementWith([pass]), integrityWarnings: warnings });
 		const row = seedTask();
 		expect(row.risk).toBe("L2");
-		expect(autoLandBlockers(row, warned([claim]), policy, true)).toEqual(["무결성 경고 1건"]);
-		for (const risk of ["L0", "L1"] as const) {
+		expect(autoLandBlockers({ ...row, risk: "L3" }, warned([claim]), { ...policy, maxRisk: "L3" }, true)).toEqual([
+			"무결성 경고 1건",
+		]);
+		for (const risk of ["L0", "L1", "L2"] as const) {
 			const low = { ...row, risk };
 			expect(autoLandBlockers(low, warned([claim]), policy, true)).toEqual([]);
 			expect(autoLandBlockers(low, warned([claim, guard]), policy, true)).toEqual(["무결성 경고 1건"]);
 		}
-		expect(holdingIntegrityWarnings("L1", [claim, guard])).toEqual([guard]);
+		expect(holdingIntegrityWarnings("L2", [claim, guard])).toEqual([guard]);
 		expect(holdingIntegrityWarnings("L3", [claim])).toEqual([claim]);
 	});
 });
@@ -340,7 +362,7 @@ describe("[TASK] review·QA gate (task-review-qa-gate)", () => {
 	let repo: string;
 	let gh: TestHome;
 	let gd: Daemon;
-	let gt: WaitingTransport;
+	let gt: WaitingDiscordTransport;
 	let order: string[];
 	/** What the fake omp answers per kind; `hold` (when set) keeps a QA running until released or aborted. */
 	let answers: { review: RunProcessResult; qa: RunProcessResult };
@@ -376,7 +398,7 @@ describe("[TASK] review·QA gate (task-review-qa-gate)", () => {
 		hold = undefined;
 		qaEntered = Promise.withResolvers<void>();
 		gh = makeHome("ompbot-gate-home-");
-		gt = new WaitingTransport();
+		gt = threadTransport();
 		const run: ProcessRunner = async (cmd, opts) => {
 			const isQa = cmd[cmd.indexOf("--model") + 1] === QA_MODEL;
 			order.push(isQa ? "qa" : "review");
@@ -399,7 +421,7 @@ describe("[TASK] review·QA gate (task-review-qa-gate)", () => {
 					qa: { overlay, model: QA_MODEL },
 				},
 			},
-			channels: [new SlackBinding(new SlackChannel(gt))],
+			channels: [discordBinding(gt)],
 			log: createLogger({ sink: () => {}, clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -425,7 +447,7 @@ describe("[TASK] review·QA gate (task-review-qa-gate)", () => {
 		const row = tasks.register({
 			title: "게이트",
 			risk,
-			originKey: `slack/ch/${CHANNEL}/t/${THREAD}`,
+			originKey: `discord/ch/${CHANNEL}/t/${THREAD}`,
 			threadRef: `${CHANNEL}:${THREAD}`,
 			host: null,
 			repo,
@@ -553,13 +575,8 @@ describe("[TASK] review·QA gate (task-review-qa-gate)", () => {
 		const h = hooks();
 		await gd.autoLand(row, h.gate);
 		await qaEntered.promise;
-		const card = await gt.postMessage({ channel: CHANNEL, threadTs: THREAD, text: "🔍 머지 대기 카드" });
-		await gt.emitBlockAction({
-			user: { id: OWNER },
-			channel: { id: CHANNEL },
-			message: { ts: card.ts },
-			actions: [{ action_id: `ompbot:task:merge:${row.taskId}`, value: row.taskId }],
-		});
+		const card = await gt.createMessage({ channelId: THREAD, content: "🔍 머지 대기 카드" });
+		await click(gt, `ompbot:task:merge:${row.taskId}`, card.id);
 		release.resolve();
 		expect(order).toEqual(["review", "qa", "land"]);
 		const after = gd.store.tasks.require(row.taskId);

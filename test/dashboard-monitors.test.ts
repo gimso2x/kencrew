@@ -15,7 +15,7 @@ import { localIso } from "../src/time";
 const NOW = Date.parse("2026-11-05T16:00:00Z");
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
-/** A Slack bot token shape `redact` masks, put together here so no token literal sits in the file. */
+/** A bot token shape `redact` masks, put together here so no token literal sits in the file. */
 const TOKEN = ["xox", "b-", "1234567890-abcdefABCDEF"].join("");
 
 /** The production instructions' opening and script sentences as the owner wrote them (2026-11-06). */
@@ -115,8 +115,6 @@ function deps(): SnapshotDeps {
 		repoDir: "/srv/ompbot",
 		timezone: "Asia/Seoul",
 		config: {
-			logChannel: "C0LOG",
-			escalationChannel: "C0ESC",
 			channels: { discord: { logChannelId: "678901234567890123", escalationChannelId: "789012345678901234" } },
 		},
 		now: () => NOW,
@@ -243,7 +241,7 @@ describe("dashboard monitors snapshot", () => {
 		}
 	});
 
-	test("the Discord log and escalation channels get the same names as Slack's", async () => {
+	test("the Discord log and escalation channels get their own names", async () => {
 		addMonitors([
 			{
 				id: "discord",
@@ -263,19 +261,19 @@ describe("dashboard monitors snapshot", () => {
 				id: "late",
 				name: "늦게",
 				trigger: cron("0 23 * * *"),
-				channel: "C0OTHER",
-				copyChannel: "C0LOG",
+				channel: "890123456789012345",
+				copyChannel: "678901234567890123",
 				procedureFiles: ["procedures/owner-distill.md", "/srv/elsewhere/scripts/a.md"],
 				instruction: "절차를 따른다. `bash ~/.ompbot/scripts/check-disk.sh`와 run.ts 를 본다.",
 			},
-			{ id: "hook", name: "훅", trigger: { kind: "webhook", id: "h", token: "t" }, channel: "C0ESC" },
+			{ id: "hook", name: "훅", trigger: { kind: "webhook", id: "h", token: "t" }, channel: "789012345678901234" },
 			{ id: "early", name: "아침 브리핑", trigger: cron("0 2 * * *"), instruction: MORNING_BRIEF },
 			{
 				id: "mid",
 				name: "전달 장부 요약",
 				trigger: { kind: "at", at: "2026-11-05T18:00:00.000Z" },
-				channel: "C0LOG",
-				copyChannel: "C0ESC",
+				channel: "678901234567890123",
+				copyChannel: "789012345678901234",
 				instruction: LEDGER_SUMMARY,
 			},
 		]);
@@ -289,7 +287,7 @@ describe("dashboard monitors snapshot", () => {
 		expect(items.map((item) => [item.destination, item.copyTo])).toEqual([
 			["오너 DM", null],
 			["로그 채널", "에스컬레이션 채널"],
-			["채널 C0OTHER", "로그 채널"],
+			["채널 890123456789012345", "로그 채널"],
 			["에스컬레이션 채널", null],
 		]);
 		expect(byName(items, "아침 브리핑").files).toEqual([{ kind: "script", name: "morning-brief-collect.py" }]);
@@ -374,7 +372,7 @@ describe("dashboard monitors view", () => {
 				name: "아침 인사",
 				trigger: cron("30 7 * * *"),
 				instruction: "오너에게 아침 인사를 한다. 절차를 따른다.",
-				channel: "C0LOG",
+				channel: "678901234567890123",
 			},
 			{ id: "busy", name: "수동 잦음", trigger: cron("0 9 * * *") },
 		]);
@@ -666,7 +664,7 @@ describe("dashboard monitors view", () => {
 				text_ref: "실패 잦음",
 				state: "answered",
 				created_at: NOW - day,
-				thread_ref: "C0LOG:-",
+				thread_ref: "678901234567890123:-",
 				op_ref: "op0",
 			},
 		]);
@@ -701,8 +699,11 @@ describe("dashboard peer monitors", () => {
 	};
 
 	test("AC-1/AC-2/AC-7: peer monitors join the list with install, prefixed name and id; no peers = no install key", async () => {
-		addMonitors([{ id: "same", name: "송박 일", trigger: cron("0 9 * * *"), channel: "C0LOG" }]);
-		addMonitors([{ id: "same", name: "후속 장부 정리", trigger: cron("0 10 * * *"), channel: "C0LOG" }], peer);
+		addMonitors([{ id: "same", name: "송박 일", trigger: cron("0 9 * * *"), channel: "678901234567890123" }]);
+		addMonitors(
+			[{ id: "same", name: "후속 장부 정리", trigger: cron("0 10 * * *"), channel: "678901234567890123" }],
+			peer,
+		);
 		const { monitors } = await peerSnapshot();
 		expect(monitors.items.map((item) => item.id).sort()).toEqual(["same", "서팍:same"]);
 		const own = monitors.items.find((item) => item.id === "same");
@@ -714,7 +715,7 @@ describe("dashboard peer monitors", () => {
 			install: "서팍",
 			name: "서팍 · 후속 장부 정리",
 			originKey: null,
-			destination: "채널 C0LOG",
+			destination: "채널 678901234567890123",
 		});
 		expect(own?.destination).toBe("로그 채널");
 		// The peer has no config.json: its reason is listed, and the monitors stay.
@@ -800,7 +801,7 @@ describe("dashboard peer monitors", () => {
 				text_ref: "실행",
 				state: "answered",
 				created_at: NOW - HOUR,
-				thread_ref: "C0LOG:-",
+				thread_ref: "678901234567890123:-",
 				op_ref: "op0",
 			},
 		]);

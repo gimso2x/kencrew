@@ -1,6 +1,5 @@
 // Approval and choice cards in a Discord conversation (doc/plans/discord-channel.md §9): the card goes up with buttons
-// in that conversation (never Slack's escalation channel), a click settles the waiting tool call through the same
-// core.onAction path as Slack, and the card is redrawn without buttons. A reply still settles it.
+// in that conversation, a click settles the waiting tool call through core.onAction, and the card is redrawn without buttons. A reply still settles it.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import type { ChannelBinding } from "../src/channel/adapter";
 import { Daemon } from "../src/daemon/daemon";
@@ -11,19 +10,9 @@ import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { approvalActionId, choiceActionId } from "../src/safety/approval";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import {
-	DISCORD_OWNER,
-	makeHome,
-	type TestHome,
-	WaitingDiscordTransport,
-	WaitingTransport,
-	withDiscord,
-} from "./helpers/bot-home";
+import { makeHome, OWNER, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 import type { FakeDiscordCall } from "./helpers/discord-fake-transport";
 
-const ESCALATION = "C0ESCALATE1";
 const DM = "123456789012345678";
 const ORIGIN = `discord/dm/${DM}`;
 const clock = { now: () => Date.now() };
@@ -32,26 +21,20 @@ type Edit = Extract<FakeDiscordCall, { method: "editMessage" }>;
 
 let home: TestHome;
 let daemon: Daemon | undefined;
-let slack: WaitingTransport;
 let discord: WaitingDiscordTransport;
 let seq: bigint;
 
 async function boot(approvalTimeoutMs?: number, escalationChannelId?: string): Promise<void> {
-	slack = new WaitingTransport();
 	discord = new WaitingDiscordTransport();
 	discord.setChannel({ id: DM, type: 1 });
 	const sessions = new FakeSessionStore();
-	const channels: ChannelBinding[] = [
-		new SlackBinding(new SlackChannel(slack)),
-		new DiscordBinding(new DiscordChannel(discord, { ownerUserId: DISCORD_OWNER })),
-	];
-	const config = withDiscord(home);
+	const channels: ChannelBinding[] = [new DiscordBinding(new DiscordChannel(discord, { ownerUserId: OWNER }))];
+	const config = home.config;
 	const discordConfig = config.channels.discord;
 	if (discordConfig === undefined) throw new Error("no discord config");
 	daemon = new Daemon({
 		config: {
 			...config,
-			escalationChannel: ESCALATION,
 			channels: {
 				...config.channels,
 				discord: { ...discordConfig, ...(escalationChannelId === undefined ? {} : { escalationChannelId }) },
@@ -101,17 +84,11 @@ function click(customId: string, card: string): Promise<void> {
 		type: 3,
 		token: `token-${seq}`,
 		channel_id: DM,
-		user: { id: DISCORD_OWNER },
+		user: { id: OWNER },
 		data: { custom_id: customId, component_type: 2 },
 		message: { id: card, channel_id: DM },
 	};
 	return discord.emitInteraction(interaction);
-}
-
-/** Nothing about the request reached Slack, the escalation channel included. */
-function expectSlackUntouched(): void {
-	expect(slack.calls.filter((call) => JSON.stringify(call).includes("승인 요청"))).toHaveLength(0);
-	expect(slack.calls.filter((call) => JSON.stringify(call).includes(ESCALATION))).toHaveLength(0);
 }
 
 beforeEach(() => {
@@ -138,7 +115,6 @@ describe("approval card on Discord", () => {
 		await click(approvalActionId("approve", DM, card), card);
 		expect(await result).toBe("approved");
 		expect((await settledCard(card)).content).toContain("✅ 승인됨");
-		expectSlackUntouched();
 	});
 
 	test("거부 resolves `denied`", async () => {
@@ -148,7 +124,6 @@ describe("approval card on Discord", () => {
 		await click(approvalActionId("deny", DM, card), card);
 		expect(await result).toBe("denied");
 		expect((await settledCard(card)).content).toContain("⛔ 거부됨");
-		expectSlackUntouched();
 	});
 
 	test("a reply to the card settles it (onCardReply) and the card loses its buttons", async () => {
@@ -158,14 +133,13 @@ describe("approval card on Discord", () => {
 		await discord.emitMessage({
 			id: "700000000000000009",
 			channel_id: DM,
-			author: { id: DISCORD_OWNER },
+			author: { id: OWNER },
 			content: "그래 진행해",
 			type: 19,
 			message_reference: { message_id: card, channel_id: DM },
 		});
 		expect(await result).toBe("replied: 그래 진행해");
 		expect((await settledCard(card)).content).toContain("💬 답장으로 처리됨");
-		expectSlackUntouched();
 	});
 
 	test("an unanswered card times out: `denied (timeout)` and the card says so without buttons", async () => {
@@ -174,7 +148,6 @@ describe("approval card on Discord", () => {
 		expect(await result).toBe("denied (timeout)");
 		const card = await shownCard();
 		expect((await settledCard(card)).content).toContain("⌛ 시간 초과: 거부로 처리됨");
-		expectSlackUntouched();
 	});
 });
 
@@ -204,7 +177,7 @@ describe("Discord escalation channel (channels.discord.escalationChannelId)", ()
 		const card = await shownCard();
 		const post = discord.posts((text) => text.includes("force push main"))[0];
 		expect(post?.channelId).toBe(DESC);
-		expect(post?.content).toContain(`<@${DISCORD_OWNER}>`);
+		expect(post?.content).toContain(`<@${OWNER}>`);
 		expect(post?.content).toContain("요청 위치: DM");
 		expect(post?.content).toContain(`${DM}/${ASKED}`);
 		const shown = discord.calls.find((c) => isEdit(c) && buttonCount(c) > 0) as Edit;
@@ -213,10 +186,9 @@ describe("Discord escalation channel (channels.discord.escalationChannelId)", ()
 		await discord.waitForPosts((text) => text.includes("force push main"), 2);
 		const mirror = discord.posts((text) => text.includes("force push main"))[1];
 		expect(mirror?.channelId).toBe(DM);
-		expect(mirror?.content).not.toContain(`<@${DISCORD_OWNER}>`);
+		expect(mirror?.content).not.toContain(`<@${OWNER}>`);
 		await click(approvalActionId("approve", DESC, card), card);
 		expect(await result).toBe("approved");
-		expectSlackUntouched();
 	});
 
 	test("a reply in the escalation card's thread decides the card", async () => {
@@ -228,26 +200,12 @@ describe("Discord escalation channel (channels.discord.escalationChannelId)", ()
 			id: "700000000000000201",
 			channel_id: card,
 			guild_id: GUILD,
-			author: { id: DISCORD_OWNER },
+			author: { id: OWNER },
 			content: "그래 진행해",
 			type: 0,
 		});
 		expect(await result).toBe("replied: 그래 진행해");
 		expect((await settledCard(card)).content).toContain("💬 답장으로 처리됨");
-		expectSlackUntouched();
-	});
-
-	test("a Slack request still goes to the Slack escalation channel, never the Discord one", async () => {
-		await bootEscalated();
-		const tool = daemon?.hostToolsFor("slack/dm/D0OWNERDM1").find((t) => t.name === "ompbot_request_approval");
-		if (!tool) throw new Error("tool missing");
-		const abort = new AbortController();
-		const result = tool.execute({ summary: "slack force push" }, { signal: abort.signal });
-		await slack.waitForPosts((text) => text.includes("slack force push"));
-		expect(slack.posts((text) => text.includes("slack force push"))[0]?.channel).toBe(ESCALATION);
-		expect(discord.posts((text) => text.includes("slack force push"))).toHaveLength(0);
-		abort.abort();
-		await result;
 	});
 });
 
@@ -300,6 +258,5 @@ describe("choice card on Discord", () => {
 		await click(choiceActionId(1, DM, card), card);
 		expect(await answer).toEqual({ answers: [{ id: "q1", selectedOptions: ["production"] }] });
 		expect((await settledCard(card)).content).toContain("✅ 답: 1) production");
-		expectSlackUntouched();
 	});
 });

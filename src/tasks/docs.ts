@@ -43,9 +43,25 @@ export interface NewTaskSpec {
 	/** The worker tier the session asked for; the default and the L3+ raise are applied after the risk floor. */
 	tier?: LaneModelTier;
 	tierReason?: string;
+	/** The judge's confidence in `tier`, 0..1 (new registrations only). */
+	tierConfidence?: number;
 }
 
 export type TaskSpecInput = { kind: "new"; spec: NewTaskSpec } | { kind: "resume"; id: string };
+
+/** A tier confidence argument: a finite number in [0, 1]; `undefined` (absent) passes. Null = not acceptable. */
+export function parseTierConfidence(value: unknown): number | undefined | null {
+	if (value === undefined) return undefined;
+	return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+}
+
+/** Reads a stored confidence (TEXT or number) back; anything that is not a finite number in [0, 1] reads null. */
+export function readTierConfidence(value: unknown): number | null {
+	const text = typeof value === "number" ? String(value) : value;
+	if (typeof text !== "string" || text.trim() === "") return null;
+	const number = Number(text);
+	return parseTierConfidence(number) ?? null;
+}
 
 /** Collapses whitespace runs (including newlines) so a field is always one line of a document. */
 export function oneLine(text: string): string {
@@ -82,8 +98,10 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 	const record = asRecord(raw);
 	if (record === undefined) throw new TaskSpecError("taskSpec은 객체여야 합니다");
 	if (record.id !== undefined) {
-		if (record.tier !== undefined || record.tierReason !== undefined)
-			throw new TaskSpecError("재개에는 tier·tierReason을 줄 수 없습니다(처음 등록한 워커 모델로 다시 뜹니다)");
+		if (record.tier !== undefined || record.tierReason !== undefined || record.tierConfidence !== undefined)
+			throw new TaskSpecError(
+				"재개에는 tier·tierReason을 줄 수 없습니다(tierConfidence도 마찬가지: 처음 등록한 워커 모델로 다시 뜹니다)",
+			);
 		if (Object.keys(record).length !== 1) throw new TaskSpecError("재개는 taskSpec에 id만 줍니다");
 		if (typeof record.id !== "string" || !TASK_ID_PATTERN.test(record.id)) {
 			throw new TaskSpecError(`taskSpec.id 형식이 아닙니다(T-YYYYMMDD-NN): ${String(record.id)}`);
@@ -111,6 +129,8 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 	const tierReason = record.tierReason;
 	if (tierReason !== undefined && typeof tierReason !== "string")
 		throw new TaskSpecError("taskSpec.tierReason은 문자열이어야 합니다");
+	const tierConfidence = parseTierConfidence(record.tierConfidence);
+	if (tierConfidence === null) throw new TaskSpecError("taskSpec.tierConfidence는 0 이상 1 이하의 숫자여야 합니다");
 	// Masked here once: the ledger row, the four documents, the accepted card and the logs all take these values.
 	// Raw here: redactCriterion validates the check block as written, then collapses only the prose around it.
 	const acceptance = textList(record, "acceptance", 1, (text) => text).map(redactCriterion);
@@ -133,6 +153,7 @@ export function parseTaskSpecInput(raw: unknown): TaskSpecInput {
 				: { assumptions: redact(oneLine(assumptions)) }),
 			...(tier === undefined ? {} : { tier: tier as LaneModelTier }),
 			...(tierReason === undefined || oneLine(tierReason) === "" ? {} : { tierReason: redact(oneLine(tierReason)) }),
+			...(tierConfidence === undefined ? {} : { tierConfidence }),
 		},
 	};
 }

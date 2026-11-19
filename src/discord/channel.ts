@@ -241,7 +241,7 @@ export class DiscordChannel implements ChannelPort {
 
 	async edit(ref: MessageRef, msg: OutboundMessage): Promise<void> {
 		const { content, embeds } = messageOf(msg);
-		// Like Slack's blocks: `buttons: []` removes earlier buttons, and so does a card redrawn without any.
+		// `buttons: []` removes earlier buttons, and so does a card redrawn without any.
 		const buttons = msg.buttons ?? (isCard(msg) ? [] : undefined);
 		const components = buttons === undefined ? undefined : buttonRows(buttons);
 		await this.transport.editMessage({
@@ -249,7 +249,7 @@ export class DiscordChannel implements ChannelPort {
 			messageId: ref.messageId,
 			content,
 			allowedMentions: this.allowedMentions(content),
-			// Like Slack's `blocks: []` for a message redrawn plain with `buttons`: an earlier card's embed goes too.
+			// A message redrawn plain with `buttons`: an earlier card's embed goes too.
 			...(embeds !== undefined ? { embeds } : msg.buttons !== undefined ? { embeds: [] } : {}),
 			...(components === undefined ? {} : { components }),
 		});

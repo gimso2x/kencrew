@@ -40,7 +40,9 @@ describe("runBackup", () => {
 		expect(result.removed).toEqual([]);
 		// The copy holds the seeded row.
 		const copy = new Database(result.file, { readonly: true, strict: true });
-		const row = copy.query("SELECT epoch FROM origins WHERE origin_key = 'slack/dm/D1'").get() as { epoch: number };
+		const row = copy.query("SELECT epoch FROM origins WHERE origin_key = 'discord/dm/200000000000000001'").get() as {
+			epoch: number;
+		};
 		copy.close();
 		expect(row.epoch).toBe(1);
 
@@ -61,6 +63,12 @@ describe("runBackup", () => {
 	});
 
 	test("fails without a stamp when the database is missing", () => {
+		expect(() => runBackup({ homeDir: home })).toThrow(/db_missing/);
+		expect(existsSync(join(home, "backups", STAMP_FILE))).toBe(false);
+	});
+
+	test("a FIFO in the ledger's place fails as missing instead of blocking the open", () => {
+		expect(Bun.spawnSync(["mkfifo", join(home, "ompbot.db")]).exitCode).toBe(0);
 		expect(() => runBackup({ homeDir: home })).toThrow(/db_missing/);
 		expect(existsSync(join(home, "backups", STAMP_FILE))).toBe(false);
 	});
@@ -117,14 +125,14 @@ describe("runBackup", () => {
 describe("backup bundle (sessions + config.json)", () => {
 	/** A home that looks lived-in: a session file, a config, and a secret that must never be bundled. */
 	function seedSources(): void {
-		mkdirSync(join(home, "sessions", "slack-dm-D1", "e1"), { recursive: true });
+		mkdirSync(join(home, "sessions", "discord-dm-200000000000000001", "e1"), { recursive: true });
 		writeFileSync(
-			join(home, "sessions", "slack-dm-D1", "e1", "s.jsonl"),
+			join(home, "sessions", "discord-dm-200000000000000001", "e1", "s.jsonl"),
 			'{"message":{"role":"user","content":"안녕"}}\n',
 		);
 		writeFileSync(join(home, "config.json"), '{"schemaVersion":1}\n', { mode: 0o600 });
 		mkdirSync(join(home, "secrets"), { recursive: true });
-		writeFileSync(join(home, "secrets", "slack-bot-token"), "xoxb-TEST-0\n", { mode: 0o600 });
+		writeFileSync(join(home, "secrets", "discord-bot-token"), "TEST-discord-0\n", { mode: 0o600 });
 	}
 
 	/**
@@ -151,7 +159,7 @@ describe("backup bundle (sessions + config.json)", () => {
 		const result = runBackup({
 			homeDir: home,
 			now: new Date(2026, 9, 23, 4, 30, 0),
-			tarBin: warningTar("tar: sessions/slack-dm-D1/e1/s.jsonl: file changed as we read it"),
+			tarBin: warningTar("tar: sessions/discord-dm-200000000000000001/e1/s.jsonl: file changed as we read it"),
 		});
 		expect(existsSync(result.bundle as string)).toBe(true);
 		expect(readStamp(join(home, "backups"))?.bundle).toBe("ompbot-bundle-20261023-043000.tar.gz");
@@ -160,7 +168,7 @@ describe("backup bundle (sessions + config.json)", () => {
 	test("tar exit 1 with any other message fails the whole backup", () => {
 		seedDb(home);
 		seedSources();
-		const tarBin = warningTar("tar: sessions/slack-dm-D1/e1/s.jsonl: Cannot open: Permission denied");
+		const tarBin = warningTar("tar: sessions/discord-dm-200000000000000001/e1/s.jsonl: Cannot open: Permission denied");
 		expect(() => runBackup({ homeDir: home, now: new Date(2026, 9, 23, 4, 30, 0), tarBin })).toThrow(/bundle_failed/);
 		expect(readStamp(join(home, "backups"))).toBeUndefined();
 	});
@@ -265,18 +273,18 @@ describe("backup bundle (sessions + config.json)", () => {
 			seedDb(home);
 			writeFileSync(join(home, "config.json"), "{}\n");
 			mkdirSync(join(home, "secrets"));
-			writeFileSync(join(home, "secrets", "slack-bot-token"), "xoxb-TEST-0\n");
+			writeFileSync(join(home, "secrets", "discord-bot-token"), "TEST-discord-0\n");
 			const real = join(home, "elsewhere", "real-sessions");
-			mkdirSync(join(real, "slack-dm-D1"), { recursive: true });
-			writeFileSync(join(real, "slack-dm-D1", "s.jsonl"), '{"memory":true}\n');
-			nodeFs.symlinkSync(join(home, "secrets", "slack-bot-token"), join(real, "inner-link"));
+			mkdirSync(join(real, "discord-dm-200000000000000001"), { recursive: true });
+			writeFileSync(join(real, "discord-dm-200000000000000001", "s.jsonl"), '{"memory":true}\n');
+			nodeFs.symlinkSync(join(home, "secrets", "discord-bot-token"), join(real, "inner-link"));
 			nodeFs.symlinkSync(real, join(home, "sessions"));
 
 			const result = runBackup({ homeDir: home, now });
 			const entries = Bun.spawnSync(["tar", "-tzf", result.bundle as string])
 				.stdout.toString()
 				.split("\n");
-			expect(entries).toContain("sessions/slack-dm-D1/s.jsonl");
+			expect(entries).toContain("sessions/discord-dm-200000000000000001/s.jsonl");
 			expect(entries).toContain("config.json");
 			expect(entries.some((e) => e.includes("real-sessions") || e.startsWith("elsewhere"))).toBe(false);
 			// Only the top-level link is followed: the inner link is archived as a link, never as the secret's bytes.
@@ -302,7 +310,7 @@ describe("backup bundle (sessions + config.json)", () => {
 					"secrets",
 					(link) => {
 						mkdirSync(join(home, "secrets", "sub"), { recursive: true });
-						writeFileSync(join(home, "secrets", "sub", "t"), "xoxb-TEST-0\n");
+						writeFileSync(join(home, "secrets", "sub", "t"), "TEST-discord-0\n");
 						nodeFs.symlinkSync(join(home, "secrets", "sub"), link);
 					},
 				],
@@ -353,7 +361,7 @@ describe("backup bundle (sessions + config.json)", () => {
 				mkdirSync(home);
 				seedDb(home);
 				mkdirSync(join(home, source, "tokens"), { recursive: true });
-				writeFileSync(join(home, source, "tokens", "t"), "xoxb-TEST-0\n");
+				writeFileSync(join(home, source, "tokens", "t"), "TEST-discord-0\n");
 				nodeFs.symlinkSync(join(home, source, "tokens"), join(home, "secrets"));
 				expect(() => runBackup({ homeDir: home, now })).toThrow(/bundle_failed.*secrets\//);
 				expect(readStamp(join(home, "backups"))).toBeUndefined();
@@ -512,7 +520,7 @@ describe("backup bundle (sessions + config.json)", () => {
 		seedDb(home);
 		seedSources();
 		mkdirSync(join(home, "workspace"), { recursive: true });
-		nodeFs.linkSync(join(home, "secrets", "slack-bot-token"), join(home, "workspace", "notes.md"));
+		nodeFs.linkSync(join(home, "secrets", "discord-bot-token"), join(home, "workspace", "notes.md"));
 		expect(() => runBackup({ homeDir: home, now: new Date(2026, 9, 26, 4, 30, 0) })).toThrow(
 			/bundle_failed: workspace\/notes\.md is a hard link to a secrets\/ file/,
 		);
@@ -522,7 +530,7 @@ describe("backup bundle (sessions + config.json)", () => {
 		// config.json itself hard-linked to a secret is refused too; an unrelated hard link is fine.
 		rmSync(join(home, "workspace", "notes.md"));
 		rmSync(join(home, "config.json"));
-		nodeFs.linkSync(join(home, "secrets", "slack-bot-token"), join(home, "config.json"));
+		nodeFs.linkSync(join(home, "secrets", "discord-bot-token"), join(home, "config.json"));
 		expect(() => runBackup({ homeDir: home, now: new Date(2026, 9, 26, 4, 31, 0) })).toThrow(
 			/config\.json is a hard link to a secrets\/ file/,
 		);

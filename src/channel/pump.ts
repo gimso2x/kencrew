@@ -12,6 +12,25 @@ export type DeliverySendResult =
 	/** `sentParts`: messages of the answer already posted before the failure (logged). */
 	| { kind: "failed"; error: string; outcome: "definitive" | "ambiguous"; sentParts: number };
 
+/**
+ * The failed-send block every adapter's send returns on a post error: the outcome is `definitive` only when nothing
+ * of the answer is out yet (`sent === 0`) and the platform's own error test (`isDefinitive`: its CallError class with
+ * `kind === "definitive"`) calls the refusal definitive — anything else may have left a partial answer, so it is
+ * never resent blindly.
+ */
+export function failedDelivery(
+	err: unknown,
+	sent: number,
+	isDefinitive: (err: unknown) => boolean,
+): DeliverySendResult {
+	return {
+		kind: "failed",
+		error: errorText(err),
+		outcome: sent === 0 && isDefinitive(err) ? "definitive" : "ambiguous",
+		sentParts: sent,
+	};
+}
+
 export interface DeliverySender {
 	/** Whether this platform's post path is rate limited right now. */
 	isBlocked(): boolean;

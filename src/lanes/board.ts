@@ -7,7 +7,7 @@ import type { LaneBoardPost, Store } from "../store/db";
 import { isLaneOrigin, type LaneRow } from "./status";
 
 /**
- * The lane board (doc/plans/lane-board.md): lanes and the owner's Slack/Discord conversations of one bot share facts
+ * The lane board (doc/plans/lane-board.md): lanes and the owner's Discord conversations of one bot share facts
  * in `general` and `repo:<absolute path>` channels. A post is information, never an instruction, approval or
  * acceptance evidence; new posts are announced by one head line in the reader's next turn prompt, never by waking it.
  */
@@ -19,7 +19,7 @@ export const BOARD_READ_MAX_LIMIT = 100;
 
 export const boardRepoChannel = (repo: string): string => `${REPO_PREFIX}${repo}`;
 
-/** Who sits at the board as an origin: a lane session (labelled by its name) or an owner Slack/Discord conversation. */
+/** Who sits at the board as an origin: a lane session (labelled by its name) or an owner Discord conversation. */
 interface BoardSeat {
 	originKey: string;
 	label: string;
@@ -31,8 +31,7 @@ function boardSeatOf(store: Store, originKey: string): BoardSeat | undefined {
 		const lane = store.getLaneByOrigin(originKey);
 		return lane === undefined ? undefined : { originKey, label: lane.name, lane };
 	}
-	const platform = parseChatOrigin(originKey)?.platform;
-	if (platform !== "slack" && platform !== "discord") return undefined;
+	if (parseChatOrigin(originKey)?.platform !== "discord") return undefined;
 	return { originKey, label: `main:${originKey}`, lane: undefined };
 }
 

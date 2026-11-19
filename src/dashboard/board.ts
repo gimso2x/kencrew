@@ -311,6 +311,8 @@ export class BoardSource {
 	private abort: AbortController | undefined;
 	private retry: NodeJS.Timeout | undefined;
 	private idle: NodeJS.Timeout | undefined;
+	/** The clock's time of the last stream chunk the watchdog counted as traffic (`0` before the first). */
+	private lastTrafficAt = 0;
 	private stopped = false;
 
 	constructor(options: BoardSourceOptions) {
@@ -332,6 +334,11 @@ export class BoardSource {
 	/** A card on the board now; the proxy answers for these panes only. */
 	card(key: string): BoardCard | undefined {
 		return this.state === undefined ? undefined : this.cardsByKey.get(key);
+	}
+
+	/** The clock's time of the last stream chunk the watchdog counted as traffic; tests await it for silent chunks. */
+	get trafficAt(): number {
+		return this.lastTrafficAt;
 	}
 
 	/** Hears every change of `current()`. */
@@ -369,7 +376,16 @@ export class BoardSource {
 	private arm(abort: AbortController): void {
 		if (this.abort !== abort) return; // stopped, or already replaced
 		clearTimeout(this.idle);
-		this.idle = setTimeout(() => abort.abort(), this.idleMs);
+		this.lastTrafficAt = this.now();
+		this.idle = setTimeout(() => {
+			// A fire the clock calls early leaves a fresh stream up (with `Date.now` a timer never fires early, so this
+			// only ever re-arms an injected clock that trails the wall one while the loop was busy).
+			if (this.now() - this.lastTrafficAt < this.idleMs) {
+				this.arm(abort);
+				return;
+			}
+			abort.abort();
+		}, this.idleMs);
 	}
 
 	private async read(abort: AbortController): Promise<void> {

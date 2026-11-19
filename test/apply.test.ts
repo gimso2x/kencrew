@@ -253,7 +253,6 @@ function makeDeps(world: World, over: Partial<ApplyDeps> = {}): ApplyDeps {
 			return {
 				ts: new Date(world.lockStartedAt + 500),
 				loopMs: 1,
-				socket: { state: "up", since },
 				discord: { state: "up", since },
 				draining: false,
 			};
@@ -364,14 +363,18 @@ describe("runApply bot omp profile sync (omp-isolation AC-6)", () => {
 	test("the CLI wires the sync only for a home whose config sets ompProfile", () => {
 		const config = {
 			schemaVersion: 1,
-			channels: { slack: { ownerUserId: "UOWNER0" } },
-			slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+			channels: {
+				discord: {
+					ownerUserId: "100000000000000001",
+					applicationId: "600000000000000000",
+					botTokenFile: "secrets/bot.token",
+				},
+			},
 			ompExecutable: "/usr/local/bin/omp",
 			workspaceDir: "workspace",
 		};
 		mkdirSync(join(home, "secrets"), { mode: 0o700 });
-		writeFileSync(join(home, "secrets", "bot.token"), "xoxb-TEST-0\n", { mode: 0o600 });
-		writeFileSync(join(home, "secrets", "app.token"), "xapp-TEST-0\n", { mode: 0o600 });
+		writeFileSync(join(home, "secrets", "bot.token"), `${["TEST", "discord", "0"].join("-")}\n`, { mode: 0o600 });
 		writeFileSync(join(home, "config.json"), JSON.stringify(config));
 		expect(homeDeps(home, "ompbot", "/usr/bin").ompSync).toBeUndefined();
 		writeFileSync(join(home, "config.json"), JSON.stringify({ ...config, ompProfile: "ompbot" }));
@@ -416,7 +419,7 @@ describe("runApply execution", () => {
 			["dashboard", true],
 		]);
 		expect(receipt.steps.at(-1)?.detail).toBe("skipped: no active dashboard unit of this home");
-		expect(receipt.steps.find((s) => s.name === "transports")?.detail).toBe("slack=up discord=up");
+		expect(receipt.steps.find((s) => s.name === "transports")?.detail).toBe("discord=up");
 		expect(readFileSync(join(home, "config.json.last-good"), "utf8")).toBe('{"v":"before"}');
 		expect(statSync(join(home, "config.json.last-good")).mode & 0o777).toBe(0o600);
 		expect(restartCommands(world)).toHaveLength(1);
@@ -442,14 +445,12 @@ describe("runApply execution", () => {
 				return {
 					ts: oldStamp,
 					loopMs: 1,
-					socket: { state: "up", since: oldStamp },
 					discord: { state: "up", since: oldStamp },
 				};
 			const since = new Date(w.lockStartedAt ?? 0);
 			return {
 				ts: new Date(since.getTime() + 500),
 				loopMs: 1,
-				socket: { state: "up", since },
 				discord: { state: "up", since },
 			};
 		};
@@ -465,7 +466,7 @@ describe("runApply execution", () => {
 			["rollback", true],
 		]);
 		expect(stale.receipt.steps.find((s) => s.name === "transports")?.detail).toContain("from before the restart");
-		expect(stale.receipt.steps.at(-1)?.detail).toContain("transports ok: slack=up discord=up");
+		expect(stale.receipt.steps.at(-1)?.detail).toContain("transports ok: discord=up");
 		expect(restartCommands(world)).toHaveLength(2);
 		expect(readFileSync(join(home, "config.json"), "utf8")).toBe('{"v":"good"}');
 
@@ -479,7 +480,6 @@ describe("runApply execution", () => {
 				? {
 						ts: oldStamp,
 						loopMs: 1,
-						socket: { state: "up", since: oldStamp },
 						discord: { state: "up", since: oldStamp },
 					}
 				: undefined;
@@ -503,12 +503,12 @@ describe("runApply execution", () => {
 		const down = makeWorld();
 		down.heartbeat = (w) => {
 			const since = new Date(w.lockStartedAt ?? 0);
-			return { ts: new Date(w.clock), loopMs: 1, socket: { state: "up", since }, discord: { state: "down", since } };
+			return { ts: new Date(w.clock), loopMs: 1, discord: { state: "down", since } };
 		};
 		const failed = await runApply({ ...base, stamp: "20261030-150000" }, makeDeps(down));
 		expect(failed.exitCode).toBe(1);
 		expect(failed.receipt.steps.find((s) => s.name === "transports")?.detail).toBe(
-			"transports not up within 120s: down: discord (slack=up discord=down)",
+			"transports not up within 120s: down: discord (discord=down)",
 		);
 	});
 
@@ -517,7 +517,7 @@ describe("runApply execution", () => {
 		world.heartbeat = (w) => ({ ts: new Date((w.lockStartedAt ?? 0) + 500), loopMs: 1 });
 		const { exitCode, receipt } = await runApply(base, makeDeps(world));
 		expect(exitCode).toBe(0);
-		expect(receipt.steps.find((s) => s.name === "transports")?.detail).toBe("slack=off discord=off");
+		expect(receipt.steps.find((s) => s.name === "transports")?.detail).toBe("discord=off");
 	});
 
 	test("a merge landing during drain: the receipt head is the commit the restart loads, preflight head kept", async () => {
@@ -948,7 +948,11 @@ describe("revertCommandFor", () => {
 });
 
 describe("runApply report", () => {
-	const report: ApplyOptions = { ...base, reportOrigin: "slack/ch/C0123456789", reportThread: "1793318305.840629" };
+	const report: ApplyOptions = {
+		...base,
+		reportOrigin: "discord/ch/111111111111111111",
+		reportThread: "700000000000000001",
+	};
 
 	test("success, failure and SKIP all inject a follow-up into the requested thread with the receipt path", async () => {
 		const ok = makeWorld();
@@ -966,7 +970,11 @@ describe("runApply report", () => {
 		] as const) {
 			expect(world.injects).toHaveLength(1);
 			const request = world.injects[0] as { origin: string; thread: string; asOwner: boolean; text: string };
-			expect(request).toMatchObject({ origin: "slack/ch/C0123456789", thread: "1793318305.840629", asOwner: true });
+			expect(request).toMatchObject({
+				origin: "discord/ch/111111111111111111",
+				thread: "700000000000000001",
+				asOwner: true,
+			});
 			expect(request.text).toContain("[자동 후속] apply 결과");
 			expect(request.text).toContain(status);
 			expect(request.text).toContain(outcome.receipt.receiptPath);
@@ -1009,8 +1017,8 @@ describe("runApply report", () => {
 			expect(world.notifies).toHaveLength(1);
 			expect(world.notifies[0]).toMatchObject({
 				op: "notify",
-				origin: "slack/ch/C0123456789",
-				thread: "1793318305.840629",
+				origin: "discord/ch/111111111111111111",
+				thread: "700000000000000001",
 			});
 			expect((world.notifies[0] as { text: string }).text).toEndWith(`영수증 ${outcome.receipt.receiptPath}`);
 			expect(readReceipt(outcome.receipt).report).toMatchObject({ ok: true, detail: "notified attempts=1" });
@@ -1312,7 +1320,11 @@ describe("runApply apply lock (one apply per home)", () => {
 	});
 
 	test("ok, failed, SKIP and a thrown apply all remove their own lock, only after the receipt carries the report", async () => {
-		const report: ApplyOptions = { ...base, reportOrigin: "slack/ch/C0123456789", reportThread: "1793318305.840629" };
+		const report: ApplyOptions = {
+			...base,
+			reportOrigin: "discord/ch/111111111111111111",
+			reportThread: "700000000000000001",
+		};
 		const cases: Array<[ApplyReceipt["status"], (w: World) => void]> = [
 			["ok", () => {}],
 			[
@@ -1364,7 +1376,11 @@ describe("runApply apply lock (one apply per home)", () => {
 });
 
 describe("runApply report inject retry", () => {
-	const report: ApplyOptions = { ...base, reportOrigin: "slack/ch/C0123456789", reportThread: "1793318305.840629" };
+	const report: ApplyOptions = {
+		...base,
+		reportOrigin: "discord/ch/111111111111111111",
+		reportThread: "700000000000000001",
+	};
 
 	test("two refused connections then a delivery: report ok on attempt 3, 5 s apart", async () => {
 		const world = makeWorld();
@@ -1406,24 +1422,21 @@ describe("apply report origin on Discord", () => {
 	const CH = "111111111111111111"; // gitleaks:allow (fake snowflake)
 	const MESSAGE = "700000000000000001"; // gitleaks:allow (fake snowflake)
 
-	test("isReportOrigin takes Slack and Discord DM/channel origins, never a thread origin", () => {
+	test("isReportOrigin takes Discord DM/channel origins, never a thread origin or a removed Slack one", () => {
 		expect(isReportOrigin(`discord/dm/${DM}`)).toBe(true);
 		expect(isReportOrigin(`discord/ch/${CH}`)).toBe(true);
 		expect(isReportOrigin(`discord/ch/${CH}/t/222222222222222222`)).toBe(false);
-		expect(isReportOrigin("slack/ch/C0123456789")).toBe(true);
-		expect(isReportOrigin("slack/dm/D0123456789")).toBe(true);
-		expect(isReportOrigin("slack/ch/C1/t/100.1")).toBe(false);
+		expect(isReportOrigin("slack/ch/C0123456789")).toBe(false);
+		expect(isReportOrigin("slack/dm/D0123456789")).toBe(false);
 		expect(isReportOrigin("telegram/dm/1")).toBe(false);
 	});
 
-	test("the report thread is a snowflake for a Discord origin and a ts for a Slack one", () => {
-		expect(reportThreadPattern(`discord/dm/${DM}`).test(MESSAGE)).toBe(true);
-		expect(reportThreadPattern(`discord/dm/${DM}`).test("1793318305.840629")).toBe(false);
-		expect(reportThreadPattern("slack/ch/C0123456789").test("1793318305.840629")).toBe(true);
-		expect(reportThreadPattern("slack/ch/C0123456789").test(MESSAGE)).toBe(false);
+	test("the report thread is a Discord message id (a snowflake), not a ts", () => {
+		expect(reportThreadPattern().test(MESSAGE)).toBe(true);
+		expect(reportThreadPattern().test("1793318305.840629")).toBe(false);
 	});
 
-	test("the CLI refuses a thread of the other platform's form with a usage error naming both forms", async () => {
+	test("the CLI refuses a Slack-form thread or origin with a usage error naming the Discord forms", async () => {
 		const written: string[] = [];
 		const write = process.stderr.write;
 		process.stderr.write = ((chunk: string) => {
@@ -1443,16 +1456,12 @@ describe("apply report origin on Discord", () => {
 			process.stderr.write = write;
 		}
 		const text = written.join("");
-		expect(text).toContain(
-			"--report-origin must be slack/ch/<channel id>, slack/dm/<dm id>, discord/ch/<channel id> or discord/dm/<dm id>",
-		);
-		expect(text).toContain(
-			"--report-thread needs --report-origin and a Slack ts like 1793318305.840629 (slack/...) or a Discord message id (discord/...)",
-		);
+		expect(text).toContain("--report-origin must be discord/ch/<channel id> or discord/dm/<dm id>");
+		expect(text).toContain("--report-thread needs --report-origin and a Discord message id");
 	});
 
 	test("APPLY_USAGE and docs/guide.md show the Discord report form", () => {
-		expect(APPLY_USAGE).toContain("--report-origin <slack/ch/C|slack/dm/D|discord/ch/<id>|discord/dm/<id>>");
+		expect(APPLY_USAGE).toContain("--report-origin <discord/ch/<id>|discord/dm/<id>> --report-thread <message id>");
 		const guide = readFileSync(join(import.meta.dir, "..", "docs", "guide.md"), "utf8");
 		expect(guide).toContain("--report-origin discord/dm/<DM ID> --report-thread <메시지 ID>");
 	});
@@ -1719,7 +1728,11 @@ describe("runApply code rollback in a real git repository (AC-2..AC-5)", () => {
 				return [{ unit: "ompbot-tteok", status: "ok", exitCode: 0, receiptPath: "/t/r.json" }];
 			},
 		});
-		const report: ApplyOptions = { ...base, reportOrigin: "slack/ch/C0123456789", reportThread: "1793318305.840629" };
+		const report: ApplyOptions = {
+			...base,
+			reportOrigin: "discord/ch/111111111111111111",
+			reportThread: "700000000000000001",
+		};
 		const { exitCode, receipt } = await runApply(report, deps);
 		expect(exitCode).toBe(1);
 		expect(receipt.status).toBe("failed");
@@ -1766,7 +1779,6 @@ describe("runApply code rollback in a real git repository (AC-2..AC-5)", () => {
 			return {
 				ts: new Date(w.lockStartedAt + 500),
 				loopMs: 1,
-				socket: { state: "up", since },
 				discord: { state: discordDown ? "down" : "up", since },
 			};
 		};
@@ -1996,7 +2008,7 @@ describe("runApply code rollback in a real git repository (AC-2..AC-5)", () => {
 				peers: peerRunner(peerOutcomes, (after) => peerApplyOptions(detach, after)),
 			});
 			const { exitCode, receipt } = await runApply(
-				{ ...detach, reportOrigin: "slack/ch/C0123456789", reportThread: "1793318305.840629" },
+				{ ...detach, reportOrigin: "discord/ch/111111111111111111", reportThread: "700000000000000001" },
 				deps,
 			);
 			expect(exitCode).toBe(1);
@@ -2214,7 +2226,7 @@ describe("apply code rollback options (apply-rollback-mode)", () => {
 			codeRollback: "detach",
 			clearRollback: true,
 			allowDetached: true,
-			reportOrigin: "slack/ch/C0123456789",
+			reportOrigin: "discord/ch/111111111111111111",
 		};
 		const peer: ApplyOptions = {
 			timeoutMin: base.timeoutMin,

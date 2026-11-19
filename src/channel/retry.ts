@@ -1,6 +1,6 @@
-// The per-method Retry-After blocking the adapters share: a 429 parks its Slack method (or Discord route) until
+// The per-method Retry-After blocking the adapters share: a 429 parks its Discord route until
 // Retry-After passes, so later callers fail fast instead of hammering the API; Teams parks its single post path the
-// same way. The parking log line (`slack_rate_limited`, `discord_rate_limited`, `teams_rate_limited`) stays with the
+// same way. The parking log line (`discord_rate_limited`, `teams_rate_limited`) stays with the
 // adapter, whose callback writes it.
 import type { AdapterClock } from "./types";
 
@@ -33,8 +33,8 @@ export class RetryAfterGate {
 
 	/**
 	 * One platform call under the gate. A parked key fails fast with `blocked(remainingMs)`; an error `rateLimited`
-	 * recognizes parks the key and rethrows. `blocked` is the platform's own (Slack's private `BlockedError`, Discord
-	 * and Teams rethrow their rate-limited error), so the callers' catch blocks keep their meaning.
+	 * recognizes parks the key and rethrows. `blocked` is the platform's own (Discord and Teams rethrow their
+	 * rate-limited error), so the callers' catch blocks keep their meaning.
 	 */
 	async call<T>(
 		key: string,

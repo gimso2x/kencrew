@@ -5,7 +5,7 @@ import type { DashboardSnapshot } from "../src/dashboard/snapshot";
 // Budgets and their measured baseline live in docs/performance.md. Raise a budget only by editing that page in the same change.
 const KIB = 1024;
 const STYLE_GZIP_BUDGET = 12 * KIB;
-const SCRIPT_GZIP_BUDGET = 60 * KIB;
+const SCRIPT_GZIP_BUDGET = 64 * KIB;
 
 const off = { ok: false as const, error: "not in this test" };
 

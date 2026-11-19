@@ -1,16 +1,20 @@
-// Discord's inbound path and delivery sender: the same rules as the Slack adapter (owner gate, addressing,
+// Discord's inbound path and delivery sender: the same rules as the other adapters (owner gate, addressing,
 // 👀 + ⏳ status, the shared delivery pump), on Discord's shapes (doc/plans/discord-channel.md §7–8).
 import { join } from "node:path";
 import type { ChannelAdapter, ChannelPolicy, OwnerIngest } from "../channel/adapter";
 import {
+	collectInboundNotes,
 	MAX_INBOUND_DOC_BYTES,
-	MAX_INBOUND_FILES,
 	MAX_INBOUND_IMAGE_BYTES,
 	saveInboundAttachment,
 } from "../channel/attachments";
+import { recoveryNotice } from "../channel/backfill";
 import {
+	DEFAULT_PEER_HOP_LIMIT,
 	guardInbound,
 	isChannelMessageAddressed,
+	PEER_HOP_NOTICE,
+	type PeerBotList,
 	recordInbound,
 	recordPeerInbound,
 	resolveThreadLinks,
@@ -22,10 +26,18 @@ import {
 	DeliveryPump,
 	type DeliverySendResult,
 	deliverySender,
+	failedDelivery,
 	finishDeliveryStatus,
 } from "../channel/pump";
 import { RetryAfterGate } from "../channel/retry";
-import { type StatusEntry, StatusTracker } from "../channel/status";
+import {
+	createStatusMessage,
+	editStatusMessage,
+	removeStatusMessage,
+	type StatusEntry,
+	StatusTracker,
+	swapStatusReaction,
+} from "../channel/status";
 import {
 	cutCodePointSafe,
 	DENIED_TEXT,
@@ -49,7 +61,6 @@ import {
 import { parseChatOrigin } from "../core/origin-key";
 import { parseCommand, TAKES_ARG } from "../core/types";
 import type { Logger } from "../log";
-import { DEFAULT_PEER_HOP_LIMIT, PEER_HOP_NOTICE, type PeerBotList } from "../slack/adapter";
 import { type BackfillCursors, type BackfillTarget, DiscordBackfill, snowflakeTime } from "./backfill";
 import { type Destination, type DiscordChannel, PUBLIC_THREAD, THREAD_EXISTS, THREAD_NAME_MAX } from "./channel";
 import { toDiscordEmoji } from "./emoji";
@@ -300,7 +311,7 @@ export class DiscordAdapter implements ChannelAdapter {
 
 	/**
 	 * Waits for the first Ready, but no longer than `startWaitMs`: a gateway that only retries (5xx, no network, no
-	 * Hello) must not hold the daemon and Slack back, so after that wait `discord_start_pending` is logged, `start()`
+	 * Hello) must not hold the daemon and the other adapters back, so after that wait `discord_start_pending` is logged, `start()`
 	 * resolves and the gateway keeps connecting; its Ready then records the bot id and releases the recovery pass the
 	 * daemon started (a pass waits for the first Ready). A fatal
 	 * close such as 4004/4014 before that rejects, so the daemon runs without Discord; one after it goes to `onFatal`.
@@ -381,7 +392,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	/** An owner message the daemon puts in, fed through the live path as the owner's own message. */
 	async ingestOwner(input: OwnerIngest): Promise<IngestOutcome> {
 		const botUserId = await this.#ready;
-		// `kind` is the daemon's guess from Slack id shapes; a Discord DM is told by its channel having no server.
+		// `kind` is the daemon's guess (`ch` for a thread ref); a Discord DM is told by its channel having no server.
 		const conversation = input.kind === "ch" ? await this.#port.channelInfo(input.conversationId) : undefined;
 		const inChannel = conversation?.guildId !== undefined;
 		const isDm = input.kind === "dm" || (conversation !== undefined && !inChannel);
@@ -430,7 +441,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	}
 
 	/**
-	 * Slack's recovery notice where the recovered answers show: a reply to the oldest recovered DM message, or in the
+	 * The recovery notice where the recovered answers show: a reply to the oldest recovered DM message, or in the
 	 * thread of the oldest recovered server root that opened one. A thread channel gets none (its answers are in it),
 	 * nor does a channel whose recovered messages opened no thread (commands): the channel body stays clean.
 	 */
@@ -441,12 +452,7 @@ export class DiscordAdapter implements ChannelAdapter {
 			undefined,
 		);
 		if (anchor === undefined) return;
-		await this.#postText(
-			target.channelId,
-			anchor,
-			`⏬ 봇이 응답하지 못한 동안 도착한 메시지 ${target.recovered.length}건을 처리합니다`,
-			"backfill_notice_failed",
-		);
+		await this.#postText(target.channelId, anchor, recoveryNotice(target.recovered.length), "backfill_notice_failed");
 	}
 
 	/** Best-effort notice at the channel's top level, or under `threadId` (a thread, or the message it answers). */
@@ -459,7 +465,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	/**
 	 * A button click (INTERACTION_CREATE type 3). Discord voids the interaction unless it is answered within 3 s, so
 	 * the answer goes out first: a stranger gets an ephemeral denial, the owner a deferred update (type 6) — then the
-	 * core's onAction runs, the way a Slack block action does, and edits the card itself if it needs to.
+	 * core's onAction runs, like any card action, and edits the card itself if it needs to.
 	 */
 	async handleInteraction(interaction: DiscordInteraction): Promise<void> {
 		if (interaction.type !== MESSAGE_COMPONENT) return;
@@ -615,7 +621,7 @@ export class DiscordAdapter implements ChannelAdapter {
 			if (cardReply !== undefined) return cardReply;
 		}
 		const replyContext = this.#replyContext(event.referenced_message, botUserId);
-		// A forward's text is the snapshots', fenced like Slack's shared messages; their files are not fetched.
+		// A forward's text is the snapshots', fenced like any shared message; their files are not fetched.
 		const snapshots = event.message_snapshots ?? [];
 		const forwarded = snapshots
 			.map((snapshot) => snapshot.message?.content ?? "")
@@ -644,7 +650,7 @@ export class DiscordAdapter implements ChannelAdapter {
 				.join("\n"),
 		});
 		if (!gate.accept) return this.#drop(event, gate.reason);
-		// A server root that is no command opens its own thread, the way a Slack root opens its own origin.
+		// A server root that is no command opens its own thread, each root gets its own origin.
 		let inbound = gate.inbound;
 		const opensThread = !dm && threadId === undefined && parseChatOrigin(inbound.originKey)?.threadId !== undefined;
 		if (opensThread) {
@@ -675,7 +681,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	}
 
 	/**
-	 * A message of an allowlisted peer bot, Slack's rules on Discord's shapes: a server channel or thread only, a read
+	 * A message of an allowlisted peer bot, the peer rules on Discord's shapes: a server channel or thread only, a read
 	 * type, this bot mentioned (whatever the channel policy), no muted thread. It never takes an owner path — no card
 	 * reply, no attachment download, no command parsing (the text goes to the core fenced) — and is capped per thread
 	 * by the core. A channel root's thread is opened only once the core recorded the message, so a dropped peer
@@ -773,13 +779,13 @@ export class DiscordAdapter implements ChannelAdapter {
 	 * Downloads an owner message's attachments (at most `MAX_INBOUND_FILES`) into `<mediaRoot>/inbound/<message id>/`
 	 * and returns their prompt notes. A file whose declared size is over its cap is refused without a download.
 	 */
-	async #collectAttachments(event: DiscordMessageEvent, files: ReadonlyArray<DiscordAttachment>): Promise<string[]> {
-		const mediaRoot = this.#mediaRoot;
-		if (mediaRoot === undefined) return [`[첨부 실패: ${files.length}개 — 미디어 저장이 구성되지 않았습니다]`];
-		const dir = join(mediaRoot, "inbound", event.id);
-		const where = { channel: event.channel_id, id: event.id };
-		const notes = await Promise.all(
-			files.slice(0, MAX_INBOUND_FILES).map((file) => {
+	#collectAttachments(event: DiscordMessageEvent, files: ReadonlyArray<DiscordAttachment>): Promise<string[]> {
+		return collectInboundNotes({
+			mediaRoot: this.#mediaRoot,
+			dir: (root) => join(root, "inbound", event.id),
+			files,
+			saveOne: (file, dir) => {
+				const where = { channel: event.channel_id, id: event.id };
 				const image = (file.content_type ?? "").startsWith("image/");
 				const cap = image ? MAX_INBOUND_IMAGE_BYTES : MAX_INBOUND_DOC_BYTES;
 				if (file.size > cap) {
@@ -793,12 +799,8 @@ export class DiscordAdapter implements ChannelAdapter {
 					log: this.#log,
 					download: (args) => this.#transport.downloadAttachment(args),
 				});
-			}),
-		);
-		if (files.length > MAX_INBOUND_FILES) {
-			notes.push(`[첨부 생략: ${files.length - MAX_INBOUND_FILES}개 — 메시지당 최대 ${MAX_INBOUND_FILES}개]`);
-		}
-		return notes;
+			},
+		});
 	}
 
 	/**
@@ -962,7 +964,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	}
 
 	async #createStatus(entry: StatusEntry, text: string): Promise<void> {
-		try {
+		return createStatusMessage(entry, this.#log, async () => {
 			const destination = await this.#port.destination(entry.channel, entry.root);
 			const posted = await this.#call("post", () =>
 				this.#transport.createMessage({
@@ -972,11 +974,8 @@ export class DiscordAdapter implements ChannelAdapter {
 					allowedMentions: { parse: [] },
 				}),
 			);
-			entry.statusChannel = destination.channelId;
-			entry.statusId = posted.id;
-		} catch (err) {
-			this.#log.warn("status_create_failed", { thread: threadRefOf(entry.channel, entry.root), error: errorText(err) });
-		}
+			return { statusChannel: destination.channelId, statusId: posted.id };
+		});
 	}
 
 	async tick(): Promise<void> {
@@ -995,41 +994,31 @@ export class DiscordAdapter implements ChannelAdapter {
 	async #editStatus(entry: StatusEntry, text: string, final: boolean): Promise<boolean> {
 		const { statusChannel, statusId } = entry;
 		if (statusChannel === undefined || statusId === undefined) return false;
-		try {
-			await this.#call("edit", () =>
-				this.#transport.editMessage({
-					channelId: statusChannel,
-					messageId: statusId,
-					content: text,
-					allowedMentions: { parse: [] },
-				}),
-			);
-			return false;
-		} catch (err) {
-			if (err instanceof DiscordRateLimitedError) return true;
-			this.#log.warn(final ? "status_final_failed" : "status_update_failed", {
-				thread: threadRefOf(entry.channel, entry.root),
-				error: errorText(err),
-			});
-			return false;
-		}
+		return editStatusMessage(entry, final, {
+			run: () =>
+				this.#call("edit", () =>
+					this.#transport.editMessage({
+						channelId: statusChannel,
+						messageId: statusId,
+						content: text,
+						allowedMentions: { parse: [] },
+					}),
+				),
+			isRateLimited: (err) => err instanceof DiscordRateLimitedError,
+			log: this.#log,
+		});
 	}
 
 	/** `true`: rate limited, tick() deletes again. A refusal turns the finish into an update of the final label. */
 	async #removeStatus(entry: StatusEntry): Promise<boolean> {
 		const { statusChannel, statusId } = entry;
 		if (statusChannel === undefined || statusId === undefined) return false;
-		try {
-			await this.#call("delete", () =>
-				this.#transport.deleteMessage({ channelId: statusChannel, messageId: statusId }),
-			);
-			return false;
-		} catch (err) {
-			if (err instanceof DiscordRateLimitedError) return true;
-			this.#log.warn("status_delete_failed", { thread: threadRefOf(entry.channel, entry.root), error: errorText(err) });
-			entry.finalAction = "update";
-			return false;
-		}
+		return removeStatusMessage(entry, {
+			run: () =>
+				this.#call("delete", () => this.#transport.deleteMessage({ channelId: statusChannel, messageId: statusId })),
+			isRateLimited: (err) => err instanceof DiscordRateLimitedError,
+			log: this.#log,
+		});
 	}
 
 	/**
@@ -1043,14 +1032,11 @@ export class DiscordAdapter implements ChannelAdapter {
 
 	/** True when the step must be retried later (rate limited); other errors (unknown reaction) are final. */
 	async #swapReaction(fn: () => Promise<void>): Promise<boolean> {
-		try {
-			await this.#call("react", fn);
-			return false;
-		} catch (err) {
-			if (err instanceof DiscordRateLimitedError) return true;
-			this.#log.info("reaction_skipped", { error: errorText(err) });
-			return false;
-		}
+		return swapStatusReaction({
+			run: () => this.#call("react", fn),
+			isRateLimited: (err) => err instanceof DiscordRateLimitedError,
+			log: this.#log,
+		});
 	}
 
 	// ---- deliveries ----
@@ -1128,13 +1114,7 @@ export class DiscordAdapter implements ChannelAdapter {
 			if (err instanceof DiscordRateLimitedError) return deferred(err);
 			// Discord refused the first message (4xx): nothing of the answer exists. Anything else — a network or 5xx
 			// error, or a refusal after parts went out — may leave a partial answer, so it is never resent blindly.
-			const definitive = sent === 0 && err instanceof DiscordCallError && err.kind === "definitive";
-			return {
-				kind: "failed",
-				error: errorText(err),
-				outcome: definitive ? "definitive" : "ambiguous",
-				sentParts: sent,
-			};
+			return failedDelivery(err, sent, (e) => e instanceof DiscordCallError && e.kind === "definitive");
 		}
 	}
 

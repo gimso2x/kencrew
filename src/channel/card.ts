@@ -1,7 +1,7 @@
 /**
  * json-render card specs (` ```card ` fences in an answer), the platform-neutral part: cutting an answer at its card
  * fences, validating one fence into a `CardElement`, and the ASCII forms of tables and charts. Each platform draws the
- * validated card its own way (Slack Block Kit in `src/slack/card.ts`, Discord embeds in `src/discord/card.ts`).
+ * validated card its own way (Discord embeds in `src/discord/card.ts`).
  */
 import { CardSpecError, standardComponentDefinitions, toCard } from "@json-render/chat";
 import type { CardChild, CardElement } from "chat";
@@ -17,7 +17,7 @@ const { Actions: _actions, Button: _button, ...CARD_COMPONENTS } = standardCompo
 
 export { CARD_COMPONENTS };
 
-/** Per-card limits the spec is validated against (Slack's, kept for every platform: 1 table, 2 charts). */
+/** Per-card limits the spec is validated against (kept for every platform: 1 table, 2 charts). */
 export const CARD_LIMITS = {
 	tables: 1,
 	charts: 2,
@@ -118,10 +118,10 @@ export function cardRuns<T extends object>(
 	return runs;
 }
 
-/** A card's risk colour (root Card prop `tone`): Slack draws it as the attachment's colour bar, Discord as the embed's. */
+/** A card's risk colour (root Card prop `tone`): Discord draws it as the embed's colour. */
 export type CardTone = "ok" | "warn" | "danger" | "info";
 
-/** The tone palette (Slack brand colours); Discord takes the same value as an integer (`toneColorInt`). */
+/** The tone palette (hex); Discord takes the same value as an integer (`toneColorInt`). */
 export const CARD_TONE_COLORS: Readonly<Record<CardTone, string>> = {
 	ok: "#2EB67D",
 	warn: "#ECB22E",
@@ -259,7 +259,7 @@ export function cardUrlIssues(card: CardElement): string[] {
 
 /**
  * One issue per chart category given twice (sections searched too): every platform draws a chart's values by
- * category, so a repeated one would show the first value twice. Slack's chart block refuses it as well.
+ * category, so a repeated one would show the first value twice.
  */
 function repeatedCategories(children: readonly CardChild[]): string[] {
 	const issues: string[] = [];

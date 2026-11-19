@@ -141,12 +141,12 @@ export function createStuckDetector({ exempt = isStuckExempt }: StuckDetectorOpt
 			const fingerprint = toolFingerprint(toolName, args, event.result, isError);
 			const count = (counts.get(fingerprint) ?? 0) + 1;
 			counts.set(fingerprint, count);
-			const slack = isTransientError(event.result, isError) ? 2 : 1;
-			if (count >= STUCK_CANCEL_AT * slack) {
+			const margin = isTransientError(event.result, isError) ? 2 : 1;
+			if (count >= STUCK_CANCEL_AT * margin) {
 				cancelled = true;
 				return { action: "cancel", toolName, count };
 			}
-			if (count >= STUCK_STEER_AT * slack && !steered.has(fingerprint)) {
+			if (count >= STUCK_STEER_AT * margin && !steered.has(fingerprint)) {
 				steered.add(fingerprint);
 				return { action: "steer", toolName, count };
 			}

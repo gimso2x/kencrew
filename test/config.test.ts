@@ -11,7 +11,6 @@ import {
 	PEER_SILENCE_DEFAULT_MINUTES,
 	peerSilenceMinutes,
 	readDiscordToken,
-	readSlackTokens,
 } from "../src/config";
 import { Daemon } from "../src/daemon/daemon";
 import { CLI_FIELDS, LIVE_FIELDS, RESTART_FIELDS } from "../src/daemon/reload";
@@ -29,11 +28,20 @@ function writeSecret(rel: string, content: string, mode = 0o600): string {
 	return p;
 }
 
+const OWNER_ID = "123456789012345678"; // gitleaks:allow (fake snowflake)
+const APP_ID = "234567890123456789"; // gitleaks:allow (fake snowflake)
+// Not a real token: assembled at runtime so no token-shaped literal sits in the repo.
+const TOKEN = ["TEST", "discord", "token"].join("-");
+
+/** A valid `channels.discord` block; `overrides` replace or add keys. */
+function discordBlock(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return { ownerUserId: OWNER_ID, botTokenFile: "secrets/discord.token", applicationId: APP_ID, ...overrides };
+}
+
 function baseConfig(overrides: Record<string, unknown> = {}): Record<string, unknown> {
 	return {
 		schemaVersion: 1,
-		channels: { slack: { ownerUserId: "UOWNER0" } },
-		slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+		channels: { discord: discordBlock() },
 		ompExecutable: "/usr/local/bin/omp",
 		workspaceDir: "workspace",
 		...overrides,
@@ -58,8 +66,7 @@ beforeEach(() => {
 	home = mkdtempSync(join(tmpdir(), "ompbot-cfg-"));
 	chmodSync(home, 0o700);
 	mkdirSync(join(home, "secrets"), { mode: 0o700 });
-	writeSecret("secrets/bot.token", "xoxb-TEST-0\n");
-	writeSecret("secrets/app.token", "xapp-TEST-0\n");
+	writeSecret("secrets/discord.token", `${TOKEN}\n`);
 	writeConfig(baseConfig());
 });
 afterEach(() => rmSync(home, { recursive: true, force: true }));
@@ -69,26 +76,18 @@ describe("loadConfig", () => {
 		const cfg = loadConfig(home);
 		expect(cfg).toMatchObject({
 			schemaVersion: 1,
-			channels: { slack: { ownerUserId: "UOWNER0" } },
+			channels: {
+				discord: { ownerUserId: OWNER_ID, botTokenFile: join(home, "secrets/discord.token"), applicationId: APP_ID },
+			},
 			ompExecutable: "/usr/local/bin/omp",
 			workspaceDir: join(home, "workspace"),
-			slack: { botTokenFile: join(home, "secrets/bot.token"), appTokenFile: join(home, "secrets/app.token") },
 		});
-		if (cfg.slack === undefined) throw new Error("expected the Slack token block");
-		expect(cfg.slack.appId).toBeUndefined();
 		expect(cfg.model).toBeUndefined();
 	});
 
-	test("optional fields: slack.appId/teamId/botUserId, model, thinking, sessionRetentionDays, maxBundleBytes", () => {
+	test("optional fields: model, thinking, sessionRetentionDays, maxBundleBytes", () => {
 		writeConfig(
 			baseConfig({
-				slack: {
-					botTokenFile: "secrets/bot.token",
-					appTokenFile: "secrets/app.token",
-					appId: "A0TEST",
-					teamId: "T0TEST",
-					botUserId: "U0BOT",
-				},
 				model: "some/model",
 				thinking: "low",
 				sessionRetentionDays: 30,
@@ -96,7 +95,6 @@ describe("loadConfig", () => {
 			}),
 		);
 		const cfg = loadConfig(home);
-		expect(cfg.slack).toMatchObject({ appId: "A0TEST", teamId: "T0TEST", botUserId: "U0BOT" });
 		expect(cfg).toMatchObject({ model: "some/model", thinking: "low", sessionRetentionDays: 30 });
 		expect(cfg.maxBundleBytes).toBe(268_435_456);
 	});
@@ -140,11 +138,9 @@ describe("loadConfig", () => {
 		}
 	});
 
-	test("agent claude with an absolute claudeExecutable is accepted", () => {
-		writeConfig(baseConfig({ agent: "claude", claudeExecutable: "/usr/local/bin/claude" }));
-		const cfg = loadConfig(home);
-		expect(cfg.agent).toBe("claude");
-		expect(cfg.claudeExecutable).toBe("/usr/local/bin/claude");
+	test("agent omp is accepted", () => {
+		writeConfig(baseConfig({ agent: "omp" }));
+		expect(loadConfig(home).agent).toBe("omp");
 	});
 
 	test("unknown agent value is rejected", () => {
@@ -153,10 +149,11 @@ describe("loadConfig", () => {
 		expect(err.message).toContain("field=agent");
 	});
 
-	test("relative claudeExecutable is rejected", () => {
-		writeConfig(baseConfig({ agent: "claude", claudeExecutable: "claude" }));
+	test("agent claude (removed) is rejected as an agent error", () => {
+		writeConfig(baseConfig({ agent: "claude" }));
 		const err = catchError(() => loadConfig(home));
-		expect(err.message).toContain("field=claudeExecutable");
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain("field=agent");
 	});
 
 	test("agent agy with an absolute agyExecutable is accepted", () => {
@@ -182,10 +179,6 @@ describe("loadConfig", () => {
 		expect(err.message).toContain("field=agyExecutable");
 	});
 
-	test("readSlackTokens returns trimmed token values", () => {
-		expect(readSlackTokens(loadConfig(home))).toEqual({ botToken: "xoxb-TEST-0", appToken: "xapp-TEST-0" });
-	});
-
 	test("home 0755 refuses to start", () => {
 		chmodSync(home, 0o755);
 		const err = catchError(() => loadConfig(home));
@@ -200,90 +193,41 @@ describe("loadConfig", () => {
 	});
 
 	test("secret file with 0644 is rejected, naming only the path", () => {
-		const p = writeSecret("secrets/bot.token", "xoxb-TEST-0", 0o644);
+		const p = writeSecret("secrets/discord.token", TOKEN, 0o644);
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("secret_permissions");
 		expect(err.path).toBe(p);
-		expect(err.message).not.toContain("xoxb-TEST-0");
-	});
-
-	test("wrong prefix: error names the path and never contains the file content", () => {
-		const content = "NOTAKEN-secret-value-123";
-		const p = writeSecret("secrets/bot.token", content);
-		const err = catchError(() => loadConfig(home));
-		expect(err.code).toBe("token_prefix");
-		expect(err.path).toBe(p);
-		expect(err.message).toContain(p);
-		expect(err.message).not.toContain(content);
-		expect(err.message).not.toContain("secret-value");
-		expect(String(err.stack)).not.toContain(content);
-	});
-
-	test("app token needs xapp- (a bot token in the app slot is rejected)", () => {
-		const p = writeSecret("secrets/app.token", "xoxb-TEST-0");
-		const err = catchError(() => loadConfig(home));
-		expect(err).toMatchObject({ code: "token_prefix", path: p });
-		expect(err.message).not.toContain("xoxb-TEST-0");
+		expect(err.message).not.toContain(TOKEN);
 	});
 
 	test("missing token file", () => {
-		rmSync(join(home, "secrets/app.token"));
+		rmSync(join(home, "secrets/discord.token"));
 		expect(catchError(() => loadConfig(home)).code).toBe("secret_missing");
 	});
 
 	test("invalid JSON error does not echo file content", () => {
-		writeFileSync(join(home, "config.json"), '{"ownerSlackUserId": "UOWNER0", oops xoxb-TEST-0');
+		writeFileSync(join(home, "config.json"), `{"channels": {"discord": {}}, oops ${TOKEN}`);
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid_json");
-		expect(err.message).not.toContain("xoxb-TEST-0");
+		expect(err.message).not.toContain(TOKEN);
 		expect(err.message).not.toContain("oops");
 		expect(err.message).toContain("look for a trailing comma");
-		writeFileSync(join(home, "config.json"), '{"schemaVersion": 1, "x": "xoxb-TEST-1" "y": 2}');
-		expect(catchError(() => loadConfig(home)).message).not.toContain("xoxb-TEST-1");
+		writeFileSync(join(home, "config.json"), `{"schemaVersion": 1, "x": "${TOKEN}-1" "y": 2}`);
+		expect(catchError(() => loadConfig(home)).message).not.toContain(`${TOKEN}-1`);
 	});
 
 	test.each([
 		["schemaVersion", baseConfig({ schemaVersion: 2 })],
-		["ownerSlackUserId", baseConfig({ ownerSlackUserId: "" })],
 		["ompExecutable", baseConfig({ ompExecutable: "omp" })],
 		["workspaceDir", baseConfig({ workspaceDir: undefined })],
-		["slack.botTokenFile", baseConfig({ slack: { appTokenFile: "secrets/app.token" } })],
 		["sessionRetentionDays", baseConfig({ sessionRetentionDays: 0 })],
 		["maxBundleBytes", baseConfig({ maxBundleBytes: 0 })],
 		["maxBundleBytes", baseConfig({ maxBundleBytes: -1 })],
 		["maxBundleBytes", baseConfig({ maxBundleBytes: 1.5 })],
 		["maxBundleBytes", baseConfig({ maxBundleBytes: "512MB" })],
-		["slack.appId", baseConfig({ slack: { botTokenFile: "a", appTokenFile: "b", appId: 5 } })],
 		["model", baseConfig({ model: 3 })],
-		["escalationChannel", baseConfig({ escalationChannel: "c0lower123" })],
-		["escalationChannel", baseConfig({ escalationChannel: "D0123456789" })],
-		["escalationChannel", baseConfig({ escalationChannel: "C012" })],
-		["escalationChannel", baseConfig({ escalationChannel: 5 })],
-		["logChannel", baseConfig({ logChannel: "c0lower123" })],
-		["logChannel", baseConfig({ logChannel: "D0123456789" })],
-		["logChannel", baseConfig({ logChannel: 7 })],
-		["mentionFreeChannels", baseConfig({ mentionFreeChannels: "C0123456789" })],
-		["mentionFreeChannels", baseConfig({ mentionFreeChannels: ["#general"] })],
-		["mentionFreeChannels", baseConfig({ mentionFreeChannels: ["C0123456789", "D0123456789"] })],
-		["mentionFreeChannels", baseConfig({ mentionFreeChannels: ["C0123456789", ""] })],
 		["recallEnabled", baseConfig({ recallEnabled: "false" })],
 		["recallEnabled", baseConfig({ recallEnabled: 0 })],
-		["peerBots", baseConfig({ peerBots: { userId: "UPEER00001", name: "떡" } })],
-		["peerBots.0.userId", baseConfig({ peerBots: [{ userId: "upeer00001", name: "떡" }] })],
-		["peerBots.0.userId", baseConfig({ peerBots: [{ userId: "UPEER", name: "떡" }] })],
-		["peerBots.0.userId", baseConfig({ peerBots: [{ userId: "UOWNER0", name: "떡" }] })],
-		["peerBots.0.name", baseConfig({ peerBots: [{ userId: "UPEER00001", name: "" }] })],
-		["peerBots.0.name", baseConfig({ peerBots: [{ userId: "UPEER00001", name: "x".repeat(33) }] })],
-		[
-			"peerBots.1.token",
-			baseConfig({
-				peerBots: [
-					{ userId: "UPEER00001", name: "a" },
-					{ userId: "UPEER00002", name: "b", token: "x" },
-				],
-			}),
-		],
-		["requireMention", baseConfig({ requireMention: "true" })],
 		["peerHopLimit", baseConfig({ peerHopLimit: 3 })],
 		["peerHopLimit.turns", baseConfig({ peerHopLimit: { turns: 0, windowMinutes: 30 } })],
 		["peerHopLimit.windowMinutes", baseConfig({ peerHopLimit: { turns: 3, windowMinutes: 1.5 } })],
@@ -317,18 +261,6 @@ describe("loadConfig", () => {
 		expect(err.message).toContain(`field=${field}`);
 	});
 
-	test("escalationChannel is optional and a Slack channel id is accepted", () => {
-		expect(loadConfig(home).escalationChannel).toBeUndefined();
-		writeConfig(baseConfig({ escalationChannel: "C0ESCALATE1" }));
-		expect(loadConfig(home).escalationChannel).toBe("C0ESCALATE1");
-	});
-
-	test("logChannel is optional and a Slack channel id is accepted", () => {
-		expect(loadConfig(home).logChannel).toBeUndefined();
-		writeConfig(baseConfig({ logChannel: "C0LOGCHAN01" }));
-		expect(loadConfig(home).logChannel).toBe("C0LOGCHAN01");
-	});
-
 	test("recallEnabled is optional and accepts a boolean", () => {
 		expect(loadConfig(home).recallEnabled).toBeUndefined();
 		writeConfig(baseConfig({ recallEnabled: false }));
@@ -337,23 +269,10 @@ describe("loadConfig", () => {
 		expect(loadConfig(home).recallEnabled).toBe(true);
 	});
 
-	test("peerBots, requireMention and peerHopLimit are optional and read as written", () => {
-		const loaded = loadConfig(home);
-		expect(loaded.peerBots).toBeUndefined();
-		expect(loaded.requireMention).toBeUndefined();
-		expect(loaded.peerHopLimit).toBeUndefined();
-		writeConfig(
-			baseConfig({
-				peerBots: [{ userId: "U0TESTPEER1", name: "떡" }],
-				requireMention: true,
-				peerHopLimit: { turns: 2, windowMinutes: 10 },
-			}),
-		);
-		expect(loadConfig(home)).toMatchObject({
-			peerBots: [{ userId: "U0TESTPEER1", name: "떡" }],
-			requireMention: true,
-			peerHopLimit: { turns: 2, windowMinutes: 10 },
-		});
+	test("peerHopLimit is optional and read as written", () => {
+		expect(loadConfig(home).peerHopLimit).toBeUndefined();
+		writeConfig(baseConfig({ peerHopLimit: { turns: 2, windowMinutes: 10 } }));
+		expect(loadConfig(home).peerHopLimit).toEqual({ turns: 2, windowMinutes: 10 });
 	});
 
 	test("peerSilenceAlert AC-5: default 10 minutes, 0 and 1440 accepted, a live field", () => {
@@ -390,64 +309,111 @@ describe("loadConfig", () => {
 			models: { high: "anthropic/claude-opus-5-5", low: "zai/glm-5.3-flash" },
 		});
 	});
-
-	test("mentionFreeChannels is optional and accepts only channel ids", () => {
-		expect(loadConfig(home).mentionFreeChannels).toBeUndefined();
-		writeConfig(baseConfig({ mentionFreeChannels: ["C0123456789"] }));
-		expect(loadConfig(home).mentionFreeChannels).toEqual(["C0123456789"]);
-	});
 });
 
-describe("channels.slack.ownerUserId", () => {
-	const legacy = (owner: unknown, extra: Record<string, unknown> = {}) => {
-		const { channels: _, ...rest } = baseConfig(extra);
-		return { ...rest, ownerSlackUserId: owner };
-	};
-
-	test("the new key alone is accepted and nothing is deprecated", () => {
-		const cfg = loadConfig(home);
-		expect(cfg.channels).toEqual({ slack: { ownerUserId: "UOWNER0" } });
-		expect(cfg.deprecated ?? []).toEqual([]);
-		expect("ownerSlackUserId" in cfg).toBe(false);
+describe("channels", () => {
+	const REMOVED = "Slack 채널은 제거됨";
+	const TEAMS_GUID = "0aaaaaaa-1111-2222-3333-444444444444";
+	const teamsBlock = () => ({
+		appId: TEAMS_GUID,
+		tenantId: TEAMS_GUID,
+		clientSecretFile: "secrets/teams.secret",
+		ownerAadObjectId: TEAMS_GUID,
 	});
 
-	test("the old ownerSlackUserId alone is read as the Slack owner and reported as deprecated", () => {
-		writeConfig(legacy("UOWNER0"));
-		const cfg = loadConfig(home);
-		if (cfg.channels.slack === undefined) throw new Error("expected channels.slack");
-		expect(cfg.channels.slack.ownerUserId).toBe("UOWNER0");
-		expect(cfg.deprecated).toEqual(["ownerSlackUserId"]);
+	test("a discord config loads as written: channels holds discord alone", () => {
+		expect(loadConfig(home).channels).toEqual({
+			discord: { ownerUserId: OWNER_ID, botTokenFile: join(home, "secrets/discord.token"), applicationId: APP_ID },
+		});
 	});
 
-	test("both keys with the same value are accepted; different values are rejected under the new key", () => {
-		writeConfig(baseConfig({ ownerSlackUserId: "UOWNER0" }));
-		expect(loadConfig(home).channels.slack?.ownerUserId).toBe("UOWNER0");
-		writeConfig(baseConfig({ ownerSlackUserId: "UOTHER00" }));
+	test("a teams config loads and leaves Discord off", () => {
+		writeSecret("secrets/teams.secret", "TEST-teams-secret\n");
+		writeConfig(baseConfig({ channels: { teams: teamsBlock() } }));
+		const cfg = loadConfig(home);
+		expect(cfg.channels.discord).toBeUndefined();
+		expect(cfg.channels.teams).toMatchObject({ appId: TEAMS_GUID, ownerAadObjectId: TEAMS_GUID });
+	});
+
+	test("discord and teams together load", () => {
+		writeSecret("secrets/teams.secret", "TEST-teams-secret\n");
+		writeConfig(baseConfig({ channels: { discord: discordBlock(), teams: teamsBlock() } }));
+		const cfg = loadConfig(home);
+		expect(cfg.channels.discord?.ownerUserId).toBe(OWNER_ID);
+		expect(cfg.channels.teams?.appId).toBe(TEAMS_GUID);
+	});
+
+	test("channels.slack is refused with the removal note, even next to a valid discord block", () => {
+		writeConfig(baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, discord: discordBlock() } }));
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
-		expect(err.message).toContain("field=channels.slack.ownerUserId");
+		expect(err.message).toContain("field=channels.slack");
+		expect(err.message).toContain(REMOVED);
+		writeConfig(baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" } } }));
+		expect(catchError(() => loadConfig(home)).message).toContain("field=channels.slack");
+	});
+
+	test("a top-level slack token block is refused as channels.slack with the removal note", () => {
+		writeConfig(baseConfig({ slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" } }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain("field=channels.slack");
+		expect(err.message).toContain(REMOVED);
 	});
 
 	test.each([
-		["neither key", legacy(undefined), "field=channels.slack.ownerUserId"],
-		["an empty new key", baseConfig({ channels: { slack: { ownerUserId: "" } } }), "field=channels.slack.ownerUserId"],
-		[
-			"a non-string new key",
-			baseConfig({ channels: { slack: { ownerUserId: 7 } } }),
-			"field=channels.slack.ownerUserId",
-		],
-		["an empty old key alone", legacy(""), "field=ownerSlackUserId"],
-		["channels not an object", baseConfig({ channels: ["slack"] }), "field=channels"],
-		["channels.slack not an object", baseConfig({ channels: { slack: "UOWNER0" } }), "field=channels.slack"],
+		["mentionFreeChannels", ["456789012345678901"]],
+		["peerBots", [{ userId: "678901234567890123", name: "떡" }]],
+		["requireMention", true],
+		["escalationChannel", "789012345678901234"],
+		["logChannel", "678901234567890123"],
+	])("the top-level %s is refused with the removal note (it lives under channels.discord now)", (key, value) => {
+		writeConfig(baseConfig({ [key]: value }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(`field=${key} `);
+		expect(err.message).toContain(REMOVED);
+	});
+
+	test("channels.discord's requireMention, mentionFreeChannels, peerBots, logChannelId and escalationChannelId load", () => {
+		writeConfig(
+			baseConfig({
+				channels: {
+					discord: discordBlock({
+						requireMention: true,
+						mentionFreeChannels: ["456789012345678901"],
+						peerBots: [{ userId: "678901234567890123", name: "떡" }],
+						logChannelId: "567890123456789012",
+						escalationChannelId: "789012345678901234",
+					}),
+				},
+			}),
+		);
+		expect(loadConfig(home).channels.discord).toMatchObject({
+			requireMention: true,
+			mentionFreeChannels: ["456789012345678901"],
+			peerBots: [{ userId: "678901234567890123", name: "떡" }],
+			logChannelId: "567890123456789012",
+			escalationChannelId: "789012345678901234",
+		});
+	});
+
+	test("there is no top-level copy of them on the loaded config", () => {
+		writeConfig(baseConfig({ channels: { discord: discordBlock({ requireMention: true }) } }));
+		const cfg = loadConfig(home) as unknown as Record<string, unknown>;
+		for (const key of ["mentionFreeChannels", "peerBots", "requireMention", "escalationChannel", "logChannel"]) {
+			expect(key in cfg).toBe(false);
+		}
+	});
+
+	test.each([
+		["no channels at all", baseConfig({ channels: undefined }), "field=channels"],
+		["channels empty", baseConfig({ channels: {} }), "field=channels"],
+		["channels not an object", baseConfig({ channels: ["discord"] }), "field=channels"],
 		[
 			"an unknown platform key",
-			baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, matrix: {} } }),
+			baseConfig({ channels: { discord: discordBlock(), matrix: {} } }),
 			"field=channels.matrix",
-		],
-		[
-			"an unknown key under slack",
-			baseConfig({ channels: { slack: { ownerUserId: "UOWNER0", botTokenFile: "x" } } }),
-			"field=channels.slack.botTokenFile",
 		],
 	])("%s is config_invalid", (_name, cfg, field) => {
 		writeConfig(cfg);
@@ -455,39 +421,15 @@ describe("channels.slack.ownerUserId", () => {
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain(field);
 	});
-
-	test("the owner can never be a peer bot, whichever key names it", () => {
-		writeConfig(legacy("UOWNER0", { peerBots: [{ userId: "UOWNER0", name: "떡" }] }));
-		expect(catchError(() => loadConfig(home)).message).toContain("field=peerBots.0.userId");
-	});
 });
 
 describe("channels.discord", () => {
-	const OWNER_ID = "123456789012345678";
-	const APP_ID = "234567890123456789";
-	// Not a real token: assembled at runtime so no token-shaped literal sits in the repo.
-	const TOKEN = ["TEST", "discord", "token"].join("-");
-	const discord = (overrides: Record<string, unknown> = {}) => ({
-		ownerUserId: OWNER_ID,
-		botTokenFile: "secrets/discord.token",
-		applicationId: APP_ID,
-		...overrides,
-	});
 	const withDiscord = (overrides: Record<string, unknown> = {}) =>
-		baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, discord: discord(overrides) } });
+		baseConfig({ channels: { discord: discordBlock(overrides) } });
 	const without = (key: string) => {
-		const full: Record<string, unknown> = discord();
-		const { [key]: _, ...rest } = full;
-		return baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, discord: rest } });
+		const { [key]: _, ...rest } = discordBlock();
+		return baseConfig({ channels: { discord: rest } });
 	};
-
-	beforeEach(() => {
-		writeSecret("secrets/discord.token", `${TOKEN}\n`);
-	});
-
-	test("absent: Discord is off", () => {
-		expect(loadConfig(home).channels.discord).toBeUndefined();
-	});
 
 	test("present: owner, application, absolute token path and the optional policy keys; never the token value", () => {
 		writeConfig(
@@ -519,27 +461,23 @@ describe("channels.discord", () => {
 		});
 	});
 
-	test("logChannelId and escalationChannelId: snowflakes are taken; a top-level Slack logChannel stays as it was", () => {
-		writeConfig({
-			...withDiscord({
+	test("logChannelId and escalationChannelId: snowflakes are taken", () => {
+		writeConfig(
+			withDiscord({
 				logChannelId: "678901234567890123",
 				escalationChannelId: "789012345678901234",
 			}),
-			logChannel: "C0LOGCHAN01",
-			escalationChannel: "C0ESCALATE1",
-		});
+		);
 		const cfg = loadConfig(home);
 		expect(cfg.channels.discord?.logChannelId).toBe("678901234567890123");
 		expect(cfg.channels.discord?.escalationChannelId).toBe("789012345678901234");
-		expect(cfg.logChannel).toBe("C0LOGCHAN01");
-		expect(cfg.escalationChannel).toBe("C0ESCALATE1");
 	});
 
 	test.each([
-		["a Slack-style logChannelId", { logChannelId: "C0LOGCHAN01" }, "channels.discord.logChannelId"],
+		["a non-snowflake logChannelId", { logChannelId: "C0LOGCHAN01" }, "channels.discord.logChannelId"],
 		["a numeric logChannelId", { logChannelId: 678901234567890 }, "channels.discord.logChannelId"],
 		[
-			"a Slack-style escalationChannelId",
+			"a non-snowflake escalationChannelId",
 			{ escalationChannelId: "C0ESCALATE1" },
 			"channels.discord.escalationChannelId",
 		],
@@ -577,7 +515,7 @@ describe("channels.discord", () => {
 		["no botTokenFile", without("botTokenFile"), "field=channels.discord.botTokenFile"],
 		["no applicationId", without("applicationId"), "field=channels.discord.applicationId"],
 		["a short ownerUserId", withDiscord({ ownerUserId: "1234" }), "field=channels.discord.ownerUserId"],
-		["a Slack-style ownerUserId", withDiscord({ ownerUserId: "UOWNER0" }), "field=channels.discord.ownerUserId"],
+		["a non-snowflake ownerUserId", withDiscord({ ownerUserId: "UOWNER0" }), "field=channels.discord.ownerUserId"],
 		["a numeric ownerUserId", withDiscord({ ownerUserId: 12345678901234 }), "field=channels.discord.ownerUserId"],
 		[
 			"a 21-digit applicationId",
@@ -594,7 +532,7 @@ describe("channels.discord", () => {
 		],
 		["requireMention not a boolean", withDiscord({ requireMention: "yes" }), "field=channels.discord.requireMention"],
 		[
-			"a Slack-style laneChannelId",
+			"a non-snowflake laneChannelId",
 			withDiscord({ laneChannelId: "C0123ABCD" }),
 			"field=channels.discord.laneChannelId",
 		],
@@ -607,11 +545,7 @@ describe("channels.discord", () => {
 		["an empty displayName", withDiscord({ displayName: "" }), "field=channels.discord.displayName"],
 		["a 33-character displayName", withDiscord({ displayName: "가".repeat(33) }), "field=channels.discord.displayName"],
 		["an unknown key", withDiscord({ botToken: "x" }), "field=channels.discord.botToken"],
-		[
-			"discord not an object",
-			baseConfig({ channels: { slack: { ownerUserId: "UOWNER0" }, discord: true } }),
-			"field=channels.discord",
-		],
+		["discord not an object", baseConfig({ channels: { discord: true } }), "field=channels.discord"],
 	])("%s is config_invalid", (_name, cfg, field) => {
 		writeConfig(cfg);
 		const err = catchError(() => loadConfig(home));
@@ -660,7 +594,11 @@ describe("channels.discord", () => {
 
 	test.each([
 		["peerBots not an array", { peerBots: { userId: "678901234567890123", name: "떡" } }, "channels.discord.peerBots"],
-		["a Slack peer id", { peerBots: [{ userId: "UPEER00001", name: "떡" }] }, "channels.discord.peerBots.0.userId"],
+		[
+			"a non-snowflake peer id",
+			{ peerBots: [{ userId: "UPEER00001", name: "떡" }] },
+			"channels.discord.peerBots.0.userId",
+		],
 		["a numeric peer id", { peerBots: [{ userId: 12345678901234, name: "떡" }] }, "channels.discord.peerBots.0.userId"],
 		["the owner as peer", { peerBots: [{ userId: OWNER_ID, name: "떡" }] }, "channels.discord.peerBots.0.userId"],
 		["an empty name", { peerBots: [{ userId: "678901234567890123", name: "" }] }, "channels.discord.peerBots.0.name"],
@@ -841,6 +779,15 @@ describe("taskAutoLand", () => {
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
 		expect(err.message).toContain("(field=herdr)");
+	});
+
+	test("a removed taskAutoLand gate key is rejected like any unknown key", () => {
+		// Assembled so the repository keeps no trace of the removed gate's name (the removal's grep check).
+		const removed = `proven${"Red"}`;
+		writeConfig(withHerdr({ repos: ["/srv/a"], [removed]: {} }));
+		const err = catchError(() => loadConfig(home));
+		expect(err.code).toBe("config_invalid");
+		expect(err.message).toContain(`(field=taskAutoLand.${removed})`);
 	});
 
 	test("lane review AC-9: review is kept with its model and timeoutMs (timeoutMs optional)", () => {
@@ -1087,40 +1034,16 @@ describe("dashboard", () => {
 	test("checkTokens: false loads a config whose token files are missing", () => {
 		rmSync(join(home, "secrets"), { recursive: true, force: true });
 		expect(catchError(() => loadConfig(home)).code).toBe("secret_missing");
-		expect(loadConfig(home, { checkTokens: false }).channels.slack?.ownerUserId).toBe("UOWNER0");
+		expect(loadConfig(home, { checkTokens: false }).channels.discord?.ownerUserId).toBe(OWNER_ID);
 	});
 });
 
-describe("Slack off: channels.slack absent (teams-channel TASK A)", () => {
-	const DISCORD_OWNER_ID = "123456789012345678"; // gitleaks:allow (fake snowflake)
-	const discordOnly = (extra: Record<string, unknown> = {}) => {
-		const { slack: _slack, ...rest } = baseConfig(extra);
-		return {
-			...rest,
-			channels: {
-				discord: {
-					ownerUserId: DISCORD_OWNER_ID,
-					botTokenFile: "secrets/discord.token",
-					applicationId: "234567890123456789",
-				},
-			},
-		};
-	};
-
-	beforeEach(() => {
-		writeSecret("secrets/discord.token", ["TEST", "discord", "token"].join("-"));
-		// No Slack token file exists at all: any attempt to read one fails with secret_missing.
-		rmSync(join(home, "secrets/bot.token"));
-		rmSync(join(home, "secrets/app.token"));
-	});
-
-	test("AC-A1: a Discord-only config loads, binds Discord alone and the daemon starts without Slack tokens", async () => {
-		writeConfig(discordOnly());
+describe("Discord-only: no other platform configured (teams-channel TASK A)", () => {
+	test("AC-A1: a Discord-only config loads, binds Discord alone and the daemon starts with Discord alone", async () => {
+		writeConfig(baseConfig());
 		const config = loadConfig(home);
-		expect(config.channels.slack).toBeUndefined();
-		expect(config.slack).toBeUndefined();
-		expect(config.channels.discord?.ownerUserId).toBe(DISCORD_OWNER_ID);
-		expect(() => readSlackTokens(config)).toThrow("channels.slack is not configured");
+		expect(Object.keys(config.channels)).toEqual(["discord"]);
+		expect(config.channels.discord?.ownerUserId).toBe(OWNER_ID);
 
 		const logs: string[] = [];
 		const log = createLogger({ sink: (line) => logs.push(line), clock: { now: () => Date.now() }, redact });
@@ -1144,13 +1067,13 @@ describe("Slack off: channels.slack absent (teams-channel TASK A)", () => {
 			await daemon.stop();
 		}
 		const ready = logs.find((line) => line.includes("event=daemon_ready"));
-		expect(ready).toContain("slack=off");
 		expect(ready).toContain("discord=on");
+		expect(ready).toContain("teams=off");
 		expect(logs.some((line) => line.includes("secret_missing"))).toBe(false);
 	});
 
 	test("no platform at all is config_invalid field=channels", () => {
-		const { slack: _slack, channels: _channels, ...rest } = baseConfig();
+		const { channels: _channels, ...rest } = baseConfig();
 		writeConfig(rest);
 		const err = catchError(() => loadConfig(home));
 		expect(err.code).toBe("config_invalid");
@@ -1159,60 +1082,29 @@ describe("Slack off: channels.slack absent (teams-channel TASK A)", () => {
 		expect(catchError(() => loadConfig(home)).message).toContain("field=channels");
 	});
 
-	test.each([
-		["peerBots", { peerBots: [{ userId: "UPEER00001", name: "떡" }] }],
-		["logChannel", { logChannel: "C0LOGCHAN01" }],
-		["escalationChannel", { escalationChannel: "C0ESCALATE1" }],
-		["mentionFreeChannels", { mentionFreeChannels: ["C0123456789"] }],
-	])("a Slack id key %s without Slack is config_invalid", (field, extra) => {
-		writeConfig(discordOnly(extra));
-		const err = catchError(() => loadConfig(home));
-		expect(err.code).toBe("config_invalid");
-		expect(err.message).toContain(`field=${field}`);
-	});
-
-	test("channels.discord.logChannelId and escalationChannelId load without Slack", () => {
-		const config = discordOnly();
-		writeConfig({
-			...config,
-			channels: {
-				discord: {
-					...config.channels.discord,
-					logChannelId: "678901234567890123",
-					escalationChannelId: "789012345678901234",
+	test("channels.discord.logChannelId and escalationChannelId load", () => {
+		writeConfig(
+			baseConfig({
+				channels: {
+					discord: discordBlock({ logChannelId: "678901234567890123", escalationChannelId: "789012345678901234" }),
 				},
-			},
-		});
+			}),
+		);
 		const loaded = loadConfig(home);
-		expect(loaded.channels.slack).toBeUndefined();
 		expect(loaded.channels.discord?.logChannelId).toBe("678901234567890123");
 		expect(loaded.channels.discord?.escalationChannelId).toBe("789012345678901234");
 	});
 
-	test("channels.discord.peerBots and peerHopLimit load without Slack", () => {
-		const config = discordOnly({ peerHopLimit: { turns: 2, windowMinutes: 10 } });
-		writeConfig({
-			...config,
-			channels: {
-				discord: { ...config.channels.discord, peerBots: [{ userId: "678901234567890123", name: "떡" }] },
-			},
-		});
+	test("channels.discord.peerBots and peerHopLimit load", () => {
+		writeConfig(
+			baseConfig({
+				channels: { discord: discordBlock({ peerBots: [{ userId: "678901234567890123", name: "떡" }] }) },
+				peerHopLimit: { turns: 2, windowMinutes: 10 },
+			}),
+		);
 		const loaded = loadConfig(home);
-		expect(loaded.channels.slack).toBeUndefined();
 		expect(loaded.channels.discord?.peerBots).toEqual([{ userId: "678901234567890123", name: "떡" }]);
 		expect(loaded.peerHopLimit).toEqual({ turns: 2, windowMinutes: 10 });
-		expect(loaded.peerBots).toBeUndefined();
-	});
-
-	test("a Slack token block without a Slack owner is still config_invalid under channels.slack.ownerUserId", () => {
-		writeConfig({ ...discordOnly(), slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" } });
-		expect(catchError(() => loadConfig(home)).message).toContain("field=channels.slack.ownerUserId");
-	});
-
-	test("channels.slack without the top-level slack token block is config_invalid field=slack", () => {
-		const { slack: _slack, ...rest } = baseConfig();
-		writeConfig(rest);
-		expect(catchError(() => loadConfig(home)).message).toContain("(field=slack)");
 	});
 });
 
@@ -1229,11 +1121,11 @@ describe("qa50b lane I", () => {
 
 	test("I-2: a config.json starting with a UTF-8 BOM loads", () => {
 		writeFileSync(join(home, "config.json"), `\ufeff${JSON.stringify(baseConfig())}`);
-		expect(loadConfig(home).channels.slack?.ownerUserId).toBe("UOWNER0");
+		expect(loadConfig(home).channels.discord?.ownerUserId).toBe(OWNER_ID);
 	});
 
 	test("I-3: unknown top-level keys load but are listed as warnings (key name only)", () => {
-		writeConfig(baseConfig({ bogusKey: "xoxb-TEST-0", ownerSlackUserId: "UOWNER0" }));
+		writeConfig(baseConfig({ bogusKey: TOKEN }));
 		const cfg = loadConfig(home);
 		expect(cfg.warnings).toEqual([{ field: "bogusKey", reason: "unknown_key" }]);
 		writeConfig(baseConfig());

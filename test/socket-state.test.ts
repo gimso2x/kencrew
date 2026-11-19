@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { SocketConnectionState } from "../src/slack/socket-transport";
+import { SocketConnectionState } from "../src/channel/socket-base";
 
 describe("SocketConnectionState", () => {
 	test("starts down since construction", () => {

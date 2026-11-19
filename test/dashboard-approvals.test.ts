@@ -9,8 +9,8 @@ import { makeHome, type TestHome } from "./helpers/bot-home";
 
 const NOW = Date.parse("2026-11-04T05:20:00Z");
 const MINUTE = 60_000;
-const CARD_URL = "https://example.slack.com/archives/C0123456789/p1793769039558599";
-const THREAD_URL = "https://example.slack.com/archives/C0234567890/p1793768647644509";
+const CARD_URL = "https://discord.com/channels/400000000000000001/300000000000000001/1793769039558599";
+const THREAD_URL = "https://discord.com/channels/400000000000000001/300000000000000002/1793768647644509";
 const FULL = "C0123456789:1793769039.558599";
 const BROKEN = "C0123456789:1793769100.000001";
 const BARE = "C0123456789:1793769200.000002";
@@ -58,7 +58,7 @@ function seed(): void {
 		FULL_SUMMARY,
 		NOW - MINUTE,
 		NOW + 29 * MINUTE,
-		"slack/ch/C0234567890/t/1793768647.644509",
+		"discord/ch/300000000000000002/t/1793768647644509",
 		JSON.stringify({
 			action: "git worktree remove /home/user/work/ompbot-t-20261102-04",
 			why: "리뷰 끝 · 토큰 xoxb-TEST-0 은 가려져야 함",
@@ -74,12 +74,22 @@ function seed(): void {
 		LONG_SUMMARY,
 		NOW - 40 * MINUTE,
 		NOW - 1_000,
-		"slack/dm/D0BOTDM",
+		"discord/dm/200000000000000001",
 		"{not json",
 		"javascript:alert(1)",
 		"http://insecure.example/thread",
 	);
-	insert.run(BARE, "1793769200.000002", "배포", NOW - MINUTE, NOW + 5 * MINUTE, "slack/ch/C0CHAN", null, null, null);
+	insert.run(
+		BARE,
+		"1793769200.000002",
+		"배포",
+		NOW - MINUTE,
+		NOW + 5 * MINUTE,
+		"discord/ch/300000000000000003",
+		null,
+		null,
+		null,
+	);
 	insert.run(LANE, "1793769300.000003", "레인 작업", NOW - MINUTE, NOW + 20 * MINUTE, "lane/a", null, null, null);
 	db.close();
 }
@@ -121,12 +131,12 @@ describe("dashboard approvals", () => {
 			summary: FULL_SUMMARY,
 			createdAt: "2026-11-04T14:19:00+09:00",
 			expiresAt: "2026-11-04T14:49:00+09:00",
-			originKey: "slack/ch/C0234567890/t/1793768647.644509",
+			originKey: "discord/ch/300000000000000002/t/1793768647644509",
 			title: "T-20261102-04 워크트리와 브랜치를 정리합니다.",
 			cardUrl: CARD_URL,
 			originUrl: THREAD_URL,
 			remainingMs: 29 * MINUTE,
-			originLabel: "채널 C0234567890 스레드",
+			originLabel: "Discord 채널 300000000000000002 스레드",
 		});
 		expect(full.detail).toEqual({
 			action: "git worktree remove /home/user/work/ompbot-t-20261102-04",
@@ -145,7 +155,11 @@ describe("dashboard approvals", () => {
 		});
 		expect(broken.title.length).toBeLessThanOrEqual(80);
 		expect(broken.title).toBe(`${LONG_SUMMARY.slice(0, 79)}…`);
-		expect(byId(items, BARE)).toMatchObject({ originLabel: "채널 C0CHAN 메인", detail: null, cardUrl: null });
+		expect(byId(items, BARE)).toMatchObject({
+			originLabel: "Discord 채널 300000000000000003 메인",
+			detail: null,
+			cardUrl: null,
+		});
 		expect(byId(items, LANE).originLabel).toBe("lane/a");
 	});
 
@@ -158,7 +172,7 @@ describe("dashboard approvals", () => {
 				origin_thread_ref TEXT, reply_ts TEXT, reply_text TEXT)`,
 		);
 		db.run(
-			"INSERT INTO approvals (approval_id, channel, message_ts, summary, created_at, expires_at, origin_key) VALUES (?, 'C1', '1.1', 'push to main', ?, ?, 'slack/dm/D1')",
+			"INSERT INTO approvals (approval_id, channel, message_ts, summary, created_at, expires_at, origin_key) VALUES (?, 'C1', '1.1', 'push to main', ?, ?, 'discord/dm/200000000000000001')",
 			[FULL, NOW - MINUTE, NOW + 3 * MINUTE],
 		);
 		db.close();
@@ -199,7 +213,7 @@ describe("dashboard approvals", () => {
 		expect(full).not.toContain("/home/user/work/ompbot-t-20261102-04");
 		expect(full).toContain("29분 남음");
 		expect(full).toContain("되돌릴 수 없음");
-		expect(full).toContain("채널 C0234567890 스레드");
+		expect(full).toContain("Discord 채널 300000000000000002 스레드");
 		const broken = rowOf(BROKEN);
 		const title = /<p class="row-title">([^<]*)<\/p>/.exec(broken)?.[1] ?? "";
 		expect(title.length).toBeLessThanOrEqual(80);
@@ -209,7 +223,7 @@ describe("dashboard approvals", () => {
 		// Visible text only: tags and attributes (row ids in hrefs and data-item) dropped.
 		const text = html.replace(/<[^>]*>/g, " ");
 		for (const id of [FULL, BROKEN, BARE, LANE]) expect(text).not.toContain(id);
-		expect(text).not.toContain("slack/ch/C0234567890/t/1793768647.644509");
+		expect(text).not.toContain("discord/ch/300000000000000002/t/1793768647644509");
 	});
 
 	test("AC-7: the detail lists what, why, impact and rollback with card and thread links; ids sit in <details>", async () => {
@@ -224,25 +238,42 @@ describe("dashboard approvals", () => {
 		] as const) {
 			expect(full).toContain(`<dt>${label}</dt><dd>${value}</dd>`);
 		}
-		expect(full).toMatch(new RegExp(`<a [^>]*href="${CARD_URL}"[^>]*rel="noopener[^"]*"[^>]*>슬랙 카드 열기</a>`));
+		expect(full).toMatch(new RegExp(`<a [^>]*href="${CARD_URL}"[^>]*rel="noopener[^"]*"[^>]*>카드 열기</a>`));
 		expect(full).toMatch(new RegExp(`<a [^>]*href="${THREAD_URL}"[^>]*>요청 스레드 열기</a>`));
-		expect(full).not.toContain("슬랙의 승인 메시지에서");
+		expect(full).not.toContain("승인 메시지에서");
 		const details = /<details[^>]*>([\s\S]*)<\/details>/.exec(full)?.[1] ?? "";
 		expect(details).toContain("<summary>내부 정보</summary>");
 		expect(details).toContain(FULL);
-		expect(details).toContain("slack/ch/C0234567890/t/1793768647.644509");
+		expect(details).toContain("discord/ch/300000000000000002/t/1793768647644509");
 		expect(full.slice(0, full.indexOf("<details"))).not.toContain(FULL);
 		expect(full).toContain("<dt>남은 시간</dt><dd>29분</dd>");
-		expect(full).toContain("<dt>요청한 곳</dt><dd>채널 C0234567890 스레드</dd>");
+		expect(full).toContain("<dt>요청한 곳</dt><dd>Discord 채널 300000000000000002 스레드</dd>");
 		expect(full).toContain(FULL_SUMMARY);
 
 		const broken = renderItemDetail(snapshot, "approvals", BROKEN);
 		expect(broken).toContain("세부 내용 없음");
-		expect(broken).toContain("슬랙의 승인 메시지에서");
+		expect(broken).toContain("디스코드의 승인 메시지에서");
 		expect(broken).not.toContain("<dt>할 일</dt>");
 		expect(broken).not.toContain("javascript:");
 		expect(broken).not.toContain("http://insecure");
-		expect(broken).not.toContain("슬랙 카드 열기");
+		expect(broken).not.toContain("카드 열기");
+		expect(renderItemDetail(snapshot, "approvals", LANE)).toContain("채팅의 승인 메시지에서");
+
+		const db = new Database(dbPath, { strict: true });
+		db.run(
+			`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, origin_key, origin_thread_ref)
+			 VALUES ('D1:1', 'C0123456789', '1.9', '정리', 'pending', ?, ?, 'discord/ch/1700000000000000017/t/1572513180679147611', '1700000000000000017:1572513180679147611')`,
+			[NOW - MINUTE, NOW + MINUTE],
+		);
+		db.close();
+		const withDiscord = await buildSnapshot(deps());
+		const discord = renderItemDetail({ ...withDiscord, discordGuild: null }, "approvals", "D1:1");
+		expect(discord).toContain("디스코드의 승인 메시지에서");
+		expect(discord).not.toContain("슬랙");
+		const linked = renderItemDetail({ ...withDiscord, discordGuild: "1500000000000000001" }, "approvals", "D1:1");
+		expect(linked).toMatch(
+			/<a [^>]*href="https:\/\/discord\.com\/channels\/1500000000000000001\/1572513180679147611"[^>]*>요청 스레드 열기<\/a>/,
+		);
 	});
 
 	test("AC-8: settled approvals list newest first with outcome and answer time; 7-day counts and median; their panel", async () => {
@@ -250,7 +281,7 @@ describe("dashboard approvals", () => {
 		const db = new Database(dbPath, { strict: true });
 		const insert = db.query(
 			`INSERT INTO approvals (approval_id, channel, message_ts, summary, status, created_at, expires_at, decided_at, origin_key, detail_json, card_url)
-			 VALUES (?, 'C0123456789', ?, ?, ?, ?, ?, ?, 'slack/dm/D0BOTDM', ?, ?)`,
+			 VALUES (?, 'C0123456789', ?, ?, ?, ?, ?, ?, 'discord/dm/200000000000000001', ?, ?)`,
 		);
 		const HOUR = 60 * MINUTE;
 		const settle = (ts: string, summary: string, status: string, createdAt: number, tookMs: number, card = false) =>
@@ -322,7 +353,7 @@ describe("dashboard approvals", () => {
 		expect(panel).toContain("<dt>할 일</dt><dd>git push origin main</dd>");
 		expect(panel).toContain("<dt>결과</dt><dd>승인 · 요청 40초 뒤</dd>");
 		expect(panel).toContain("<dt>결정</dt><dd>2026-11-04 12:20</dd>");
-		expect(panel).toContain("슬랙 카드 열기");
+		expect(panel).toContain("카드 열기");
 		expect(panel).not.toContain("남은 시간");
 		const bare = renderItemDetail(snapshot, "approvals", "C0123456789:1.3");
 		expect(bare).toContain("<dt>결과</dt><dd>만료 · 요청 30분 0초 뒤</dd>");

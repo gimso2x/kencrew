@@ -232,3 +232,175 @@ export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
 		picked === undefined ? "" : ` is-${picked.kind} is-${picked.status}`
 	}" role="dialog" aria-labelledby="tw-pop-title" data-part="html"${picked === undefined ? " hidden" : ""}>${pop}</section></div>`;
 }
+
+/**
+ * What a flow card says it is doing now, in one line (cut at 70 characters). The first match wins: a worker with no
+ * recorded steps (agy, remote, no session) says so whatever its status; a running one names its newest tool (else its
+ * newest span), or waits; a finished one adds its last step; a failed one its error. Delegated workers (spans with
+ * `worker`) and what is under them are not looked at, so the turn's own card never shows a worker's tool.
+ * Self-contained (shipped to the page).
+ */
+export function flowDoing(span: TraceSpan): string {
+	const cut = (text: string): string => (text.length > 70 ? `${text.slice(0, 69)}…` : text);
+	const own: TraceSpan[] = [];
+	const collect = (list: TraceSpan[] | undefined): void => {
+		for (const child of list ?? []) {
+			if (child.worker !== undefined) continue;
+			own.push(child);
+			collect(child.children);
+		}
+	};
+	collect(span.children);
+	const newest = (spans: TraceSpan[]): TraceSpan | undefined => {
+		let found: TraceSpan | undefined;
+		for (const item of spans) if (found === undefined || item.start >= found.start) found = item;
+		return found;
+	};
+	const say = (item: TraceSpan | undefined): string => (item === undefined ? "" : (item.detail ?? item.name));
+	if (own.length === 0 && (span.detail ?? "").endsWith("단계 기록 없음")) return "단계 기록 없음";
+	if (span.status === "running") {
+		const last = newest(own.filter((item) => item.kind === "tool")) ?? newest(own);
+		return last === undefined ? "기다리는 중" : cut(say(last));
+	}
+	const last = say(newest(own));
+	if (span.status === "failed") {
+		const why = span.error ?? last;
+		return cut(why === "" ? "실패" : `실패 · ${why}`);
+	}
+	return cut(last === "" ? "끝남" : `끝남 · ${last}`);
+}
+
+/**
+ * The turn as a flow: request → the bot (the turn's root) → one card per delegated worker, the owner's approvals as a
+ * branch beside the bot. Cards carry `data-flow-card` and a `data-sig` of their own markup so the page replaces only
+ * the cards that changed; worker cards are `[data-flow-worker]` buttons. Shares no selector with the waterfall.
+ * Self-contained apart from `flowDoing` (both shipped to the page).
+ */
+export function renderFlow(answer: TurnTrace, state: TraceViewState): string {
+	const esc = (value: unknown): string =>
+		String(value ?? "")
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;");
+	if (!answer.ok) return `<p class="note">${esc(answer.error)}</p>`;
+	const STATUS: Record<SpanStatus, [string, string]> = {
+		running: ["실행 중", "is-info"],
+		done: ["완료", "is-success"],
+		failed: ["실패", "is-danger"],
+	};
+	const money = (amount: number): string => (amount <= 0 ? "" : `$${amount.toFixed(amount >= 1 ? 2 : 3)}`);
+	const clockText = (ms: number): string => {
+		const at = new Date(ms);
+		return [at.getHours(), at.getMinutes()].map((n) => String(n).padStart(2, "0")).join(":");
+	};
+	const costOf = (span: TraceSpan): number =>
+		(span.cost ?? 0) + (span.children ?? []).reduce((sum, child) => sum + costOf(child), 0);
+	const cut = (text: string, length: number): string => (text.length > length ? `${text.slice(0, length - 1)}…` : text);
+	const sigOf = (text: string): string => {
+		let hash = 5381;
+		for (let i = 0; i < text.length; i++) hash = ((hash << 5) + hash + text.charCodeAt(i)) | 0;
+		return (hash >>> 0).toString(36);
+	};
+	const card = (tag: string, attrs: string, key: string, classes: string, inner: string): string =>
+		`<${tag} class="fl-card ${classes}" data-flow-card="${esc(key)}" data-sig="${sigOf(inner)}"${attrs}>${inner}</${tag}>`;
+	const chip = (status: SpanStatus): string => `<span class="badge ${STATUS[status][1]}">${STATUS[status][0]}</span>`;
+
+	const root = answer.root;
+	const workers = (root.children ?? []).filter((span) => span.worker !== undefined);
+	const approvals = answer.approvals ?? [];
+	const counts = {
+		running: workers.filter((span) => span.status === "running").length,
+		done: workers.filter((span) => span.status === "done").length,
+		failed: workers.filter((span) => span.status === "failed").length,
+		pending: approvals.filter((item) => item.status === "pending").length,
+	};
+	const chips = (
+		[
+			["진행 중", counts.running, "is-info"],
+			["끝남", counts.done, "is-success"],
+			["실패", counts.failed, "is-danger"],
+			["승인 대기", counts.pending, "is-warning"],
+		] as Array<[string, number, string]>
+	)
+		.map(([label, n, tone]) => `<span class="badge fl-count ${n > 0 ? tone : "is-zero"}">${label} <b>${n}</b></span>`)
+		.join("");
+
+	const requestCard = card(
+		"div",
+		"",
+		"request",
+		"is-request",
+		`<span class="fl-kicker">요청</span><span class="fl-title">${esc(cut(state.title === "" ? "(제목 없음)" : state.title, 120))}</span><span class="fl-meta">${esc(
+			clockText(answer.startedAt),
+		)} 시작 ${chip(root.status)}</span>`,
+	);
+	const rootCost = money(costOf(root));
+	const rootCard = card(
+		"div",
+		"",
+		"root",
+		`is-root is-${root.status}`,
+		`<span class="fl-kicker">송박</span><span class="fl-title">${esc(root.model ?? "모델 미상")}</span><span class="fl-meta">${chip(
+			root.status,
+		)}${rootCost === "" ? "" : `<span class="fl-cost">${esc(rootCost)}</span>`}</span><span class="fl-doing">${esc(flowDoing(root))}</span>`,
+	);
+
+	const approvalRow = (item: (typeof approvals)[number]): string => {
+		const wait = Math.max(0, Math.floor((state.now - item.createdAt) / 60_000));
+		const at = item.decidedAt === null ? "" : clockText(item.decidedAt);
+		const text: Record<string, string> = {
+			pending: `${item.summary} · 대기 ${wait}분`,
+			approved: `승인됨 · ${at}`,
+			denied: `거부됨 · ${at}`,
+			replied: `답장됨 · ${at}`,
+			expired: "시간 초과",
+		};
+		return `<li class="fl-appr is-${item.status}" data-approval="${esc(item.id)}">${esc(cut(text[item.status] ?? item.status, 90))}</li>`;
+	};
+	const approvalCard =
+		approvals.length === 0
+			? ""
+			: card(
+					"div",
+					"",
+					"approvals",
+					`is-approvals${counts.pending > 0 ? " is-pending" : ""}`,
+					`<span class="fl-kicker">오너 승인</span><ul class="fl-apprs">${approvals.map(approvalRow).join("")}</ul>`,
+				);
+
+	const workerCard = (span: TraceSpan): string => {
+		const info = span.worker;
+		const confidence = info?.tierConfidence ?? null;
+		const percent = confidence === null ? 0 : Math.round(confidence * 100);
+		const cost = money(costOf(span));
+		const reason = info?.tierReason ?? "";
+		return card(
+			"button",
+			` type="button" data-flow-worker="${esc(span.id)}" aria-label="${esc(`${span.name} 워커, 폭포에서 보기`)}"`,
+			span.id,
+			`is-worker is-${span.status}`,
+			`<span class="fl-kicker">${esc(span.name)}</span><span class="fl-title">${esc(span.model ?? "모델 미상")}</span><span class="fl-meta"><span class="badge">${esc(
+				info?.tier ?? "등급 없음",
+			)}</span>${chip(span.status)}${cost === "" ? "" : `<span class="fl-cost">${esc(cost)}</span>`}</span>${
+				confidence === null
+					? '<span class="fl-confline is-none">판정 없음</span>'
+					: `<span class="fl-confline"><span class="fl-bar" role="img" aria-label="확신 ${percent}%"><i style="--w:${confidence.toFixed(
+							2,
+						)}"></i></span>확신 ${percent}%</span>`
+			}<span class="fl-doing">${esc(flowDoing(span))}</span>${
+				reason === "" ? "" : `<span class="fl-reason">${esc(cut(reason, 70))}</span>`
+			}`,
+		);
+	};
+
+	return `<div class="fl" data-flow><div class="fl-chips" data-flow-card="chips" data-sig="${sigOf(chips)}">${chips}</div><div class="fl-main${
+		approvalCard === "" ? "" : " has-approvals"
+	}">${requestCard}<span class="fl-link" aria-hidden="true"></span>${rootCard}${
+		approvalCard === "" ? "" : `<span class="fl-link is-side" aria-hidden="true"></span>${approvalCard}`
+	}</div>${
+		workers.length === 0
+			? '<p class="note-sub fl-empty">이 턴은 맡긴 워커가 없어요</p>'
+			: `<div class="fl-workers" role="list">${workers.map(workerCard).join("")}</div>`
+	}</div>`;
+}

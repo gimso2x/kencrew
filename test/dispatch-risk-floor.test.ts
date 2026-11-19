@@ -1,12 +1,13 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { DiscordChannel } from "../src/discord/channel";
 import type { ProcessRunner } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
-import { SlackChannel } from "../src/slack/channel";
 import type { TaskHostOps, TaskResumeOps } from "../src/tasks/host";
 import { TaskLedger } from "../src/tasks/ledger";
+import { OWNER } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
+import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const NOW = Date.parse("2026-11-13T06:00:00Z");
 const SPEC = {
@@ -62,7 +63,7 @@ async function intake(spec: Record<string, unknown>): Promise<{ reply: string; r
 	const logs: string[] = [];
 	const record = (event: string) => logs.push(event);
 	const tool = buildDispatchTool({
-		originKey: "slack/ch/C1/t/100.1",
+		originKey: "discord/ch/300000000000000001/t/100000000000000001",
 		ompExecutable: "omp",
 		homeDir: "/home",
 		workspaceDir: "/ws",
@@ -72,9 +73,9 @@ async function intake(spec: Record<string, unknown>): Promise<{ reply: string; r
 		tasks: {
 			ledger,
 			timezone: "Asia/Seoul",
-			threadRef: () => "C1:100.1",
+			threadRef: () => "300000000000000001:100000000000000001",
 			rootText: () => "[TASK] L1 로그 회전",
-			channels: registryOf(new SlackChannel(new FakeSlackTransport())),
+			channels: registryOf(new DiscordChannel(new FakeDiscordTransport(), { ownerUserId: OWNER })),
 			now: () => NOW,
 			hostOps: () => host,
 		},

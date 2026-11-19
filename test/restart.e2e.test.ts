@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { join } from "node:path";
 import { REDELIVERED_PREFIX } from "../src/channel/text";
 import { INTERRUPTED_NOTICE } from "../src/daemon/recovery";
-import { makeHome, type TestHome } from "./helpers/bot-home";
+import { makeHome, OWNER_DM, type TestHome } from "./helpers/bot-home";
 import {
 	expectNoProcessesMentioning,
 	killSpawned,
@@ -14,7 +14,7 @@ import {
 } from "./helpers/daemon-process";
 
 /**
- * Restart E2E: a REAL omp behind the real daemon process (`bun src/main.ts daemon`) with the file-backed fake Slack
+ * Restart E2E: a REAL omp behind the real daemon process (`bun src/main.ts daemon`) with the file-backed fake Discord
  * transport. For each crash hook the daemon is killed (exit 137) mid-flight and started again on the same home.
  * Costs tokens, so it only runs with OMPBOT_E2E_OMP=1 (model: OMPBOT_E2E_OMP_PROVIDER/OMPBOT_E2E_OMP_MODEL).
  */
@@ -24,7 +24,7 @@ if (!enabled) console.log("[skip] restart.e2e.test.ts: set OMPBOT_E2E_OMP=1 to r
 const PROVIDER = process.env.OMPBOT_E2E_OMP_PROVIDER ?? "zai";
 const MODEL = process.env.OMPBOT_E2E_OMP_MODEL ?? "glm-5.3-flash";
 const OMP_EXECUTABLE = process.env.OMPBOT_OMP_EXECUTABLE ?? Bun.which("omp") ?? "omp";
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = `discord/dm/${OWNER_DM}`;
 const SCENARIO_TIMEOUT_MS = 420_000;
 // Failure deadlines on awaited events (file changes, process exit, log lines), never a wait for time to pass.
 const EVENT_TIMEOUT_MS = 180_000;

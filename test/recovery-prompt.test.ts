@@ -93,38 +93,47 @@ const recover = () =>
 
 describe("restart recovery of a turn whose prompt the mailbox composed", () => {
 	test("a recall-prefixed turn that finished before the restart is answered", async () => {
-		store.ensureOrigin("slack/ch/C1/t/1000.1", join(dir, "seed"));
+		store.ensureOrigin("discord/ch/300000000000000001/t/1000001", join(dir, "seed"));
 		store.recordInbound({
-			originKey: "slack/ch/C1/t/1000.1",
-			platformMessageId: "C1:1000.1#seed",
+			originKey: "discord/ch/300000000000000001/t/1000001",
+			platformMessageId: "300000000000000001:1000001#seed",
 			textRef: "백업 경로는 /srv/backup 으로 정했어",
-			threadRef: "C1:1000.1",
+			threadRef: "300000000000000001:1000001",
 		});
 		const prompt = await finishedUnseen(
-			"slack/ch/C1/t/5000.1",
-			"C1:5000.1",
-			"C1:5000.2",
+			"discord/ch/300000000000000001/t/5000001",
+			"300000000000000001:5000001",
+			"300000000000000001:5000002",
 			"저번에 정한 백업 경로 뭐였지",
 		);
 		expect(prompt.startsWith(`${RECALL_HEADER}\n`)).toBe(true);
 
 		expect(await recover()).toEqual({ answered: 1, interrupted: 0, continued: 0 });
-		expect(store.getInbound("C1:5000.2")?.state).toBe("answered");
-		expect(store.listDeliveries({ originKey: "slack/ch/C1/t/5000.1" }).map((d) => d.body)).toEqual(["끝난 답"]);
+		expect(store.getInbound("300000000000000001:5000002")?.state).toBe("answered");
+		expect(store.listDeliveries({ originKey: "discord/ch/300000000000000001/t/5000001" }).map((d) => d.body)).toEqual([
+			"끝난 답",
+		]);
 	});
 
 	test("a fresh thread session's context-prefixed first turn is answered", async () => {
-		store.ensureOrigin("slack/ch/C1", join(dir, "seed"));
+		store.ensureOrigin("discord/ch/300000000000000001", join(dir, "seed"));
 		store.recordInbound({
-			originKey: "slack/ch/C1",
-			platformMessageId: "C1:6000.1",
+			originKey: "discord/ch/300000000000000001",
+			platformMessageId: "300000000000000001:6000001",
 			textRef: "스레드 시작 메시지 내용",
-			threadRef: "C1:6000.1",
+			threadRef: "300000000000000001:6000001",
 		});
-		const prompt = await finishedUnseen("slack/ch/C1/t/6000.1", "C1:6000.1", "C1:6000.2", "이어서 정리해줘");
+		const prompt = await finishedUnseen(
+			"discord/ch/300000000000000001/t/6000001",
+			"300000000000000001:6000001",
+			"300000000000000001:6000002",
+			"이어서 정리해줘",
+		);
 		expect(prompt.startsWith(THREAD_CONTEXT_HEADER)).toBe(true);
 
 		expect(await recover()).toEqual({ answered: 1, interrupted: 0, continued: 0 });
-		expect(store.listDeliveries({ originKey: "slack/ch/C1/t/6000.1" }).map((d) => d.body)).toEqual(["끝난 답"]);
+		expect(store.listDeliveries({ originKey: "discord/ch/300000000000000001/t/6000001" }).map((d) => d.body)).toEqual([
+			"끝난 답",
+		]);
 	});
 });

@@ -17,22 +17,32 @@ import {
 	RESTART_NOTICE_TEXT,
 	writeRestartMarker,
 } from "../src/daemon/restart-notice";
-import { renderContextLine, renderStatusText } from "../src/daemon/status";
+import { renderStatusText } from "../src/daemon/status";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { RESTART_CUT_CARD_TEXT } from "../src/safety/approval";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	BOT,
+	CHANNEL,
+	discordBinding,
+	ownerMessage as dmMessage,
+	GUILD,
+	makeHome,
+	OWNER_DM,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { killSpawned, runCliCapture, runMain } from "./helpers/daemon-process";
 
-const DM = "D1";
-const ORIGIN = `slack/dm/${DM}`;
+const DM = OWNER_DM;
+const ORIGIN = `discord/dm/${DM}`;
+/** A server thread (its id is the id of the message that opened it) under `CHANNEL`. */
+const THREAD = "1700000000000000001";
 const clock = { now: () => Date.now() };
 
 let home: TestHome;
-let transport: WaitingTransport;
+let transport: WaitingDiscordTransport;
 let daemon: Daemon;
 let drivers: FakeOmpDriver[];
 let logs: string[];
@@ -53,10 +63,12 @@ function untilLog(event: string, count = 1): Promise<void> {
 }
 
 async function boot(holdTurns: boolean): Promise<Daemon> {
-	transport = new WaitingTransport();
+	transport = new WaitingDiscordTransport();
+	transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
+	transport.setChannel({ id: THREAD, type: 11, parentId: CHANNEL, guildId: GUILD });
 	const started = new Daemon({
 		config: home.config,
-		channels: [new SlackBinding(new SlackChannel(transport))],
+		channels: [discordBinding(transport)],
 		clock,
 		log: createLogger({
 			sink: (line) => {
@@ -82,8 +94,8 @@ async function boot(holdTurns: boolean): Promise<Daemon> {
 	return started;
 }
 
-function ownerMessage(ts: string, text: string): Promise<unknown> {
-	return transport.emitMessage({ type: "message", channel: DM, channel_type: "im", user: OWNER, text, ts });
+function say(id: string, text: string): Promise<unknown> {
+	return transport.emitMessage(dmMessage(id, text));
 }
 
 const inboundState = (ts: string) => daemon.store.getInbound(`${DM}:${ts}`)?.state;
@@ -105,7 +117,7 @@ describe("ompbot drain", () => {
 	test("--wait exits 0 once the running turn ends; meanwhile inbound stays pending and no monitor fires; the next process answers it", async () => {
 		daemon = await boot(true);
 		const started = untilLog("turn_start");
-		await ownerMessage("1700.000001", "first");
+		await say("1700000000000000001", "first");
 		await started;
 
 		const draining = untilLog("drain_started");
@@ -114,9 +126,9 @@ describe("ompbot drain", () => {
 		await draining;
 
 		const deferred = untilLog("drain_deferred");
-		await ownerMessage("1700.000002", "second");
+		await say("1700000000000000002", "second");
 		await deferred;
-		expect(inboundState("1700.000002")).toBe("pending");
+		expect(inboundState("1700000000000000002")).toBe("pending");
 		const monitor = daemon.store.monitors.addMonitor({
 			name: "due",
 			trigger: { kind: "at", at: new Date(Date.now() - 60_000).toISOString() },
@@ -137,23 +149,23 @@ describe("ompbot drain", () => {
 		expect(drivers[0]?.calls.filter((c) => c.startsWith("steer:") || c.startsWith("prompt:"))).toEqual([
 			"prompt:first",
 		]);
-		expect(inboundState("1700.000002")).toBe("pending");
+		expect(inboundState("1700000000000000002")).toBe("pending");
 
 		await daemon.stop();
 		daemon = await boot(false);
 		await transport.waitForPosts((text) => text.includes("ECHO second"));
-		expect(inboundState("1700.000002")).toBe("answered");
+		expect(inboundState("1700000000000000002")).toBe("answered");
 		expect(daemon.status().drain).toBeUndefined();
 	});
 
 	test("a timeout cancels the drain and exits 1; what waited is dispatched", async () => {
 		daemon = await boot(true);
 		const started = untilLog("turn_start");
-		await ownerMessage("1700.000001", "first");
+		await say("1700000000000000001", "first");
 		await started;
 		expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 		const deferred = untilLog("drain_deferred");
-		await ownerMessage("1700.000002", "second");
+		await say("1700000000000000002", "second");
 		await deferred;
 
 		const steered = untilLog("steer_delivered");
@@ -161,7 +173,7 @@ describe("ompbot drain", () => {
 		expect(timedOut.code).toBe(1);
 		expect(timedOut.stderr).toContain("timed out after 0 min, drain cancelled turns=1");
 		await steered;
-		expect(inboundState("1700.000002")).toBe("dispatched");
+		expect(inboundState("1700000000000000002")).toBe("dispatched");
 		expect(daemon.status().drain).toBeUndefined();
 	});
 
@@ -169,41 +181,42 @@ describe("ompbot drain", () => {
 		daemon = await boot(false);
 		expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 		const deferred = untilLog("drain_deferred");
-		await ownerMessage("1700.000001", "hello");
+		await say("1700000000000000001", "hello");
 		await deferred;
-		expect(inboundState("1700.000001")).toBe("pending");
+		expect(inboundState("1700000000000000001")).toBe("pending");
 
 		const cancelled = await runCliCapture(home.dir, ["drain", "--cancel"]);
 		expect(cancelled.code).toBe(0);
 		expect(cancelled.stdout).toContain("drain cancelled");
 		await transport.waitForPosts((text) => text.includes("ECHO hello"));
-		expect(inboundState("1700.000001")).toBe("answered");
+		expect(inboundState("1700000000000000001")).toBe("answered");
 	});
 
 	describe("restart notices", () => {
-		const notices = (text: string) => transport.posts((t) => t === text).map((p) => `${p.channel}:${p.threadTs}`);
+		const notices = (text: string) =>
+			transport.posts((t) => t === text).map((p) => p.messageReference?.messageId ?? p.channelId);
 
 		test("drain tells the active conversation in its thread; the next process says it is back; the marker is consumed", async () => {
 			daemon = await boot(false);
-			await ownerMessage("1700.000001", "hello");
+			await say("1700000000000000001", "hello");
 			await transport.waitForPosts((text) => text.includes("ECHO hello"));
 
 			expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 			await transport.waitForPosts((text) => text === RESTART_NOTICE_TEXT.draining);
-			expect(notices(RESTART_NOTICE_TEXT.draining)).toEqual([`${DM}:1700.000001`]);
+			expect(notices(RESTART_NOTICE_TEXT.draining)).toEqual(["1700000000000000001"]);
 			expect(existsSync(join(home.dir, RESTART_NOTICE_FILE))).toBe(true);
 
 			await daemon.stop();
 			daemon = await boot(false);
 			await transport.waitForPosts((text) => text === RESTART_NOTICE_TEXT.back);
-			expect(notices(RESTART_NOTICE_TEXT.back)).toEqual([`${DM}:1700.000001`]);
+			expect(notices(RESTART_NOTICE_TEXT.back)).toEqual(["1700000000000000001"]);
 			expect(existsSync(join(home.dir, RESTART_NOTICE_FILE))).toBe(false);
 			expect(notices(RESTART_NOTICE_TEXT.cancelled)).toEqual([]);
 		});
 
 		test("a cancelled drain says so instead; a plain restart without a drain says nothing", async () => {
 			daemon = await boot(false);
-			await ownerMessage("1700.000001", "hello");
+			await say("1700000000000000001", "hello");
 			await transport.waitForPosts((text) => text.includes("ECHO hello"));
 			expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 			expect((await runCliCapture(home.dir, ["drain", "--cancel"])).code).toBe(0);
@@ -220,7 +233,7 @@ describe("ompbot drain", () => {
 		test("restartNotice=false posts nothing; a stale marker is dropped silently", async () => {
 			home.config.restartNotice = false;
 			daemon = await boot(false);
-			await ownerMessage("1700.000001", "hello");
+			await say("1700000000000000001", "hello");
 			await transport.waitForPosts((text) => text.includes("ECHO hello"));
 			expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 			expect(notices(RESTART_NOTICE_TEXT.draining)).toEqual([]);
@@ -228,7 +241,10 @@ describe("ompbot drain", () => {
 
 			await daemon.stop();
 			home.config.restartNotice = true;
-			writeRestartMarker(home.dir, { at: Date.now() - RESTART_NOTICE_STALE_MS - 1, threads: [`${DM}:1700.000001`] });
+			writeRestartMarker(home.dir, {
+				at: Date.now() - RESTART_NOTICE_STALE_MS - 1,
+				threads: [`${DM}:1700000000000000001`],
+			});
 			const dropped = untilLog("restart_notice_dropped");
 			daemon = await boot(false);
 			await dropped;
@@ -241,42 +257,17 @@ describe("ompbot drain", () => {
 			daemon = await boot(false);
 			expect((await runCliCapture(home.dir, ["drain"])).code).toBe(0);
 			const first = untilLog("drain_deferred");
-			await ownerMessage("1700.000001", "hello");
+			await transport.emitMessage(dmMessage(THREAD, `<@${BOT}> hello`, { channel_id: CHANNEL, guild_id: GUILD }));
 			await first;
 			await transport.waitForPosts((text) => text === DRAIN_DEFERRED_COMMAND_TEXT);
 			const second = untilLog("drain_deferred", 2);
-			await transport.emitMessage({
-				type: "message",
-				channel: DM,
-				channel_type: "im",
-				user: OWNER,
-				text: "again",
-				ts: "1700.000002",
-				thread_ts: "1700.000001",
-			});
+			await transport.emitMessage(
+				dmMessage("1700000000000000002", `<@${BOT}> again`, { channel_id: THREAD, guild_id: GUILD }),
+			);
 			await second;
-			expect(notices(DRAIN_DEFERRED_COMMAND_TEXT)).toEqual([`${DM}:1700.000001`]);
+			expect(notices(DRAIN_DEFERRED_COMMAND_TEXT)).toHaveLength(1);
 			expect(notices(RESTART_NOTICE_TEXT.draining)).toEqual([]);
 		});
-	});
-
-	test("a slash command during a drain is recorded once and told it runs after the restart; status still answers", async () => {
-		daemon = await boot(false);
-		const slashRows = () =>
-			daemon.store
-				.listInbound()
-				.filter((row) => row.platformMessageId.startsWith(`slash:${DM}:`))
-				.map((row) => [row.textRef, row.state]);
-		daemon.setDraining(true);
-		const ack = await transport.emitSlash({ command: "/new-ompbot", user_id: OWNER, channel_id: DM });
-		expect(ack).toEqual({ response_type: "ephemeral", text: DRAIN_DEFERRED_COMMAND_TEXT });
-		expect(slashRows()).toEqual([["/new-ompbot", "pending"]]);
-		const status = await transport.emitSlash({ command: "/status-ompbot", user_id: OWNER, channel_id: DM });
-		// No turn ran in the DM yet: its context line says the session is idle, then the daemon-wide text.
-		expect(status?.text).toBe(`${renderContextLine("idle")}\n${renderStatusText(daemon.status())}`);
-		expect(slashRows()).toHaveLength(1);
-		daemon.setDraining(false);
-		expect(await transport.emitSlash({ command: "/usage-ompbot", user_id: OWNER, channel_id: DM })).toBeUndefined();
 	});
 
 	test("a waiting approval counts as a running host tool and a pending approval", async () => {
@@ -349,12 +340,12 @@ describe("waitForDrain cutAfterMin", () => {
 describe("drain_cut", () => {
 	const STAMP = "20261112-210000";
 	const cutCards = () =>
-		transport.calls.filter((c) => c.method === "updateMessage" && c.text.includes(RESTART_CUT_CARD_TEXT));
+		transport.calls.filter((c) => c.method === "editMessage" && (c.content ?? "").includes(RESTART_CUT_CARD_TEXT));
 
 	async function busyWithApprovals(summaries: string[]): Promise<void> {
 		daemon = await boot(true);
 		const started = untilLog("turn_start");
-		await ownerMessage("1700.000001", "long job");
+		await say("1700000000000000001", "long job");
 		await started;
 		const tool = daemon.hostToolsFor(ORIGIN).find((t) => t.name === "ompbot_request_approval");
 		if (!tool) throw new Error("tool missing");
@@ -375,12 +366,12 @@ describe("drain_cut", () => {
 		expect(statSync(path).mode & 0o777).toBe(0o600);
 		expect(readdirSync(home.dir).filter((name) => name.startsWith(`${RESTART_CUT_FILE}.tmp-`))).toEqual([]);
 		const record = JSON.parse(readFileSync(path, "utf8")) as RestartCut;
-		const row = daemon.store.getInbound(`${DM}:1700.000001`);
+		const row = daemon.store.getInbound(`${DM}:1700000000000000001`);
 		expect(record.applyStamp).toBe(STAMP);
 		expect(record.opRefs).toEqual([{ originKey: ORIGIN, opRef: row?.opRef ?? "missing", approval: "force push main" }]);
 		// One cancellation per pending request, on its own card; the drain itself stays on for the restart.
-		const cards = transport.posts((text) => text.startsWith("🔐 승인 요청")).map((p) => p.ts);
-		expect(cutCards().map((c) => (c.method === "updateMessage" ? c.ts : ""))).toEqual(cards);
+		const cards = transport.posts((text) => text.startsWith("🔐 승인 요청")).map((p) => p.id);
+		expect(cutCards().map((c) => (c.method === "editMessage" ? c.messageId : ""))).toEqual(cards);
 		expect(logs.filter((line) => line.includes("event=drain_cut "))).toHaveLength(1);
 		expect(await callDaemon(socket, { op: "drain_status" })).toMatchObject({ draining: true });
 	});
@@ -400,7 +391,7 @@ describe("drain_cut", () => {
 		expect(await callDaemon(socket, { op: "drain_cut", applyStamp: STAMP })).toMatchObject({ ok: true, opRefs: 1 });
 		const record = JSON.parse(readFileSync(join(home.dir, RESTART_CUT_FILE), "utf8")) as RestartCut;
 		expect(record.opRefs.map((entry) => entry.opRef)).toEqual([
-			daemon.store.getInbound(`${DM}:1700.000001`)?.opRef ?? "missing",
+			daemon.store.getInbound(`${DM}:1700000000000000001`)?.opRef ?? "missing",
 		]);
 	});
 
@@ -415,9 +406,11 @@ describe("drain_cut", () => {
 		daemon = await boot(false);
 		await continued;
 		await transport.waitForPosts((text) => text.startsWith(`ECHO ${CONTINUE_PROMPT}`));
-		expect(transport.posts((text) => text === CONTINUE_NOTICE).map((p) => p.threadTs)).toEqual(["1700.000001"]);
+		expect(
+			transport.posts((text) => text === CONTINUE_NOTICE).map((p) => p.messageReference?.messageId ?? p.channelId),
+		).toEqual(["1700000000000000001"]);
 		expect(transport.posts((text) => text === INTERRUPTED_NOTICE)).toEqual([]);
-		expect(daemon.store.getInbound(`cut-${DM}:1700.000001`)?.state).toBe("answered");
+		expect(daemon.store.getInbound(`cut-${DM}:1700000000000000001`)?.state).toBe("answered");
 		expect(logs.filter((line) => /event=recovery_done .* continued=1$/.test(line))).toHaveLength(1);
 	});
 

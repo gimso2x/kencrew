@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { LaneHistoryEntry, LaneMeta, LaneStatus } from "../src/lanes/status";
 import { localDay } from "../src/time";
-import { makeHome, type TestHome } from "./helpers/bot-home";
+import { makeHome, OWNER_DM, type TestHome } from "./helpers/bot-home";
 import {
 	expectNoProcessesMentioning,
 	killSpawned,
@@ -18,9 +18,9 @@ import {
 import { pickE2eModel } from "./helpers/omp-model";
 
 /**
- * Work-lane E2E: a REAL omp lane behind the real daemon process, file-backed fake Slack, temp OMPBOT_HOME with FAKE
+ * Work-lane E2E: a REAL omp lane behind the real daemon process, file-backed fake Discord, temp OMPBOT_HOME with FAKE
  * tokens and a throwaway git repository (the lane works in its own worktree beside it). Costs tokens: OMPBOT_E2E_OMP=1 only. Judged by the registry, git and the
- * delivered Slack calls; waits are on daemon log events and file changes, never fixed sleeps.
+ * delivered Discord calls; waits are on daemon log events and file changes, never fixed sleeps.
  */
 const enabled = process.env.OMPBOT_E2E_OMP === "1";
 if (!enabled) console.log("[skip] lane.e2e.test.ts: set OMPBOT_E2E_OMP=1 to run against a real omp (costs tokens)");
@@ -32,8 +32,8 @@ if (enabled && picked?.model === undefined)
 	console.log(`[skip] lane.e2e.test.ts: ${picked?.reason ?? "no model offered"}`);
 const model = picked?.model;
 const REAL = model === undefined ? undefined : { ompExecutable: OMP_EXECUTABLE, model };
-const ORIGIN = "slack/dm/D1";
-const CHANNEL = "D1";
+const ORIGIN = `discord/dm/${OWNER_DM}`;
+const CHANNEL = OWNER_DM;
 const SCENARIO_TIMEOUT_MS = 480_000;
 const EVENT_TIMEOUT_MS = 300_000;
 
@@ -84,10 +84,7 @@ const realRepoPath = (path: string): string => Bun.spawnSync(["realpath", path])
 const firstLaneWorktree = (repo: string): string => `${repo}-l-${localDay(Date.now(), "Asia/Seoul")}-01`;
 
 function newHome(): TestHome {
-	const made = makeHome("ompbot-e2e-lane-", REAL);
-	writeFileSync(join(made.dir, "secrets", "slack-bot-token"), "xoxb-TEST-SECRET-0\n", { mode: 0o600 });
-	writeFileSync(join(made.dir, "secrets", "slack-app-token"), "xapp-TEST-SECRET-0\n", { mode: 0o600 });
-	return made;
+	return makeHome("ompbot-e2e-lane-", REAL);
 }
 
 interface LaneSnapshot {
@@ -189,9 +186,9 @@ function rootTexts(log: TransportLog, rootTs: string): string[] {
 		.filter((post) => post.ts === rootTs)
 		.map((post) => post.text);
 	const edited = log
-		.calls("updateMessage")
-		.filter((call) => call.ts === rootTs)
-		.map((call) => String(call.text));
+		.calls("editMessage")
+		.filter((call) => call.messageId === rootTs)
+		.map((call) => String(call.content));
 	return [...posted, ...edited];
 }
 

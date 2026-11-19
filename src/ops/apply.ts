@@ -27,29 +27,27 @@ import type { Gate } from "./gates";
 export const READY_TIMEOUT_MS = 120_000;
 /**
  * After `ready`, how long the new daemon gets to write a heartbeat (after the restart) with no chat transport down.
- * Covers the Slack/Discord connect plus one sweep (15 s); a stamp the old daemon wrote never counts.
+ * Covers the Discord connect plus one sweep (15 s); a stamp the old daemon wrote never counts.
  */
-export const TRANSPORTS_TIMEOUT_MS = 120_000;
+const TRANSPORTS_TIMEOUT_MS = 120_000;
 const READY_POLL_MS = 1_000;
 export const DEFAULT_DRAIN_TIMEOUT_MIN = 60;
 /** `apply --cut-after` default: a drain still busy after this many minutes restarts anyway (the cut turns resume). */
 export const DEFAULT_DRAIN_CUT_MIN = 5;
 /** The `[자동 후속]` report inject is tried this many times while the daemon socket refuses connections. */
-export const REPORT_INJECT_ATTEMPTS = 6;
-export const REPORT_INJECT_RETRY_MS = 5_000;
+const REPORT_INJECT_ATTEMPTS = 6;
+const REPORT_INJECT_RETRY_MS = 5_000;
 export const SYSTEMD_UNIT = "ompbot";
 
 /**
- * The apply report goes to a Slack or Discord DM or channel origin (`slack/ch/<C>`, `slack/dm/<D>`, `discord/ch/<id>`,
- * `discord/dm/<id>`), never a thread origin.
+ * The apply report goes to a Discord DM or channel origin (`discord/ch/<id>`, `discord/dm/<id>`), never a thread origin.
  */
 export const isReportOrigin = (originKey: string): boolean => {
 	const ref = parseChatOrigin(originKey);
-	return (ref?.platform === "slack" || ref?.platform === "discord") && ref.threadId === undefined;
+	return ref?.platform === "discord" && ref.threadId === undefined;
 };
-/** `--report-thread` of a report origin: a Slack message ts, or a Discord message id (snowflake) — as `inject` checks. */
-export const reportThreadPattern = (originKey: string): RegExp =>
-	parseChatOrigin(originKey)?.platform === "discord" ? /^\d{17,20}$/ : /^\d+\.\d+$/;
+/** `--report-thread` of a report origin: a Discord message id (snowflake) — as `inject` checks. */
+export const reportThreadPattern = (): RegExp => /^\d{17,20}$/;
 export const STAMP_PATTERN = /^\d{8}-\d{6}$/;
 /** The config copies `apply` itself makes (`config.json.bak-<stamp>-apply`); hand-made bak names never match. */
 const APPLY_CONFIG_COPY = /^config\.json\.bak-\d{8}-\d{6}-apply$/;
@@ -141,7 +139,7 @@ export interface PeerApply {
 	receiptPath: string;
 }
 
-export interface DaemonUnit {
+interface DaemonUnit {
 	unit: string;
 	homeDir: string;
 }
@@ -219,14 +217,14 @@ async function findCheckoutUnits(
 	return found;
 }
 
-export interface StepRecord {
+interface StepRecord {
 	name: string;
 	ok: boolean;
 	detail: string;
 	ms: number;
 }
 
-export type ApplyStatus = "ok" | "already_applied" | "failed" | "skipped";
+type ApplyStatus = "ok" | "already_applied" | "failed" | "skipped";
 
 export interface ApplyReceipt {
 	stamp: string;
@@ -270,7 +268,7 @@ export function receiptPathFor(homeDir: string, stamp: string): string {
 }
 
 /** PATH directories a systemd user unit lacks; `~/.local/bin` and `~/.bun/bin` come first. */
-export function applyPathDirs(env: Record<string, string | undefined>): string[] {
+function applyPathDirs(env: Record<string, string | undefined>): string[] {
 	const home = env.HOME ?? homedir();
 	return [join(home, ".local", "bin"), join(home, ".bun", "bin")];
 }
@@ -304,7 +302,7 @@ export function revertCommandFor(repoDir: string, prev: string): string {
 	return `git -C ${repoDir} diff --cached --quiet && git -C ${repoDir} read-tree -m -u HEAD ${prev} && git -C ${repoDir} commit -m "revert: restore tree of ${prev}"`;
 }
 
-export const LAST_GOOD_SUFFIX = ".last-good";
+const LAST_GOOD_SUFFIX = ".last-good";
 
 /** Text of `<home>/config.json`, or undefined when it cannot be read (or is no regular file: a FIFO would block). */
 export function readConfigText(homeDir: string): string | undefined {
@@ -393,12 +391,12 @@ export function readCodeRollbackJournal(gitDir: string): CodeRollbackJournal | u
 }
 
 /** `<home>/head.last-good`: the commit the last apply that passed every check loaded (the code rollback target). */
-export const HEAD_LAST_GOOD_FILE = "head.last-good";
+const HEAD_LAST_GOOD_FILE = "head.last-good";
 /** Gates that, open after the restart, keep the loaded commit from becoming `head.last-good`. */
 const LAST_GOOD_BLOCKING_GATES: readonly string[] = ["omp_runtime", "turns_failing"];
 
 /** The commit in `<home>/head.last-good`; undefined when absent or not a full commit id. */
-export function readHeadLastGood(homeDir: string): string | undefined {
+function readHeadLastGood(homeDir: string): string | undefined {
 	try {
 		const text = readFileSync(join(homeDir, HEAD_LAST_GOOD_FILE), "utf8").trim();
 		return /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(text) ? text : undefined;
@@ -412,7 +410,7 @@ export function readHeadLastGood(homeDir: string): string | undefined {
  * again unasked. Auto-merge (tasks and lanes) skips while it exists; the owner's own 머지 does not; the next apply
  * that ends ok removes it.
  */
-export const AUTOLAND_HOLD_FILE = "autoland.hold";
+const AUTOLAND_HOLD_FILE = "autoland.hold";
 
 /** Why auto-merge is held (`<reason> (<at>)`); undefined when there is no hold file. */
 export function readAutoLandHold(homeDir: string): string | undefined {
@@ -578,7 +576,7 @@ const isConnectFailure = (error: unknown): boolean => {
 };
 
 /** What apply's preflight reads off the checkout: branch, HEAD against main, the code rollback journal, `src` changes. */
-export interface CheckoutCheck {
+interface CheckoutCheck {
 	/** Why an apply SKIPs here; empty when the checkout may be applied. */
 	skipReasons: string[];
 	/** Informational preflight notes (`--clear-rollback` removing the journal). */
@@ -707,7 +705,7 @@ export function detachedApplyCommand(input: {
  * The model-free apply report (`--report-plain`, `!restart`): one line with the outcome and the loaded commit, the
  * failed steps, the code rollback line of the model report, then the receipt path. Redacted: it is posted as is.
  */
-export function plainReportText(input: {
+function plainReportText(input: {
 	status: ApplyStatus;
 	head: string | undefined;
 	steps: readonly StepRecord[];
@@ -1228,11 +1226,8 @@ async function applyUnderLock(
 			if (beat === undefined) last = "no heartbeat";
 			else if (beat.ts.getTime() <= restartAt) last = `heartbeat ${beat.ts.toISOString()} is from before the restart`;
 			else {
-				const down = [
-					beat.socket?.state === "down" ? "slack" : undefined,
-					beat.discord?.state === "down" ? "discord" : undefined,
-				].filter((name) => name !== undefined);
-				const states = `slack=${beat.socket?.state ?? "off"} discord=${beat.discord?.state ?? "off"}`;
+				const down = beat.discord?.state === "down" ? ["discord"] : [];
+				const states = `discord=${beat.discord?.state ?? "off"}`;
 				if (down.length === 0) return { ok: true, detail: states };
 				last = `down: ${down.join(",")} (${states})`;
 			}

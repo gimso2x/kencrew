@@ -1,12 +1,12 @@
 import { Database } from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import type { LaneModelTiers, WorkerAgyConfig } from "../src/config";
+import { DiscordChannel } from "../src/discord/channel";
 import type { HerdrBoardConfig } from "../src/dispatch/board";
 import type { ProcessRunner } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
 import type { ApprovalDetail, ApprovalResult } from "../src/safety/approval";
 import type { HostToolDef } from "../src/safety/host-tools";
-import { SlackChannel } from "../src/slack/channel";
 import type { HerdrPromptInput } from "../src/store/db";
 import { type TaskJudgement, taskChecksOf } from "../src/tasks/checker";
 import { acceptanceItems, docsDirOf, type TaskRisk } from "../src/tasks/docs";
@@ -14,8 +14,9 @@ import type { HostResult, ProgressLag, TaskHostOps, TaskResumeOps } from "../src
 import { TaskLedger } from "../src/tasks/ledger";
 import { buildAcceptedCard, buildAutoLandCard, buildReachedCard } from "../src/tasks/notify";
 import { agySecretsDirs, agySettings, resolveWorkerTier } from "../src/tasks/worker-tier";
+import { OWNER } from "./helpers/bot-home";
 import { registryOf } from "./helpers/channels";
-import { FakeSlackTransport } from "./helpers/slack-fake-transport";
+import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const NOW = Date.parse("2026-10-26T06:00:00Z");
 const GOOD_SPEC = {
@@ -106,7 +107,7 @@ function fakeHost(): FakeHost {
 interface Harness {
 	tool: HostToolDef;
 	ledger: TaskLedger;
-	transport: FakeSlackTransport;
+	transport: FakeDiscordTransport;
 	host: FakeHost;
 	herdr: string[][];
 	agents: Set<string>;
@@ -146,7 +147,7 @@ function harness(
 ): Harness {
 	const db = new Database(":memory:", { strict: true });
 	const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => NOW } });
-	const transport = new FakeSlackTransport();
+	const transport = new FakeDiscordTransport();
 	const host = fakeHost();
 	const logs: string[] = [];
 	const record = (event: string, fields?: Record<string, unknown>) => logs.push(JSON.stringify({ event, fields }));
@@ -188,7 +189,7 @@ function harness(
 		return ok();
 	};
 	const tool = buildDispatchTool({
-		originKey: "slack/ch/C1/t/100.1",
+		originKey: "discord/ch/111111111111111111/t/222222222222222222",
 		ompExecutable: "omp",
 		homeDir: "/home",
 		workspaceDir: "/ws",
@@ -221,9 +222,9 @@ function harness(
 					tasks: {
 						ledger,
 						timezone: "Asia/Seoul",
-						threadRef: () => ("threadRef" in options ? options.threadRef : "C1:100.1"),
+						threadRef: () => ("threadRef" in options ? options.threadRef : "111111111111111111:222222222222222222"),
 						rootText: () => (options.noRoot === true ? undefined : "[TASK] L2 로그 회전\n목표: 회전"),
-						channels: registryOf(new SlackChannel(transport)),
+						channels: registryOf(new DiscordChannel(transport, { ownerUserId: OWNER })),
 						now: () => NOW,
 						hostOps: () => host,
 						...(options.disk === undefined
@@ -255,6 +256,10 @@ function harness(
 	};
 }
 
+/** The text of a posted message; a card's text is its `content`. */
+const contentOf = (call: { method: string; content?: string | undefined } | undefined): string =>
+	call?.method === "createMessage" ? (call.content ?? "") : "";
+
 const call = (h: Harness, params: Record<string, unknown>) =>
 	h.tool.execute(params, { signal: new AbortController().signal });
 
@@ -267,13 +272,13 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 		const row = h.ledger.require("T-20261026-01");
 		expect(row).toMatchObject({
 			status: "working",
-			threadRef: "C1:100.1",
+			threadRef: "111111111111111111:222222222222222222",
 			host: null,
 			repo: "/r/repo",
 			worktree: "/r/repo-t-20261026-01",
 			branch: "task/T-20261026-01",
 			agent: "t-20261026-01",
-			originKey: "slack/ch/C1/t/100.1",
+			originKey: "discord/ch/111111111111111111/t/222222222222222222",
 		});
 		expect(row.acceptance).toEqual(acceptanceItems(GOOD_SPEC.acceptance));
 		// The four docs are committed on the task branch right after they are written, before the agent starts.
@@ -303,16 +308,19 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 		expect(prompt?.[4]).toContain("단계 커밋에는 docs/tasks/T-20261026-01/ 갱신을 함께 넣는다");
 		expect(prompt?.[4]).toEndWith("회전을 구현해");
 
-		const post = h.transport.calls.find((c) => c.method === "postMessage");
-		expect(post).toMatchObject({ channel: "C1", threadTs: "100.1" });
-		const card = (post && "text" in post ? post.text : "").split("\n");
+		const post = h.transport.calls.find((c) => c.method === "createMessage");
+		expect(post).toMatchObject({
+			channelId: "111111111111111111",
+			messageReference: { messageId: "222222222222222222" },
+		});
+		const card = contentOf(post).split("\n");
 		expect(card[0]).toStartWith("`local`에서 `t-20261026-01`(로그 회전)가 맡았습니다.");
 		expect(card).toContain("[목표] 로그 회전을 넣는다");
 		expect(card).toContain("[가정] 없음");
 		expect(card.some((line) => line.startsWith("진행 보기"))).toBe(false); // no board configured
 		expect(result).toContain("접수 카드");
 		expect(h.transport.calls.filter((c) => c.method === "addReaction")).toEqual([
-			{ method: "addReaction", channel: "C1", timestamp: "100.1", name: "hourglass_flowing_sand" },
+			{ method: "addReaction", channelId: "111111111111111111", messageId: "222222222222222222", emoji: "⏳" },
 		]);
 	});
 
@@ -335,18 +343,16 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 				taskSpec: { ...GOOD_SPEC, assumptions: "로그는 앱 로그만으로 봤다" },
 				task: "go",
 			});
-			const post = local.transport.calls.find((c) => c.method === "postMessage");
-			const card = (post && "text" in post ? post.text : "").split("\n");
+			const post = local.transport.calls.find((c) => c.method === "createMessage");
+			const card = contentOf(post).split("\n");
 			expect(card[1]).toBe("진행 보기: https://board.test/task/?card=P1");
 			expect(card).toContain("[가정] 로그는 앱 로그만으로 봤다");
 			expect(result).toContain("진행 보기: https://board.test/task/?card=P1");
 
 			const remote = harness({ board });
 			await call(remote, { taskSpec: GOOD_SPEC, task: "go", host: "wsl" });
-			const remotePost = remote.transport.calls.find((c) => c.method === "postMessage");
-			expect(remotePost && "text" in remotePost ? remotePost.text : "").toContain(
-				"진행 보기: https://board.test/task/?card=m-wsl:P1",
-			);
+			const remotePost = remote.transport.calls.find((c) => c.method === "createMessage");
+			expect(contentOf(remotePost)).toContain("진행 보기: https://board.test/task/?card=m-wsl:P1");
 		} finally {
 			server.stop(true);
 		}
@@ -417,8 +423,8 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 		expect(commitFails.ledger.list()).toEqual([]);
 		expect(commitFails.herdr).toEqual([]);
 		expect(agentFails.ledger.list()).toEqual([]);
-		// Only the read-only permalink lookup for context.md ran; nothing was posted or reacted.
-		expect(agentFails.transport.calls.filter((call) => call.method !== "getPermalink")).toEqual([]);
+		// Only the read-only channel lookup ran; nothing was posted or reacted.
+		expect(agentFails.transport.calls.filter((call) => call.method !== "getChannel")).toEqual([]);
 
 		const occupied = harness();
 		occupied.host.existing.add("/r/repo-t-20261026-01");
@@ -454,7 +460,9 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 		await expect(call(harness({ threadRef: undefined }), { taskSpec: GOOD_SPEC, task: "go" })).rejects.toThrow(
 			"스레드",
 		);
-		await expect(call(harness({ threadRef: "C1:-" }), { taskSpec: GOOD_SPEC, task: "go" })).rejects.toThrow("스레드");
+		await expect(
+			call(harness({ threadRef: "111111111111111111:-" }), { taskSpec: GOOD_SPEC, task: "go" }),
+		).rejects.toThrow("스레드");
 		await expect(call(harness({ withTasks: false }), { taskSpec: GOOD_SPEC, task: "go" })).rejects.toThrow(
 			"쓸 수 없습니다",
 		);
@@ -477,7 +485,7 @@ describe("ompbot_dispatch taskSpec: new task", () => {
 
 describe("ompbot_dispatch taskSpec: secrets never reach the ledger, the documents or the card", () => {
 	// Fake token shapes only, built at run time.
-	const SLACK = ["xoxb", "TEST", "0", "ledger"].join("-");
+	const XOX = ["xoxb", "TEST", "0", "ledger"].join("-");
 	const GH = `ghp_${"T".repeat(36)}`;
 	const CHECK = '[check: command ["bun","run","check"]]';
 	const dir = docsDirOf("/r/repo-t-20261026-01", "T-20261026-01");
@@ -493,13 +501,13 @@ describe("ompbot_dispatch taskSpec: secrets never reach the ledger, the document
 		const h = harness();
 		const spec = {
 			...GOOD_SPEC,
-			title: `로그 회전 ${SLACK}`,
+			title: `로그 회전 ${XOX}`,
 			goal: `회전을 넣는다 ${GH}`,
-			scope: [`src/log.ts ${SLACK}`],
+			scope: [`src/log.ts ${XOX}`],
 			exclusions: [`배포 ${GH}`],
-			background: `배경 ${SLACK}`,
+			background: `배경 ${XOX}`,
 			assumptions: `가정 ${GH}`,
-			acceptance: [`토큰 ${SLACK} 없이 통과한다 ${CHECK}`, `README에 ${GH} 설명이 없다`],
+			acceptance: [`토큰 ${XOX} 없이 통과한다 ${CHECK}`, `README에 ${GH} 설명이 없다`],
 		};
 		const result = await call(h, { taskSpec: spec, task: "회전을 구현해" });
 		expect(result).toContain("T-20261026-01 등록·시작했습니다");
@@ -513,7 +521,7 @@ describe("ompbot_dispatch taskSpec: secrets never reach the ledger, the document
 			...h.logs,
 		];
 		for (const text of surfaces) {
-			expect(text).not.toContain(SLACK);
+			expect(text).not.toContain(XOX);
 			expect(text).not.toContain(GH);
 		}
 		expect(row.title).toBe("로그 회전 [REDACTED]");
@@ -530,7 +538,7 @@ describe("ompbot_dispatch taskSpec: secrets never reach the ledger, the document
 		}
 		const context = h.host.files.get(`${dir}/context.md`) ?? "";
 		expect(context).toContain("## 배경\n배경 [REDACTED]\n## 가정\n가정 [REDACTED]");
-		const card = JSON.stringify(h.transport.calls.filter((c) => c.method === "postMessage"));
+		const card = JSON.stringify(h.transport.calls.filter((c) => c.method === "createMessage"));
 		expect(card).toContain("로그 회전 [REDACTED]");
 		expect(card).toContain("[목표] 회전을 넣는다 [REDACTED]");
 		const acceptance = h.ledger.require("T-20261026-01").acceptance;
@@ -541,7 +549,7 @@ describe("ompbot_dispatch taskSpec: secrets never reach the ledger, the document
 	test("AC-2: a secret inside a check block refuses the registration without echoing it", async () => {
 		for (const acceptance of [
 			["회전", `API가 응답한다 [check: command ["curl","-H","Authorization: Bearer ${GH}","https://api.test"]]`],
-			["회전", `토큰이 맞다 [check: command ["sh","-c","test \\"$TOKEN\\" = ${SLACK}"]]`],
+			["회전", `토큰이 맞다 [check: command ["sh","-c","test \\"$TOKEN\\" = ${XOX}"]]`],
 		]) {
 			const h = harness();
 			const error = await refusal(h, { taskSpec: { ...GOOD_SPEC, acceptance }, task: "go" });
@@ -555,7 +563,7 @@ describe("ompbot_dispatch taskSpec: secrets never reach the ledger, the document
 			expect(h.herdr).toEqual([]);
 			expect(h.transport.calls).toEqual([]);
 			expect(h.logs.join("\n")).not.toContain(GH);
-			expect(h.logs.join("\n")).not.toContain(SLACK);
+			expect(h.logs.join("\n")).not.toContain(XOX);
 		}
 	});
 
@@ -569,10 +577,10 @@ describe("ompbot_dispatch taskSpec: secrets never reach the ledger, the document
 
 	test("AC-2b: without a root text the task brief is masked before it reaches context.md", async () => {
 		const h = harness({ noRoot: true });
-		await call(h, { taskSpec: GOOD_SPEC, task: `회전을 구현해 ${SLACK}` });
+		await call(h, { taskSpec: GOOD_SPEC, task: `회전을 구현해 ${XOX}` });
 		const context = h.host.files.get(`${dir}/context.md`) ?? "";
 		expect(context).toContain("## 요청 원문\n회전을 구현해 [REDACTED]\n");
-		expect(context).not.toContain(SLACK);
+		expect(context).not.toContain(XOX);
 	});
 
 	test("AC-2c: hashes, absolute paths and test argv in a check block are not refused and stay as written", async () => {
@@ -614,8 +622,8 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 			reason: "resume dispatch",
 		});
 		const reactions = h.transport.calls.filter((c) => c.method === "addReaction" || c.method === "removeReaction");
-		expect(reactions.at(-1)).toMatchObject({ method: "addReaction", name: "hourglass_flowing_sand" });
-		expect(reactions.some((c) => c.method === "removeReaction" && c.name === "mag")).toBe(true);
+		expect(reactions.at(-1)).toMatchObject({ method: "addReaction", emoji: "⏳" });
+		expect(reactions.some((c) => c.method === "removeReaction" && c.emoji === "🔍")).toBe(true);
 	});
 
 	test("an unconfirmed resume prompt still resumes, saying the start was not seen", async () => {
@@ -656,7 +664,7 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 		const h = harness();
 		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
 		const kinds = () => h.prompts.map((input) => [input.host, input.agent, input.kind, input.originKey]);
-		expect(kinds()).toEqual([[null, "t-20261026-01", "start", "slack/ch/C1/t/100.1"]]);
+		expect(kinds()).toEqual([[null, "t-20261026-01", "start", "discord/ch/111111111111111111/t/222222222222222222"]]);
 		expect(h.prompts[0]?.text).toContain("T-20261026-01");
 		await call(h, { taskSpec: { id: "T-20261026-01" }, task: "리뷰 반영해" });
 		h.promptStalled.value = true;
@@ -665,9 +673,9 @@ describe("ompbot_dispatch taskSpec: resume and read", () => {
 		h.agents.clear();
 		await call(h, { taskSpec: { id: "T-20261026-01" } });
 		expect(kinds().slice(1)).toEqual([
-			[null, "t-20261026-01", "followup", "slack/ch/C1/t/100.1"],
-			[null, "t-20261026-01", "followup", "slack/ch/C1/t/100.1"],
-			[null, "t-20261026-01", "start", "slack/ch/C1/t/100.1"],
+			[null, "t-20261026-01", "followup", "discord/ch/111111111111111111/t/222222222222222222"],
+			[null, "t-20261026-01", "followup", "discord/ch/111111111111111111/t/222222222222222222"],
+			[null, "t-20261026-01", "start", "discord/ch/111111111111111111/t/222222222222222222"],
 		]);
 		expect(h.prompts[1]?.text).toEndWith("리뷰 반영해");
 	});
@@ -879,11 +887,18 @@ describe("ompbot_dispatch handoff risk scan", () => {
 		expect(kept.ledger.require("T-20261026-01").risk).toBe("L4");
 	});
 
-	test("a new task is scanned on task, title, goal, scope and background, not exclusions or acceptance", async () => {
+	test("a new task is scanned on task, title, goal, scope, background and assumptions, not exclusions or acceptance", async () => {
 		const inGoal = harness({ approval: "denied" });
 		await expect(
 			call(inGoal, { taskSpec: { ...GOOD_SPEC, goal: "운영 DB에서 DROP TABLE logs 실행" }, task: "go" }),
 		).rejects.toThrow("sql_destructive");
+		const inAssumptions = harness({ approval: "denied" });
+		await expect(
+			call(inAssumptions, {
+				taskSpec: { ...GOOD_SPEC, assumptions: "먼저 git reset --hard HEAD~3 으로 정리한 상태라고 가정한다" },
+				task: "go",
+			}),
+		).rejects.toThrow("git_reset_hard");
 		const inExclusions = harness({ approval: "denied" });
 		const out = await call(inExclusions, {
 			taskSpec: { ...GOOD_SPEC, exclusions: ["git reset --hard"], acceptance: ["git push --force 없이 끝난다"] },
@@ -1134,6 +1149,18 @@ describe("worker tier (taskSpec tier, lanes.models)", () => {
 		expect(ompArgsOf(h)).toEqual(["--model", SONNET]);
 	});
 
+	test("tierConfidence is stored on the row; an out-of-range value is refused before anything is registered", async () => {
+		const h = harness({ models: { current: MODELS } });
+		for (const bad of [1.5, -0.1, "x"]) {
+			await expect(call(h, { taskSpec: { ...GOOD_SPEC, tierConfidence: bad }, task: "go" })).rejects.toThrow(
+				"tierConfidence",
+			);
+		}
+		expect(h.ledger.list()).toEqual([]);
+		await call(h, { taskSpec: { ...GOOD_SPEC, tier: "middle", tierReason: "일반", tierConfidence: 0.88 }, task: "go" });
+		expect(h.ledger.require(TASK_ID).tierConfidence).toBe(0.88);
+	});
+
 	test("AC-6: a resume carrying tier or tierReason is refused with a message", async () => {
 		const h = harness({ models: { current: MODELS } });
 		await call(h, { taskSpec: GOOD_SPEC, task: "go" });
@@ -1168,12 +1195,12 @@ describe("worker tier (taskSpec tier, lanes.models)", () => {
 		const h = harness({ models: { current: MODELS } });
 		await call(h, { taskSpec: { ...GOOD_SPEC, tier: "middle", tierReason: "일반 구현" }, task: "go" });
 		const line = "워커: claude-sonnet-5-5 (middle — 일반 구현)";
-		const post = h.transport.calls.find((c) => c.method === "postMessage");
-		expect((post && "text" in post ? post.text : "").split("\n")).toContain(line);
+		const post = h.transport.calls.find((c) => c.method === "createMessage");
+		expect(contentOf(post).split("\n")).toContain(line);
 		const row = h.ledger.require(TASK_ID);
 		expect(buildAcceptedCard(row, { goal: "g" }, undefined).body.split("\n")).toContain(line);
 		for (const card of [
-			buildReachedCard(row, reached, "U1"),
+			buildReachedCard(row, reached, OWNER),
 			buildAutoLandCard(row, reached, { state: "in_flight" }),
 		]) {
 			expect(card.text.split("\n")).toContain(line);
@@ -1189,7 +1216,7 @@ describe("worker tier (taskSpec tier, lanes.models)", () => {
 		const unset = { ...base, workerModel: null, tier: "middle" as const, tierReason: "기본값" };
 		const cards = (row: typeof base) => [
 			buildAcceptedCard(row, { goal: "g" }, undefined),
-			buildReachedCard(row, reached, "U1"),
+			buildReachedCard(row, reached, OWNER),
 			buildAutoLandCard(row, reached, { state: "in_flight" }),
 		];
 		for (const card of cards(old)) expect(card.text).not.toContain("워커:");
@@ -1240,6 +1267,12 @@ describe("agy worker trial (taskSpec worker: agy, config workerAgy)", () => {
 		expect(row).toMatchObject({ workerModel: `agy:${AGY.model}`, tier: "low", risk: "L1" });
 		expect(out.split("\n")).toContain(`워커: agy ${AGY.model} (low)`);
 		expect(out).not.toContain(FALLBACK);
+	});
+
+	test("tierConfidence is stored for a TASK that switched to the agy worker too", async () => {
+		const h = harness({ agy: AGY });
+		await call(h, { taskSpec: { ...L1, tierConfidence: 0.7 }, task: "go" });
+		expect(h.ledger.require("T-20261026-01")).toMatchObject({ workerModel: `agy:${AGY.model}`, tierConfidence: 0.7 });
 	});
 
 	test("AC-2: L2, a host, no workerAgy, another agy TASK working or blocked → omp tier worker with a reason line", async () => {
@@ -1355,5 +1388,37 @@ describe("agy worker trial (taskSpec worker: agy, config workerAgy)", () => {
 		);
 		expect(h.herdr).toEqual([]);
 		expect(h.ledger.list()).toEqual([]);
+	});
+});
+
+describe("wiki session notes of TASK workers (doc/plans/wiki-work-outcome-notes.md E)", () => {
+	const ENV = ["--env", "OMP_WIKI_NOTE_DISABLE=1"];
+	const words = (cmd: string[]): string[] => (cmd[0] === "ssh" ? cmd.slice(cmd.indexOf("--") + 2) : cmd);
+	/** The `workspace create` / `tab create` calls: where herdr takes the environment of the launched pane. */
+	const creates = (h: Harness): string[][] =>
+		h.herdr.map(words).filter((args) => (args[1] === "workspace" || args[1] === "tab") && args[2] === "create");
+
+	test("AC-5: a local omp TASK, a remote TASK and an agy TASK all start their pane with --env OMP_WIKI_NOTE_DISABLE=1", async () => {
+		const local = harness();
+		await call(local, { taskSpec: GOOD_SPEC, task: "go" });
+		expect(creates(local)).toHaveLength(1);
+		expect(creates(local)[0]).toEqual(expect.arrayContaining(ENV));
+
+		const remote = harness();
+		await call(remote, { taskSpec: GOOD_SPEC, task: "go", host: "wsl" });
+		expect(creates(remote)).toHaveLength(1);
+		expect(creates(remote)[0]).toEqual(expect.arrayContaining(ENV));
+
+		const agy = harness({ agy: { model: "gemini-4-hydrogen-high" } });
+		await call(agy, { taskSpec: { ...GOOD_SPEC, risk: "L1", worker: "agy" }, task: "go" });
+		expect(agy.herdr.map(words).some((args) => args.includes("agy"))).toBe(true);
+		expect(creates(agy)[0]).toEqual(expect.arrayContaining(ENV));
+	});
+
+	test("AC-5: a plain herdr dispatch (no taskSpec) keeps its pane environment as before", async () => {
+		const h = harness();
+		await call(h, { name: "plain-1", task: "go" });
+		expect(creates(h)).toHaveLength(1);
+		expect(creates(h)[0]).not.toContain("--env");
 	});
 });

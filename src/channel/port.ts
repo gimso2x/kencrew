@@ -1,4 +1,4 @@
-// What the core may ask of a chat platform. Platform ids (Slack channel/ts, Discord ids) only appear as
+// What the core may ask of a chat platform. Platform ids (Discord ids, Teams aliases) only appear as
 // opaque `conversationId`/`messageId`/`threadId` strings; each adapter maps them onto its own API.
 import type { ChatPlatform } from "../core/origin-key";
 
@@ -24,7 +24,7 @@ export interface ActionButton {
 }
 
 export interface OutboundMessage {
-	/** The text as the core writes it today (Slack mrkdwn); P1 does no format conversion. */
+	/** The text as the core writes it today (mrkdwn); P1 does no format conversion. */
 	text: string;
 	/** Buttons under the text. `[]` on an edit removes the buttons an earlier version had. */
 	buttons?: readonly ActionButton[];
@@ -33,11 +33,11 @@ export interface OutboundMessage {
 	 * (`title`/`body`/`fields`) shows it on its own too (the result line once the buttons are gone).
 	 */
 	buttonsNote?: string;
-	/** Card title (Slack: a `header` block); a port without cards ignores it and `text` carries everything. */
+	/** Card title (a port without cards ignores it and `text` carries everything. */
 	title?: string;
 	/** Card body in place of `text`, which then only serves notifications and clients that cannot show the card. */
 	body?: string;
-	/** Labelled values under the body (Slack: one section of `fields`). */
+	/** Labelled values under the body (a card's fields). */
 	fields?: ReadonlyArray<{ label: string; value: string }>;
 }
 
@@ -53,7 +53,7 @@ export interface ChannelPort {
 	mentionUser(userId: string): string;
 	/**
 	 * Starts the thread of the message `ref` (its id becomes the thread id), for a platform whose replies do not open
-	 * one by themselves (Discord). Absent where a reply to the message is already its thread (Slack).
+	 * one by themselves (Discord). Absent where a reply to the message is already its thread.
 	 */
 	openThread?(ref: MessageRef, name: string): Promise<void>;
 }

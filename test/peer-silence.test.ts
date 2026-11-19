@@ -242,9 +242,13 @@ describe("AC-3: what is never a call", () => {
 		expect(calls().map((c) => c.thread_ref)).toEqual([`${CONV}:${THREAD}`]);
 	});
 
-	test("a Slack thread and a post that mentions no peer record nothing", () => {
+	test("a thread ref of no platform and a post that mentions no peer record nothing", () => {
 		const store = open();
-		answer(store, `<@${PEER}> 슬랙`, { opRef: "slack", threadRef: "C0TEST0001:1700000000.000100", originKey: "o1" });
+		answer(store, `<@${PEER}> 플랫폼 없음`, {
+			opRef: "no-platform",
+			threadRef: "C0TEST0001:1700000000.000100",
+			originKey: "o1",
+		});
 		answer(store, `<@${SELF}> 혼잣말`, { opRef: "self" });
 		expect(calls()).toEqual([]);
 	});

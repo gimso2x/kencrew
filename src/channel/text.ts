@@ -109,8 +109,8 @@ export function chunkText(
 		let state = { ...from };
 		for (const line of chunk.split("\n")) {
 			if (state.lineHead) {
-				const close = /^ {0,3}(`+)[ \t]*\r?$/.exec(line);
-				if (close !== null && (close[1]?.length ?? 0) >= state.open) state = { open: 0, lineHead: false };
+				const close = fenceCloseRun(line);
+				if (close !== undefined && close >= state.open) state = { open: 0, lineHead: false };
 				continue;
 			}
 			const run = state.open === 0 ? fenceRun(line, limit) : undefined;
@@ -163,12 +163,27 @@ export function chunkText(
 }
 
 /**
- * The backtick count of a line opening a fence (up to 3 spaces, 3+ backticks, an info string without backticks).
- * Tracked up to `max(16, limit / 4)` backticks, the longest mark a chunk can close and reopen with and still fit; a
- * longer run is treated as plain ```.
+ * The backtick count of a line opening a fence (up to 3 spaces, 3+ backticks, an info string without backticks);
+ * `undefined` when the line opens none. The one line-head rule every renderer's fence handling shares.
+ */
+export function fenceOpenRun(line: string): number | undefined {
+	return /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length;
+}
+
+/**
+ * The backtick count of a line closing a fence (up to 3 spaces, backticks alone, optional trailing spaces and CR);
+ * `undefined` when the line closes none. A fence closes only on a line at least as long as its opening run.
+ */
+export function fenceCloseRun(line: string): number | undefined {
+	return /^ {0,3}(`+)[ \t]*\r?$/.exec(line)?.[1]?.length;
+}
+
+/**
+ * `fenceOpenRun` capped to a chunk budget: up to `max(16, limit / 4)` backticks, the longest mark a chunk can close
+ * and reopen with and still fit; a longer run is treated as plain ```.
  */
 function fenceRun(line: string, limit: number): number | undefined {
-	const run = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length;
+	const run = fenceOpenRun(line);
 	return run !== undefined && run <= Math.max(16, Math.floor(limit / 4)) ? run : undefined;
 }
 
@@ -188,7 +203,7 @@ export const FINAL_MARKS: Record<FinalOutcome, { label: string; mark: string }> 
 
 /**
  * The footer an answer carries when it takes the place of the thread's deleted `⏳` status: `✅ 00:42 · 도구 6회`
- * (the outcome's mark and elapsed time, then the tool count when the turn ran any). Slack, Discord and Teams share
+ * (the outcome's mark and elapsed time, then the tool count when the turn ran any). Discord and Teams share
  * the string; each decides from its own status entry whether the answer gets one at all.
  */
 export function formatFooter(outcome: "done" | "failed", elapsedMs: number, tools: number): string {
@@ -339,8 +354,8 @@ export function tableSpans(text: string): Array<readonly [number, number]> {
 			continue;
 		}
 		const line = lines[i] ?? "";
-		if (fence === 0) fence = /^ {0,3}(`{3,})[^`]*$/.exec(line)?.[1]?.length ?? 0;
-		else if ((/^ {0,3}(`+)[ \t]*\r?$/.exec(line)?.[1]?.length ?? 0) >= fence) fence = 0;
+		if (fence === 0) fence = fenceOpenRun(line) ?? 0;
+		else if ((fenceCloseRun(line) ?? 0) >= fence) fence = 0;
 		i++;
 	}
 	return spans;

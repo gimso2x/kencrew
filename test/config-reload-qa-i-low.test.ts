@@ -20,8 +20,13 @@ afterEach(() => home.remove());
 function writeConfig(patch: Record<string, unknown>): void {
 	const base = {
 		schemaVersion: 1,
-		channels: { slack: { ownerUserId: "UOWNER0" } },
-		slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+		channels: {
+			discord: {
+				ownerUserId: "100000000000000001",
+				applicationId: "600000000000000000",
+				botTokenFile: "secrets/discord-bot-token",
+			},
+		},
 		ompExecutable: "/usr/local/bin/omp",
 		workspaceDir: "workspace",
 	};

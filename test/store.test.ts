@@ -184,29 +184,20 @@ describe("inbound", () => {
 describe("owner DM origin", () => {
 	test("undefined before the owner ever DM'd (channel origins don't count)", () => {
 		const store = open();
-		store.ensureOrigin("slack/ch/C1", "/s/c1");
-		expect(store.ownerDmOrigin()).toBeUndefined();
-		expect(store.ownerChannel()).toBe("");
+		store.ensureOrigin("discord/ch/300000000000000001", "/s/c1");
+		expect(store.ownerDmOrigin("discord")).toBeUndefined();
 	});
 
 	test("picks the DM origin with the latest updated_at, not the alphabetically first", () => {
 		const store = open();
-		store.ensureOrigin("slack/dm/AOLD", "/s/old");
+		store.ensureOrigin("discord/dm/200000000000000001", "/s/old");
 		clock.advance(10);
-		store.ensureOrigin("slack/dm/BNEW", "/s/new");
-		expect(store.ownerDmOrigin()).toBe("slack/dm/BNEW");
+		store.ensureOrigin("discord/dm/200000000000000002", "/s/new");
+		expect(store.ownerDmOrigin("discord")).toBe("discord/dm/200000000000000002");
 		// A /new on the older origin makes it the live one again.
 		clock.advance(10);
-		store.newEpoch("slack/dm/AOLD", "/s/old-2");
-		expect(store.ownerDmOrigin()).toBe("slack/dm/AOLD");
-	});
-
-	test("ownerChannel() resolves from the same origin (one selection rule)", () => {
-		const store = open();
-		store.ensureOrigin("slack/dm/AOLD", "/s/old");
-		clock.advance(10);
-		store.ensureOrigin("slack/dm/BNEW", "/s/new");
-		expect(store.ownerChannel()).toBe("BNEW");
+		store.newEpoch("discord/dm/200000000000000001", "/s/old-2");
+		expect(store.ownerDmOrigin("discord")).toBe("discord/dm/200000000000000001");
 	});
 });
 
@@ -397,23 +388,43 @@ describe("delivery backoff, expiry, ambiguity", () => {
 describe("latestInboundThread", () => {
 	test("latestInboundThread returns the origin's newest recorded thread", () => {
 		const store = open();
-		store.ensureOrigin("slack/dm/D1", "/s/d1");
-		store.recordInbound({ originKey: "slack/dm/D1", platformMessageId: "D1:1", textRef: "x", threadRef: "D1:1" });
-		store.recordInbound({ originKey: "slack/dm/D1", platformMessageId: "D1:2", textRef: "y", threadRef: "D1:9" });
-		expect(store.latestInboundThread("slack/dm/D1")).toBe("D1:9");
-		expect(store.latestInboundThread("slack/dm/DX")).toBeUndefined();
+		const dm = "discord/dm/200000000000000001";
+		const ref = (id: string) => `200000000000000001:${id}`;
+		store.ensureOrigin(dm, "/s/d1");
+		store.recordInbound({ originKey: dm, platformMessageId: ref("1"), textRef: "x", threadRef: ref("1") });
+		store.recordInbound({ originKey: dm, platformMessageId: ref("2"), textRef: "y", threadRef: ref("9") });
+		expect(store.latestInboundThread(dm)).toBe(ref("9"));
+		expect(store.latestInboundThread("discord/dm/200000000000000009")).toBeUndefined();
 	});
 });
 
 describe("backfill thread targets", () => {
 	test("top-level posts (`<C>:-`: slash answers, log copies) are never thread targets", () => {
-		const store = openStore({ timezone: "Asia/Seoul", path: dbPath, clock, redact: maskTest, logChannel: "CLOG" });
+		const store = openStore({
+			timezone: "Asia/Seoul",
+			path: dbPath,
+			clock,
+			redact: maskTest,
+			logChannel: { discord: "CLOG" },
+		});
 		opened.push(store);
-		store.ensureOrigin("slack/ch/C1", "/s/c1");
+		const origin = "discord/ch/300000000000000001";
+		const channel = "300000000000000001";
+		store.ensureOrigin(origin, "/s/c1");
 		// A completion answer in a thread also writes its log-channel copy on `CLOG:-`.
-		store.recordAnswer({ originKey: "slack/ch/C1", opRef: "op1", threadRef: "C1:1.1", parts: ["✅ 완료 · done"] });
-		store.recordAnswer({ originKey: "slack/ch/C1", opRef: "new:slash:C1:x", threadRef: "C1:-", parts: ["🆕"] });
-		expect(store.listThreadTargets("slack", 0, 200)).toEqual([{ channel: "C1", rootTs: "1.1" }]);
+		store.recordAnswer({
+			originKey: origin,
+			opRef: "op1",
+			threadRef: `${channel}:700000000000000001`,
+			parts: ["✅ 완료 · done"],
+		});
+		store.recordAnswer({
+			originKey: origin,
+			opRef: `new:slash:${channel}:x`,
+			threadRef: `${channel}:-`,
+			parts: ["🆕"],
+		});
+		expect(store.listThreadTargets("discord", 0, 200)).toEqual([{ channel, rootTs: "700000000000000001" }]);
 	});
 });
 
@@ -540,7 +551,7 @@ describe("ledger query plans", () => {
 		clock.t = 200 * DAY;
 		const store = open();
 		const raw = rawDb();
-		const key = "slack/dm/D1";
+		const key = "discord/dm/200000000000000001";
 		store.ensureOrigin(key, "/s/d1");
 		let seq = 0;
 		const turn = (dispatchedAt: number, ms: number) => {
@@ -567,10 +578,14 @@ describe("ledger query plans", () => {
 
 	test("OPT-06 turn board: a thread's newest and oldest rows come off an index, no temp sort", () => {
 		const store = open();
-		store.ensureOrigin("slack/ch/C1/t/1.1", "/s/t");
+		store.ensureOrigin("discord/ch/300000000000000001/t/700000000000000001", "/s/t");
 		for (let i = 0; i < 5; i += 1) {
 			clock.advance(1000);
-			store.recordInbound({ originKey: "slack/ch/C1/t/1.1", platformMessageId: `m${i}`, textRef: "x" });
+			store.recordInbound({
+				originKey: "discord/ch/300000000000000001/t/700000000000000001",
+				platformMessageId: `m${i}`,
+				textRef: "x",
+			});
 		}
 		const raw = rawDb();
 		const columns = `inbound_id, platform_message_id, origin_key, text_ref, thread_ref, state, created_at,
@@ -578,9 +593,15 @@ describe("ledger query plans", () => {
 		// dashboard/snapshot.ts: the board thread's `recent` and `first` reads.
 		const recent = `SELECT ${columns} FROM inbound WHERE origin_key = ? ORDER BY created_at DESC, inbound_id DESC LIMIT ?`;
 		const first = `SELECT ${columns} FROM inbound WHERE origin_key = ? ORDER BY created_at, inbound_id LIMIT 1`;
-		expect(planOf(raw, recent, ["slack/ch/C1/t/1.1", 3])).not.toContain("USE TEMP B-TREE FOR ORDER BY");
-		expect(planOf(raw, first, ["slack/ch/C1/t/1.1"])).not.toContain("USE TEMP B-TREE FOR ORDER BY");
-		const rows = raw.query(recent).all("slack/ch/C1/t/1.1", 3) as Array<{ platform_message_id: string }>;
+		expect(planOf(raw, recent, ["discord/ch/300000000000000001/t/700000000000000001", 3])).not.toContain(
+			"USE TEMP B-TREE FOR ORDER BY",
+		);
+		expect(planOf(raw, first, ["discord/ch/300000000000000001/t/700000000000000001"])).not.toContain(
+			"USE TEMP B-TREE FOR ORDER BY",
+		);
+		const rows = raw.query(recent).all("discord/ch/300000000000000001/t/700000000000000001", 3) as Array<{
+			platform_message_id: string;
+		}>;
 		expect(rows.map((row) => row.platform_message_id)).toEqual(["m4", "m3", "m2"]);
 	});
 
@@ -588,20 +609,24 @@ describe("ledger query plans", () => {
 		clock.t = 200 * DAY;
 		const store = open();
 		const raw = rawDb();
-		store.ensureOrigin("slack/ch/C1/t/1.1", "/s/t1");
-		store.ensureOrigin("slack/ch/C1/t/2.2", "/s/t2");
+		store.ensureOrigin("discord/ch/300000000000000001/t/700000000000000001", "/s/t1");
+		store.ensureOrigin("discord/ch/300000000000000001/t/700000000000000002", "/s/t2");
 		raw
 			.query(
-				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref) VALUES ('old', 'slack/ch/C1/t/1.1', 1, '오래된 질문', ?, 'C1:1.1')",
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref) VALUES ('old', 'discord/ch/300000000000000001/t/700000000000000001', 1, '오래된 질문', ?, '300000000000000001:700000000000000001')",
 			)
 			.run(clock.t - 91 * DAY);
 		raw
 			.query(
-				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref) VALUES ('new', 'slack/ch/C1/t/2.2', 1, '최근 질문', ?, 'C1:2.2')",
+				"INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at, thread_ref) VALUES ('new', 'discord/ch/300000000000000001/t/700000000000000002', 1, '최근 질문', ?, '300000000000000001:700000000000000002')",
 			)
 			.run(clock.t - 89 * DAY);
-		expect(store.listRecallCandidates("C1", "C1:9.9", 50).map((c) => c.text)).toEqual(["최근 질문"]);
-		const [plan] = plansOf(store, () => store.listRecallCandidates("C1", "C1:9.9", 50));
+		expect(
+			store.listRecallCandidates("300000000000000001", "300000000000000001:700000000000000009", 50).map((c) => c.text),
+		).toEqual(["최근 질문"]);
+		const [plan] = plansOf(store, () =>
+			store.listRecallCandidates("300000000000000001", "300000000000000001:700000000000000009", 50),
+		);
 		expect(plan).toContain("inbound");
 		expect(plan).not.toContain("SCAN inbound");
 	});

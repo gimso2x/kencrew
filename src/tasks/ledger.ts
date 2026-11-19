@@ -3,7 +3,15 @@ import { pathToFileURL } from "node:url";
 import type { LaneModelTier } from "../config";
 import type { LaneQa, LaneReview } from "../lanes/status";
 import { localDay } from "../time";
-import { type AcceptanceItem, agentNameOf, branchOf, formatTaskId, type TaskRisk, worktreePathOf } from "./docs";
+import {
+	type AcceptanceItem,
+	agentNameOf,
+	branchOf,
+	formatTaskId,
+	readTierConfidence,
+	type TaskRisk,
+	worktreePathOf,
+} from "./docs";
 
 export const TASK_STATUSES = ["working", "blocked", "review", "done", "cancelled"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
@@ -60,6 +68,8 @@ export interface TaskRow {
 	/** The worker's model tier; null only for tasks registered before tiers existed. */
 	tier: LaneModelTier | null;
 	tierReason: string | null;
+	/** The judge's confidence in `tier` (0..1); null = none recorded or an unreadable stored value. */
+	tierConfidence: number | null;
 	/** The independent review and run QA receipts of the task's tips (`recordGate`); null before the first. */
 	gate: TaskGate | null;
 }
@@ -79,7 +89,7 @@ export interface NewTask {
 	repo: string;
 	acceptance: AcceptanceItem[];
 	/** The worker tier fixed for the task's life (resume and restart included); absent → all three stay null. */
-	worker?: { tier: LaneModelTier; tierReason: string; model: string | null };
+	worker?: { tier: LaneModelTier; tierReason: string; model: string | null; tierConfidence?: number };
 }
 
 export const TASK_SCHEMA = `
@@ -105,6 +115,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 	worker_model TEXT,
 	tier TEXT,
 	tier_reason TEXT,
+	tier_confidence TEXT,
 	gate_json TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_thread ON tasks(thread_ref);
@@ -133,7 +144,7 @@ export interface TaskTransitionRow {
 }
 
 /** Columns added after the first `tasks` schema; rows that predate them read null. */
-const LATER_TASK_COLUMNS = ["worker_model", "tier", "tier_reason", "gate_json"] as const;
+const LATER_TASK_COLUMNS = ["worker_model", "tier", "tier_reason", "tier_confidence", "gate_json"] as const;
 
 /** Creates the tables in a database that may predate them and adds later columns (idempotent, never touches rows). */
 export function migrateTaskSchema(db: Database): void {
@@ -191,6 +202,7 @@ export interface TaskSql {
 	worker_model?: string | null;
 	tier?: LaneModelTier | null;
 	tier_reason?: string | null;
+	tier_confidence?: string | null;
 	gate_json?: string | null;
 }
 
@@ -264,6 +276,7 @@ export function readTaskSql(r: TaskSql): ReadTask {
 		workerModel: r.worker_model ?? null,
 		tier: r.tier ?? null,
 		tierReason: r.tier_reason ?? null,
+		tierConfidence: readTierConfidence(r.tier_confidence),
 		gate: parseGate(r.gate_json),
 	};
 	return { row, broken };
@@ -333,8 +346,8 @@ export class TaskLedger {
 			this.#db
 				.query(
 					`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
-						acceptance_json, created_at, updated_at, worker_model, tier, tier_reason)
-						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'working', ?, ?, ?, ?, ?, ?)`,
+						acceptance_json, created_at, updated_at, worker_model, tier, tier_reason, tier_confidence)
+						VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'working', ?, ?, ?, ?, ?, ?, ?)`,
 				)
 				.run(
 					taskId,
@@ -353,6 +366,7 @@ export class TaskLedger {
 					input.worker?.model ?? null,
 					input.worker?.tier ?? null,
 					input.worker?.tierReason ?? null,
+					input.worker?.tierConfidence === undefined ? null : String(input.worker.tierConfidence),
 				);
 			this.#recordTransition(taskId, null, "working", "bot", "registered", now);
 			return this.require(taskId);
@@ -396,7 +410,21 @@ export class TaskLedger {
 		).map(toTask);
 	}
 
-	/** Whether a Slack thread root (`<channel>:<ts>`) carries a registered task. */
+	/** Tasks closed `done` at or after `since` (epoch ms), oldest first: the startup pass of the wiki result notes. */
+	listDoneSince(since: number): TaskRow[] {
+		return (
+			this.#db
+				.query(`SELECT * FROM tasks WHERE status = 'done' AND closed_at >= ? ORDER BY closed_at, task_id`)
+				.all(since) as TaskSql[]
+		).map(toTask);
+	}
+
+	/** Whether any task was registered from the conversation `originKey`. */
+	hasOrigin(originKey: string): boolean {
+		return this.#db.query("SELECT 1 FROM tasks WHERE origin_key = ? LIMIT 1").get(originKey) !== null;
+	}
+
+	/** Whether a thread root (`<channel>:<ts>`) carries a registered task. */
 	isTaskRoot(threadRef: string): boolean {
 		return this.#db.query("SELECT 1 FROM tasks WHERE thread_ref = ? LIMIT 1").get(threadRef) !== null;
 	}

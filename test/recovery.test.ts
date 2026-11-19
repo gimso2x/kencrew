@@ -23,7 +23,7 @@ import { redact } from "../src/redact";
 import { peerTouchedTurnNotice } from "../src/safety/prompt";
 import type { Store } from "../src/store/db";
 
-const ORIGIN = "slack/dm/D1";
+const ORIGIN = "discord/dm/200000000000000001";
 const SESSION_DIR = "sess/e1";
 const clock = { now: () => 1_000_000 };
 
@@ -89,7 +89,12 @@ async function dispatchedTurn(
 	const leaf = await driver.leafId();
 	const final = nextFinal(driver);
 	const opRef = await driver.prompt(options.prompt ?? text);
-	store.recordInbound({ originKey: ORIGIN, platformMessageId: id, textRef: text, threadRef: `D1:${id}` });
+	store.recordInbound({
+		originKey: ORIGIN,
+		platformMessageId: id,
+		textRef: text,
+		threadRef: `200000000000000001:${id}`,
+	});
 	store.markDispatched(id, { opRef, entryCursor: options.cursor ? options.cursor(leaf) : leaf });
 	if (options.finish) await final;
 	else driver.crash(137); // the process died before any final
@@ -107,7 +112,12 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 		const leaf = await previous.leafId();
 		const final = nextFinal(previous);
 		const opRef = await previous.prompt("이어서");
-		store.recordInbound({ originKey: ORIGIN, platformMessageId: "m1", textRef: "이어서", threadRef: "D1:m1" });
+		store.recordInbound({
+			originKey: ORIGIN,
+			platformMessageId: "m1",
+			textRef: "이어서",
+			threadRef: "200000000000000001:m1",
+		});
 		store.markDispatched("m1", { opRef, entryCursor: leaf });
 		await final;
 		await previous.stop();
@@ -137,7 +147,9 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 		expect(result).toEqual({ answered: 1, interrupted: 0, continued: 0 });
 		expect(store.getInbound("m1")?.state).toBe("answered");
 		const deliveries = store.listDeliveries({ originKey: ORIGIN });
-		expect(deliveries.map((d) => [d.body, d.threadRef, d.opRef])).toEqual([["ECHO ECHO abc", "D1:m1", opRef]]);
+		expect(deliveries.map((d) => [d.body, d.threadRef, d.opRef])).toEqual([
+			["ECHO ECHO abc", "200000000000000001:m1", opRef],
+		]);
 	});
 
 	test("a reminder-continued turn is answered with every stop answer, like the live mailbox", async () => {
@@ -172,7 +184,7 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 			["m1", first],
 			["m2", second],
 		] as const) {
-			const threadRef = `D1:${id}`;
+			const threadRef = `200000000000000001:${id}`;
 			store.recordInterim({ originKey: ORIGIN, opRef, threadRef, index: 0, body: "LONG REPORT" });
 			store.recordInterim({ originKey: ORIGIN, opRef, threadRef, index: 1, body: note });
 		}
@@ -202,7 +214,7 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 			originKey: ORIGIN,
 			platformMessageId: "m1",
 			textRef: "/followup-ompbot B 작업",
-			threadRef: "D1:m1",
+			threadRef: "200000000000000001:m1",
 		});
 		store.markDispatched("m1", { opRef, entryCursor: leaf });
 		await final;
@@ -291,14 +303,19 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 
 	test("rows steered into one turn share an op_ref and get a single settlement", async () => {
 		const { opRef } = await dispatchedTurn("m1", "first", { finish: true });
-		store.recordInbound({ originKey: ORIGIN, platformMessageId: "m2", textRef: "second", threadRef: "D1:m2" });
+		store.recordInbound({
+			originKey: ORIGIN,
+			platformMessageId: "m2",
+			textRef: "second",
+			threadRef: "200000000000000001:m2",
+		});
 		store.markDispatched("m2", { opRef, entryCursor: store.getInbound("m1")?.entryCursor ?? null });
 		const result = await recoverDispatched({ store, driverFactory: factory(), log: log() });
 		expect(result.answered + result.interrupted).toBe(1);
 		// One settlement in the lead's thread; m2's own thread gets only the steered-thread pointer.
 		expect(store.listDeliveries().map((d) => d.threadRef)).toEqual([
 			store.getInbound("m1")?.threadRef ?? "missing",
-			"D1:m2",
+			"200000000000000001:m2",
 		]);
 		expect(store.listInbound({ state: "dispatched" })).toEqual([]);
 	});
@@ -340,12 +357,12 @@ describe("recovery of turns a planned restart cut (restart-cut.json)", () => {
 		expect(await recover()).toEqual({ answered: 0, interrupted: 0, continued: 1 });
 		expect(store.getInbound("m1")?.state).toBe("failed_notified");
 		expect(bodies()).toEqual([CONTINUE_NOTICE]);
-		expect(store.listDeliveries().map((d) => d.threadRef)).toEqual(["D1:m1"]);
+		expect(store.listDeliveries().map((d) => d.threadRef)).toEqual(["200000000000000001:m1"]);
 		const [resume] = resumeRows();
 		expect(resume).toMatchObject({
 			platformMessageId: "cut-m1",
 			originKey: ORIGIN,
-			threadRef: "D1:m1",
+			threadRef: "200000000000000001:m1",
 			state: "pending",
 			textRef: CONTINUE_PROMPT,
 			peerUserId: null,
@@ -367,12 +384,22 @@ describe("recovery of turns a planned restart cut (restart-cut.json)", () => {
 
 		const monitor = "monitor/7";
 		store.ensureOrigin(monitor, "sess/mon");
-		store.recordInbound({ originKey: monitor, platformMessageId: "mon1", textRef: "check", threadRef: "D1:mon1" });
+		store.recordInbound({
+			originKey: monitor,
+			platformMessageId: "mon1",
+			textRef: "check",
+			threadRef: "200000000000000001:mon1",
+		});
 		store.markDispatched("mon1", { opRef: "op-mon", entryCursor: null });
 		writeCut([{ originKey: monitor, opRef: "op-mon" }]);
 		expect(await recover()).toEqual({ answered: 0, interrupted: 1, continued: 0 });
 
-		store.recordInbound({ originKey: ORIGIN, platformMessageId: "cut-m0", textRef: "resume", threadRef: "D1:m0" });
+		store.recordInbound({
+			originKey: ORIGIN,
+			platformMessageId: "cut-m0",
+			textRef: "resume",
+			threadRef: "200000000000000001:m0",
+		});
 		store.markDispatched("cut-m0", { opRef: "op-resume", entryCursor: null });
 		writeCut([{ originKey: ORIGIN, opRef: "op-resume" }]);
 		expect(await recover()).toEqual({ answered: 0, interrupted: 1, continued: 0 });
@@ -392,7 +419,12 @@ describe("recovery of turns a planned restart cut (restart-cut.json)", () => {
 			["t1", "task:T-1"],
 			["c1", "compact:c1"],
 		] as const) {
-			store.recordInbound({ originKey: ORIGIN, platformMessageId: id, textRef: "x", threadRef: `D1:${id}` });
+			store.recordInbound({
+				originKey: ORIGIN,
+				platformMessageId: id,
+				textRef: "x",
+				threadRef: `200000000000000001:${id}`,
+			});
 			store.markDispatched(id, { opRef, entryCursor: null });
 		}
 		writeCut([
@@ -426,9 +458,14 @@ describe("recovery of turns a planned restart cut (restart-cut.json)", () => {
 
 	test("rollback restart: the same record twice still gives one resume row per cut turn, and recovery never deletes it (AC-8)", async () => {
 		const first = await dispatchedTurn("m1", "x", { finish: false });
-		const other = "slack/dm/D2";
+		const other = "discord/dm/200000000000000002";
 		store.ensureOrigin(other, "sess/d2");
-		store.recordInbound({ originKey: other, platformMessageId: "n1", textRef: "y", threadRef: "D2:n1" });
+		store.recordInbound({
+			originKey: other,
+			platformMessageId: "n1",
+			textRef: "y",
+			threadRef: "200000000000000002:n1",
+		});
 		store.markDispatched("n1", { opRef: "op-d2", entryCursor: null });
 		writeCut([
 			{ originKey: ORIGIN, opRef: first.opRef },
@@ -466,10 +503,15 @@ describe("recovery of turns a planned restart cut (restart-cut.json)", () => {
 
 describe("inbound.thread_ref migration", () => {
 	test("recordInbound persists threadRef and defaults it to the platform message id", () => {
-		store.recordInbound({ originKey: ORIGIN, platformMessageId: "D1:1.1", textRef: "a", threadRef: "D1:0.5" });
-		store.recordInbound({ originKey: ORIGIN, platformMessageId: "D1:2.2", textRef: "b" });
-		expect(store.getInbound("D1:1.1")?.threadRef).toBe("D1:0.5");
-		expect(store.getInbound("D1:2.2")?.threadRef).toBe("D1:2.2");
+		store.recordInbound({
+			originKey: ORIGIN,
+			platformMessageId: "200000000000000001:1.1",
+			textRef: "a",
+			threadRef: "200000000000000001:0.5",
+		});
+		store.recordInbound({ originKey: ORIGIN, platformMessageId: "200000000000000001:2.2", textRef: "b" });
+		expect(store.getInbound("200000000000000001:1.1")?.threadRef).toBe("200000000000000001:0.5");
+		expect(store.getInbound("200000000000000001:2.2")?.threadRef).toBe("200000000000000001:2.2");
 	});
 
 	test("a database created before the column existed gets it added and backfilled", () => {
@@ -490,14 +532,19 @@ describe("inbound.thread_ref migration", () => {
 				entry_cursor TEXT
 			);
 			INSERT INTO origins VALUES ('${ORIGIN}', 1, 'sess/e1', 1);
-			INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at) VALUES ('D1:9.9', '${ORIGIN}', 1, 'old', 1);
+			INSERT INTO inbound (platform_message_id, origin_key, epoch, text_ref, created_at) VALUES ('200000000000000001:9.9', '${ORIGIN}', 1, 'old', 1);
 		`);
 		old.close();
 		const migrated = openBotStore(path, clock, "Asia/Seoul");
 		try {
-			expect(migrated.getInbound("D1:9.9")?.threadRef).toBe("D1:9.9");
-			migrated.recordInbound({ originKey: ORIGIN, platformMessageId: "D1:10.1", textRef: "new", threadRef: "D1:9.9" });
-			expect(migrated.getInbound("D1:10.1")?.threadRef).toBe("D1:9.9");
+			expect(migrated.getInbound("200000000000000001:9.9")?.threadRef).toBe("200000000000000001:9.9");
+			migrated.recordInbound({
+				originKey: ORIGIN,
+				platformMessageId: "200000000000000001:10.1",
+				textRef: "new",
+				threadRef: "200000000000000001:9.9",
+			});
+			expect(migrated.getInbound("200000000000000001:10.1")?.threadRef).toBe("200000000000000001:9.9");
 		} finally {
 			migrated.close();
 		}

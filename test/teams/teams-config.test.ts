@@ -1,4 +1,4 @@
-// channels.teams: parsed alone (no Slack), its secret file held to 0600 and masked, its listener loopback only;
+// channels.teams: parsed alone (no other channel), its secret file held to 0600 and masked, its listener loopback only;
 // `ompbot init --platform teams` writes such a config.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -41,13 +41,13 @@ const base = {
 };
 
 describe("channels.teams", () => {
-	test("Teams alone is a whole config: default listener, secret path resolved, no Slack", () => {
+	test("Teams alone is a whole config: default listener, secret path resolved, no other channel", () => {
 		writeConfig(base);
 		const config = loadConfig(home);
 		expect(config.channels).toEqual({
 			teams: { ...base, clientSecretFile: join(home, "teams-client-secret"), listen: "127.0.0.1:3978" },
 		});
-		expect(config.slack).toBeUndefined();
+		expect(config.channels.discord).toBeUndefined();
 	});
 
 	test("a listener off loopback, a non-GUID id and an unknown key are config_invalid", () => {
@@ -115,7 +115,7 @@ describe("ompbot init --platform teams", () => {
 		expect(code).toBe(0);
 		expect(stdout).toContain("teams-client-secret");
 		const written = JSON.parse(readFileSync(join(target, "config.json"), "utf8")) as Record<string, unknown>;
-		expect(written.slack).toBeUndefined();
+		expect(Object.keys(written.channels as Record<string, unknown>)).toEqual(["teams"]);
 		writeFileSync(join(target, "secrets", "teams-client-secret"), "fake-client-secret-0\n", { mode: 0o600 });
 		expect(loadConfig(target).channels.teams?.ownerAadObjectId).toBe(OWNER_AAD);
 	});

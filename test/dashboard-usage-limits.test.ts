@@ -244,8 +244,13 @@ describe("AC-1: config validation", () => {
 			join(home, "config.json"),
 			JSON.stringify({
 				schemaVersion: 1,
-				channels: { slack: { ownerUserId: "UOWNER0" } },
-				slack: { botTokenFile: "secrets/bot.token", appTokenFile: "secrets/app.token" },
+				channels: {
+					discord: {
+						ownerUserId: "100000000000000001",
+						botTokenFile: "secrets/bot.token",
+						applicationId: "600000000000000000",
+					},
+				},
 				ompExecutable: "/usr/local/bin/omp",
 				workspaceDir: "workspace",
 				dashboard: { port: 7331, usageLimits },

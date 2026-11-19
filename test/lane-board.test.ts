@@ -16,16 +16,14 @@ import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import { PEER_TOOL_DENIED } from "../src/safety/host-tools";
 import { buildFloorsPrompt, peerTouchedTurnNotice } from "../src/safety/prompt";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
 import { LANE_BOARD_TEXT_MAX, type Store } from "../src/store/db";
-import { makeHome, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import { CHANNEL, discordBinding, makeHome, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 import { makeRepo } from "./helpers/git-fixtures";
 import { laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
 
 const REPO_1 = "/work/repo-one";
 const REPO_2 = "/work/repo-two";
-const OWNER_DM = "slack/dm/D0BOARD001";
+const OWNER_DM = "discord/dm/200000000000000001";
 const FENCE = "f".repeat(16);
 const signal = new AbortController().signal;
 
@@ -50,7 +48,7 @@ function addLane(name: string, repo: string | undefined): string {
 	store.insertLane({
 		name,
 		title: `${name} title`,
-		threadRef: `C0BOARD001:${name}`,
+		threadRef: `300000000000000001:${name}`,
 		originKey,
 		cwd: repo ?? "/work/plain",
 		sessionDir: join(dir, "sessions", name),
@@ -295,9 +293,9 @@ describe("lane start prompt names same-repo lanes", () => {
 		try {
 			const repo = makeRepo(repos);
 			const other = makeRepo(repos);
-			const a = await h.manager.start({ title: "결제 리팩터", cwd: repo, channel: "D1" });
-			const b = await h.manager.start({ title: "결제 테스트", cwd: repo, channel: "D1" });
-			const lone = await h.manager.start({ title: "다른 저장소 일", cwd: other, channel: "D1" });
+			const a = await h.manager.start({ title: "결제 리팩터", cwd: repo, channel: CHANNEL });
+			const b = await h.manager.start({ title: "결제 테스트", cwd: repo, channel: CHANNEL });
+			const lone = await h.manager.start({ title: "다른 저장소 일", cwd: other, channel: CHANNEL });
 			await h.settle();
 			const [promptA] = h.prompts(a.originKey);
 			const [promptB] = h.prompts(b.originKey);
@@ -337,7 +335,7 @@ describe("daemon: who gets the board tools", () => {
 		const clock = { now: () => clockNow };
 		const started = new Daemon({
 			config: home.config,
-			channels: [new SlackBinding(new SlackChannel(new WaitingTransport()))],
+			channels: [discordBinding(new WaitingDiscordTransport())],
 			clock,
 			log: createLogger({ sink: () => {}, clock, redact }),
 			ompVersion: "omp-test 0",
@@ -360,10 +358,10 @@ describe("daemon: who gets the board tools", () => {
 		started.store.ensureOrigin(OWNER_DM, join(home.dir, "sessions", "dm"));
 		started.store.recordInbound({
 			originKey: OWNER_DM,
-			platformMessageId: "D0BOARD001:900.1",
+			platformMessageId: "200000000000000001:900000000000000001",
 			textRef: "peer",
-			threadRef: "D0BOARD001:900.1",
-			peerUserId: "UPEER00001",
+			threadRef: "200000000000000001:900000000000000001",
+			peerUserId: "800000000000000001",
 		});
 		expect(names(OWNER_DM)).not.toContain("ompbot_board_post");
 		expect(names(OWNER_DM)).not.toContain("ompbot_board_read");

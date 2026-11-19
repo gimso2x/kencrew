@@ -1,13 +1,21 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { DiscordChannelConfig } from "../src/config";
 import { Daemon } from "../src/daemon/daemon";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	CHANNEL,
+	discordBinding,
+	GUILD,
+	makeHome,
+	OWNER,
+	OWNER_DM,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import { removeRepoAndWorktrees } from "./helpers/lane-harness";
 
@@ -18,14 +26,15 @@ let home: TestHome;
 let repos: string[];
 let daemons: Daemon[];
 let drivers: Map<string, FakeOmpDriver>;
-let transport: WaitingTransport;
+let transport: WaitingDiscordTransport;
 
 beforeEach(() => {
 	home = makeHome("ompbot-lane-followup-");
 	repos = [];
 	daemons = [];
 	drivers = new Map();
-	transport = new WaitingTransport();
+	transport = new WaitingDiscordTransport();
+	transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
 });
 
 afterEach(async () => {
@@ -40,14 +49,17 @@ function commitMore(repo: string): void {
 	git(repo, "commit", "-q", "-m", "work");
 }
 
-/** A daemon with one lane `ask` that did real work and was closed through `ompbot_claim_done`; returns its root ts. */
-async function closedLane(): Promise<{ daemon: Daemon; rootTs: string }> {
+/** A daemon with one lane `ask` that did real work and was closed through `ompbot_claim_done`; returns its root message id. */
+async function closedLane(): Promise<{ daemon: Daemon; rootId: string }> {
 	const repo = makeRepo(repos);
 	const sessions = new FakeSessionStore();
 	const clock = { now: () => Date.now() };
 	const daemon = new Daemon({
-		config: home.config,
-		channels: [new SlackBinding(new SlackChannel(transport))],
+		config: {
+			...home.config,
+			channels: { discord: { ...(home.config.channels.discord as DiscordChannelConfig), laneChannelId: CHANNEL } },
+		},
+		channels: [discordBinding(transport)],
 		log: createLogger({ sink: () => undefined, clock, redact }),
 		ompVersion: "omp-test 0",
 		bootId: "boot",
@@ -59,9 +71,9 @@ async function closedLane(): Promise<{ daemon: Daemon; rootTs: string }> {
 	});
 	daemons.push(daemon);
 	await daemon.start();
-	await daemon.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: ask @${repo}` });
+	await daemon.inject({ origin: `discord/dm/${OWNER_DM}`, asOwner: true, text: `작업: ask @${repo}` });
 	await transport.waitForPosts((text) => text.startsWith("ECHO ulw explore"));
-	const rootTs = transport.posts((text) => text === "🔄 ask")[0]?.ts ?? "";
+	const rootId = transport.posts((text) => text === "🔄 ask")[0]?.id ?? "";
 	const claim = daemon.hostToolsFor("ompbot/work/ask").find((tool) => tool.name === "ompbot_claim_done");
 	// The lane works in its own worktree beside `repo`; that is where its commit lands.
 	const worktree = daemon.store.getLane("ask")?.cwd ?? "";
@@ -69,25 +81,25 @@ async function closedLane(): Promise<{ daemon: Daemon; rootTs: string }> {
 	const signal = new AbortController().signal;
 	expect(await claim?.execute({ repo: worktree, commit: "HEAD", summary: "done" }, { signal })).toContain("검증 통과");
 	expect(daemon.store.getLane("ask")?.status).toBe("closed");
-	return { daemon, rootTs };
+	return { daemon, rootId };
 }
 
-const send = (text: string, ts: string, rootTs: string, user = OWNER) =>
-	transport.emitMessage({ type: "message", channel: "D1", channel_type: "im", user, text, ts, thread_ts: rootTs });
+const send = (content: string, id: string, rootId: string, author = OWNER) =>
+	transport.emitMessage({ id, channel_id: rootId, guild_id: GUILD, author: { id: author }, content, type: 0 });
 
 const laneEvents = (daemon: Daemon) => daemon.store.getLane("ask")?.history.map((entry) => entry.event) ?? [];
 const lanePrompts = () => drivers.get("ompbot/work/ask")?.calls.filter((call) => call.startsWith("prompt:")) ?? [];
 
 describe("owner messages in a closed lane's thread", () => {
 	test("a plain question is answered by the lane session and does not reopen the lane", async () => {
-		const { daemon, rootTs } = await closedLane();
-		await send("이거 왜 이렇게 했어?", "1900000000.000100", rootTs);
+		const { daemon, rootId } = await closedLane();
+		await send("이거 왜 이렇게 했어?", "7100000000000000100", rootId);
 		await transport.waitForPosts((text) => text.startsWith("ECHO") && text.includes("이거 왜 이렇게 했어?"));
 		// Before the change this message reopened the lane (status working, `reopened` in history).
 		expect(daemon.store.getLane("ask")?.status).toBe("closed");
 		expect(laneEvents(daemon)).not.toContain("reopened");
 		expect(laneEvents(daemon).at(-1)).toBe("owner_question");
-		expect(daemon.store.getInbound("D1:1900000000.000100")).toMatchObject({
+		expect(daemon.store.getInbound(`${CHANNEL}:7100000000000000100`)).toMatchObject({
 			originKey: "ompbot/work/ask",
 			state: "answered",
 		});
@@ -96,22 +108,22 @@ describe("owner messages in a closed lane's thread", () => {
 	});
 
 	test("control commands keep their meaning and are not recorded as questions", async () => {
-		const { daemon, rootTs } = await closedLane();
+		const { daemon, rootId } = await closedLane();
 		const before = laneEvents(daemon);
-		await send("!queue", "1900000000.000200", rootTs);
+		await send("!queue", "7100000000000000200", rootId);
 		await transport.waitForPosts((text) => text.includes("대기열 비어 있음"));
-		await send("!new", "1900000000.000300", rootTs);
+		await send("!new", "7100000000000000300", rootId);
 		await transport.waitForPosts((text) => text.includes("새 대화를 시작했습니다"));
 		expect(daemon.store.getLane("ask")?.status).toBe("closed");
 		expect(laneEvents(daemon)).toEqual(before);
-		expect(daemon.store.getInbound("D1:1900000000.000200")?.textRef).toBe("!queue");
-		expect(daemon.store.getInbound("D1:1900000000.000300")?.textRef).toBe("!new");
+		expect(daemon.store.getInbound(`${CHANNEL}:7100000000000000200`)?.textRef).toBe("!queue");
+		expect(daemon.store.getInbound(`${CHANNEL}:7100000000000000300`)?.textRef).toBe("!new");
 		expect(lanePrompts().some((call) => call.includes("!queue") || call.includes("!new"))).toBe(false);
 	});
 
 	test("a `!followup <work>` payload runs only as an answer-only question with the closed notice", async () => {
-		const { daemon, rootTs } = await closedLane();
-		await send("!followup README에 한 줄 더 추가해", "1900000000.000400", rootTs);
+		const { daemon, rootId } = await closedLane();
+		await send("!followup README에 한 줄 더 추가해", "7100000000000000400", rootId);
 		await transport.waitForPosts((text) => text.startsWith("ECHO") && text.includes("README에 한 줄 더 추가해"));
 		expect(daemon.store.getLane("ask")?.status).toBe("closed");
 		expect(laneEvents(daemon)).not.toContain("reopened");
@@ -123,9 +135,9 @@ describe("owner messages in a closed lane's thread", () => {
 	});
 
 	test("`!reopen <지시>` reopens the lane and hands the message over as typed", async () => {
-		const { daemon, rootTs } = await closedLane();
-		await send("!reopen 테스트 하나 더", "1900000000.000500", rootTs);
-		await transport.waitForPosts((text) => text === "ECHO !reopen 테스트 하나 더");
+		const { daemon, rootId } = await closedLane();
+		await send("!reopen 테스트 하나 더", "7100000000000000500", rootId);
+		await transport.waitForPosts((text) => text.startsWith("ECHO !reopen 테스트 하나 더"));
 		expect(daemon.store.getLane("ask")?.status).toBe("working");
 		// The reopened turn ends with no claim, so the core's automatic nudges may follow it in the history.
 		expect(
@@ -141,10 +153,10 @@ describe("owner messages in a closed lane's thread", () => {
 	});
 
 	test("a non-owner message in the thread is ignored: nothing recorded, the lane untouched", async () => {
-		const { daemon, rootTs } = await closedLane();
+		const { daemon, rootId } = await closedLane();
 		const before = daemon.store.getLane("ask");
-		await send("이거 다시 열어줘", "1900000000.000600", rootTs, "USTRANGER");
-		expect(daemon.store.getInbound("D1:1900000000.000600")).toBeUndefined();
+		await send("이거 다시 열어줘", "7100000000000000600", rootId, "700000000000000009");
+		expect(daemon.store.getInbound(`${CHANNEL}:7100000000000000600`)).toBeUndefined();
 		expect(daemon.store.getLane("ask")?.status).toBe("closed");
 		expect(daemon.store.getLane("ask")?.history).toEqual(before?.history ?? []);
 		expect(lanePrompts().some((call) => call.includes("이거 다시 열어줘"))).toBe(false);

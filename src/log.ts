@@ -1,4 +1,3 @@
-import { appendFileSync } from "node:fs";
 import { byteLength, type Redactor, truncateUtf8 } from "./redact";
 
 export type LogLevel = "debug" | "info" | "warn" | "error";
@@ -80,9 +79,4 @@ export function createLogger(options: LoggerOptions): Logger {
 		warn: (event, fields) => emit("warn", event, fields),
 		error: (event, fields) => emit("error", event, fields),
 	};
-}
-
-/** Append-only file sink; created 0600. */
-export function fileSink(path: string): (line: string) => void {
-	return (line) => appendFileSync(path, `${line}\n`, { mode: 0o600 });
 }

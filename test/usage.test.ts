@@ -82,12 +82,15 @@ describe("summarizeSessionFiles", () => {
 
 describe("session file discovery", () => {
 	test("a conversation is every epoch of its origin directory, sub-agent transcripts included", () => {
-		const origin = join(dir, "sessions", encodeURIComponent("slack/dm/D1"));
+		const origin = join(dir, "sessions", encodeURIComponent("discord/dm/200000000000000001"));
 		const a = writeJsonl(join(origin, "e1", "2026-11-01_a.jsonl"), []);
 		const b = writeJsonl(join(origin, "e2", "2026-11-02_b.jsonl"), []);
 		const nested = writeJsonl(join(origin, "e2", "2026-11-02_b", "Scout.jsonl"), []);
 		writeJsonl(join(origin, "notes", "x.jsonl"), []);
-		const other = writeJsonl(join(dir, "sessions", encodeURIComponent("slack/dm/D2"), "e1", "c.jsonl"), []);
+		const other = writeJsonl(
+			join(dir, "sessions", encodeURIComponent("discord/dm/200000000000000002"), "e1", "c.jsonl"),
+			[],
+		);
 		expect(conversationSessionFiles(origin).sort()).toEqual([a, b, nested].sort());
 		expect(allSessionFiles(join(dir, "sessions")).length).toBe(5);
 		expect(allSessionFiles(join(dir, "sessions"))).toContain(other);

@@ -18,9 +18,9 @@ class FakeClock {
 	}
 }
 
-const CHANNEL = "slack/ch/C1";
-const THREAD = `${CHANNEL}/t/111.222`;
-const REF = "C1:111.222";
+const CHANNEL = "discord/ch/300000000000000001";
+const THREAD = `${CHANNEL}/t/400000000000000222`;
+const REF = "300000000000000001:400000000000000222";
 const ROTATE = "@rotate";
 
 function msg(originKey: string, threadRef: string, platformMessageId: string, text: string): InboundRecord {
@@ -165,7 +165,7 @@ describe("thread context injection", () => {
 	test("threadRefOfOrigin maps only thread-session origins", () => {
 		expect(threadRefOfOrigin(THREAD)).toBe(REF);
 		expect(threadRefOfOrigin(CHANNEL)).toBeUndefined();
-		expect(threadRefOfOrigin("slack/dm/D1")).toBeUndefined();
+		expect(threadRefOfOrigin("discord/dm/200000000000000001")).toBeUndefined();
 		expect(threadRefOfOrigin("monitor/abc12345")).toBeUndefined();
 	});
 });

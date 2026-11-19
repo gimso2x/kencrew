@@ -29,8 +29,18 @@ import type {
 } from "./snapshot";
 import { STYLE } from "./style";
 import { TRACE_CLIENT } from "./trace-client";
-import { renderTrace } from "./trace-view";
+import { flowDoing, renderFlow, renderTrace } from "./trace-view";
 import { resetIn, usageLevel } from "./usage-limits";
+
+/** HTML-escapes text for the renderers below. Self-contained (shipped to the page). */
+export function esc(value: unknown): string {
+	return String(value ?? "")
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#39;");
+}
 
 /** The gate thresholds the screens put into words; shipped to the page as JSON next to the renderers. */
 const GATE_LIMITS = {
@@ -129,17 +139,13 @@ export function gateText(name: string): { label: string; todo: string } {
 			`스윕 하트비트가 ${span(limits.sweepStalledMs)} 넘게 멈춤`,
 			"`systemctl --user status ompbot`으로 데몬 확인",
 		],
-		slack_disconnected: [`Slack 소켓이 ${span(limits.socketDownMs)} 넘게 끊김`, "네트워크·Slack 토큰과 데몬 로그 확인"],
 		discord_disconnected: [
 			`Discord 게이트웨이가 ${span(limits.socketDownMs)} 넘게 끊김`,
 			"네트워크·Discord 토큰과 데몬 로그 확인",
 		],
 		inbound_starved: [`턴이 ${span(limits.inboundStarvationMs)} 넘게 응답 없음`, "`ompbot status`로 멈춘 턴 확인"],
 		origin_silent: [`받은 메시지가 ${span(limits.originSilentMs)} 넘게 대기`, "`ompbot status`로 대기 중인 대화 확인"],
-		deliveries_overdue: [
-			`Slack 전달이 ${span(limits.deliveryOverdueMs)} 넘게 밀림`,
-			"데몬 로그에서 전달 실패 사유 확인",
-		],
+		deliveries_overdue: [`전달이 ${span(limits.deliveryOverdueMs)} 넘게 밀림`, "데몬 로그에서 전달 실패 사유 확인"],
 		monitors_failed: [
 			`최근 ${span(limits.monitorFailureWindowMs)} 안에 모니터 실패`,
 			"`ompbot monitors list`로 실패한 모니터 확인",
@@ -151,7 +157,7 @@ export function gateText(name: string): { label: string; todo: string } {
 		herdr_unreachable: ["herdr에 연결하지 못함", "herdr 서버 상태·`herdr.bin` 설정 확인"],
 		disk_low: ["디스크 여유 공간 부족", "`df -h` 확인·`ompbot gc`·백업 정리"],
 		host_pressure: ["호스트 부하·메모리 압박", "`uptime`·`free -m` 확인"],
-		cost_cap: ["오늘 비용이 하루 상한을 넘어 모니터가 멈춤", "`!budget`으로 확인, 오늘만 풀려면 `!budget off`"],
+		cost_cap: ["오늘 비용이 하루 상한을 넘음(알림만, 모니터는 계속 돎)", "`!budget`으로 확인, 자정에 닫힘"],
 	};
 	const known = TEXT[name];
 	return known === undefined ? { label: name, todo: "`ompbot gates` 확인" } : { label: known[0], todo: known[1] };
@@ -211,7 +217,7 @@ export interface DashboardUi {
  * A thread's open turns in words: inbound rows steered into one omp run are that run's merged messages, not a queue.
  * Empty for no open turn.
  */
-export function openTurnsText(thread: { openCount: number; runCount: number; pendingCount: number }): string {
+function openTurnsText(thread: { openCount: number; runCount: number; pendingCount: number }): string {
 	const sent = thread.openCount - thread.pendingCount;
 	const parts = [
 		...(thread.runCount === 0 ? [] : [`실행 ${thread.runCount}`]),
@@ -221,7 +227,7 @@ export function openTurnsText(thread: { openCount: number; runCount: number; pen
 	return parts.join(" · ");
 }
 
-export type InboxCol = "attention" | "working" | "wait";
+type InboxCol = "attention" | "working" | "wait";
 
 /** One inbox card: an agent pane (with its TASK merged in), or an open TASK no pane carries. */
 export interface InboxEntry {
@@ -336,7 +342,7 @@ export function isStale(entry: InboxEntry, now: number): boolean {
  * The 확인 필요 group of an entry: 0 failed (TASK documents not judged, worker check failed or gone, unknown pane state),
  * 1 blocked, 2 the rest (no agent card…). Self-contained (shipped).
  */
-export function attentionGroup(entry: InboxEntry): number {
+function attentionGroup(entry: InboxEntry): number {
 	const task = entry.task;
 	const card = entry.card;
 	const herdr = task?.herdr;
@@ -371,7 +377,7 @@ export function inboxAttention(s: DashboardSnapshot, live?: BoardPanel | null): 
 }
 
 /** Why the owner should look at a 확인 필요 entry, failure first, cut at 120 characters. Self-contained (shipped). */
-export function inboxNextReason(entry: InboxEntry, live: boolean): string {
+function inboxNextReason(entry: InboxEntry, live: boolean): string {
 	const task = entry.task;
 	const card = entry.card;
 	const herdr = task?.herdr;
@@ -394,7 +400,7 @@ export function inboxNextReason(entry: InboxEntry, live: boolean): string {
 }
 
 /** The tab icon for a state: the brand mark, the same with a red dot (확인 필요), all grey (이상). Self-contained. */
-export function faviconHref(state: "ok" | "attention" | "bad"): string {
+function faviconHref(state: "ok" | "attention" | "bad"): string {
 	const fill = state === "bad" ? "#525860" : "#0860CA";
 	const dot =
 		state === "attention" ? '<circle cx="25" cy="7" r="6" fill="#B91C1C" stroke="#FFFFFF" stroke-width="2"/>' : "";
@@ -418,7 +424,7 @@ export function tabSignal(
 }
 
 /** A key press as the number and reply keys see it. */
-export interface OrderKeyInput {
+interface OrderKeyInput {
 	key: string;
 	meta?: boolean;
 	ctrl?: boolean;
@@ -452,7 +458,7 @@ export const UNREAD_KEEP_MS = 14 * 86_400_000;
 export const UNREAD_MAX = 1000;
 
 /** What the owner saw of an entry: its {@link entrySig}, its `since`, and when it was read. */
-export interface UnreadMark {
+interface UnreadMark {
 	sig: string;
 	since: number;
 	at: number;
@@ -595,13 +601,6 @@ export function renderDashboardMain(
 	now?: number,
 	ui: DashboardUi = {},
 ): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	/** `2026-11-04T09:02:53-05:00` → `11-04 09:02` (times arrive with the offset of the snapshot's `timezone`). */
 	const at = (iso: string | null | undefined): string => (iso ? esc(iso.slice(5, 16).replace("T", " ")) : "-");
 	const dur = (ms: number | null | undefined): string => {
@@ -1132,7 +1131,7 @@ export function renderDashboardMain(
 							: `진행 중인 턴 ${holding.length}개가 끝나면 재시작합니다 (가장 오래된 턴 경과 ${dur(oldest)}).`
 					} 그동안 들어온 요청은 재시작 뒤 처리됩니다.</span></p>`
 				: "";
-			// One card per conversation (Slack thread = omp session), laid out like the inbox.
+			// One card per conversation (chat thread = omp session), laid out like the inbox.
 			const openThreads = turns.threads.filter((thread) => thread.column === "working").length;
 			// Every number in the head says what it counts: open threads match the 진행 중 column, jobs link to their block.
 			const title = head(
@@ -1146,12 +1145,12 @@ export function renderDashboardMain(
 			if (turns.threads.length === 0) {
 				return liveJobs.length > 0
 					? `${title}${banners.join("")}${drainLine}${jobTop}${jobDone}`
-					: `${title}${banners.join("")}${drainLine}${jobTop}<div class="empty-box"><p class="note">최근 24시간 턴이 없어요</p><p class="note-sub">슬랙 대화나 모니터에서 새 턴이 시작되면 실시간으로 표시됩니다.</p></div>${jobDone}`;
+					: `${title}${banners.join("")}${drainLine}${jobTop}<div class="empty-box"><p class="note">최근 24시간 턴이 없어요</p><p class="note-sub">채팅 대화나 모니터에서 새 턴이 시작되면 실시간으로 표시됩니다.</p></div>${jobDone}`;
 			}
 			type ThreadCol = "attention" | "working" | "done";
 			const THREAD_RANK: Record<ThreadCol, number> = { attention: 0, working: 1, done: 2 };
 			const threads = turns.threads.filter((thread) =>
-				hit(thread.title, thread.latest.preview, thread.originKey, thread.threadRef),
+				hit(thread.title, thread.latest.preview, thread.originKey, thread.threadRef, ...(thread.jobs ?? [])),
 			);
 			const restartHeld = new Set(holding.map((turn) => turn.originKey));
 			const placeOf = (key: string): string => {
@@ -1166,11 +1165,29 @@ export function renderDashboardMain(
 			};
 			const threadLink = (key: string): string =>
 				`href="?view=turns&amp;item=${esc(encodeURIComponent(key))}" data-item="${esc(key)}"`;
+			const jobByName = new Map((s.jobs.ok ? s.jobs.items : []).map((job) => [job.name, job]));
+			const threadJobBadge = (thread: (typeof threads)[number]): string => {
+				const names = thread.jobs ?? [];
+				if (names.length === 0) return "";
+				const sorted = names.slice().sort((a, b) => {
+					const ja = jobByName.get(a);
+					const jb = jobByName.get(b);
+					if (ja === undefined && jb === undefined) return 0;
+					if (ja === undefined) return 1;
+					if (jb === undefined) return -1;
+					return msOf(jb.updatedAt) - msOf(ja.updatedAt);
+				});
+				const target = `job:${sorted[0]}`;
+				return `<a class="badge is-info card-job" href="?view=turns&amp;item=${esc(
+					encodeURIComponent(target),
+				)}" data-item="${esc(target)}" title="${esc(sorted.join(", "))}">백그라운드 작업 ${names.length}</a>`;
+			};
 			const threadBadges = (thread: (typeof threads)[number]): string =>
 				[
 					state(thread.latest.state),
 					...(thread.stalledCount > 0 ? [badge("정체", "is-warning")] : []),
 					...(restartHeld.has(thread.originKey) ? [badge("재시작이 기다리는 턴", "is-warning")] : []),
+					...(thread.jobs && thread.jobs.length > 0 ? [threadJobBadge(thread)] : []),
 				].join("");
 			const byRecent = (a: (typeof threads)[number], b: (typeof threads)[number]): number =>
 				THREAD_RANK[a.column] - THREAD_RANK[b.column] || msOf(b.updatedAt) - msOf(a.updatedAt);
@@ -1197,15 +1214,19 @@ export function renderDashboardMain(
 					.join(" · ");
 				// One open turn is already the state badge; more rows say whether they are one run or a queue.
 				const meta = [`턴 ${thread.turnCount}`, ...(thread.openCount > 1 ? [openTurnsText(thread)] : [])];
-				return `<a class="card${isSel(key) ? " is-selected" : ""}" data-state="${esc(`${thread.column}:${latest.state}`)}" ${threadLink(key)} data-row="${esc(key)}"${
+				return `<article class="card card-thread${isSel(key) ? " is-selected" : ""}" data-state="${esc(
+					`${thread.column}:${latest.state}`,
+				)}" data-row="${esc(key)}"><a class="card-link" data-row-link ${threadLink(key)}${
 					isSel(key) ? ' aria-current="true"' : ""
 				}><p class="card-eyebrow"><span>${esc(TURN_LABELS.kind[thread.kind])}</span>${
 					place === "" ? "" : ` · <span>${esc(place)}</span>`
-				}</p><p class="card-title">${esc(thread.title)}</p>${sum === "" ? "" : `<p class="card-sum">${sum}</p>`}<div class="card-foot"><span class="badges">${threadBadges(
+				}</p><p class="card-title">${esc(thread.title)}</p>${
+					sum === "" ? "" : `<p class="card-sum">${sum}</p>`
+				}</a><div class="card-foot"><span class="badges">${threadBadges(
 					thread,
 				)}</span><span class="card-time">${ago(msOf(thread.updatedAt))}</span><span class="card-meta">${meta
 					.map((part) => `<span>${esc(part)}</span>`)
-					.join("")}${modelChip(thread.model)}</span></div></a>`;
+					.join("")}${modelChip(thread.model)}</span></div></article>`;
 			};
 			const lead = `${banners.join("")}${drainLine}${threads.length === 0 ? nothing : ""}`;
 			if (ui.layout === "list") {
@@ -1250,7 +1271,7 @@ export function renderDashboardMain(
 						(thread) =>
 							`<tr data-row="${esc(thread.originKey)}" data-state="${esc(`${thread.column}:${thread.latest.state}`)}"${
 								isSel(thread.originKey) ? ' class="is-selected"' : ""
-							}><td><span class="badges">${threadBadges(thread)}</span></td><td class="list-title"><a ${threadLink(
+							}><td><span class="badges">${threadBadges(thread)}</span></td><td class="list-title"><a data-row-link ${threadLink(
 								thread.originKey,
 							)}${isSel(thread.originKey) ? ' aria-current="true"' : ""}>${esc(thread.title)}</a></td><td>${esc(
 								TURN_LABELS.kind[thread.kind],
@@ -1271,7 +1292,7 @@ export function renderDashboardMain(
 					"working",
 					"진행 중",
 					"진행 중인 턴이 없어요",
-					"슬랙 대화나 모니터에서 새 턴이 시작되면 실시간으로 표시됩니다.",
+					"채팅 대화나 모니터에서 새 턴이 시작되면 실시간으로 표시됩니다.",
 				],
 				["done", "완료", "끝난 스레드가 없어요", "턴이 끝난 스레드는 마지막 활동 뒤 24시간 동안 여기에 남습니다."],
 			];
@@ -1338,7 +1359,7 @@ export function renderDashboardMain(
 				rows,
 				lanes.items.length,
 				"열린 레인이 없어요",
-				"슬랙에서 '작업: <제목> @<경로>'로 작업 레인을 열면 여기에 표시됩니다.",
+				"채팅에서 '작업: <제목> @<경로>'로 작업 레인을 열면 여기에 표시됩니다.",
 			);
 		}
 		if (view === "approvals") {
@@ -1391,7 +1412,7 @@ export function renderDashboardMain(
 				rows,
 				approvals.items.length,
 				"기다리는 승인이 없어요",
-				"승인이 필요한 작업이 올라오면 슬랙 승인 카드와 함께 여기에 표시됩니다.",
+				"승인이 필요한 작업이 올라오면 채팅 승인 카드와 함께 여기에 표시됩니다.",
 				lead,
 			)}${
 				decided.length === 0
@@ -1629,21 +1650,6 @@ export function renderDashboardMain(
 			);
 		}
 
-		const socket = d.ok ? d.heartbeat?.socket : undefined;
-		if (s.slackOff === true) pushCard("slack", "Slack", "ok", facts([["상태", "꺼짐 · channels.slack 없음"]]));
-		else if (!d.ok) pushCard("slack", "Slack", "warn", noDaemon);
-		else if (socket === undefined) pushCard("slack", "Slack", "warn", note("소켓 상태 기록이 아직 없어요."));
-		else {
-			pushCard(
-				"slack",
-				"Slack",
-				socket.state === "up" ? "ok" : "bad",
-				facts([
-					["소켓", socket.state === "up" ? "연결" : "끊김"],
-					["그 뒤", `${dur(clock - msOf(socket.since))} · ${at(socket.since)}부터`],
-				]),
-			);
-		}
 		// Only an install with Discord on records its gateway in the heartbeat; without it there is no card.
 		const gateway = d.ok ? d.heartbeat?.discord : undefined;
 		if (gateway !== undefined) {
@@ -1874,8 +1880,6 @@ export function renderDashboardMain(
 	if (!d.ok) chips.push(badge("데몬 상태 모름", "is-danger"));
 	else {
 		chips.push(d.running ? badge("데몬 켜짐", "is-success") : badge("데몬 꺼짐", "is-danger"));
-		const socket = d.heartbeat?.socket;
-		if (socket) chips.push(socket.state === "up" ? badge("소켓 연결", "is-success") : badge("소켓 끊김", "is-danger"));
 		chips.push(
 			d.openGates.length === 0
 				? badge("게이트 정상", "is-success")
@@ -2047,13 +2051,6 @@ export function renderDashboardMain(
  * Only what the snapshot already carries. Self-contained (shipped to the page).
  */
 export function renderTaskFacts(task: TaskInfo): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	const at = (iso: string | undefined): string => (iso ? esc(iso.slice(0, 16).replace("T", " ")) : "-");
 	const percent =
 		task.acChecked === undefined || task.acTotal === 0 ? 0 : Math.round((task.acChecked / task.acTotal) * 100);
@@ -2178,18 +2175,6 @@ export function renderTaskFacts(task: TaskInfo): string {
 }
 
 /**
- * The `slack://` link that opens a conversation's Slack thread in the app (`<C>:<ts>`), or its channel for a ref with
- * no message ts (a monitor's `<C>:-`); "" without the workspace id or a usable ref. The dashboard only reads: the owner
- * steps into a running turn by replying in that thread. Self-contained (shipped to the page).
- */
-export function slackThreadHref(team: string | null | undefined, threadRef: string | null | undefined): string {
-	const ref = /^([CDG][A-Z0-9]+):(\d+\.\d+)?/.exec(threadRef ?? "");
-	if (!team || ref === null) return "";
-	const thread = ref[2] === undefined ? "" : `&message=${ref[2]}&thread_ts=${ref[2]}`;
-	return `slack://channel?team=${encodeURIComponent(team)}&id=${ref[1]}${thread}`;
-}
-
-/**
  * The `https://discord.com/channels/…` link that opens a Discord conversation: a DM at its message
  * (`discord/dm/…`, `<dm>:<message>`), a server thread or a lane (`<parent>:<thread>`) at the thread, a server channel
  * at its message. "" for a ref that is not two snowflakes, or a server conversation without the one server id (a DM
@@ -2219,13 +2204,6 @@ export function discordThreadHref(
  * closed TASKs past the snapshot's limit only have a panel there. Self-contained (shipped to the page).
  */
 export function renderFlowChain(chain: FlowChainInfo, focus: string, panel: boolean): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	const at = (iso: string | null | undefined): string => (iso ? iso.slice(5, 16).replace("T", " ") : "-");
 	/** status → [chip, tone of the chip]. */
 	const CHIPS: Record<string, [string, string]> = {
@@ -2342,13 +2320,6 @@ export function renderTaskDetail(
 	cardKey?: string,
 	chain?: FlowChainInfo,
 ): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	if (task === undefined) {
 		return `<p class="eyebrow">TASK ${esc(taskId)}</p><h2 class="detail-title" id="detail-title" tabindex="-1">지금 목록에 없는 TASK예요</h2><p class="lead">닫힌 지 7일이 지났거나 ID가 틀렸어요. 인박스에서 다시 골라 주세요.</p>`;
 	}
@@ -2390,13 +2361,6 @@ export function renderDetailHead(
 	now: number,
 	chain?: FlowChainInfo,
 ): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	if (card === undefined) {
 		return `<p class="eyebrow">카드 ${esc(key)}</p><h2 class="detail-title" id="detail-title" tabindex="-1">지금 보드에 없는 패널이에요</h2><p class="lead">패널이 닫혔거나 herdr-web-ui에서 아직 받지 못했어요. 보드에 다시 나타나면 여기에 열려요.</p>`;
 	}
@@ -2499,13 +2463,6 @@ export function renderDetailHead(
  * ({@link renderMonitorDetail}), a loading line until then. Self-contained (shipped to the page).
  */
 export function renderItemDetail(s: DashboardSnapshot, view: string, id: string, monitorBody?: string): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	const at = (iso: string | null | undefined): string => (iso ? esc(iso.slice(0, 16).replace("T", " ")) : "-");
 	const dur = (ms: number | null): string => {
 		if (ms === null) return "-";
@@ -2553,7 +2510,15 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 		const job = s.jobs.items.find((item) => `job:${item.name}` === id);
 		if (job) {
 			const [word] = JOB_LABELS[job.health === "ok" ? (job.state ?? "running") : job.health];
-			return show(job.title, [
+			const progressBlock =
+				job.progressLines === undefined
+					? ""
+					: job.progressLines.length === 0
+						? '<h3 class="h2">진행 기록</h3><p class="note">진행 기록이 비어 있어요</p>'
+						: `<h3 class="h2">진행 기록 (최근 ${job.progressLines.length}줄)</h3><pre class="mon-text">${esc(
+								job.progressLines.join("\n"),
+							)}</pre>`;
+			return `${show(job.title, [
 				["상태", `${esc(word)} · ${esc(job.state ?? "-")}`],
 				[
 					"진행",
@@ -2569,9 +2534,11 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 				["pid", job.pid === undefined ? "-" : `<code>${esc(job.pid)}</code>`],
 				["스레드", esc(job.thread ?? "-")],
 				["로그", job.log === undefined ? "-" : `<code>${esc(job.log)}</code>`],
+				["진행 파일", job.progress === undefined ? "-" : `<code>${esc(job.progress)}</code>`],
+				["작업 디렉터리", job.cwd === undefined ? "-" : `<code>${esc(job.cwd)}</code>`],
 				["설명", esc(job.detail ?? "-")],
 				["파일", `<code>jobs/${esc(job.name)}.json</code>`],
-			]);
+			])}${progressBlock}`;
 		}
 	}
 	if (view === "turns" && s.turns.ok) {
@@ -2682,7 +2649,7 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 			s.approvals.items.find((approval) => approval.approvalId === id) ??
 			s.approvals.recent.find((approval) => approval.approvalId === id);
 		if (item) {
-			// Same order and labels as the Slack card's sections (`DETAIL_SECTIONS` in safety/approval.ts).
+			// Same order and labels as the approval card's sections (`DETAIL_SECTIONS` in safety/approval.ts).
 			const SECTIONS = [
 				["action", "할 일"],
 				["why", "이유"],
@@ -2710,13 +2677,16 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 				);
 			}
 			facts.push(["요청한 곳", esc(item.originLabel ?? "-")]);
+			// A Discord card has no stored permalink: open the asking thread instead.
+			const originUrl =
+				item.originUrl ?? (discordThreadHref(s.discordGuild, item.originKey, item.originThreadRef) || null);
 			const links = [
 				item.cardUrl === null
 					? ""
-					: `<a class="button" href="${esc(item.cardUrl)}" target="_blank" rel="noopener noreferrer">슬랙 카드 열기</a>`,
-				item.originUrl === null
+					: `<a class="button" href="${esc(item.cardUrl)}" target="_blank" rel="noopener noreferrer">카드 열기</a>`,
+				originUrl === null
 					? ""
-					: `<a class="button is-ghost" href="${esc(item.originUrl)}" target="_blank" rel="noopener noreferrer">요청 스레드 열기</a>`,
+					: `<a class="button is-ghost" href="${esc(originUrl)}" target="_blank" rel="noopener noreferrer">요청 스레드 열기</a>`,
 			].join("");
 			return `<p class="eyebrow">${"status" in item ? "승인 결정" : esc(LABELS[view])}</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(
 				item.title,
@@ -2727,7 +2697,9 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
 					? `<div class="detail-actions">${links}</div>`
 					: "status" in item
 						? ""
-						: '<p class="lead">슬랙의 승인 메시지에서 승인하거나 거절해요.</p>'
+						: `<p class="lead">${
+								item.originKey?.startsWith("discord/") ? "디스코드" : "채팅"
+							}의 승인 메시지에서 승인하거나 거절해요.</p>`
 			}<details class="detail-internal"><summary>내부 정보</summary><dl class="facts"><dt>승인 ID</dt><dd><code>${esc(
 				item.approvalId,
 			)}</code></dd><dt>대화</dt><dd><code>${esc(item.originKey ?? "-")}</code></dd></dl></details>`;
@@ -2831,13 +2803,6 @@ export function renderItemDetail(s: DashboardSnapshot, view: string, id: string,
  * Self-contained apart from `MONITOR_STAGES`/`monitorTook` (shipped to the page).
  */
 export function renderMonitorDetail(body: unknown): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	const answer = (body ?? {}) as {
 		instruction?: string;
 		procedures?: MonitorProcedure[];
@@ -2885,10 +2850,48 @@ export function renderMonitorDetail(body: unknown): string {
 }
 
 /**
- * The detail panel's tab buttons: a herdr card's 개요/대화/plan, or a conversation's 개요/대화/트레이스 (turn board).
- * Self-contained (shipped to the page).
+ * A lane's or TASK's change (`api/diff` answer) as the detail panel: a title, the totals and one folded block per
+ * file (+/- counts in the summary, hunks inside, added/removed lines coloured). `body` undefined = still being read.
+ * All text escaped; self-contained (shipped to the page).
  */
-export function renderDetailTabs(mode: "card" | "thread", selected: string): string {
+export function renderDiffDetail(subject: string, body?: unknown): string {
+	const head = `<p class="eyebrow">변경 보기</p><h2 class="detail-title" id="detail-title" tabindex="-1">${esc(subject)}</h2>`;
+	if (body === undefined) return `${head}<p class="note">변경 내용을 불러오는 중이에요…</p>`;
+	const answer = body as {
+		sha?: string;
+		base?: string;
+		files?: { path: string; added: number; deleted: number; binary: boolean; hunks: string }[];
+		truncated?: boolean;
+		error?: string;
+	};
+	if (!Array.isArray(answer.files))
+		return `${head}<p class="note">변경 내용을 읽지 못했어요 (${esc(answer.error ?? "알 수 없는 응답")})</p>`;
+	const added = answer.files.reduce((sum, file) => sum + file.added, 0);
+	const deleted = answer.files.reduce((sum, file) => sum + file.deleted, 0);
+	const lines = (hunks: string): string =>
+		hunks
+			.split("\n")
+			.map((line) => {
+				const tone = line.startsWith("@@") ? "dh" : line.startsWith("+") ? "da" : line.startsWith("-") ? "dd" : "";
+				return `<span class="${tone}">${esc(line)}</span>`;
+			})
+			.join("");
+	const files = answer.files.map(
+		(file) =>
+			`<details class="diff-file"><summary><span class="diff-path">${esc(file.path)}</span> <span class="diff-add">+${esc(file.added)}</span> <span class="diff-del">−${esc(file.deleted)}</span>${
+				file.binary ? " 바이너리" : ""
+			}</summary>${file.binary ? "" : `<pre class="diff-code">${lines(file.hunks)}</pre>`}</details>`,
+	);
+	return `${head}<p class="lead">파일 ${answer.files.length}개 · +${added} −${deleted} · ${esc(String(answer.base ?? "").slice(0, 12))} → ${esc(
+		String(answer.sha ?? "").slice(0, 12),
+	)}</p>${answer.truncated ? '<p class="note">너무 커서 일부가 잘렸어요 (잘림).</p>' : ""}${files.join("")}`;
+}
+
+/**
+ * The detail panel's tab buttons: a herdr card's 개요/대화/plan (+ 트레이스 for a local omp worker, `withTrace`), a
+ * conversation's 개요/대화/트레이스 (turn board), or a background job's 개요/트레이스. Self-contained (shipped to the page).
+ */
+export function renderDetailTabs(mode: "card" | "thread" | "job", selected: string, withTrace = false): string {
 	const tabs =
 		mode === "thread"
 			? [
@@ -2896,11 +2899,17 @@ export function renderDetailTabs(mode: "card" | "thread", selected: string): str
 					["conv", "대화", "detail-conv"],
 					["trace", "트레이스", "detail-trace"],
 				]
-			: [
-					["head", "개요", "detail-head"],
-					["conv", "대화", "detail-conv"],
-					["plan", "plan", "detail-plan"],
-				];
+			: mode === "job"
+				? [
+						["head", "개요", "detail-head"],
+						["trace", "트레이스", "detail-trace"],
+					]
+				: [
+						["head", "개요", "detail-head"],
+						["conv", "대화", "detail-conv"],
+						["plan", "plan", "detail-plan"],
+						...(withTrace ? [["trace", "트레이스", "detail-trace"]] : []),
+					];
 	return tabs
 		.map(
 			([id, label, panel]) =>
@@ -2911,13 +2920,6 @@ export function renderDetailTabs(mode: "card" | "thread", selected: string): str
 
 /** herdr-web-ui's plan answer as a step list; nothing when the pane has no plan. Self-contained (shipped to the page). */
 export function renderPlan(body: unknown): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	const steps = (body as { plan?: { steps?: unknown } | null } | null)?.plan?.steps;
 	if (!Array.isArray(steps) || steps.length === 0) return "";
 	const WORDS: Record<string, [string, string]> = {
@@ -2940,13 +2942,6 @@ export function renderPlan(body: unknown): string {
  * string is escaped. Self-contained (shipped to the page).
  */
 export function renderConversation(body: unknown, agent: string, md: (text: string) => string, now: number): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	const answer = (body ?? {}) as { turns?: unknown; cursor?: unknown };
 	if (!Array.isArray(answer.turns)) return '<p class="block-note">대화를 읽지 못했어요</p>';
 	const more =
@@ -3034,13 +3029,6 @@ export function renderLiveTurn(
 	md: (text: string) => string,
 	state: { settling?: boolean; error?: string; fail?: string; elapsedMs?: number },
 ): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	if (state.error === "daemon_unreachable") {
 		return '<p class="turn-note live-down">데몬에 연결할 수 없어 실시간 내용을 못 받고 있어요</p>';
 	}
@@ -3109,10 +3097,10 @@ export function renderLiveTurn(
 }
 
 /** Where a number's change is bad news: a count that grew (`up`) or a remaining share that fell (`down`). */
-export type RollBad = "up" | "down";
+type RollBad = "up" | "down";
 
 /** One header number that changed between two draws. */
-export interface RollChange {
+interface RollChange {
 	key: string;
 	from: number;
 	to: number;
@@ -3154,7 +3142,7 @@ export function rollLabel(change: RollChange, bad: RollBad | undefined): { text:
 }
 
 /** An inbox card the owner should see arrive: a card not in the last draw, or one that moved to another column. */
-export interface FreshCard {
+interface FreshCard {
 	id: string;
 	kind: "card" | "task";
 	col: string;
@@ -3217,13 +3205,6 @@ export function expireStack(list: StackCard[], now: number, since: number, ttl: 
 
 /** The stack's cards as HTML (front card first, three shown) and its one-line announcement. Self-contained. */
 export function stackHtml(list: StackCard[]): { html: string; say: string } {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;")
-			.replace(/'/g, "&#39;");
 	const COLS: Record<string, string> = { attention: "확인 필요", working: "진행 중", wait: "완료·대기" };
 	const shown = list.slice(0, 3);
 	const cards = shown.map((card, i) => {
@@ -3292,6 +3273,7 @@ const TURN_LABELS = ${JSON.stringify(TURN_LABELS)};
 const JOB_LABELS = ${JSON.stringify(JOB_LABELS)};
 const MONITOR_STAGES = ${JSON.stringify(MONITOR_STAGES)};
 const APPROVAL_OUTCOMES = ${JSON.stringify(APPROVAL_OUTCOMES)};
+const esc = ${esc.toString()};
 const monitorTook = ${monitorTook.toString()};
 const gateText = ${gateText.toString()};
 const alertText = ${alertText.toString()};
@@ -3327,12 +3309,12 @@ const resetIn = ${resetIn.toString()};
 const renderDashboardMain = ${renderDashboardMain.toString()};
 const renderTaskFacts = ${renderTaskFacts.toString()};
 const renderFlowChain = ${renderFlowChain.toString()};
-const slackThreadHref = ${slackThreadHref.toString()};
 const discordThreadHref = ${discordThreadHref.toString()};
 const renderTaskDetail = ${renderTaskDetail.toString()};
 const renderDetailHead = ${renderDetailHead.toString()};
 const renderItemDetail = ${renderItemDetail.toString()};
 const renderMonitorDetail = ${renderMonitorDetail.toString()};
+const renderDiffDetail = ${renderDiffDetail.toString()};
 const renderDetailTabs = ${renderDetailTabs.toString()};
 const renderPlan = ${renderPlan.toString()};
 const renderConversation = ${renderConversation.toString()};
@@ -3348,6 +3330,8 @@ const pillMotion = ${pillMotion.toString()};
 const freshSteps = ${freshSteps.toString()};
 const renderMarkdown = ${renderMarkdown.toString()};
 const renderTrace = ${renderTrace.toString()};
+const flowDoing = ${flowDoing.toString()};
+const renderFlow = ${renderFlow.toString()};
 ${TRACE_CLIENT}
 function boot() {
 	const main = document.getElementById("main");
@@ -3370,7 +3354,7 @@ function boot() {
 	const stackBody = document.getElementById("es-body");
 	const stackSay = document.getElementById("es-say");
 	const boardOn = main.getAttribute("data-board") === "1";
-	const LABELS = { card: "카드 상세", task: "TASK 상세", item: "항목 상세" };
+	const LABELS = { card: "카드 상세", task: "TASK 상세", item: "항목 상세", diff: "변경 보기" };
 	let snapshot = null;
 	// The board the server drew the page with, so the first snapshot refresh does not redraw without it.
 	const seeded = boardOn ? document.getElementById("board-data") : null;
@@ -3380,10 +3364,14 @@ function boot() {
 	let tab = "head";
 	// The turn the 트레이스 tab shows when not the thread's last one (a 최근 턴 row, or the old one-turn address).
 	let traceTurn = null;
+	// Whether the open card's tab strip has the 트레이스 tab (only a local omp worker's does).
+	let cardTrace = false;
 	// The open thread's updatedAt and last turn as the snapshot last told them: a change reads its conversation again.
 	let threadSeen = "";
 	// The open monitor's \`api/monitor/detail\` answer as drawn by renderMonitorDetail; null while it is being read.
 	let monitorHtml = null;
+	// The open lane's or TASK's \`api/diff\` answer as drawn by renderDiffDetail; null while it is being read.
+	let diffHtml = null;
 	let drawnMain = "";
 	let drawnHead = "";
 	let loadedKey = null;
@@ -3517,7 +3505,7 @@ function boot() {
 		const view = query.get("view") || "inbox";
 		const layout = query.get("layout") === "list" ? "list" : "";
 		const stale = query.get("stale") === "1";
-		for (const kind of ["card", "task", "item"]) {
+		for (const kind of ["card", "task", "item", "diff"]) {
 			const id = query.get(kind);
 			if (id) return { view, layout, stale, open: { kind, id } };
 		}
@@ -3525,7 +3513,7 @@ function boot() {
 	};
 	const toUrl = (target) => {
 		const url = new URL(location.href);
-		for (const name of ["view", "layout", "stale", "card", "task", "item"]) url.searchParams.delete(name);
+		for (const name of ["view", "layout", "stale", "card", "task", "item", "diff"]) url.searchParams.delete(name);
 		if (ui.view !== "inbox") url.searchParams.set("view", ui.view);
 		if (ui.view === "turns" && ui.layout === "list") url.searchParams.set("layout", "list");
 		if (ui.stale && (ui.view === "inbox" || ui.view === "list")) url.searchParams.set("stale", "1");
@@ -3537,8 +3525,30 @@ function boot() {
 		const card = board && board.ok ? board.cards.find((item) => item.key === key) : undefined;
 		return card ? cardWithSay(snapshot, card) : undefined;
 	};
+	/** The open card runs omp on this machine: the only kind with a trace (the server answers the rest 404). */
+	const traceableCard = () => {
+		const card = !!open && open.kind === "card" ? cardOf(open.id) : undefined;
+		return !!card && card.local === true && card.agent === "omp";
+	};
+	/** A card's tab strip follows its board entry: the 트레이스 tab appears or goes with it. */
+	function syncCardTabs() {
+		if (!open || open.kind !== "card") return;
+		const want = traceableCard();
+		if (want === cardTrace) return;
+		cardTrace = want;
+		tabs.innerHTML = renderDetailTabs("card", tab, want);
+		if (!want && tab === "trace") setTab("head");
+	}
 	/** A turn-board conversation is open (any turns-view item but a background job). */
 	const threadOpen = () => !!open && open.kind === "item" && ui.view === "turns" && !open.id.startsWith("job:");
+	/** A background job detail is open (\`?view=turns&item=job:<name>\`). */
+	const jobOpen = () => !!open && open.kind === "item" && ui.view === "turns" && open.id.startsWith("job:");
+	const jobOf = (id) => {
+		if (!snapshot || !snapshot.jobs || !snapshot.jobs.ok) return undefined;
+		const name = id.slice(4);
+		return snapshot.jobs.items.find((item) => item.name === name);
+	};
+	const jobIsLive = (job) => !!job && job.state === "running" && job.health !== "dead";
 	/** The snapshot's thread by origin key, or the one holding inbound id \`id\` (the old one-turn address). */
 	const threadOf = (id) => {
 		if (!snapshot || !snapshot.turns.ok) return undefined;
@@ -3558,7 +3568,9 @@ function boot() {
 		snapshot && snapshot.tasks.ok ? snapshot.tasks.items.find((task) => task.taskId === id) : undefined;
 	const rowOf = (id) => {
 		for (const element of main.querySelectorAll("[data-row]")) {
-			if (element.getAttribute("data-row") === id) return element.matches("a") ? element : element.querySelector("a");
+			if (element.getAttribute("data-row") === id) {
+				return element.matches("a") ? element : element.querySelector("a[data-row-link]") || element.querySelector("a");
+			}
 		}
 		return null;
 	};
@@ -3567,7 +3579,7 @@ function boot() {
 		for (const element of main.querySelectorAll("[data-row]")) {
 			const closedDetails = element.closest("details:not([open])");
 			if (closedDetails) continue;
-			const link = element.matches("a") ? element : element.querySelector("a");
+			const link = element.matches("a") ? element : element.querySelector("a[data-row-link]") || element.querySelector("a");
 			if (link) out.push({ id: element.getAttribute("data-row"), link });
 		}
 		return out;
@@ -3831,11 +3843,10 @@ function boot() {
 		if (!snapshot || !snapshot.flows || !snapshot.flows.ok) return undefined;
 		return snapshot.flows.items.find((chain) => chain.tasks.some((step) => step.taskId === id));
 	}
-	/** The bar's 슬랙 스레드에서 답하기 / 디스코드에서 답하기 links follow the open conversation, on every tab. */
-	function syncSlack() {
+	/** The bar's 디스코드에서 답하기 link follows the open conversation, on every tab. */
+	function syncReplyLink() {
 		const thread = threadOpen() ? threadOf(open.id) : undefined;
 		const links = [
-			["detail-slack", thread && snapshot ? slackThreadHref(snapshot.slackTeam, thread.threadRef) : ""],
 			[
 				"detail-discord",
 				thread && snapshot ? discordThreadHref(snapshot.discordGuild, thread.originKey, thread.threadRef) : "",
@@ -3846,7 +3857,7 @@ function boot() {
 			if (!link) continue;
 			link.hidden = href === "";
 			if (href !== "") link.setAttribute("href", href);
-			// Only the Discord link leaves for another site (a new tab); \`slack://\` hands over to the app.
+			// Only the Discord link leaves for another site (a new tab).
 			if (href !== "" && id === "detail-discord") {
 				link.setAttribute("target", "_blank");
 				link.setAttribute("rel", "noopener noreferrer");
@@ -3859,12 +3870,12 @@ function boot() {
 		if (!barTitle) return;
 		const titleEl = document.getElementById("detail-title");
 		const text = open && titleEl ? (titleEl.textContent || "").trim() : "";
-		const tabbed = !!open && (open.kind === "card" || threadOpen());
+		const tabbed = !!open && (open.kind === "card" || threadOpen() || jobOpen());
 		barTitle.textContent = text;
 		barTitle.hidden = !tabbed || tab === "head" || text === "";
 	}
 	function drawDetail() {
-		syncSlack();
+		syncReplyLink();
 		if (!open) {
 			syncBarTitle();
 			return;
@@ -3872,6 +3883,7 @@ function boot() {
 		let html = null;
 		if (open.kind === "card") {
 			if (board === null) return;
+			syncCardTabs();
 			const card = cardOf(open.id);
 			html = renderDetailHead(
 				open.id,
@@ -3880,6 +3892,8 @@ function boot() {
 				Date.now(),
 				card && card.taskId ? chainOf(card.taskId) : undefined,
 			);
+		} else if (open.kind === "diff") {
+			html = diffHtml === null ? renderDiffDetail(open.id) : diffHtml;
 		} else if (snapshot) {
 			if (open.kind === "task") {
 				const card = board && board.ok ? board.cards.find((item) => item.taskId === open.id) : undefined;
@@ -3901,12 +3915,13 @@ function boot() {
 	function setTab(name) {
 		tab = name;
 		const card = !!open && open.kind === "card";
-		const tabbed = card || threadOpen();
+		const thread = threadOpen();
+		const tabbed = card || thread || jobOpen();
 		for (const button of tabs.querySelectorAll("[data-tab]")) {
 			button.setAttribute("aria-selected", String(button.getAttribute("data-tab") === name));
 		}
 		head.hidden = tabbed && name !== "head";
-		conv.hidden = !tabbed || name !== "conv";
+		conv.hidden = !(card || thread) || name !== "conv";
 		plan.hidden = !card || name !== "plan";
 		detail.scrollTop = name === "conv" ? detail.scrollHeight : 0;
 		syncBarTitle();
@@ -4095,9 +4110,34 @@ function boot() {
 		monitorHtml = renderMonitorDetail(body);
 		drawDetail();
 	}
+	/** Reads the open lane's or TASK's change (\`api/diff\`) into its panel. */
+	async function loadDiff(id) {
+		const mine = generation;
+		const at = id.indexOf(":");
+		const kind = id.slice(0, at);
+		let body;
+		try {
+			if (kind !== "lane" && kind !== "task") throw new Error("lane:<이름> 또는 task:<id>만 열 수 있어요");
+			const query = new URLSearchParams();
+			query.set(kind, id.slice(at + 1));
+			const response = await fetch("api/diff?" + query.toString(), { cache: "no-store" });
+			body = await response.json();
+			if (!response.ok && !(body && body.error)) body = { error: "HTTP " + response.status };
+		} catch (error) {
+			body = { error: error && error.message ? error.message : String(error) };
+		}
+		if (mine !== generation) return;
+		diffHtml = renderDiffDetail(id, body);
+		drawDetail();
+	}
 	/** Starts reading the open card's pane once the board has it, the open conversation's session, or a monitor's detail. */
 	function sync() {
 		if (!open || loadedKey === open.id) return;
+		if (open.kind === "diff") {
+			loadedKey = open.id;
+			loadDiff(open.id);
+			return;
+		}
 		if (threadOpen()) {
 			// The old one-turn address waits for the snapshot to name its conversation.
 			if (/^\\d+$/.test(open.id)) return;
@@ -4160,15 +4200,22 @@ function boot() {
 		paged = false;
 		drawnHead = "";
 		monitorHtml = null;
+		diffHtml = null;
 		const thread = threadOpen();
+		const job = jobOpen();
 		traceTurn = thread && /^\\d+$/.test(open.id) ? open.id : null;
 		adoptOldTurn();
 		detail.hidden = !open;
 		detail.classList.toggle("is-open", !!open);
 		detail.setAttribute("aria-label", LABELS[open ? open.kind : "card"]);
 		document.body.classList.toggle("detail-open", !!open);
-		tabs.hidden = !open || (open.kind !== "card" && !thread);
-		tabs.innerHTML = renderDetailTabs(thread ? "thread" : "card", thread ? (traceTurn ? "trace" : "conv") : "head");
+		tabs.hidden = !open || (open.kind !== "card" && !thread && !job);
+		cardTrace = traceableCard();
+		tabs.innerHTML = renderDetailTabs(
+			thread ? "thread" : job ? "job" : "card",
+			thread ? (traceTurn ? "trace" : "conv") : "head",
+			cardTrace,
+		);
 		const back = toUrl(null);
 		closer.setAttribute("href", back.search || "./");
 		plan.replaceChildren();
@@ -4186,8 +4233,39 @@ function boot() {
 		const title = document.getElementById("detail-title");
 		if (title) title.focus({ preventScroll: true });
 	}
-	/** A conversation's 트레이스 tab carries the waterfall of its last (or chosen) turn and widens the panel. */
+	const CARD_TRACE_NOTES = {
+		no_session: "이 워커의 omp 세션을 찾지 못했습니다",
+		unsupported_card: "이 카드는 트레이스를 지원하지 않습니다",
+		unknown_pane: "이 카드는 더 이상 보드에 없습니다",
+		trace_disabled: "이 대시보드는 트레이스를 켜지 않았습니다",
+		board_disabled: "이 대시보드는 에이전트 보드를 켜지 않았습니다",
+	};
+	const JOB_TRACE_NOTES = {
+		no_session: "이 작업의 omp 세션을 찾지 못했습니다",
+		unknown_job: "이 작업은 더 이상 목록에 없습니다",
+		invalid_name: "작업 이름이 올바르지 않습니다",
+		trace_disabled: "이 대시보드는 트레이스를 켜지 않았습니다",
+	};
+	/** A conversation's 트레이스 tab carries the waterfall of its last (or chosen) turn and widens the panel; a local omp worker card's or job's, its last turn. */
 	function syncTrace() {
+		const onCard = !!open && open.kind === "card" && tab === "trace" && cardTrace;
+		if (onCard) {
+			document.body.classList.add("detail-trace");
+			const card = cardOf(open.id);
+			return trace.open("card:" + open.id, card ? card.paneLabel : "", {
+				url: "api/pane/trace?card=" + encodeURIComponent(open.id),
+				notes: CARD_TRACE_NOTES,
+			});
+		}
+		if (jobOpen() && tab === "trace") {
+			document.body.classList.add("detail-trace");
+			const job = jobOf(open.id);
+			const name = open.id.slice(4);
+			return trace.open(open.id, job ? job.title : name, {
+				url: "api/job/trace?name=" + encodeURIComponent(name),
+				notes: JOB_TRACE_NOTES,
+			});
+		}
 		const on = threadOpen() && tab === "trace";
 		document.body.classList.toggle("detail-trace", on);
 		const thread = on ? threadOf(open.id) : undefined;
@@ -4630,9 +4708,9 @@ function boot() {
 		}
 		if ((event.key === "ArrowLeft" || event.key === "ArrowRight") && event.target instanceof Element && event.target.matches("button[data-tab]")) {
 			event.preventDefault();
-			const order = ["head", "conv", threadOpen() ? "trace" : "plan"];
+			const order = Array.from(tabs.querySelectorAll("[data-tab]")).map((button) => button.getAttribute("data-tab"));
 			const idx = order.indexOf(tab);
-			const next = order[(idx + (event.key === "ArrowRight" ? 1 : 2)) % 3];
+			const next = order[(idx + (event.key === "ArrowRight" ? 1 : order.length - 1)) % order.length];
 			setTab(next);
 			const btn = tabs.querySelector('[data-tab="' + next + '"]');
 			if (btn) btn.focus();
@@ -4652,6 +4730,7 @@ function boot() {
 		if (moved) drawMain(true);
 	});
 	async function refresh() {
+		const wasJobLive = jobOpen() && jobIsLive(jobOf(open.id));
 		try {
 			snapshot = await getSnapshot();
 			adoptOldTurn();
@@ -4663,6 +4742,7 @@ function boot() {
 			syncLive();
 			// A ?view=turns&item= deep link starts its waterfall here, and the root row picks up the request line.
 			syncTrace();
+			if (jobOpen() && tab === "trace" && (wasJobLive || jobIsLive(jobOf(open.id)))) trace.reload();
 			stale.hidden = true;
 			updateTabSignal();
 		} catch (error) {
@@ -4712,9 +4792,13 @@ function boot() {
 	if (boardOn) {
 		const events = new EventSource("api/board/events");
 		events.addEventListener("snapshot", (event) => {
+			const before = open && open.kind === "card" ? cardOf(open.id) : undefined;
 			board = JSON.parse(event.data);
 			drawMain(false);
 			drawDetail();
+			// A status move (working → done) ends the live trace: read it once more so no span stays running.
+			const after = open && open.kind === "card" ? cardOf(open.id) : undefined;
+			if (before && after && before.status !== after.status && tab === "trace" && cardTrace) trace.reload();
 			sync();
 			updateTabSignal();
 		});
@@ -4734,6 +4818,8 @@ export interface DashboardPageOptions {
 	task?: string;
 	/** `?item=` of the request: the detail panel starts open on that row of the view. */
 	item?: string;
+	/** `?diff=` of the request (`lane:<name>` or `task:<id>`): the detail panel starts open on that change. */
+	diff?: string;
 	/** `?layout=` of the request (`list`: the turns view as a table). */
 	layout?: string;
 	/** `?stale=` of the request (`1`: the inbox and list show 방치 panes only). */
@@ -4742,7 +4828,7 @@ export interface DashboardPageOptions {
 
 /** The whole page: first render on the server (readable without JavaScript), then the inline script. */
 export function renderDashboardPage(snapshot: DashboardSnapshot, options: DashboardPageOptions = {}): string {
-	const { board, view, card, task, item, layout, stale } = options;
+	const { board, view, card, task, item, diff, layout, stale } = options;
 	const live = board?.ok === true ? board : undefined;
 	const tasks = snapshot.tasks.ok ? snapshot.tasks.items : [];
 	const open =
@@ -4752,7 +4838,9 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 				? { kind: "task" as const, id: task }
 				: item !== undefined
 					? { kind: "item" as const, id: item }
-					: undefined;
+					: diff !== undefined
+						? { kind: "diff" as const, id: diff }
+						: undefined;
 	const chainOf = (id: string | undefined): FlowChainInfo | undefined =>
 		id === undefined || !snapshot.flows?.ok
 			? undefined
@@ -4773,15 +4861,24 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 		);
 	} else if (open?.kind === "item") {
 		headHtml = renderItemDetail(snapshot, view ?? "inbox", open.id);
+	} else if (open?.kind === "diff") {
+		headHtml = renderDiffDetail(open.id);
 	}
 	const label =
-		open === undefined || open.kind === "card" ? "카드 상세" : open.kind === "task" ? "TASK 상세" : "항목 상세";
+		open === undefined || open.kind === "card"
+			? "카드 상세"
+			: open.kind === "task"
+				? "TASK 상세"
+				: open.kind === "diff"
+					? "변경 보기"
+					: "항목 상세";
 	const turnsList = view === "turns" && layout === "list";
 	const back =
 		view !== undefined && /^(list|turns|flow|lanes|approvals|monitors|alerts|system)$/.test(view)
 			? `?view=${view}${turnsList ? "&amp;layout=list" : ""}`
 			: "./";
-	// A turn-board conversation: tabs 개요/대화/트레이스, 대화 first; the old one-turn address opens on 트레이스.
+	// A turn-board conversation: tabs 개요/대화/트레이스, 대화 first; the old one-turn address opens on 트레이스. A job opens on 개요/트레이스.
+	const jobDetail = open?.kind === "item" && view === "turns" && open.id.startsWith("job:");
 	const thread = open?.kind === "item" && view === "turns" && !open.id.startsWith("job:");
 	const oldTurn = thread && /^\d+$/.test(open.id);
 	const found =
@@ -4790,8 +4887,7 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 				? snapshot.turns.threads.find((entry) => entry.recent.some((turn) => String(turn.inboundId) === open.id))
 				: snapshot.turns.threads.find((entry) => entry.originKey === open.id)
 			: undefined;
-	const tab = open?.kind === "card" ? "head" : thread ? (oldTurn ? "trace" : "conv") : undefined;
-	const slackHref = found === undefined ? "" : slackThreadHref(snapshot.slackTeam, found.threadRef);
+	const tab = open?.kind === "card" || jobDetail ? "head" : thread ? (oldTurn ? "trace" : "conv") : undefined;
 	const discordHref =
 		found === undefined ? "" : discordThreadHref(snapshot.discordGuild, found.originKey, found.threadRef);
 	const barTitle = /<h2 class="detail-title"[^>]*>([\s\S]*?)<\/h2>/.exec(headHtml)?.[1] ?? "";
@@ -4813,7 +4909,7 @@ export function renderDashboardPage(snapshot: DashboardSnapshot, options: Dashbo
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
 <meta name="theme-color" content="#FFFFFF" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#15181D" media="(prefers-color-scheme: dark)">
-<style>${STYLE}</style>
+<style>${STYLE}.card-thread{position:relative}.card-link{display:flex;flex-direction:column;gap:var(--sp-1);min-width:0}.card-link::after{content:"";position:absolute;inset:0;border-radius:var(--r-m)}.card-job{position:relative;z-index:1}.card-job:hover{text-decoration:underline}</style>
 </head>
 <body${open === undefined ? "" : tab === "trace" ? ' class="detail-open detail-trace"' : ' class="detail-open"'}>
 <div class="shell">
@@ -4824,14 +4920,13 @@ ${renderDashboardMain(snapshot, board, undefined, ui)}
 ${open === undefined ? `<aside id="detail" class="detail" aria-label="${label}" hidden>` : `<aside id="detail" class="detail is-open" aria-label="${label}">`}
 <div class="detail-bar"><span id="detail-bar-title" class="detail-bar-title"${
 		tab === undefined || tab === "head" || barTitle === "" ? " hidden" : ""
-	}>${barTitle}</span><a id="detail-slack" class="button is-ghost detail-slack" href="${slackHref.replace(/&/g, "&amp;")}"${
-		slackHref === "" ? " hidden" : ""
-	}>슬랙 스레드에서 답하기</a><a id="detail-discord" class="button is-ghost detail-slack" href="${discordHref}"${
+	}>${barTitle}</span><a id="detail-discord" class="button is-ghost detail-reply" href="${discordHref}"${
 		discordHref === "" ? " hidden" : ' target="_blank" rel="noopener noreferrer"'
 	}>디스코드에서 답하기</a><a class="detail-close" href="${back}" data-close>닫기 <kbd>Esc</kbd></a></div>
 <div id="detail-tabs" class="tabs" role="tablist" aria-label="상세 보기"${tab === undefined ? " hidden" : ""}>${renderDetailTabs(
-		thread ? "thread" : "card",
+		thread ? "thread" : jobDetail ? "job" : "card",
 		tab ?? "head",
+		open?.kind === "card" && live?.cards.some((entry) => entry.key === open.id && entry.local && entry.agent === "omp"),
 	)}</div>
 <div id="detail-head" role="tabpanel" aria-labelledby="tab-head"${tab === undefined || tab === "head" ? "" : " hidden"}>${headHtml}</div>
 <section id="detail-plan" role="tabpanel" aria-labelledby="tab-plan" hidden></section>

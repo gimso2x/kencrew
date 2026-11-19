@@ -2,6 +2,7 @@ import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { DiscordChannelConfig } from "../src/config";
 import { openBotStore } from "../src/core/origin";
 import { Daemon, PENDING_ALERT_AFTER } from "../src/daemon/daemon";
 import { classifyLaneControl } from "../src/lanes/control";
@@ -14,9 +15,16 @@ import type { OmpState } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { collectGates, LANE_STUCK_MS, ORIGIN_SILENT_MS } from "../src/ops/gates";
 import { redact } from "../src/redact";
-import { SlackBinding } from "../src/slack/binding";
-import { SlackChannel } from "../src/slack/channel";
-import { makeHome, OWNER, type TestHome, WaitingTransport } from "./helpers/bot-home";
+import {
+	CHANNEL,
+	discordBinding,
+	GUILD,
+	makeHome,
+	OWNER,
+	OWNER_DM,
+	type TestHome,
+	WaitingDiscordTransport,
+} from "./helpers/bot-home";
 import { git, makeRepo } from "./helpers/git-fixtures";
 import { LANE_START, laneHarness, removeRepoAndWorktrees } from "./helpers/lane-harness";
 
@@ -116,14 +124,15 @@ describe("classifyLaneControl: exact phrase match only (AC-1)", () => {
 describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, AC-7)", () => {
 	let daemons: Daemon[];
 	let drivers: Map<string, FakeOmpDriver>;
-	let transport: WaitingTransport;
+	let transport: WaitingDiscordTransport;
 	let sessions: FakeSessionStore;
 	let logs: string[];
 
 	beforeEach(() => {
 		daemons = [];
 		drivers = new Map();
-		transport = new WaitingTransport();
+		transport = new WaitingDiscordTransport();
+		transport.setChannel({ id: CHANNEL, type: 0, guildId: GUILD });
 		sessions = new FakeSessionStore();
 		logs = [];
 	});
@@ -136,10 +145,13 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 		options: { hold?: boolean; pendingRetryMs?: number; clock?: { now(): number } } = {},
 	): Promise<Daemon> {
 		const daemon = new Daemon({
-			config: home.config,
+			config: {
+				...home.config,
+				channels: { discord: { ...(home.config.channels.discord as DiscordChannelConfig), laneChannelId: CHANNEL } },
+			},
 			...(options.pendingRetryMs === undefined ? {} : { pendingRetryMs: options.pendingRetryMs }),
 			...(options.clock === undefined ? {} : { clock: options.clock }),
-			channels: [new SlackBinding(new SlackChannel(transport))],
+			channels: [discordBinding(transport)],
 			log: createLogger({ sink: (line) => logs.push(line), clock, redact }),
 			ompVersion: "omp-test 0",
 			bootId: "boot",
@@ -159,21 +171,13 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 		return daemon;
 	}
 
-	const ownerMessage = (text: string, ts: string, threadTs: string) =>
-		transport.emitMessage({
-			type: "message",
-			channel: "D1",
-			channel_type: "im",
-			user: OWNER,
-			text,
-			ts,
-			thread_ts: threadTs,
-		});
+	const ownerMessage = (content: string, id: string, rootId: string) =>
+		transport.emitMessage({ id, channel_id: rootId, guild_id: GUILD, author: { id: OWNER }, content, type: 0 });
 
 	/** A lane whose first turn is held (the daemon's fake omp keeps it running until aborted). */
-	async function heldLane(title: string, daemon: Daemon): Promise<{ lane: LaneRow; rootTs: string }> {
+	async function heldLane(title: string, daemon: Daemon): Promise<{ lane: LaneRow; rootId: string }> {
 		const repo = makeRepo(repos);
-		await daemon.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: ${title} @${repo}` });
+		await daemon.inject({ origin: `discord/dm/${OWNER_DM}`, asOwner: true, text: `작업: ${title} @${repo}` });
 		await transport.waitForPosts((text) => text.includes(`작업 레인 \`${title}\`을 시작했습니다`));
 		const root = transport.posts((text) => text === `🔄 ${title}`)[0];
 		expect(root).toBeDefined();
@@ -183,18 +187,18 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 		);
 		const lane = daemon.store.getLane(title);
 		expect(lane?.status).toBe("working");
-		return { lane: lane as LaneRow, rootTs: root?.ts ?? "" };
+		return { lane: lane as LaneRow, rootId: root?.id ?? "" };
 	}
 
 	test("`멈춰` in a running lane settles as `lane:` without reaching omp; the turn aborts once; the answer reports the re-read state (AC-2)", async () => {
 		const daemon = await startDaemon({ hold: true });
-		const { lane, rootTs } = await heldLane("pause-me", daemon);
+		const { lane, rootId } = await heldLane("pause-me", daemon);
 		const origin = lane.originKey;
 
-		await ownerMessage("멈춰", "1900000000.000100", rootTs);
+		await ownerMessage("멈춰", "7100000000000000100", rootId);
 		await transport.waitForPosts((text) => text.includes("멈췄습니다"));
 
-		const row = daemon.store.getInbound("D1:1900000000.000100");
+		const row = daemon.store.getInbound(`${CHANNEL}:7100000000000000100`);
 		expect(row).toMatchObject({ originKey: origin, state: "answered" });
 		expect(row?.opRef).toStartWith("lane:");
 		const after = daemon.store.getLane("pause-me");
@@ -218,15 +222,15 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 
 	test("a held lane's owner messages stay pending with exactly one notice, and survive a daemon restart (AC-4, AC-5)", async () => {
 		const first = await startDaemon({ hold: true });
-		const { lane, rootTs } = await heldLane("hold-it", first);
-		await ownerMessage("멈춰", "1900000000.000100", rootTs);
+		const { lane, rootId } = await heldLane("hold-it", first);
+		await ownerMessage("멈춰", "7100000000000000100", rootId);
 		await transport.waitForPosts((text) => text.includes("멈췄습니다"));
 
-		await ownerMessage("이거 확인해줘", "1900000000.000200", rootTs);
-		await ownerMessage("그리고 이것도", "1900000000.000300", rootTs);
+		await ownerMessage("이거 확인해줘", "7100000000000000200", rootId);
+		await ownerMessage("그리고 이것도", "7100000000000000300", rootId);
 		await until(() => transport.posts((text) => text.includes("전달하지 않았습니다")).length >= 1);
-		expect(first.store.getInbound("D1:1900000000.000200")?.state).toBe("pending");
-		expect(first.store.getInbound("D1:1900000000.000300")?.state).toBe("pending");
+		expect(first.store.getInbound(`${CHANNEL}:7100000000000000200`)?.state).toBe("pending");
+		expect(first.store.getInbound(`${CHANNEL}:7100000000000000300`)?.state).toBe("pending");
 		expect(transport.posts((text) => text.includes("전달하지 않았습니다"))).toHaveLength(1);
 		expect(drivers.get(lane.originKey)?.calls.filter((call) => call.startsWith("steer:"))).toHaveLength(0);
 
@@ -234,11 +238,11 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 		await first.stop();
 		const second = await startDaemon({ hold: true });
 		expect(second.store.getLane("hold-it")?.status).toBe("paused");
-		expect(second.store.getInbound("D1:1900000000.000200")?.state).toBe("pending");
-		expect(second.store.getInbound("D1:1900000000.000300")?.state).toBe("pending");
+		expect(second.store.getInbound(`${CHANNEL}:7100000000000000200`)?.state).toBe("pending");
+		expect(second.store.getInbound(`${CHANNEL}:7100000000000000300`)?.state).toBe("pending");
 
 		// `계속` delivers the held owner messages into a fresh turn of the same lane session.
-		await ownerMessage("계속", "1900000000.000400", rootTs);
+		await ownerMessage("계속", "7100000000000000400", rootId);
 		await transport.waitForPosts((text) => text.includes("재개했습니다"));
 		expect(second.store.getLane("hold-it")?.status).toBe("working");
 		await until(() =>
@@ -246,23 +250,23 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 				call.includes("이거 확인해줘"),
 			),
 		);
-		expect(second.store.getInbound("D1:1900000000.000200")?.state).toBe("dispatched");
-		expect(second.store.getInbound("D1:1900000000.000300")?.state).toBe("dispatched");
+		expect(second.store.getInbound(`${CHANNEL}:7100000000000000200`)?.state).toBe("dispatched");
+		expect(second.store.getInbound(`${CHANNEL}:7100000000000000300`)?.state).toBe("dispatched");
 		const answer = second.store
 			.listDeliveries({ originKey: lane.originKey })
-			.find((delivery) => delivery.opRef === second.store.getInbound("D1:1900000000.000400")?.opRef);
+			.find((delivery) => delivery.opRef === second.store.getInbound(`${CHANNEL}:7100000000000000400`)?.opRef);
 		expect(answer?.body).toContain("재개했습니다");
 	});
 
 	test("a held message is a deliberate wait: no stuck-dispatch alert from the sweep, no origin_silent gate (AC-4)", async () => {
 		let now = Date.now();
 		const daemon = await startDaemon({ hold: true, pendingRetryMs: 1, clock: { now: () => now } });
-		const { rootTs } = await heldLane("quiet-hold", daemon);
-		await ownerMessage("멈춰", "1900000000.000100", rootTs);
+		const { rootId } = await heldLane("quiet-hold", daemon);
+		await ownerMessage("멈춰", "7100000000000000100", rootId);
 		await transport.waitForPosts((text) => text.includes("멈췄습니다"));
-		await ownerMessage("이거 확인해줘", "1900000000.000200", rootTs);
+		await ownerMessage("이거 확인해줘", "7100000000000000200", rootId);
 		await until(() => transport.posts((text) => text.includes("전달하지 않았습니다")).length === 1);
-		expect(daemon.store.getInbound("D1:1900000000.000200")?.state).toBe("pending");
+		expect(daemon.store.getInbound(`${CHANNEL}:7100000000000000200`)?.state).toBe("pending");
 
 		// More sweeps than the alert threshold, each past the retry interval.
 		for (let i = 0; i < PENDING_ALERT_AFTER + 2; i++) {
@@ -271,7 +275,7 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 			// Let a retry's settle (resumePending → count → notice) run before the next sweep.
 			for (let turn = 0; turn < 50; turn++) await Promise.resolve();
 		}
-		expect(daemon.store.getInbound("D1:1900000000.000200")?.state).toBe("pending");
+		expect(daemon.store.getInbound(`${CHANNEL}:7100000000000000200`)?.state).toBe("pending");
 		expect(transport.posts((text) => text.includes("보내지 못하고"))).toHaveLength(0);
 		// Logged synchronously when the retry streak alerts: absent means no retry was counted at all.
 		expect(logs.some((line) => line.includes("event=pending_dispatch_notified"))).toBe(false);
@@ -283,15 +287,21 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 
 	test("the ▶ 재개 button resumes a paused lane from the status message (AC-5)", async () => {
 		const daemon = await startDaemon({ hold: true });
-		const { lane, rootTs } = await heldLane("button-resume", daemon);
-		await ownerMessage("멈춰", "1900000000.000100", rootTs);
+		const { lane, rootId } = await heldLane("button-resume", daemon);
+		await ownerMessage("멈춰", "7100000000000000100", rootId);
 		await transport.waitForPosts((text) => text.includes("멈췄습니다"));
 
-		await transport.emitBlockAction({
-			user: { id: OWNER },
-			channel: { id: "D1" },
-			message: { ts: lane.meta.statusTs ?? "" },
-			actions: [{ action_id: `ompbot:lane:resume:${lane.name}`, value: lane.name }],
+		const interactionId = "7200000000000000001";
+		await transport.emitInteraction({
+			id: interactionId,
+			application_id: "600000000000000000",
+			type: 3,
+			token: `token-${interactionId}`,
+			channel_id: rootId,
+			guild_id: GUILD,
+			member: { user: { id: OWNER } },
+			data: { custom_id: `ompbot:lane:resume:${lane.name}`, component_type: 2 },
+			message: { id: lane.meta.statusTs ?? "", channel_id: rootId },
 		});
 		await transport.waitForPosts((text) => text.includes("재개했습니다"));
 		expect(daemon.store.getLane("button-resume")?.status).toBe("working");
@@ -301,7 +311,7 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 	test("`멈춰` on a closed lane with a pending landing holds only the auto-merge; `머지해` still lands (AC-7)", async () => {
 		const repo = makeRepo(repos);
 		const daemon = await startDaemon();
-		await daemon.inject({ origin: "slack/dm/D1", asOwner: true, text: `작업: hold-merge @${repo}` });
+		await daemon.inject({ origin: `discord/dm/${OWNER_DM}`, asOwner: true, text: `작업: hold-merge @${repo}` });
 		await transport.waitForPosts((text) => text.includes("작업 레인 `hold-merge`을 시작했습니다"));
 		await transport.waitForPosts((text) => text.startsWith("ECHO ulw explore"));
 		const lane = daemon.store.getLane("hold-merge");
@@ -323,7 +333,7 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 		expect(daemon.store.getLane("hold-merge")?.status).toBe("closed");
 		expect(daemon.store.getLane("hold-merge")?.meta.land?.state).toBe("pending");
 
-		await ownerMessage("멈춰", "1900000000.000100", root?.ts ?? "");
+		await ownerMessage("멈춰", "7100000000000000100", root?.id ?? "");
 		await transport.waitForPosts((text) => text.includes("자동 머지"));
 		const held = daemon.store.getLane("hold-merge");
 		expect(held?.status).toBe("closed"); // never paused
@@ -332,7 +342,7 @@ describe("lanes inside the daemon: pause settles in the core (AC-2, AC-4, AC-5, 
 			"오너 멈춤",
 		);
 
-		await ownerMessage("머지해", "1900000000.000200", root?.ts ?? "");
+		await ownerMessage("머지해", "7100000000000000200", root?.id ?? "");
 		await transport.waitForPosts((text) => text.includes("머지했습니다"));
 		const landed = daemon.store.getLane("hold-merge");
 		expect(landed?.meta.land?.state).toBe("landed");
@@ -351,7 +361,7 @@ describe("pause outcome is the re-read state (manager, AC-3)", () => {
 			},
 		});
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "never-settled", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "never-settled", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		const driver = neverSettled.get(lane.originKey);
 		expect(driver).toBeDefined();
@@ -389,7 +399,7 @@ describe("while paused, every autonomous action is held (manager, AC-4)", () => 
 			},
 		});
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "quiet", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "quiet", cwd: repo, channel: CHANNEL });
 		await h.settle();
 
 		await h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "a".repeat(40), summary: "x" });
@@ -403,7 +413,7 @@ describe("while paused, every autonomous action is held (manager, AC-4)", () => 
 
 		const statusTs = h.store.getLane(lane.name)?.meta.statusTs ?? "";
 		const editsOf = () =>
-			h.transport.calls.filter((call) => call.method === "updateMessage" && call.ts === statusTs).length;
+			h.transport.calls.filter((call) => call.method === "editMessage" && call.messageId === statusTs).length;
 		const editsBefore = editsOf();
 		h.advance(PROGRESS_INTERVAL_MS + 60_000);
 		h.advance(CLAIM_GRACE_MS + 60_000);
@@ -434,7 +444,7 @@ describe("while paused, every autonomous action is held (manager, AC-4)", () => 
 		const gate = Promise.withResolvers<VerifyResult>();
 		const h = laneHarness(home.dir, { verify: async () => gate.promise });
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "late-notdone", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "late-notdone", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		const settled = h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "a".repeat(40), summary: "x" });
 		void settled;
@@ -456,7 +466,7 @@ describe("while paused, every autonomous action is held (manager, AC-4)", () => 
 	test("the lane tools answer a paused notice and record nothing", async () => {
 		const h = laneHarness(home.dir);
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "tools-held", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "tools-held", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		await h.manager.pause(lane.name, "owner-message");
 		await h.settle();
@@ -481,7 +491,7 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 	test("working: held owner messages go out only at resume; nothing else unpause (tick, tools)", async () => {
 		const h = laneHarness(home.dir);
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "resume-working", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "resume-working", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		await h.manager.pause(lane.name, "owner-message");
 		await h.settle();
@@ -490,12 +500,12 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 
 		h.store.recordInbound({
 			originKey: lane.originKey,
-			platformMessageId: "D1:1900000000.000900",
+			platformMessageId: `${CHANNEL}:7100000000000000900`,
 			textRef: "늦게 온 지시",
 			threadRef: lane.threadRef,
 		});
 		await h.settle();
-		expect(h.store.getInbound("D1:1900000000.000900")?.state).toBe("pending");
+		expect(h.store.getInbound(`${CHANNEL}:7100000000000000900`)?.state).toBe("pending");
 
 		// Neither the tick nor the lane tools lift the pause.
 		await h.manager.tick();
@@ -512,7 +522,7 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 		expect(h.store.getLane(lane.name)?.meta.pausedAt).toBeUndefined();
 		expect(h.prompts(lane.originKey).some((text) => text.includes("늦게 온 지시"))).toBe(true);
 		expect(h.steers(lane.originKey).some((text) => text.includes("오너가 재개했습니다"))).toBe(true);
-		expect(h.store.getInbound("D1:1900000000.000900")?.state).toBe("dispatched");
+		expect(h.store.getInbound(`${CHANNEL}:7100000000000000900`)?.state).toBe("dispatched");
 		h.close();
 	});
 
@@ -520,7 +530,7 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 		const gate = Promise.withResolvers<VerifyResult>();
 		const h = laneHarness(home.dir, { verify: async () => gate.promise });
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "resume-claim", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "resume-claim", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		const settled = h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "d".repeat(40), summary: "x" });
 		void settled;
@@ -548,7 +558,7 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 		const gate = Promise.withResolvers<VerifyResult>();
 		const h = laneHarness(home.dir, { verify: async () => gate.promise });
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "resume-answered", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "resume-answered", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		const settled = h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "e".repeat(40), summary: "x" });
 		void settled;
@@ -557,7 +567,7 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 		await h.settle();
 		h.store.recordInbound({
 			originKey: lane.originKey,
-			platformMessageId: "D1:1900000000.000950",
+			platformMessageId: `${CHANNEL}:7100000000000000950`,
 			textRef: "아직 아니야, 이것도 고쳐",
 			threadRef: lane.threadRef,
 		});
@@ -578,7 +588,7 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 		const state: { value: { since: string; reason: string; by: string } | undefined } = { value: undefined };
 		const h = laneHarness(home.dir, { frozen: () => state.value });
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "resume-frozen", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "resume-frozen", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		await h.manager.pause(lane.name, "owner-message");
 		await h.settle();
@@ -598,11 +608,11 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 		const h = laneHarness(home.dir);
 		const repo = makeRepo(repos);
 		// Both starts have picked their name before either row exists: the status posts wait for each other.
-		const post = h.transport.postMessage.bind(h.transport);
+		const post = h.transport.createMessage.bind(h.transport);
 		const both = Promise.withResolvers<void>();
 		let statusPosts = 0;
-		h.transport.postMessage = async (args) => {
-			if (args.text.startsWith("⏳")) {
+		h.transport.createMessage = async (args) => {
+			if (args.content?.startsWith("⏳")) {
 				statusPosts += 1;
 				if (statusPosts === 2) both.resolve();
 				await both.promise;
@@ -610,8 +620,8 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 			return post(args);
 		};
 		const [a, b] = await Promise.all([
-			h.manager.start({ title: "twin", cwd: repo, channel: "D1" }),
-			h.manager.start({ title: "twin", cwd: repo, channel: "D1" }),
+			h.manager.start({ title: "twin", cwd: repo, channel: CHANNEL }),
+			h.manager.start({ title: "twin", cwd: repo, channel: CHANNEL }),
 		]);
 		await h.settle();
 		expect(a.name).not.toBe(b.name);
@@ -623,7 +633,7 @@ describe("resume returns to pausedFrom and delivers the held messages (manager, 
 	test("resume on a lane that is not paused changes nothing", async () => {
 		const h = laneHarness(home.dir);
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "not-paused", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "not-paused", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		const outcome = await h.manager.resume(lane.name, "owner-message");
 		expect(outcome.handled).toBe(false);
@@ -636,7 +646,7 @@ describe("a held lane that starts working again is stopped once (AC-6)", () => {
 	test("tool_execution_start outside a turn: one warning in the thread and the abort retries", async () => {
 		const h = laneHarness(home.dir);
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "held-work", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "held-work", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		await h.manager.pause(lane.name, "owner-message");
 		await h.settle();
@@ -698,7 +708,7 @@ describe("the lanes CHECK constraint and the stuck gate (AC-8)", () => {
 			updated_at INTEGER NOT NULL
 		)`);
 		raw.run(
-			"INSERT INTO lanes (name, title, thread_ref, origin_key, cwd, session_dir, status, history, meta, created_at, updated_at) VALUES ('old', '옛 레인', 'D1:1', 'ompbot/work/old', '/tmp/x', '/tmp/x', 'working', '[]', '{}', 1, 1)",
+			"INSERT INTO lanes (name, title, thread_ref, origin_key, cwd, session_dir, status, history, meta, created_at, updated_at) VALUES ('old', '옛 레인', '300000000000000001:900000000000000001', 'ompbot/work/old', '/tmp/x', '/tmp/x', 'working', '[]', '{}', 1, 1)",
 		);
 		raw.close();
 
@@ -713,7 +723,7 @@ describe("the lanes CHECK constraint and the stuck gate (AC-8)", () => {
 	test("the lanes_stuck gate does not count a paused lane, however long it sits", async () => {
 		const h = laneHarness(home.dir);
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "gate-paused", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "gate-paused", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		// The gate reads the harness clock's future: two days after the lane's last activity.
 		const later = LANE_START + 2 * LANE_STUCK_MS;
@@ -730,30 +740,30 @@ describe("the pause/resume buttons ride the status message (AC-5)", () => {
 	test("working shows ⏸ 멈춤, paused shows the ⏸ text and ▶ 재개", async () => {
 		const h = laneHarness(home.dir);
 		const repo = makeRepo(repos);
-		const lane = await h.manager.start({ title: "button-view", cwd: repo, channel: "D1" });
+		const lane = await h.manager.start({ title: "button-view", cwd: repo, channel: CHANNEL });
 		await h.settle();
 		const statusTs = h.store.getLane(lane.name)?.meta.statusTs ?? "";
 		const lastStatus = () => {
-			const call = h.transport.calls.findLast((call) => call.method === "updateMessage" && call.ts === statusTs);
-			return call?.method === "updateMessage" ? call : undefined;
+			const call = h.transport.calls.findLast((call) => call.method === "editMessage" && call.messageId === statusTs);
+			return call?.method === "editMessage" ? call : undefined;
 		};
 
 		// The working status message (a post at the start, then edits) carries the pause button.
-		const working = h.transport.posts().find((post) => post.ts === statusTs);
-		expect(working?.text).toContain("⏳ button-view");
-		expect(JSON.stringify(working?.blocks ?? [])).toContain(`ompbot:lane:pause:${lane.name}`);
+		const working = h.transport.posts().find((post) => post.id === statusTs);
+		expect(working?.content).toContain("⏳ button-view");
+		expect(JSON.stringify(working?.components ?? [])).toContain(`ompbot:lane:pause:${lane.name}`);
 
 		await h.manager.pause(lane.name, "button");
 		await h.settle();
 		const paused = lastStatus();
-		expect(paused?.text).toContain("⏸ button-view");
-		expect(paused?.text).toContain("멈춤");
-		expect(JSON.stringify(paused?.blocks ?? [])).toContain(`ompbot:lane:resume:${lane.name}`);
+		expect(paused?.content).toContain("⏸ button-view");
+		expect(paused?.content).toContain("멈춤");
+		expect(JSON.stringify(paused?.components ?? [])).toContain(`ompbot:lane:resume:${lane.name}`);
 
 		await h.manager.resume(lane.name, "button");
 		await h.settle();
 		expect(h.store.getLane(lane.name)?.status).toBe("working");
-		expect(lastStatus()?.text).toContain("⏳ button-view");
+		expect(lastStatus()?.content).toContain("⏳ button-view");
 		h.close();
 	});
 });

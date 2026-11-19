@@ -51,7 +51,7 @@ CUT = "…(잘림)"
 OMP_TIMEOUT_S = 120
 USES = ["대화", "omp직접", "모니터", "레인", "리뷰", "하위", "기타"]
 AUTO_USES = ("모니터", "레인", "리뷰", "하위")
-CHAT_ORIGINS = ("discord", "slack", "telegram", "teams")
+CHAT_ORIGINS = ("discord", "telegram", "teams")
 SNAPSHOT = re.compile(r"^catalog-(\d{4}-\d{2}-\d{2})\.json$")
 LOG_FIELD = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S*)')
 HTTP_STATUS = re.compile(r"\b([45]\d\d)\b")

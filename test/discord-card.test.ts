@@ -149,7 +149,7 @@ describe("OutboundMessage card → one embed", () => {
 		expect(edit.components).toEqual([]);
 	});
 
-	test("a card redrawn plain with buttons (an expired approval) drops the old embed, like Slack's blocks: []", async () => {
+	test("a card redrawn plain with buttons (an expired approval) drops the old embed", async () => {
 		const ref = await channel.post({ conversationId: CH }, { text: "t", title: "제목", body: "본문", buttons: [] });
 		await channel.edit(ref, { text: "⌛ 만료됨", buttons: [] });
 		const edit = transport.calls.find((c) => c.method === "editMessage") as Extract<

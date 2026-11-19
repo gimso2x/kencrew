@@ -126,8 +126,8 @@ function fixtureHome(): string {
 		join(logs, "ompbot.log"),
 		[
 			"ts=2026-10-31T20:59:59.000Z level=warn event=old_out_of_window",
-			"ts=2026-10-31T21:00:00.000Z level=warn event=slack_socket_reconnecting reason=x",
-			"ts=2026-11-03T01:00:00.000Z level=warn event=slack_socket_reconnecting reason=y",
+			"ts=2026-10-31T21:00:00.000Z level=warn event=discord_gateway_reconnecting reason=x",
+			"ts=2026-11-03T01:00:00.000Z level=warn event=discord_gateway_reconnecting reason=y",
 			"ts=2026-11-04T01:00:00.000Z level=error event=turn_failed reason=z",
 			"ts=2026-11-04T02:00:00.000Z level=info event=info_only_event",
 			"not a logfmt line",
@@ -187,7 +187,7 @@ describe("weekly-improvement collect.py", () => {
 		expect(out).toContain("T-20261020-01 review 검토작업 (경과 18일)");
 		expect(out).toContain("done 1 · cancelled 1");
 
-		expect(out).toContain("slack_socket_reconnecting 2");
+		expect(out).toContain("discord_gateway_reconnecting 2");
 		expect(out).toContain("turn_failed 1");
 		expect(out).not.toContain("info_only_event");
 

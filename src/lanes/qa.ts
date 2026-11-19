@@ -281,7 +281,7 @@ export async function cleanQaWorktrees(
 	for (const entry of entries) await removeQaWorktree(join(worktreesDir, entry), git, log);
 }
 
-/** One copy: its repository is read from the copy's `.git` file (`gitdir: <common>/worktrees/<name>`) before removal. */
+/** One copy (QA's): its repository is read from the copy's `.git` file (`gitdir: <common>/worktrees/<name>`) before removal. */
 async function removeQaWorktree(copy: string, git: GitRunner, log?: Pick<Logger, "warn">): Promise<void> {
 	const common = commonDirOf(copy);
 	try {

@@ -16,6 +16,7 @@ import {
 	PortableApplyError,
 	type PortableContext,
 	PortableUsageError,
+	specOfRow,
 } from "../monitors/portable";
 import { runScript } from "../monitors/script";
 import { MonitorSpecError, mergeMonitorSpec, parseMonitorSpec } from "../monitors/spec";
@@ -160,7 +161,6 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 		webhook: config?.webhook,
 		// A home without a usable config takes the zone a config without `timezone` gets.
 		defaultTimezone: config?.timezone ?? hostTimezone(),
-		slackOff: config !== undefined && config.channels.slack === undefined,
 	};
 	if (sub === "export" || sub === "apply") return portableCommand(sub, rest, homeDir, ctx);
 	if (sub !== "add" && sub !== "list" && sub !== "show" && sub !== "update" && sub !== "remove" && sub !== "test") {
@@ -203,19 +203,7 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 			return 0;
 		}
 		if (sub === "update") {
-			const current = {
-				name: row.name,
-				trigger: row.trigger,
-				instruction: row.instruction,
-				overlap: row.overlap,
-				enabled: row.enabled,
-				...(row.channel === null ? {} : { channel: row.channel }),
-				...(row.copyChannel === null ? {} : { copyChannel: row.copyChannel }),
-				...(row.model === null ? {} : { model: row.model }),
-				...(row.thinking === null ? {} : { thinking: row.thinking }),
-				deliver: row.deliver,
-				...(row.procedureFiles.length === 0 ? {} : { procedureFiles: row.procedureFiles }),
-			};
+			const current = { ...specOfRow(row), deliver: row.deliver };
 			const next = mergeMonitorSpec(current, parseJson(values.json, "monitors update"), ctx);
 			const updated = ledger.updateMonitor(row.id, next);
 			out({ monitor: masked(updated), schedule: scheduleOf(updated, ctx.defaultTimezone) });

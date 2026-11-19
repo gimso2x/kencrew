@@ -24,6 +24,7 @@ interface ExportModule {
 	exportRelease(options: ExportOptions): Promise<number>;
 	findGitleaks(): string | undefined;
 	readAllowlist(file?: string): string[];
+	denylistHits(repo?: string): string[];
 }
 
 // Dynamic import: release/ is absent from the exported public tree, where a static import would break tsc and bun test.
@@ -324,4 +325,13 @@ describe.skipIf(mod === undefined || gitleaks === undefined)("release export", (
 		},
 		EXPORT_TEST_TIMEOUT_MS,
 	);
+});
+
+// The export's first leak gate, run over this working tree: a planted owner id in a tracked public file
+// fails `bun test` in the lane instead of the next export. No gitleaks needed, only release/.
+// Skipped only in the exported public tree, which has this test (allowlist `test/`) but no release/.
+describe.skipIf(mod === undefined)("denylist match", () => {
+	test("the working tree's allowlisted files have zero denylist hits", () => {
+		expect(mod?.denylistHits()).toEqual([]);
+	});
 });
