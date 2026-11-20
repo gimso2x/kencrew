@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { isThreadOrigin } from "../core/normalize";
 import { sessionDirFor } from "../core/origin";
 import { MONITOR_ORIGIN_PREFIX } from "../monitors/ledger";
+import { checkSchemaVersion } from "../store/schema-version";
 import { removeTurnRefsSync, TURN_SNAPSHOT_RETENTION_DAYS } from "./turn-snapshot";
 
 const REMOVED_SLACK_THREAD = /^slack\/ch\/[^/]+\/t\/[^/]+$/;
@@ -95,7 +96,7 @@ export function gcSessions(options: GcOptions): GcResult {
 	const sessionsRoot = join(options.homeDir, "sessions");
 	const db = new Database(dbPath, { readonly: true, strict: true });
 	let origins: Array<{ origin_key: string; epoch: number; session_dir: string; updated_at: number }>;
-	/** Origins with inbound still waiting for a turn: their directory and row stay whatever their age. */
+	/** Origins with inbound still waiting for a turn (or parked as uncertain until the owner decides): their directory and row stay whatever their age. */
 	let waiting: Set<string>;
 	// A home without a `monitors` table has no monitor ids, so the deleted-monitor rule is skipped entirely.
 	let monitorIds: Set<string> | undefined;
@@ -105,11 +106,15 @@ export function gcSessions(options: GcOptions): GcResult {
 			.all() as typeof origins;
 		waiting = new Set(
 			(
-				db.query("SELECT DISTINCT origin_key FROM inbound WHERE state IN ('pending', 'dispatched')").all() as Array<{
+				db
+					.query("SELECT DISTINCT origin_key FROM inbound WHERE state IN ('pending', 'dispatched', 'uncertain')")
+					.all() as Array<{
 					origin_key: string;
 				}>
 			).map((row) => row.origin_key),
 		);
+		// Before anything is deleted: a ledger from a newer build must stop gc while every directory is still there.
+		if (!options.dryRun) checkSchemaVersion(db);
 		if (hasTable(db, "monitors")) {
 			monitorIds = new Set((db.query("SELECT id FROM monitors").all() as Array<{ id: string }>).map((row) => row.id));
 		}
@@ -204,7 +209,7 @@ function hasTable(db: Database, name: string): boolean {
  *   first. The gc connection never turns `foreign_keys` on (origins expire at 30 days, inbound at 90, so the origin
  *   delete would be refused), which is why the posts→deliveries order is kept here by hand.
  * - monitor_events: the final stages only, aged by `updated_at`.
- * Waiting and running rows, approvals, usage and alert incidents are never touched. A table missing from an old
+ * Waiting, running and uncertain rows, approvals, usage and alert incidents are never touched. A table missing from an old
  * home makes its rule empty instead of failing.
  */
 function gcLedger(db: Database, options: GcOptions): LedgerRemoved {
@@ -262,7 +267,10 @@ function gcTurnSnapshots(db: Database, options: GcOptions): number {
 		repo: string;
 	}>;
 	if (rows.length === 0 || options.dryRun === true) return rows.length;
-	db.query("DELETE FROM turn_snapshots WHERE ended_at < ?").run(cutoff);
-	removeTurnRefsSync(rows.map((row) => ({ id: row.id, repo: row.repo })));
-	return rows.length;
+	// Refs go first: a row whose ref could not be deleted stays in the ledger, so the next gc retries it.
+	const kept = new Set<number>();
+	removeTurnRefsSync(rows, (id) => kept.add(id));
+	const remove = db.query("DELETE FROM turn_snapshots WHERE id = ?");
+	for (const row of rows) if (!kept.has(row.id)) remove.run(row.id);
+	return rows.length - kept.size;
 }

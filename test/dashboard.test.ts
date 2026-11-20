@@ -237,7 +237,7 @@ const STATUS: StatusReport = {
 		{ originKey: "discord/ch/300000000000000001", epoch: 1, ompPid: null, busy: false },
 	],
 	ledger: { pending: 0, inflight: 1, confirmed: 5, ambiguous: 0, expired: 0 },
-	inbound: { pending: 1, dispatched: 1, answered: 1, failed_notified: 0, discarded: 0 },
+	inbound: { pending: 1, dispatched: 1, answered: 1, failed_notified: 0, discarded: 0, uncertain: 0 },
 	monitors: { count: 1, next: null },
 	openGates: [],
 };

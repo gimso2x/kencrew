@@ -20,6 +20,18 @@ import type { SweepHeartbeat } from "../daemon/heartbeat";
 import { RESTART_CUT_FILE } from "../daemon/recovery";
 import { redact } from "../redact";
 import { type BackupResult, backupStamp } from "./backup";
+
+/** The backup step made `file` but could not use it; apply records the file in the receipt before failing. */
+export class BackupUnusableError extends Error {
+	constructor(
+		readonly file: string,
+		message: string,
+	) {
+		super(message);
+		this.name = "BackupUnusableError";
+	}
+}
+
 import { type EnsureDepsResult, ensureDeps } from "./deps";
 import type { Gate } from "./gates";
 
@@ -1098,7 +1110,14 @@ async function applyUnderLock(
 	// 2. backup: ledger/bundle snapshot plus a config copy to roll back to.
 	const configPath = join(homeDir, "config.json");
 	const backedUp = await step("backup", () => {
-		const result = deps.backup();
+		let result: BackupResult;
+		try {
+			result = deps.backup();
+		} catch (error) {
+			// A snapshot made but refused by the schema check still goes into the receipt.
+			if (error instanceof BackupUnusableError) receipt.backupFile = error.file;
+			throw error;
+		}
 		receipt.backupFile = result.file;
 		let detail = `db=${result.file}`;
 		if (existsSync(configPath)) {

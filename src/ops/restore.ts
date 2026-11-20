@@ -2,9 +2,15 @@ import { Database } from "bun:sqlite";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, realpathSync, renameSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { acquireLock, LockHeldError } from "../daemon/lock";
+import { newerSchemaMessage, readSchemaVersion, SCHEMA_VERSION } from "../store/schema-version";
 import { BACKUP_FILE_PATTERN, backupStamp, fsyncPath } from "./backup";
 
-export type RestoreErrorCode = "bad_source" | "daemon_running" | "integrity_check_failed" | "restore_failed";
+export type RestoreErrorCode =
+	| "bad_source"
+	| "daemon_running"
+	| "newer_schema"
+	| "integrity_check_failed"
+	| "restore_failed";
 
 export class RestoreError extends Error {
 	readonly code: RestoreErrorCode;
@@ -106,12 +112,6 @@ export async function runRestore(options: RestoreOptions): Promise<RestoreResult
 	const target = join(homeDir, "ompbot.db");
 	const stamp = backupStamp(options.now ?? new Date());
 	const preRestoreDir = freshPreRestoreDir(homeDir, stamp);
-	const plan: RestorePlan = {
-		source,
-		target,
-		preRestoreDir,
-		moves: SIDECARS.map((suffix) => `${target}${suffix}`).filter((path) => existsSync(path)),
-	};
 
 	let answered = false;
 	try {
@@ -133,6 +133,13 @@ export async function runRestore(options: RestoreOptions): Promise<RestoreResult
 		throw error;
 	}
 	try {
+		// Listed under the lock: a -wal a dying writer left while the probe ran would otherwise stay beside the new db.
+		const plan: RestorePlan = {
+			source,
+			target,
+			preRestoreDir,
+			moves: SIDECARS.map((suffix) => `${target}${suffix}`).filter((path) => existsSync(path)),
+		};
 		if (!options.yes) return { applied: false, plan };
 		install(plan, rename);
 		return { applied: true, plan };
@@ -152,7 +159,9 @@ function install(plan: RestorePlan, rename: (from: string, to: string) => void):
 		const copy = new Database(tmp, { readonly: true, strict: true });
 		let check: string;
 		let missing: string[];
+		let copyVersion: number;
 		try {
+			copyVersion = readSchemaVersion(copy);
 			check = (copy.query("PRAGMA quick_check").get() as { quick_check?: string } | undefined)?.quick_check ?? "";
 			// quick_check passes an empty file and any foreign sqlite db alike; the daemon would not start on either.
 			const tables = new Set(
@@ -165,6 +174,9 @@ function install(plan: RestorePlan, rename: (from: string, to: string) => void):
 			throw new RestoreError("integrity_check_failed", error instanceof Error ? error.message : String(error));
 		} finally {
 			copy.close();
+		}
+		if (copyVersion > SCHEMA_VERSION) {
+			throw new RestoreError("newer_schema", newerSchemaMessage(copyVersion).replace(/^newer_schema: /, ""));
 		}
 		if (check !== "ok") throw new RestoreError("integrity_check_failed", `quick_check=${check}`);
 		if (missing.length > 0) {

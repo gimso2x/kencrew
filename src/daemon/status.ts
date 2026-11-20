@@ -69,6 +69,7 @@ const emptyInbound = (): Record<InboundState, number> => ({
 	answered: 0,
 	failed_notified: 0,
 	discarded: 0,
+	uncertain: 0,
 });
 
 function ledgerFrom(counts: Partial<Record<DeliveryState, number>>): StatusReport["ledger"] {
@@ -286,7 +287,7 @@ export function renderStatusText(report: StatusReport): string {
 		`ompbot · omp ${report.ompVersion} · 데몬 ${report.daemonRunning ? "실행 중" : "중지"} · origin ${report.origins.length}개`,
 		...renderOriginLines(report.origins),
 		`장부 p/i/c/a/e: ${ledger.pending}/${ledger.inflight}/${ledger.confirmed}/${ledger.ambiguous}/${ledger.expired}`,
-		`입수 pending=${inbound.pending} dispatched=${inbound.dispatched} answered=${inbound.answered} failed=${inbound.failed_notified} discarded=${inbound.discarded}`,
+		`입수 pending=${inbound.pending} dispatched=${inbound.dispatched} answered=${inbound.answered} failed=${inbound.failed_notified} discarded=${inbound.discarded} uncertain=${inbound.uncertain}`,
 		renderMonitorsLine(report.monitors, report.timezone),
 	];
 	if (report.frozen !== undefined) {

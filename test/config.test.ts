@@ -461,16 +461,18 @@ describe("channels.discord", () => {
 		});
 	});
 
-	test("logChannelId and escalationChannelId: snowflakes are taken", () => {
+	test("logChannelId, escalationChannelId and alertChannelId: snowflakes are taken", () => {
 		writeConfig(
 			withDiscord({
 				logChannelId: "678901234567890123",
 				escalationChannelId: "789012345678901234",
+				alertChannelId: "890123456789012345",
 			}),
 		);
 		const cfg = loadConfig(home);
 		expect(cfg.channels.discord?.logChannelId).toBe("678901234567890123");
 		expect(cfg.channels.discord?.escalationChannelId).toBe("789012345678901234");
+		expect(cfg.channels.discord?.alertChannelId).toBe("890123456789012345");
 	});
 
 	test.each([
@@ -489,6 +491,12 @@ describe("channels.discord", () => {
 		[
 			"logChannelId equal to laneChannelId",
 			{ logChannelId: "678901234567890123", laneChannelId: "678901234567890123" },
+			"channels.discord.logChannelId",
+		],
+		["a non-snowflake alertChannelId", { alertChannelId: "C0ALERT01" }, "channels.discord.alertChannelId"],
+		[
+			"logChannelId equal to alertChannelId",
+			{ logChannelId: "678901234567890123", alertChannelId: "678901234567890123" },
 			"channels.discord.logChannelId",
 		],
 		[

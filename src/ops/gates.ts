@@ -1,11 +1,12 @@
 import { Database } from "bun:sqlite";
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { OmpbotConfig } from "../config";
+import { isAutonomousRow } from "../core/mailbox";
 import { DEFAULT_SWEEP_MS, readSweepHeartbeat } from "../daemon/heartbeat";
 import { nextFireOf, toMonitor } from "../monitors/ledger";
-import { checkOmpRuntime } from "../omp/runtime-check";
+import { checkOmpRuntimeSync } from "../omp/runtime-check";
 import { localDay } from "../time";
 import { readStamp } from "./backup";
 import { readFreeze, readUnfrozenAt } from "./freeze";
@@ -51,7 +52,7 @@ export const ORIGIN_SILENT_MS = 15 * 60_000;
 export const DELIVERY_OVERDUE_MS = 10 * 60_000;
 /** A lane that has not progressed for a day needs attention. */
 export const LANE_STUCK_MS = 24 * 60 * 60_000;
-/** Only fresh monitor failures gate; an old `failed_no_retry` already notified once and must not alarm forever. */
+/** Only fresh, unrecovered monitor failures gate; an old `failed_no_retry` already notified once and must not alarm forever. */
 export const MONITOR_FAILURE_WINDOW_MS = 24 * 60 * 60_000;
 /**
  * Chat turns failing repeatedly: `[turn failed]` notice deliveries are the only ledger trace of a broken bot (the
@@ -240,21 +241,12 @@ function monitorsStalled(
 }
 
 /**
- * Opens as soon as an omp upgrade leaves an install the RPC driver will refuse (standalone launcher, too-old bun),
- * so the owner hears about it before chat turns start failing. Uses the bun on this process's PATH, as the driver does.
+ * Opens as soon as `ompExecutable` stops answering `--version` with `omp/<x.y.z>` (gone, not executable, not omp), so
+ * the owner hears about it before chat turns start failing. Same check, and remembered versions, as the RPC driver.
  */
 function ompRuntimeGate(ompExecutable: string): Gate {
-	const name = "omp_runtime";
-	const bun = Bun.which("bun");
-	if (!bun) return gate(name, true, "bun=missing");
-	let cliPath: string;
-	try {
-		cliPath = realpathSync(ompExecutable);
-	} catch {
-		return gate(name, true, `omp=missing path=${ompExecutable}`);
-	}
-	const problem = checkOmpRuntime(cliPath, bun);
-	return gate(name, problem !== undefined, problem === undefined ? "ok" : `${problem.code} ${problem.detail}`);
+	const problem = checkOmpRuntimeSync(ompExecutable);
+	return gate("omp_runtime", problem !== undefined, problem === undefined ? "ok" : `${problem.code} ${problem.detail}`);
 }
 
 /** Open when any judged filesystem is low; the detail names the tightest one (lowest free share). */
@@ -437,13 +429,35 @@ export function collectGates(options: GatesOptions): Gate[] {
 				tableExists(db, "lanes") && columnExists(db, "lanes", "origin_key")
 					? " AND origin_key NOT IN (SELECT origin_key FROM lanes WHERE status = 'paused')"
 					: "";
-			const silent = db
+			// A freeze holds autonomous rows (peer, lane, monitor) pending on purpose; the owner's rows still wait on a turn.
+			const peerColumn = columnExists(db, "inbound", "peer_user_id") ? "peer_user_id" : "NULL";
+			const waiting = db
 				.query(
-					`SELECT COUNT(*) AS n, COUNT(DISTINCT origin_key) AS origins, MIN(created_at) AS oldest FROM inbound
+					`SELECT origin_key, platform_message_id, ${peerColumn} AS peer_user_id, created_at FROM inbound
 					 WHERE state = 'pending' AND created_at <= ${now - ORIGIN_SILENT_MS} AND origin_key NOT LIKE 'monitor/%'${waitingOnOwner}${heldByPause}
 					 AND origin_key NOT IN (SELECT origin_key FROM inbound WHERE state = 'dispatched' AND ${lastSign} > ${now - INBOUND_STARVATION_MS})`,
 				)
-				.get() as { n: number; origins: number; oldest: number | null };
+				.all() as Array<{
+				origin_key: string;
+				platform_message_id: string;
+				peer_user_id: string | null;
+				created_at: number;
+			}>;
+			const counted =
+				freeze === undefined
+					? waiting
+					: waiting.filter(
+							(row) =>
+								!isAutonomousRow(row.origin_key, {
+									peerUserId: row.peer_user_id,
+									platformMessageId: row.platform_message_id,
+								}),
+						);
+			const silent = {
+				n: counted.length,
+				origins: new Set(counted.map((row) => row.origin_key)).size,
+				oldest: counted.length === 0 ? null : Math.min(...counted.map((row) => row.created_at)),
+			};
 			const minutes = silent.oldest === null ? 0 : Math.floor((now - silent.oldest) / 60_000);
 			ledger.push(
 				gate(
@@ -494,12 +508,16 @@ export function collectGates(options: GatesOptions): Gate[] {
 			),
 		);
 
+		// A monitor whose run after the failure succeeded (delivered or deliberately silent) has recovered: the same
+		// success resolves its incidents, so it no longer gates even while the failure is inside the window.
 		const failedMonitors =
 			tableExists(db, "monitor_events") && tableExists(db, "monitors")
 				? scalar(
 						db,
 						`SELECT COUNT(DISTINCT e.monitor_id) AS n FROM monitor_events e JOIN monitors m ON m.id = e.monitor_id
-						 WHERE e.stage = 'failed_no_retry' AND e.updated_at > ${now - MONITOR_FAILURE_WINDOW_MS} AND m.enabled = 1`,
+						 WHERE e.stage = 'failed_no_retry' AND e.updated_at > ${now - MONITOR_FAILURE_WINDOW_MS} AND m.enabled = 1
+						 AND NOT EXISTS (SELECT 1 FROM monitor_events later WHERE later.monitor_id = e.monitor_id
+						   AND later.event_id > e.event_id AND later.stage IN ('delivered', 'no_report'))`,
 					)
 				: 0;
 		ledger.push(gate("monitors_failed", failedMonitors > 0, `failed_recent=${failedMonitors}`));

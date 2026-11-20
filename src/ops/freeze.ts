@@ -71,6 +71,11 @@ export function writeFreeze(homeDir: string, input: { reason?: string; by: strin
 		throw new Error(`${path}: FROZEN is not a regular file; run \`ompbot unfreeze\` first`);
 	}
 	const tmp = `${path}.tmp`;
+	// Opening a FIFO for writing blocks for good, and a link would be written through: only a plain file or nothing
+	// may stand at the tmp path; a leftover special entry is removed, a directory is the owner's to clear.
+	const tmpKind = lstatSync(tmp, { throwIfNoEntry: false });
+	if (tmpKind?.isDirectory() === true) throw new Error(`${tmp}: FROZEN.tmp is not a regular file; remove it first`);
+	if (tmpKind !== undefined && !tmpKind.isFile()) rmSync(tmp);
 	try {
 		writeFileSync(tmp, `${JSON.stringify(state)}\n`, { mode: 0o600 });
 		renameSync(tmp, path);

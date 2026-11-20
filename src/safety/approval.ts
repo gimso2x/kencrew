@@ -186,22 +186,43 @@ const realTimers: ApprovalTimers = {
 	clear: (handle) => clearTimeout(handle as NodeJS.Timeout),
 };
 
+export interface ApprovalInput {
+	approvalId: string;
+	channel: string;
+	messageTs: string;
+	summary: string;
+	createdAt: number;
+	expiresAt: number;
+	/** The conversation that asked and the thread the request came from (absent for lane/legacy callers). */
+	originKey?: string | undefined;
+	originThreadRef?: string | undefined;
+	/** The card's sections as shown (redacted, cut); the dashboard reads them back. Only filled fields are stored. */
+	detail?: ApprovalDetail | undefined;
+	/** Card and asking-thread permalinks; absent when the platform has none or the lookup failed. */
+	cardUrl?: string | undefined;
+	originUrl?: string | undefined;
+}
+
+export interface AutoChoiceInput {
+	originKey?: string | undefined;
+	threadRef?: string | undefined;
+	question: string;
+	chosen: string;
+	createdAt: number;
+}
+
+/** A pending approval the sweep just expired, for its card rewrite (the mirror too, and `다시 요청` with a thread). */
+export interface ExpiredApproval {
+	approvalId: string;
+	channel: string;
+	messageTs: string;
+	summary: string;
+	originThreadRef: string | null;
+	mirrorRef: string | null;
+}
+
 export interface ApprovalStore {
-	createApproval(input: {
-		approvalId: string;
-		channel: string;
-		messageTs: string;
-		summary: string;
-		createdAt: number;
-		expiresAt: number;
-		originKey?: string | undefined;
-		originThreadRef?: string | undefined;
-		/** The card's sections as shown (redacted, cut); the dashboard reads them back. */
-		detail?: ApprovalDetail | undefined;
-		/** Card and asking-thread permalinks; absent when the platform has none or the lookup failed. */
-		cardUrl?: string | undefined;
-		originUrl?: string | undefined;
-	}): void;
+	createApproval(input: ApprovalInput): void;
 	getApproval(approvalId: string):
 		| {
 				status: string;
@@ -212,23 +233,15 @@ export interface ApprovalStore {
 				mirrorRef: string | null;
 		  }
 		| undefined;
+	/** Records one `ask` question that closed unanswered and what omp's fallback picked for it. */
+	addAutoChoice(input: AutoChoiceInput): void;
 	/** Records the mirror card (`<channel>:<ts>`) of a pending approval; false when it is no longer pending. */
 	setApprovalMirrorRef(approvalId: string, mirrorRef: string): boolean;
 	/** Settles a pending approval as `replied`; false when it was no longer pending (or already due). */
 	replyApproval(approvalId: string, replyTs: string, text: string, now: number): boolean;
 	decideApproval(approvalId: string, status: "approved" | "denied" | "expired", now: number): boolean;
 	/** Expires due (or, with `due = false`, ALL) pending approvals and returns them for card updates. */
-	expirePendingApprovals(
-		now: number,
-		due?: boolean,
-	): Array<{
-		approvalId: string;
-		channel: string;
-		messageTs: string;
-		summary: string;
-		originThreadRef: string | null;
-		mirrorRef: string | null;
-	}>;
+	expirePendingApprovals(now: number, due?: boolean): ExpiredApproval[];
 }
 
 /** The escalation channel of each platform that has one (Discord: `channels.discord.escalationChannelId`). */
@@ -873,6 +886,25 @@ export class ApprovalBroker {
 			return undefined;
 		}
 		return held.text;
+	}
+
+	/** Files the `ask` questions the deadline answered for the dashboard; a ledger failure is logged, the dialog goes on. */
+	recordAutoChoices(origin: ApprovalOrigin, picks: ReadonlyArray<{ question: string; chosen: string }>): void {
+		const createdAt = this.#clock.now();
+		const threadRef = origin.threadTs === undefined ? undefined : `${origin.channel}:${origin.threadTs}`;
+		for (const pick of picks) {
+			try {
+				this.#options.store.addAutoChoice({
+					originKey: origin.originKey,
+					threadRef,
+					question: cutCodePointSafe(redact(pick.question), FIELD_LIMIT),
+					chosen: cutCodePointSafe(redact(pick.chosen), FIELD_LIMIT),
+					createdAt,
+				});
+			} catch (error) {
+				this.#options.log.warn("auto_choice_record_failed", { origin: origin.originKey, error: String(error) });
+			}
+		}
 	}
 
 	/** Drops a held text that will not be used (the next dialog is no `input`, or the turn ended). */

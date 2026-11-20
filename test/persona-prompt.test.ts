@@ -230,6 +230,15 @@ describe("chat origin system prompt per platform", () => {
 		}
 	});
 
+	test("without host tools no line tells the session to upload a file", () => {
+		const dm = "discord/dm/123456789012345678"; // gitleaks:allow (fake snowflake)
+		const args = [BASE_SECRETS, dm, false, false, false] as const;
+		expect(buildFloorsPrompt(...args, {}, true)).toContain("파일로 만들어 올리고");
+		const hostless = buildFloorsPrompt(...args, {}, false);
+		expect(hostless).not.toContain("파일로 만들어 올리고");
+		expect(hostless).toContain("워크스페이스 파일로 만들어 경로를 알리고");
+	});
+
 	test("a Discord chat origin names its own upload tool and, in the owner DM, the monitor tools", () => {
 		const discord = buildFloorsPrompt(BASE_SECRETS, "discord/dm/123456789012345678", false, false, true); // gitleaks:allow (fake snowflake)
 		expect(discord).not.toContain("slack_send_file");

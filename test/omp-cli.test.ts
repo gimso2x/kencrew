@@ -1,9 +1,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
-	accessSync,
 	chmodSync,
-	constants,
 	existsSync,
 	lstatSync,
 	mkdirSync,
@@ -19,10 +17,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import {
-	cliPathIn,
 	type OmpCliDeps,
 	ompCommand,
-	ompRoot,
 	profileAgentDir,
 	runProfileSync,
 	TRIAL_PROMPT,
@@ -68,8 +64,6 @@ function writeConfig(extra: Record<string, unknown> = {}): void {
 }
 
 interface Fake {
-	/** What `bun <cli> --version` prints per installed version (default `omp/<version>`). */
-	reported: Map<string, string>;
 	runtime: "ok" | "fail";
 	rpc: TrialResult;
 	print: RunProcessResult;
@@ -81,7 +75,6 @@ interface Fake {
 
 function fake(): Fake {
 	return {
-		reported: new Map(),
 		runtime: "ok",
 		rpc: { ok: true, detail: "ok" },
 		print: { code: 0, stdout: "OK\n", timedOut: false },
@@ -92,7 +85,7 @@ function fake(): Fake {
 	};
 }
 
-/** `OmpCliDeps` over a fake bun: `bun add` writes a non-executable cli.js, `--version` and `omp -p` answer from `f`. */
+/** `OmpCliDeps` over a fake omp: the runtime check, the RPC turn and `omp -p` answer from `f`. */
 function deps(
 	f: Fake,
 	env: Record<string, string> = { HOME: userHome, PATH: "/usr/bin", PI_CODING_AGENT_DIR: "/inherited/agent" },
@@ -102,26 +95,19 @@ function deps(
 		homeDir: home,
 		...(config === undefined ? {} : { config }),
 		env,
-		bun: "/fake/bun",
 		run: async (cmd, opts) => {
 			f.calls.push({ cmd, opts });
-			if (cmd[0] === "/fake/bun" && cmd[1] === "add") {
-				const cli = cliPathIn(opts.cwd ?? "");
-				mkdirSync(dirname(cli), { recursive: true });
-				writeFileSync(cli, "#!/usr/bin/env bun\n", { mode: 0o644 });
-				return { code: 0, stdout: "installed", timedOut: false };
-			}
-			if (cmd[0] === "/fake/bun" && cmd[2] === "--version") {
-				const version = (cmd[1] ?? "").split("/omp/")[1]?.split("/")[0] ?? "";
-				return { code: 0, stdout: `${f.reported.get(version) ?? `omp/${version}`}\n`, timedOut: false };
-			}
 			if (cmd[1] === "-p") return f.print;
 			throw new Error(`unexpected command ${cmd.join(" ")}`);
 		},
-		runtimeCheck: () =>
+		runtimeCheck: async () =>
 			f.runtime === "ok"
 				? undefined
-				: { code: "bun_too_old", detail: "bun=1.0.0 need=>=9", message: "bun too old for this omp" },
+				: {
+						code: "omp_executable_missing",
+						detail: "version=unrecognized exit=1",
+						message: "omp --version did not answer",
+					},
 		rpcTrial: async (input) => {
 			f.rpcCalls.push(input);
 			return f.rpc;
@@ -133,108 +119,86 @@ function deps(
 }
 
 const omp = (f: Fake, ...args: string[]) => ompCommand(args, home, {}, deps(f));
-const link = (name: string): string | undefined => {
-	try {
-		return readlinkSync(join(ompRoot(home), name));
-	} catch {
-		return undefined;
-	}
-};
+const TRIAL_STAGES = ["runtime", "rpc", "print-exit", "print-timeout", "print-no-ok"] as const;
 
-describe("AC-4: ompbot omp install/use/rollback/prune", () => {
-	test("install: a version mismatch removes the folder and fails", async () => {
+describe("ompbot omp trial", () => {
+	test("all three stages pass: exit 0, run against config ompExecutable with the bot env", async () => {
+		writeConfig({ ompProfile: "ompbot", model: "zai/glm-5" });
 		const f = fake();
-		f.reported.set("18.18.9", "omp/18.18.8");
-		expect(await omp(f, "install", "18.18.9")).toBe(1);
-		expect(existsSync(join(ompRoot(home), "18.18.9"))).toBe(false);
-		expect(f.lines.join("\n")).toContain('installed --version is "omp/18.18.8", expected omp/18.18.9');
-		expect(link("current")).toBeUndefined();
+		expect(await omp(f, "trial")).toBe(0);
+		expect(f.rpcCalls).toHaveLength(1);
+		expect(f.rpcCalls[0]).toMatchObject({ cliPath: "/usr/local/bin/omp", profile: "ompbot", model: "zai/glm-5" });
+		const print = f.calls.filter((c) => c.cmd[1] === "-p");
+		expect(print).toHaveLength(1);
+		expect(print[0]?.cmd).toEqual(["/usr/local/bin/omp", "-p", "--no-title", "--model", "zai/glm-5", TRIAL_PROMPT]);
+		expect(print[0]?.opts.env?.OMP_PROFILE).toBe("ompbot");
+		expect(print[0]?.opts.env).not.toHaveProperty("PI_CODING_AGENT_DIR");
+		expect(print[0]?.opts.timeoutMs).toBe(120_000);
+		expect(f.lines).toEqual([
+			"omp_trial stage=runtime ok=true",
+			"omp_trial stage=rpc ok=true",
+			"omp_trial stage=print ok=true",
+			"omp_trial ok executable=/usr/local/bin/omp",
+		]);
 	});
 
-	test("install: bun add in a 0700 folder with a private package.json; cli.js made executable; current untouched", async () => {
-		const f = fake();
-		expect(await omp(f, "install", "18.18.9")).toBe(0);
-		const dir = join(ompRoot(home), "18.18.9");
-		expect(lstatSync(dir).mode & 0o777).toBe(0o700);
-		expect(JSON.parse(readFileSync(join(dir, "package.json"), "utf8"))).toEqual({ private: true });
-		expect(f.calls[0]?.cmd).toEqual(["/fake/bun", "add", "@oh-my-pi/pi-coding-agent@18.18.9"]);
-		expect(f.calls[0]?.opts.cwd).toBe(dir);
-		expect(() => accessSync(cliPathIn(dir), constants.X_OK)).not.toThrow();
-		expect(link("current")).toBeUndefined();
-		expect(await omp(f, "install", "not-a-version")).toBe(2);
-	});
-
-	async function installed(f: Fake, ...versions: string[]): Promise<void> {
-		for (const version of versions) expect(await omp(f, "install", version)).toBe(0);
-	}
-
-	for (const stage of ["runtime", "rpc", "print-exit", "print-timeout", "print-no-ok"] as const) {
-		test(`use: a failing ${stage} trial leaves current unchanged and exits 1`, async () => {
-			writeConfig({ ompProfile: "ompbot", model: "zai/glm-5" });
+	for (const stage of TRIAL_STAGES) {
+		test(`a failing ${stage} stage exits 1 with the stage and the log tail, and skips the later stages`, async () => {
+			writeConfig({});
 			const f = fake();
-			await installed(f, "18.18.8");
-			expect(await omp(f, "use", "18.18.8")).toBe(0);
 			if (stage === "runtime") f.runtime = "fail";
 			if (stage === "rpc") f.rpc = { ok: false, detail: "no answer within 120s" };
 			if (stage === "print-exit") f.print = { code: 3, stdout: "boom", timedOut: false };
 			if (stage === "print-timeout") f.print = { code: null, stdout: "", timedOut: true };
 			if (stage === "print-no-ok") f.print = { code: 0, stdout: "NOPE", timedOut: false };
-			f.lines.length = 0;
-			expect(await omp(f, "use", "18.18.9")).toBe(1);
-			expect(link("current")).toBe("18.18.8");
-			expect(link("previous")).toBeUndefined();
-			expect(f.lines.join("\n")).toContain("current unchanged");
+			expect(await omp(f, "trial")).toBe(1);
+			const text = f.lines.join("\n");
+			const failed = stage.startsWith("print") ? "print" : stage;
+			expect(text).toContain(`omp trial failed: ${failed} (/usr/local/bin/omp)`);
+			expect(text).not.toContain("omp_trial ok");
+			expect(f.rpcCalls.length).toBe(stage === "runtime" ? 0 : 1);
+			expect(f.calls.length).toBe(stage === "runtime" || stage === "rpc" ? 0 : 1);
+			if (stage === "runtime") expect(text).toContain("omp --version did not answer");
+			if (stage === "rpc") expect(text).toContain("no answer within 120s");
+			if (stage === "print-exit") expect(text).toContain("exit=3");
+			if (stage === "print-timeout") expect(text).toContain("timeout after 120s");
+			if (stage === "print-no-ok") expect(text).toContain("no OK in the answer");
 		});
 	}
 
-	test("use: all three trials pass → current switched, previous recorded; trials run with the bot env", async () => {
-		writeConfig({ ompProfile: "ompbot", model: "zai/glm-5" });
+	test("--executable <abs path> trials that omp instead of config ompExecutable (all three stages)", async () => {
+		writeConfig({ model: "zai/glm-5" });
 		const f = fake();
-		await installed(f, "18.18.8");
-		expect(await omp(f, "use", "18.18.8")).toBe(0);
-		expect(link("current")).toBe("18.18.8");
-		expect(await omp(f, "use", "18.18.9")).toBe(0); // installs it first
-		expect(link("current")).toBe("18.18.9");
-		expect(link("previous")).toBe("18.18.8");
-		const cli = cliPathIn(join(ompRoot(home), "18.18.9"));
-		expect(f.rpcCalls.at(-1)).toMatchObject({ cliPath: cli, profile: "ompbot", model: "zai/glm-5" });
-		const print = f.calls.filter((c) => c.cmd[1] === "-p").at(-1);
-		expect(print?.cmd).toEqual([cli, "-p", "--no-title", "--model", "zai/glm-5", TRIAL_PROMPT]);
-		expect(print?.opts.env?.OMP_PROFILE).toBe("ompbot");
-		expect(print?.opts.env).not.toHaveProperty("PI_CODING_AGENT_DIR");
-		expect(print?.opts.timeoutMs).toBe(120_000);
-		expect(f.lines).toContain(
-			`ompExecutable: ${join(home, "omp", "current", "node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js")}`,
-		);
-		expect(f.lines.at(-1)).toBe("`ompbot apply`로 재시작해야 반영된다");
+		expect(await omp(f, "trial", "--executable", "/opt/global/omp")).toBe(0);
+		expect(f.rpcCalls[0]?.cliPath).toBe("/opt/global/omp");
+		expect(f.calls.find((c) => c.cmd[1] === "-p")?.cmd[0]).toBe("/opt/global/omp");
+		expect(f.lines.at(-1)).toBe("omp_trial ok executable=/opt/global/omp");
+		f.lines.length = 0;
+		f.print = { code: 3, stdout: "boom", timedOut: false };
+		expect(await omp(f, "trial", "--executable", "/opt/global/omp")).toBe(1);
+		expect(f.lines.join("\n")).toContain("omp trial failed: print (/opt/global/omp)");
+		for (const args of [
+			["trial", "--executable", "relative/omp"],
+			["status", "--executable", "/opt/global/omp"],
+		]) {
+			expect(await omp(f, ...args)).toBe(2);
+		}
 	});
 
-	test("rollback restores previous (and swaps), fails without one; prune keeps current and previous", async () => {
+	test("a home without config.json cannot be trialled; the removed pin commands and extra words are usage errors", async () => {
 		const f = fake();
-		expect(await omp(f, "rollback")).toBe(1);
-		await installed(f, "18.18.7", "18.18.8", "18.18.9");
-		expect(await omp(f, "use", "18.18.8")).toBe(0);
-		expect(await omp(f, "use", "18.18.9")).toBe(0);
-		expect(await omp(f, "rollback")).toBe(0);
-		expect(link("current")).toBe("18.18.8");
-		expect(link("previous")).toBe("18.18.9");
-		writeFileSync(join(ompRoot(home), "last-sync"), "x\n");
-		expect(await omp(f, "prune")).toBe(0);
-		expect(existsSync(join(ompRoot(home), "18.18.7"))).toBe(false);
-		expect(existsSync(join(ompRoot(home), "18.18.8"))).toBe(true);
-		expect(existsSync(join(ompRoot(home), "18.18.9"))).toBe(true);
-		expect(existsSync(join(ompRoot(home), "last-sync"))).toBe(true);
-		expect(f.lines).toContain("omp_prune removed=18.18.7");
+		expect(await omp(f, "trial")).toBe(1);
+		expect(f.lines.join("\n")).toContain("no config.json");
+		for (const args of [["trial", "x"], ["install", "18.18.9"], ["use", "18.18.9"], ["rollback"], ["prune"]]) {
+			expect(await omp(f, ...args)).toBe(2);
+		}
 	});
 });
 
 describe("AC-6b: login check and profile-aware doctor/gates", () => {
-	test("omp status fails when the pinned omp reads no login (models=0), passes with models", async () => {
+	test("omp status fails when the omp reads no login (models=0), passes with models", async () => {
 		writeConfig({ ompProfile: "ompbot" });
 		const f = fake();
-		expect(await omp(f, "install", "18.18.9")).toBe(0);
-		expect(await omp(f, "use", "18.18.9")).toBe(0);
-		f.lines.length = 0;
 		f.models = 0;
 		expect(await omp(f, "status")).toBe(1);
 		expect(f.lines.join("\n")).toContain("login fail models=0");
@@ -243,12 +207,20 @@ describe("AC-6b: login check and profile-aware doctor/gates", () => {
 		f.lines.length = 0;
 		f.models = 5;
 		expect(await omp(f, "status")).toBe(0);
-		expect(f.lines).toContain("current=18.18.9 previous=none");
+		expect(f.lines).toContain("ompExecutable=/usr/local/bin/omp");
 		expect(f.lines).toContain("login ok models=5");
 		expect(f.lines.some((l) => l.startsWith(`profile=ompbot dir=${profileAgentDir(userHome, "ompbot")}`))).toBe(true);
 		expect(f.lines).toContain(
 			"last_sync=never pending_changes=unknown (source agent dir /inherited/agent does not exist)",
 		);
+		expect(f.lines.some((l) => /current|previous|installed/.test(l))).toBe(false);
+	});
+
+	test("omp status without a config checks the omp on PATH, and fails when there is none", async () => {
+		const f = fake();
+		expect(await ompCommand(["status"], home, {}, deps(f, { HOME: userHome, PATH: "/nonexistent" }))).toBe(1);
+		expect(f.lines).toContain("global=none");
+		expect(f.lines.join("\n")).toContain("login fail: no omp");
 	});
 
 	test("countOmpModels (doctor) gives the child OMP_PROFILE and drops PI_CODING_AGENT_DIR", async () => {
@@ -380,7 +352,7 @@ describe("AC-5: ompbot omp sync", () => {
 		expect(readFileSync(join(target, "managed-skills", "m1", "SKILL.md"), "utf8")).toBe("m1 v1\n");
 		expect(rows(join(target, "memories", "mnemopi", "mnemopi.db"))).toEqual(["owner-1"]);
 		expect(rows(join(target, "memories", "mnemopi", "banks", "b1", "mnemopi.db"))).toEqual(["bank-1"]);
-		expect(readFileSync(join(ompRoot(home), "last-sync"), "utf8")).toContain("2026-11-12T00:00:00.000Z");
+		expect(readFileSync(join(home, "omp", "last-sync"), "utf8")).toContain("2026-11-12T00:00:00.000Z");
 
 		// Same input again: nothing to do, with or without --init.
 		const quiet = ["warn skipped broken link skills/broken -> ../nowhere", "omp_profile_sync changed=0"];

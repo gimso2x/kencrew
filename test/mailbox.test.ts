@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+	appendFileSync,
 	existsSync,
 	mkdirSync,
 	mkdtempSync,
@@ -10,7 +11,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import type { ChannelPort } from "../src/channel/port";
 import {
 	type CacheMissInfo,
@@ -43,6 +44,7 @@ import {
 	OmpDriverError,
 	type OmpEntries,
 	type OmpEvent,
+	type OmpExitInfo,
 	type OmpFinal,
 	type OmpOpenResult,
 	type OmpState,
@@ -79,6 +81,8 @@ class FakeClock {
  */
 class SteerFailingDriver extends FakeOmpDriver {
 	failSteers = 0;
+	/** Rejects the next steer-time `leafId()` calls: the cursor read comes before the steer, so nothing was sent. */
+	failLeafIds = 0;
 	stale = false;
 	/** Reject cursor reads like a session whose turn-start cursor is gone (`unknown_since`); `leafId()` still works. */
 	failEntriesSince = false;
@@ -94,6 +98,11 @@ class SteerFailingDriver extends FakeOmpDriver {
 	/** Resolves when a held `leafId()` / `steer()` is waiting on its gate. */
 	gateEntered = Promise.withResolvers<void>();
 	override async leafId(): Promise<string | null> {
+		// The turn's own prompt reads the cursor first: only reads after a prompt (the steers) are refused.
+		if (this.failLeafIds > 0 && this.calls.some((c) => c.startsWith("prompt:"))) {
+			this.failLeafIds--;
+			throw new OmpDriverError("rpc_error", "leafId refused");
+		}
 		const gate = this.leafGate;
 		if (gate !== undefined) {
 			this.leafGate = undefined;
@@ -161,6 +170,18 @@ class SteerFailingDriver extends FakeOmpDriver {
 	failTurn(error: string): void {
 		for (const listener of [...this.#finals])
 			listener({ opRef: this.lastOpRef ?? "", status: "error", text: "", error });
+	}
+	readonly #exits = new Set<(info: OmpExitInfo) => void>();
+	override onExit(listener: (info: OmpExitInfo) => void): () => void {
+		this.#exits.add(listener);
+		const off = super.onExit(listener);
+		return () => {
+			this.#exits.delete(listener);
+			off();
+		};
+	}
+	crashWith(code: number | null, stderr: string): void {
+		for (const listener of [...this.#exits]) listener({ code, expected: false, stderr });
 	}
 	override async availableModels(): Promise<string[]> {
 		return this.stale
@@ -280,6 +301,7 @@ let router: OriginRouter;
 let drivers: SteerFailingDriver[];
 let driverOptions: FakeOmpDriverOptions;
 let failSteers: number;
+let failLeafIds: number;
 let statusCalls: string[];
 /** `restartProvider` calls: (origin, threadRef). */
 let restartCalls: Array<[string, string]>;
@@ -345,6 +367,7 @@ function buildRouter(): OriginRouter {
 				sessionDir,
 			);
 			driver.failSteers = failSteers;
+			driver.failLeafIds = failLeafIds;
 			drivers.push(driver);
 			return driver;
 		},
@@ -358,6 +381,7 @@ beforeEach(() => {
 	drivers = [];
 	driverOptions = {};
 	failSteers = 0;
+	failLeafIds = 0;
 	statusCalls = [];
 	restartCalls = [];
 	logLines = [];
@@ -442,9 +466,9 @@ describe("mailbox: prompt vs steer", () => {
 		expect(deliveries.filter((d) => d.threadRef === b.threadRef)).toHaveLength(1);
 	});
 
-	test("steer failure leaves the row pending and sends it as the next turn (no session replacement)", async () => {
+	test("a cursor read that fails before the steer leaves the row pending and sends it as the next turn", async () => {
 		driverOptions = { holdTurns: true };
-		failSteers = 1;
+		failLeafIds = 1;
 		const mailbox = router.mailbox(ORIGIN);
 		const a = msg("first");
 		const b = msg("second");
@@ -463,40 +487,118 @@ describe("mailbox: prompt vs steer", () => {
 		expect(drivers).toHaveLength(1);
 	});
 
-	for (const held of ["leafId", "steer"] as const) {
-		test(`the turn ending while a steer's ${held} call is in flight: the message runs as a new turn (#61)`, async () => {
-			driverOptions = { holdTurns: true };
-			const mailbox = router.mailbox(ORIGIN);
-			const a = msg("long job");
-			await router.route(a);
-			const driver = drivers[0] as SteerFailingDriver;
-			const gate = Promise.withResolvers<void>();
-			if (held === "leafId") driver.leafGate = gate;
-			else driver.steerGate = gate;
-			const b = msg("추가 지시");
-			const routed = router.route(b);
-			await driver.gateEntered.promise;
-			// The final arrives while the dispatch still awaits the call; its handler queues behind the dispatch.
-			const finalSeen = Promise.withResolvers<void>();
-			const off = driver.onFinal(() => {
-				off();
-				finalSeen.resolve();
-			});
-			driver.release();
-			await finalSeen.promise;
-			gate.resolve();
-			await routed;
-			await mailbox.sweepIdle();
-			expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:long job", "prompt:추가 지시"]);
-			const rowA = store.getInbound(a.platformMessageId);
-			const rowB = store.getInbound(b.platformMessageId);
-			expect(rowB?.opRef).not.toBe(rowA?.opRef ?? "missing");
-			await untilFinal(mailbox, driver, () => driver.release());
-			expect(store.getInbound(b.platformMessageId)?.state).toBe("answered");
-			const replies = store.listDeliveries({ originKey: ORIGIN }).filter((d) => d.threadRef === b.threadRef);
-			expect(replies.map((d) => d.body)).toEqual(["ECHO 추가 지시"]);
+	test("a steer that throws parks the row as uncertain: never prompted again, the rows behind it still go out", async () => {
+		driverOptions = { holdTurns: true };
+		failSteers = 1;
+		const mailbox = router.mailbox(ORIGIN);
+		const a = msg("first");
+		const b = msg("second");
+		const c = msg("third");
+		await router.route(a);
+		await router.route(b);
+		await router.route(c);
+		const driver = drivers[0] as SteerFailingDriver;
+		expect(store.getInbound(b.platformMessageId)).toMatchObject({ state: "uncertain", uncertainReason: "steer_threw" });
+		expect(store.getInbound(c.platformMessageId)?.state).toBe("dispatched");
+		await untilFinal(mailbox, driver, () => driver.release());
+		await mailbox.sweepIdle();
+		expect(driver.calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:first"]);
+		expect(store.getInbound(b.platformMessageId)?.state).toBe("uncertain");
+		expect(store.getInbound(a.platformMessageId)?.state).toBe("answered");
+		expect(logLines.some((line) => line.includes("inbound_uncertain") && line.includes("steer_threw"))).toBe(true);
+		// Neither a drain nor the startup resume touches it.
+		await mailbox.resumePending();
+		expect(driver.calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:first"]);
+		expect(store.getInbound(b.platformMessageId)?.state).toBe("uncertain");
+	});
+
+	test("a failed ledger write after a delivered steer parks the row as uncertain, never re-sent", async () => {
+		driverOptions = { holdTurns: true };
+		const mailbox = router.mailbox(ORIGIN);
+		const a = msg("first");
+		const b = msg("second");
+		await router.route(a);
+		const markDispatched = store.markDispatched.bind(store);
+		store.markDispatched = (id, input) => {
+			if (id === b.platformMessageId) throw new Error("disk full");
+			return markDispatched(id, input);
+		};
+		await router.route(b);
+		const driver = drivers[0] as SteerFailingDriver;
+		expect(driver.calls.filter((call) => call.startsWith("steer:"))).toEqual(["steer:second"]);
+		expect(store.getInbound(b.platformMessageId)).toMatchObject({
+			state: "uncertain",
+			uncertainReason: "dispatch_record_failed",
 		});
-	}
+		await untilFinal(mailbox, driver, () => driver.release());
+		expect(driver.calls.filter((call) => call.startsWith("steer:") || call.startsWith("prompt:"))).toEqual([
+			"prompt:first",
+			"steer:second",
+		]);
+		expect(store.getInbound(b.platformMessageId)?.state).toBe("uncertain");
+	});
+
+	test("the turn ending while a steer's leafId call is in flight: nothing was sent, the message runs as a new turn (#61)", async () => {
+		driverOptions = { holdTurns: true };
+		const mailbox = router.mailbox(ORIGIN);
+		const a = msg("long job");
+		await router.route(a);
+		const driver = drivers[0] as SteerFailingDriver;
+		const gate = Promise.withResolvers<void>();
+		driver.leafGate = gate;
+		const b = msg("추가 지시");
+		const routed = router.route(b);
+		await driver.gateEntered.promise;
+		// The final arrives while the dispatch still awaits the call; its handler queues behind the dispatch.
+		const finalSeen = Promise.withResolvers<void>();
+		const off = driver.onFinal(() => {
+			off();
+			finalSeen.resolve();
+		});
+		driver.release();
+		await finalSeen.promise;
+		gate.resolve();
+		await routed;
+		await mailbox.sweepIdle();
+		expect(driver.calls.filter((c) => c.startsWith("prompt:"))).toEqual(["prompt:long job", "prompt:추가 지시"]);
+		const rowA = store.getInbound(a.platformMessageId);
+		const rowB = store.getInbound(b.platformMessageId);
+		expect(rowB?.opRef).not.toBe(rowA?.opRef ?? "missing");
+		await untilFinal(mailbox, driver, () => driver.release());
+		expect(store.getInbound(b.platformMessageId)?.state).toBe("answered");
+		const replies = store.listDeliveries({ originKey: ORIGIN }).filter((d) => d.threadRef === b.threadRef);
+		expect(replies.map((d) => d.body)).toEqual(["ECHO 추가 지시"]);
+	});
+	test("the turn ending (final) while the steer is in flight: the row is uncertain and never prompted again", async () => {
+		driverOptions = { holdTurns: true };
+		const mailbox = router.mailbox(ORIGIN);
+		const a = msg("long job");
+		await router.route(a);
+		const driver = drivers[0] as SteerFailingDriver;
+		const gate = Promise.withResolvers<void>();
+		driver.steerGate = gate;
+		const b = msg("추가 지시");
+		const routed = router.route(b);
+		await driver.gateEntered.promise;
+		const finalSeen = Promise.withResolvers<void>();
+		const off = driver.onFinal(() => {
+			off();
+			finalSeen.resolve();
+		});
+		driver.release();
+		await finalSeen.promise;
+		gate.resolve();
+		await routed;
+		await mailbox.sweepIdle();
+		expect(store.getInbound(b.platformMessageId)).toMatchObject({
+			state: "uncertain",
+			uncertainReason: "turn_ended_after_steer",
+		});
+		expect(drivers.flatMap((d) => d.calls).filter((c) => c === "prompt:추가 지시")).toEqual([]);
+		await mailbox.resumePending();
+		expect(drivers.flatMap((d) => d.calls).filter((c) => c === "prompt:추가 지시")).toEqual([]);
+		expect(store.getInbound(b.platformMessageId)?.state).toBe("uncertain");
+	});
 
 	test("a duplicate platform message is prompted once", async () => {
 		const mailbox = router.mailbox(ORIGIN);
@@ -513,7 +615,7 @@ describe("mailbox: prompt vs steer", () => {
 describe("mailbox: /new, /status, failures", () => {
 	test("/new discards pending rows and drops the old epoch's output", async () => {
 		driverOptions = { holdTurns: true };
-		failSteers = 1;
+		failLeafIds = 1;
 		const mailbox = router.mailbox(ORIGIN);
 		await router.route(msg("old turn"));
 		const pending = msg("never reached the turn");
@@ -628,7 +730,7 @@ describe("mailbox: /new, /status, failures", () => {
 describe("mailbox: queue drop", () => {
 	test("a steer-blocked plain message (끼워넣기 대기) is dropped without touching the running turn", async () => {
 		driverOptions = { holdTurns: true };
-		failSteers = 1;
+		failLeafIds = 1;
 		const mailbox = router.mailbox(ORIGIN);
 		await router.route(msg("first"));
 		const blocked = msg("끼워넣기 거부된 메시지");
@@ -727,7 +829,7 @@ describe("mailbox: !stop stops the turn and keeps the session", () => {
 
 	test("rows waiting before !stop (a steer-blocked message, a !followup) are cancelled and the drain opens no turn", async () => {
 		driverOptions = { holdTurns: true };
-		failSteers = 2; // the !followup's drain tries the blocked row once more
+		failLeafIds = 2; // the !followup's drain tries the blocked row once more
 		const mailbox = router.mailbox(ORIGIN);
 		const first = msg("first");
 		const blocked = msg("끼워넣기 거부된 메시지");
@@ -2945,7 +3047,7 @@ describe("mailbox: a failed usage_daily write never holds up the answer or the q
 					? { holdTurns: true, turnUsage }
 					: { holdTurns: true, sessionFile: join(dir, "missing-session.jsonl") };
 			// A steer the child refuses leaves the second row pending: it is the queue's next turn.
-			failSteers = 1;
+			failLeafIds = 1;
 			store.addDailyUsage = () => {
 				throw new Error("disk full");
 			};
@@ -2963,4 +3065,660 @@ describe("mailbox: a failed usage_daily write never holds up the answer or the q
 			expect(logLines.some((line) => line.includes("usage_daily_failed") && line.includes("disk full"))).toBe(true);
 		});
 	}
+});
+
+describe("mailbox: compaction and between-turn model_usage ledger (compaction-cost-ledger)", () => {
+	class TranscriptDriver extends SteerFailingDriver {
+		sessionFile: string;
+		failState = false;
+		onRespond?: (file: string, prompt: string) => void;
+		onCompact?: (file: string) => void;
+
+		constructor(
+			options: FakeOmpDriverOptions,
+			sessionDir: string,
+			hooks: {
+				fileForDir: (dir: string) => string;
+				onRespond?: (file: string, prompt: string) => void;
+				onCompact?: (file: string) => void;
+			},
+		) {
+			super(options);
+			this.sessionFile = hooks.fileForDir(sessionDir);
+			this.onRespond = hooks.onRespond;
+			this.onCompact = hooks.onCompact;
+		}
+
+		override async state(): Promise<OmpState> {
+			if (this.failState) throw new OmpDriverError("rpc_error", "state failed");
+			return { ...(await super.state()), sessionFile: this.sessionFile };
+		}
+
+		override async switchSession(sessionFile: string): Promise<{ cancelled: boolean }> {
+			this.sessionFile = sessionFile;
+			return super.switchSession(sessionFile);
+		}
+
+		override async leafId(): Promise<string | null> {
+			if (!existsSync(this.sessionFile)) return null;
+			let last: string | null = null;
+			for (const line of readFileSync(this.sessionFile, "utf8").split("\n")) {
+				if (line.trim() === "") continue;
+				try {
+					const rec = JSON.parse(line) as { type?: unknown; id?: unknown };
+					if (rec.type !== "session" && typeof rec.id === "string" && rec.id !== "") last = rec.id;
+				} catch {
+					// ignore malformed line
+				}
+			}
+			return last;
+		}
+
+		override async compact(instructions?: string): Promise<{ tokensBefore: number; summary: string }> {
+			const res = await super.compact(instructions);
+			this.onCompact?.(this.sessionFile);
+			return res;
+		}
+	}
+
+	function appendRecords(file: string, records: readonly Record<string, unknown>[]): void {
+		mkdirSync(dirname(file), { recursive: true });
+		const body = records.map((r) => JSON.stringify(r)).join("\n");
+		appendFileSync(file, `${body}\n`);
+	}
+
+	function seedSessionFile(file: string, sessionId = "s1"): void {
+		mkdirSync(dirname(file), { recursive: true });
+		writeFileSync(
+			file,
+			`${[
+				{ type: "session", version: 3, id: sessionId, timestamp: new Date(clock.now()).toISOString() },
+				{ id: "e1", type: "model_change", timestamp: new Date(clock.now()).toISOString() },
+				{ id: "e2", type: "thinking_level_change", timestamp: new Date(clock.now()).toISOString() },
+			]
+				.map((r) => JSON.stringify(r))
+				.join("\n")}\n`,
+		);
+	}
+
+	function makeTranscriptRouter(hooks: {
+		fileForDir?: (sessionDir: string) => string;
+		onRespond?: (file: string, prompt: string) => void;
+		onCompact?: (file: string) => void;
+		holdTurns?: boolean;
+	}): { router: OriginRouter; created: TranscriptDriver[] } {
+		const created: TranscriptDriver[] = [];
+		const fileForDir = hooks.fileForDir ?? ((sessionDir: string) => join(sessionDir, "session.jsonl"));
+		const localRouter = new OriginRouter({
+			timezone: "Asia/Seoul",
+			store,
+			clock,
+			sessionsRoot: join(dir, "sessions"),
+			log: createLogger({ sink: (line) => logLines.push(line), clock, redact }),
+			statusProvider: () => "status: ok",
+			driverFactory: (_origin, sessionDir) => {
+				let driverRef: TranscriptDriver | undefined;
+				const driver = new TranscriptDriver(
+					{
+						holdTurns: hooks.holdTurns ?? false,
+						sessionDir,
+						store: sessionStore,
+						respond: (prompt) => {
+							if (driverRef) hooks.onRespond?.(driverRef.sessionFile, prompt);
+							return `ECHO ${prompt}`;
+						},
+					},
+					sessionDir,
+					{ fileForDir, onRespond: hooks.onRespond, onCompact: hooks.onCompact },
+				);
+				driverRef = driver;
+				created.push(driver);
+				return driver;
+			},
+		});
+		return { router: localRouter, created };
+	}
+
+	test("AC-1: model_usage (compaction:soft, 0.5) appended after a turn is charged once on the next turn", async () => {
+		let seq = 2;
+		const e1File = join(sessionDirFor(join(dir, "sessions"), ORIGIN, 1), "session.jsonl");
+		seedSessionFile(e1File);
+		const { router: r } = makeTranscriptRouter({
+			onRespond: (file) => {
+				const cost = seq === 2 ? 1.0 : 0.25;
+				clock.advance(1_000);
+				appendRecords(file, [
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "user" },
+					},
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "assistant", usage: { cost: { total: cost } } },
+					},
+				]);
+			},
+		});
+		try {
+			const day = localDay(clock.now(), "Asia/Seoul");
+			const mailbox = r.mailbox(ORIGIN);
+			await r.route(msg("turn 1"));
+			await mailbox.sweepIdle();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.0, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te4`);
+
+			// Between turns: soft compaction writes a model_usage record directly to the session file.
+			clock.advance(5_000);
+			appendRecords(e1File, [
+				{
+					id: `e${++seq}`,
+					type: "model_usage",
+					purpose: "compaction:soft",
+					timestamp: new Date(clock.now()).toISOString(),
+					usage: { cost: { total: 0.5 } },
+				},
+			]);
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.0, 6);
+
+			await r.route(msg("turn 2"));
+			await mailbox.sweepIdle();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.75, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te7`);
+
+			await r.route(msg("turn 3"));
+			await mailbox.sweepIdle();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(2.0, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te9`);
+		} finally {
+			await r.close();
+		}
+	});
+
+	test("AC-2: idle /compact immediately adds between-turn + compaction model_usage and is not charged again on the next turn", async () => {
+		let seq = 2;
+		const e1File = join(sessionDirFor(join(dir, "sessions"), ORIGIN, 1), "session.jsonl");
+		seedSessionFile(e1File);
+		const { router: r } = makeTranscriptRouter({
+			onRespond: (file) => {
+				const cost = seq === 2 ? 1.0 : 0.25;
+				clock.advance(1_000);
+				appendRecords(file, [
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "user" },
+					},
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "assistant", usage: { cost: { total: cost } } },
+					},
+				]);
+			},
+			onCompact: (file) => {
+				clock.advance(1_000);
+				appendRecords(file, [
+					{
+						id: `e${++seq}`,
+						type: "model_usage",
+						purpose: "compaction:remote",
+						timestamp: new Date(clock.now()).toISOString(),
+						usage: { cost: { total: 0.6 } },
+					},
+					{ id: `e${++seq}`, type: "compaction", timestamp: new Date(clock.now()).toISOString() },
+				]);
+			},
+		});
+		try {
+			const day = localDay(clock.now(), "Asia/Seoul");
+			const mailbox = r.mailbox(ORIGIN);
+			await r.route(msg("turn 1"));
+			await mailbox.sweepIdle();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.0, 6);
+
+			clock.advance(5_000);
+			appendRecords(e1File, [
+				{
+					id: `e${++seq}`,
+					type: "model_usage",
+					purpose: "compaction:soft",
+					timestamp: new Date(clock.now()).toISOString(),
+					usage: { cost: { total: 0.4 } },
+				},
+			]);
+
+			const compactCmd = msg("/compact-ompbot");
+			await r.route(compactCmd);
+			await mailbox.sweepIdle();
+			expect(store.listDeliveries({ originKey: ORIGIN }).at(-1)?.body).toContain("압축했습니다");
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(2.0, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te7`);
+
+			await r.route(msg("turn 2"));
+			await mailbox.sweepIdle();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(2.25, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te9`);
+		} finally {
+			await r.close();
+		}
+	});
+
+	test("AC-3: mismatched sessionFile or missing charged entryId falls back cleanly to turn.entryCursor without error", async () => {
+		const e1File = join(sessionDirFor(join(dir, "sessions"), ORIGIN, 1), "session.jsonl");
+		let seq = 2;
+		const { router: r } = makeTranscriptRouter({
+			onRespond: (file) => {
+				clock.advance(1_000);
+				appendRecords(file, [
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "user" },
+					},
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "assistant", usage: { cost: { total: 1.0 } } },
+					},
+				]);
+			},
+		});
+		try {
+			const day = localDay(clock.now(), "Asia/Seoul");
+			const mailbox = r.mailbox(ORIGIN);
+
+			// Case 1: charged cursor points to a different sessionFile.
+			seedSessionFile(e1File);
+			store.setCursor(`charged:${ORIGIN}`, `${join(dir, "other-session.jsonl")}\tghost`);
+			await r.route(msg("turn with different file cursor"));
+			await mailbox.sweepIdle();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.0, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te4`);
+
+			// Case 2: charged cursor points to the same file, but its entryId is absent from disk.
+			store.setCursor(`charged:${ORIGIN}`, `${e1File}\tmissing-entry-id`);
+			await r.route(msg("turn with missing entryId cursor"));
+			await mailbox.sweepIdle();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(2.0, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te6`);
+			expect(logLines.some((line) => line.includes("usage_daily_failed"))).toBe(false);
+		} finally {
+			await r.close();
+		}
+	});
+
+	test("AC-4: turn.costUsd fallback deletes the cursor so the next turn does not recount; addDailyUsage failure leaves cursor unchanged", async () => {
+		let seq = 2;
+		const e1File = join(sessionDirFor(join(dir, "sessions"), ORIGIN, 1), "session.jsonl");
+		seedSessionFile(e1File);
+		const { router: r, created } = makeTranscriptRouter({
+			holdTurns: true,
+			onRespond: (file) => {
+				const cost = seq === 2 ? 1.0 : seq === 4 ? 0.8 : 0.25;
+				clock.advance(1_000);
+				appendRecords(file, [
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "user" },
+					},
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "assistant", usage: { cost: { total: cost } } },
+					},
+				]);
+			},
+			onCompact: (file) => {
+				clock.advance(1_000);
+				appendRecords(file, [
+					{
+						id: `e${++seq}`,
+						type: "model_usage",
+						purpose: "compaction:soft",
+						timestamp: new Date(clock.now()).toISOString(),
+						usage: { cost: { total: 0.5 } },
+					},
+				]);
+			},
+		});
+		try {
+			const day = localDay(clock.now(), "Asia/Seoul");
+			const mailbox = r.mailbox(ORIGIN);
+
+			// Turn 1 sets charged cursor to e4.
+			await r.route(msg("turn 1"));
+			const driver = created[0] as TranscriptDriver;
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.0, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te4`);
+
+			// Turn 2: driver.state() fails -> turn.costUsd (0.8) fallback charges 0.8 and deletes the cursor.
+			await r.route(msg("turn 2"));
+			driver.emitTestEvent({
+				type: "message_end",
+				message: { role: "assistant", content: [], usage: { input: 1, output: 1, cost: { total: 0.8 } } },
+			});
+			driver.failState = true;
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.8, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBeUndefined();
+
+			// Turn 3: because the cursor was deleted, it starts at turn.entryCursor (e6) instead of e4 (no double-count of e6).
+			driver.failState = false;
+			await r.route(msg("turn 3"));
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(2.05, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te8`);
+
+			// addDailyUsage failure on a turn keeps cursor at e8.
+			const realAddDailyUsage = store.addDailyUsage.bind(store);
+			store.addDailyUsage = () => {
+				throw new Error("disk full");
+			};
+			await r.route(msg("turn 4 failing ledger"));
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te8`);
+
+			// addDailyUsage failure on /compact also keeps cursor at e8.
+			await r.route(msg("/compact-ompbot"));
+			await mailbox.sweepIdle();
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te8`);
+
+			// /compact window-read failure (driver.state() throws) deletes the cursor without breaking the reply.
+			store.addDailyUsage = realAddDailyUsage;
+			driver.failState = true;
+			await r.route(msg("/compact-ompbot"));
+			await mailbox.sweepIdle();
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBeUndefined();
+			expect(store.listDeliveries({ originKey: ORIGIN }).at(-1)?.body).toContain("압축했습니다");
+
+			// Re-establish cursor, then trigger wedged !stop (failAbort): turn.costUsd fallback charges and deletes the cursor.
+			driver.failState = false;
+			await r.route(msg("turn 5"));
+			await untilFinal(mailbox, driver, () => driver.release());
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te14`);
+			await r.route(msg("turn 6 wedged"));
+			driver.emitTestEvent({
+				type: "message_end",
+				message: { role: "assistant", content: [], usage: { input: 1, output: 1, cost: { total: 0.3 } } },
+			});
+			driver.failAbort = true;
+			await r.route(msg("!stop"));
+			await mailbox.sweepIdle();
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBeUndefined();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(2.6, 6);
+		} finally {
+			await r.close();
+		}
+	});
+
+	test("AC-5: first /compact after /new or /resume ignores the old session cursor, starts from pre-compact leafId, and skips earlier sub-agent records", async () => {
+		const e1File = join(sessionDirFor(join(dir, "sessions"), ORIGIN, 1), "2026-11-19_11111111.jsonl");
+		const e2File = join(sessionDirFor(join(dir, "sessions"), ORIGIN, 2), "2026-11-19_22222222.jsonl");
+		const e3File = join(sessionDirFor(join(dir, "sessions"), ORIGIN, 3), "2026-11-19_33333333.jsonl");
+		let seq = 2;
+		const { router: r } = makeTranscriptRouter({
+			fileForDir: (sessionDir) => {
+				if (sessionDir.endsWith("/e1")) return e1File;
+				if (sessionDir.endsWith("/e2")) return e2File;
+				return e3File;
+			},
+			onRespond: (file) => {
+				clock.advance(1_000);
+				appendRecords(file, [
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "user" },
+					},
+					{
+						id: `e${++seq}`,
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "assistant", usage: { cost: { total: 1.0 } } },
+					},
+				]);
+			},
+			onCompact: (file) => {
+				clock.advance(1_000);
+				appendRecords(file, [
+					{
+						id: `e${++seq}`,
+						type: "model_usage",
+						purpose: "compaction:soft",
+						timestamp: new Date(clock.now()).toISOString(),
+						usage: { cost: { total: 0.5 } },
+					},
+					{ id: `e${++seq}`, type: "compaction", timestamp: new Date(clock.now()).toISOString() },
+				]);
+			},
+		});
+		try {
+			const day = localDay(clock.now(), "Asia/Seoul");
+			const mailbox = r.mailbox(ORIGIN);
+
+			// Epoch 1 turn sets charged cursor to e1File\te4.
+			seedSessionFile(e1File, "11111111-aaaa");
+			await r.route(msg("epoch 1 turn"));
+			await mailbox.sweepIdle();
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.0, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e1File}\te4`);
+
+			// Prepare epoch 2 session file (used after /new) with pre-compact assistant cost 5.0 and an earlier sub-agent cost 9.0.
+			await r.route(msg("/new-ompbot"));
+			await mailbox.sweepIdle();
+			mkdirSync(dirname(e2File), { recursive: true });
+			writeFileSync(
+				e2File,
+				`${[
+					{ type: "session", version: 3, id: "22222222-bbbb", timestamp: new Date(clock.now()).toISOString() },
+					{
+						id: "n1",
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "assistant", usage: { cost: { total: 5.0 } } },
+					},
+					{ id: "n2", type: "thinking_level_change", timestamp: new Date(clock.now()).toISOString() },
+				]
+					.map((r) => JSON.stringify(r))
+					.join("\n")}\n`,
+			);
+			const e2Sub = join(e2File.replace(/\.jsonl$/, ""), "sub-before.jsonl");
+			appendRecords(e2Sub, [
+				{
+					type: "model_usage",
+					timestamp: new Date(clock.now() - 10_000).toISOString(),
+					usage: { cost: { total: 9.0 } },
+				},
+			]);
+
+			clock.advance(5_000);
+			await r.route(msg("/compact-ompbot"));
+			await mailbox.sweepIdle();
+			// Only compaction's 0.5 is added (not n1's 5.0, not sub-before's 9.0).
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(1.5, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e2File}\te6`);
+
+			// Prepare epoch 3 saved session for /resume with existing cost 7.0 and an earlier sub-agent cost 8.0.
+			mkdirSync(dirname(e3File), { recursive: true });
+			writeFileSync(
+				e3File,
+				`${[
+					{ type: "session", version: 3, id: "33333333-cccc", timestamp: new Date(clock.now()).toISOString() },
+					{
+						id: "r1",
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "user", content: [{ type: "text", text: "saved session" }] },
+					},
+					{
+						id: "r2",
+						type: "message",
+						timestamp: new Date(clock.now()).toISOString(),
+						message: { role: "assistant", usage: { cost: { total: 7.0 } } },
+					},
+				]
+					.map((r) => JSON.stringify(r))
+					.join("\n")}\n`,
+			);
+			const e3Sub = join(e3File.replace(/\.jsonl$/, ""), "sub-old.jsonl");
+			appendRecords(e3Sub, [
+				{
+					type: "model_usage",
+					timestamp: new Date(clock.now() - 10_000).toISOString(),
+					usage: { cost: { total: 8.0 } },
+				},
+			]);
+
+			await r.route(msg("/resume-ompbot 3333"));
+			await mailbox.sweepIdle();
+			expect(store.getOrigin(ORIGIN)?.sessionFile).toBe(e3File);
+
+			clock.advance(5_000);
+			await r.route(msg("/compact-ompbot"));
+			await mailbox.sweepIdle();
+			// Only this compaction's 0.5 is added (not r2's 7.0, not sub-old's 8.0).
+			expect(store.dailyCost(day, ORIGIN)).toBeCloseTo(2.0, 6);
+			expect(store.getCursor(`charged:${ORIGIN}`)).toBe(`${e3File}\te8`);
+		} finally {
+			await r.close();
+		}
+	});
+});
+
+describe("mailbox: turn failure kinds and turn_failed logs", () => {
+	test("owner turn failures show kind-specific tails and log turn_failed with kind", async () => {
+		const cases: Array<{ error: string; expectedKind: string; expectedTail: string }> = [
+			{
+				error: "429 Usage limit reached for 5 hour. Your limit will reset at 2026-11-20 12:15:02",
+				expectedKind: "provider_limit",
+				expectedTail: "공급자 한도입니다. 12:15 이후 다시 보내거나 다른 모델로 `/model-ompbot`",
+			},
+			{
+				error: "Too Many Requests",
+				expectedKind: "provider_limit",
+				expectedTail: "공급자 한도입니다. 다시 보내거나 다른 모델로 `/model-ompbot`",
+			},
+			{
+				error: "prompt is too long: 215000 tokens > 200000 maximum",
+				expectedKind: "context_overflow",
+				expectedTail: "대화가 너무 길어 이어갈 수 없습니다. `/new-ompbot`(또는 `/compact-ompbot`) 뒤 다시 보내 주세요",
+			},
+			{
+				error: "401 invalid api key",
+				expectedKind: "auth",
+				expectedTail: "봇 계정 인증 문제입니다. 다시 보내도 같습니다 — 오너가 로그인·키를 확인해야 합니다",
+			},
+			{
+				error: "socket hang up",
+				expectedKind: "transient",
+				expectedTail: "다시 보내 주세요",
+			},
+			{
+				error: "unexpected failure",
+				expectedKind: "unknown",
+				expectedTail: "다시 보내 주세요",
+			},
+		];
+
+		for (const [i, c] of cases.entries()) {
+			const origin = `discord/dm/2000000000000090${i}`;
+			const row = msg(`ask ${c.expectedKind}`, { originKey: origin, threadRef: `dm:2000000000000090${i}` });
+			driverOptions = { holdTurns: true };
+			const beforeLogs = logLines.length;
+			const mailbox = router.mailbox(origin);
+			await router.route(row);
+			const driver = drivers.at(-1) as SteerFailingDriver;
+			await untilFinal(mailbox, driver, () => driver.failTurn(c.error));
+
+			const newDeliveries = store.listDeliveries({ originKey: origin });
+			expect(newDeliveries.map((d) => d.body)).toEqual([`[turn failed] ${c.error} — ${c.expectedTail}`]);
+
+			const turnFailedLogs = logLines.slice(beforeLogs).filter((line) => line.includes("event=turn_failed"));
+			expect(turnFailedLogs).toHaveLength(1);
+			expect(turnFailedLogs[0]).toContain(`kind=${c.expectedKind}`);
+			expect(turnFailedLogs[0]).toContain(`origin=${origin}`);
+		}
+	});
+
+	test("dispatch failure keeps code prefix, classifies from raw error, and logs redacted turn_failed up to 300 chars", async () => {
+		const raw = `401 invalid api key token=xoxb-TEST-secret ${"x".repeat(350)}`;
+		driverOptions = { startError: new OmpDriverError("rpc_error", raw) };
+		await router.route(msg("hi"));
+
+		const deliveries = store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body);
+		expect(deliveries).toEqual([
+			"[turn failed] rpc_error — 봇 계정 인증 문제입니다. 다시 보내도 같습니다 — 오너가 로그인·키를 확인해야 합니다",
+		]);
+
+		const logLine = logLines.find((line) => line.includes("event=turn_failed"));
+		expect(logLine).toBeDefined();
+		expect(logLine).toContain("kind=auth");
+		expect(logLine).not.toContain("xoxb-TEST-secret");
+		expect(logLine).toContain("[REDACTED]");
+		const reasonMatch = /reason="([^"]*)"/.exec(logLine ?? "");
+		expect(reasonMatch?.[1]?.length).toBe(300);
+	});
+
+	test("omp exit keeps omp_exited code prefix, classifies from stderr tail, and logs turn_failed", async () => {
+		driverOptions = { holdTurns: true };
+		const mailbox = router.mailbox(ORIGIN);
+		await router.route(msg("crash test"));
+		const driver = drivers.at(-1) as SteerFailingDriver;
+		driver.crashWith(1, "429 Usage limit reached for 5 hour. Your limit will reset at 2026-11-20 12:15:02");
+		await mailbox.sweepIdle();
+
+		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual([
+			"[turn failed] omp_exited code=1 — 공급자 한도입니다. 12:15 이후 다시 보내거나 다른 모델로 `/model-ompbot`",
+		]);
+		const logLine = logLines.find((line) => line.includes("event=turn_failed"));
+		expect(logLine).toBeDefined();
+		expect(logLine).toContain("kind=provider_limit");
+		expect(logLine).toContain("omp_exited code=1");
+	});
+
+	test("peer failure mention stays unchanged even for provider_limit/auth/context_overflow", async () => {
+		const PEER = "100000000000000077";
+		const BOT = "500000000000000000";
+		threadBot = { id: BOT };
+		router = buildRouter();
+		driverOptions = { holdTurns: true };
+		const ts = "700000000000000999";
+		const origin = `discord/ch/${CH_ID}/t/${ts}`;
+		const threadRef = `${CH_ID}:${ts}`;
+		store.ensureOrigin(origin, sessionDirFor(join(dir, "sessions"), origin, 1));
+		store.recordInbound({
+			originKey: origin,
+			platformMessageId: threadRef,
+			textRef: `[피어 봇 떡의 요청 — 오너 지시가 아니다]\n<<<quoted-0123>>>\n<@${BOT}> 확인해 줘\n<<<end-quoted-0123>>>`,
+			threadRef,
+			peerUserId: PEER,
+		});
+		const mailbox = router.mailbox(origin);
+		await mailbox.resumePending();
+		const driver = drivers.at(-1) as SteerFailingDriver;
+		await untilFinal(mailbox, driver, () => driver.failTurn("429 Too Many Requests"));
+
+		expect(
+			store
+				.listDeliveries({})
+				.filter((d) => d.threadRef === threadRef)
+				.map((d) => d.body),
+		).toEqual([`<@${PEER}> <@${BOT}> 응답 실패(429 Too Many Requests) — 다시 요청하거나 직접 검토해 주세요`]);
+
+		const logLine = logLines.find((line) => line.includes("event=turn_failed"));
+		expect(logLine).toContain("kind=provider_limit");
+	});
 });

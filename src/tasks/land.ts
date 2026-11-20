@@ -71,6 +71,11 @@ export interface TaskLandDeps {
 	land: LandLane;
 	/** `button`: the owner clicked `머지` — an unproven claim word the card already showed does not hand the landing back. */
 	mode: "auto" | "button";
+	/**
+	 * Stops the task's queued and running `[check:]` jobs and resolves once the check process is gone: the rebase must
+	 * not run in a worktree a check is still using. Absent = no check queue (tests, remote handoff).
+	 */
+	stopChecks?(taskId: string): Promise<void>;
 	/** Judges the task at its worktree's HEAD with the `[check:]` re-runs and the integrity read (`evaluateTask`). */
 	judge(row: TaskRow): Promise<TaskEvaluation>;
 	/** Read right before the landing (`taskLandHold`): why it must not happen now; `undefined` = go on. */
@@ -345,6 +350,7 @@ export async function landTask(row: TaskRow, deps: TaskLandDeps): Promise<TaskLa
 	const git = deps.git ?? defaultGit;
 	let rebase: TaskLandRebase | undefined;
 	try {
+		await deps.stopChecks?.(row.taskId);
 		const refused = await precondition(git, row);
 		if (refused !== undefined) return handoff(refused);
 		const baseBranch = await baseBranchOf(git, row.repo);

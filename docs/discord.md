@@ -100,6 +100,7 @@ umask 077; cat > ~/.ompbot/secrets/discord-bot-token   # 2절의 봇 토큰 붙�
       "laneChannelId": "<4절 5단계의 채널 ID>",
       "logChannelId": "<#log로 쓸 서버 텍스트 채널 ID>",
       "escalationChannelId": "<승인 카드를 받을 서버 텍스트 채널 ID>",
+      "alertChannelId": "<경보를 받을 서버 텍스트 채널 ID>",
       "displayName": "송박"
     }
   }
@@ -110,6 +111,7 @@ umask 077; cat > ~/.ompbot/secrets/discord-bot-token   # 2절의 봇 토큰 붙�
 - `displayName`은 선택입니다. 넣으면 기동 때 봇의 글로벌 표시 이름을 이 값으로 바꿉니다(`PATCH /users/@me`, 1~32자). DM·별명 없는 서버의 메시지 위에 이 이름이 보입니다. 바꾸기가 실패하면 경고 로그만 남고 기동은 계속됩니다.
 - `laneChannelId`는 선택입니다. 없으면 DM 세션에는 `ompbot_work_start`가 없고, DM의 `작업: …`에는 이 설정이 필요하다는 답이 옵니다. 서버 채널·스레드에서 요청한 레인은 설정 없이 그 채널에 열립니다.
 - `logChannelId`는 선택입니다. 넣으면 Discord 대화와 Discord 스레드의 작업 레인 답 첫 줄이 `✅ 완료`로 시작할 때 그 답의 사본이 `📒 완료 보고 사본 · <요청 위치 + 원 스레드 링크>` 머리말과 함께 이 채널에 한 번 올라갑니다. 이 채널과 그 스레드의 글은 멘션이 있어도 턴이 되지 않습니다(`inbound_dropped reason=log_channel`). `escalationChannelId`·`laneChannelId`·`mentionFreeChannels`와 같은 채널이면 `config_invalid field=channels.discord.logChannelId`로 기동하지 않습니다.
+- `alertChannelId`는 선택입니다. 넣으면 오너 경보(게이트 열림·회복, 턴 연속 실패·멈춤, 처리 정체, 공급자 한도, 모니터 실패)가 오너 DM 대신 이 채널 최상위에 올라갑니다. 답장으로 이어 물으려면 `mentionFreeChannels`에도 넣습니다. `logChannelId`와 같으면 기동하지 않습니다.
 - `escalationChannelId`는 선택입니다. 넣으면 Discord 대화에서 올린 승인 카드가 이 채널에 뜹니다(Discord 오너 멘션, `요청 위치` 링크). 요청한 대화에 스레드가 있으면 그곳에 버튼 달린 사본 카드가 뜨고, 카드 스레드에 단 답글도 카드를 결정합니다. 없으면 지금처럼 요청한 대화에 카드가 뜹니다.
 - 두 채널 모두 봇이 보고 글을 쓸 수 있어야 합니다(View Channel·Send Messages). `channels`는 재시작 키라 두 값도 재시작해야 반영됩니다.
 - `guildIds`·`mentionFreeChannels`·`requireMention`은 선택입니다. `guildIds`를 비우면 봇이 들어간 모든 서버의 글을 받습니다(오너 글만 처리하는 건 같습니다).
@@ -130,6 +132,7 @@ bun src/main.ts apply --detach  # 재시작
 - `!status`가 답합니다.
 - 서버 채널에서 봇을 멘션 → 스레드가 생기고 답이 스레드에 옵니다. 같은 스레드에 멘션 없이 답해도 이어집니다.
 - 봇 글에 Discord "답장"을 달면 멘션이 없어도 봇이 받고, 답장 대상 글의 앞부분을 참고합니다. 답장하면서 피어 봇만 멘션하면 피어 몫입니다.
+- 오너가 보낸 글을 30분 안에 고치면 고친 글이 `[오너가 앞 글을 고쳤다 — 이미 답했다면 바뀐 부분만 반영한다]` 표지 줄과 함께 새 입력으로 한 번 들어갑니다. 명령(`!…`)으로 고친 글, 봇이 받지 않았던 글, 30분이 지난 수정은 무시합니다.
 - 서버 멤버 목록에서 봇이 온라인(초록불)으로 보입니다.
 - 승인이 필요한 일을 시키면 버튼 카드가 오고, 누르면 결과 줄로 바뀝니다.
 - DM에서 `1분 뒤에 물 마시라고 알려줘` → 모니터가 등록되고(`모니터 목록 보여줘`에 보임) 1분 뒤 결과가 그 DM에 새 글로 옵니다.

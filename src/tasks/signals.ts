@@ -7,6 +7,7 @@
  *   file <worktree-relative path> [sha256=<hex>] [json:.a.b=<json value>]
  */
 import { createHash } from "node:crypto";
+import { redact } from "../redact";
 
 export const CHECK_TIMEOUT_MS = 900_000;
 
@@ -280,9 +281,12 @@ export interface SignalIo {
 	readBytes(path: string): Promise<Uint8Array | undefined>;
 }
 
-/** The last characters of an output on one line: where a test runner prints its verdict. */
+/**
+ * The last characters of an output on one line: where a test runner prints its verdict. Masked before it is cut, so a
+ * secret the check printed reaches neither the card nor the ledger's `check_json`, whole or in part (qa-x #39).
+ */
 const tail = (text: string): string => {
-	const line = text.replace(/\s+/g, " ").trim();
+	const line = redact(text).replace(/\s+/g, " ").trim();
 	return line.length > 80 ? `…${line.slice(-80)}` : line;
 };
 

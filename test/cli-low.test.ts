@@ -134,7 +134,7 @@ describe("CLI commands without a daemon", () => {
 		chmodSync(join(home.dir, "secrets", "discord-bot-token"), 0o644);
 		const loose = await runMain(home.dir, ["status", "--json"]);
 		expect(loose.code, loose.stderr).toBe(0);
-		expect(JSON.parse(loose.stdout).ompVersion).toBe("omp-stub 0.0.0");
+		expect(JSON.parse(loose.stdout).ompVersion).toBe("omp/0.0.0-stub");
 
 		rmSync(join(home.dir, "config.json"));
 		const dbOnly = await runMain(home.dir, ["status", "--json"]);

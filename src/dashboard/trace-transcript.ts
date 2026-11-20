@@ -1,13 +1,20 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { PURPOSE_HEADER, ROTATION_CONTEXT_HEADER, THREAD_CONTEXT_HEADER } from "../core/mailbox";
+import { QUOTED_HEADER } from "../core/normalize";
+import { RECALL_HEADER } from "../core/recall";
+import { CURRENT_REQUEST_MARKER } from "../core/types";
+import { BOARD_NOTICE_HEAD } from "../lanes/board";
 import { isRecord } from "../omp/type-guards";
-import { redact } from "../redact";
-import type { TraceSpan } from "./trace";
+import { byteLength, maskPersonal, redact } from "../redact";
+import { INJECTION_WARNING_HEAD } from "../safety/injection";
+import { PEER_NOTICE_HEAD } from "../safety/prompt";
+import type { TraceInput, TraceSpan } from "./trace";
 
 /**
  * An omp session transcript (`<session>.jsonl`, sub-agents in `<session>/<name>.jsonl`) as spans on a turn's clock.
- * Of its text only the tool's intent line (`i`), a failed tool's first output and a failed model call's error leave,
- * masked and cut.
+ * Of its text only the tool's intent line (`i`), a failed tool's first output, a failed model call's error and a
+ * sub-agent's brief preview leave, masked and cut; everything else is sizes and marks.
  */
 
 /** Spans kept per transcript (the newest ones); a longer turn says `truncated`. */
@@ -16,16 +23,96 @@ const SPAN_LIMIT = 400;
 const DEPTH_LIMIT = 2;
 const DETAIL_CHARS = 60;
 const ERROR_CHARS = 160;
+export const BRIEF_PREVIEW_CHARS = 120;
 
 type Json = Record<string, unknown>;
 const num = (value: unknown): number | undefined =>
 	typeof value === "number" && Number.isFinite(value) ? value : undefined;
-const text = (value: unknown, limit: number): string | undefined => {
+/** Secrets, then personal data, then the cut: a cut never leaves half of a masked shape. */
+export const maskText = (value: string): string => maskPersonal(redact(value));
+export const oneLineText = (value: unknown, limit: number): string | undefined => {
 	if (typeof value !== "string") return undefined;
-	const line = redact(value).replace(/\s+/g, " ").trim();
+	const line = maskText(value).replace(/\s+/g, " ").trim();
 	if (line === "") return undefined;
 	return line.length > limit ? `${line.slice(0, limit - 1)}…` : line;
 };
+const text = oneLineText;
+
+/** The text parts of a session message (a string content counts as one part). */
+export function messageText(message: Json): string {
+	if (typeof message.content === "string") return message.content;
+	return (Array.isArray(message.content) ? message.content : [])
+		.filter((part): part is Json => isRecord(part) && part.type === "text" && typeof part.text === "string")
+		.map((part) => part.text as string)
+		.join("\n");
+}
+
+/** The first user message of a session file (what its agent was told to do): its size and masked first words. */
+export function readBrief(file: string): { text: string; bytes: number; preview: string } | undefined {
+	for (const entry of readJsonlRecords(file)) {
+		const message = entry.type === "message" && isRecord(entry.message) ? entry.message : undefined;
+		if (message?.role !== "user") continue;
+		const body = messageText(message);
+		if (body.trim() === "") continue;
+		return { text: body, bytes: byteLength(body), preview: oneLineText(body, BRIEF_PREVIEW_CHARS) ?? "" };
+	}
+	return undefined;
+}
+
+// Heads of what `composeTurnPrompt` puts in front of the request, as far as the header's own words go.
+const headOf = (header: string): string => header.slice(0, header.search(/ —|\]/));
+const BLOCK_HEADS: Array<[string, string]> = [
+	[headOf(PEER_NOTICE_HEAD), "안내"],
+	[headOf(ROTATION_CONTEXT_HEADER), "회전 맥락"],
+	[headOf(THREAD_CONTEXT_HEADER), "스레드 맥락"],
+	[headOf(PURPOSE_HEADER), "용도"],
+	[headOf(RECALL_HEADER), "회상"],
+	[headOf(BOARD_NOTICE_HEAD), "게시판"],
+	[headOf(QUOTED_HEADER), "인용"],
+];
+const FENCED = /<<<quoted-([^>\n]*)>>>[\s\S]*?<<<end-quoted-\1>>>/g;
+
+/** The label of a block that starts with an optional injection warning line and then a known head; else undefined. */
+function blockHead(text: string, at: number): { label: string; warned: boolean } | undefined {
+	let rest = text.slice(at);
+	const warned = rest.startsWith(INJECTION_WARNING_HEAD);
+	if (warned) {
+		const lineEnd = rest.indexOf("\n");
+		rest = lineEnd < 0 ? "" : rest.slice(lineEnd + 1);
+	}
+	const known = BLOCK_HEADS.find(([head]) => rest.startsWith(head));
+	return known === undefined ? undefined : { label: known[1], warned };
+}
+
+/**
+ * A turn's first user message as the blocks `composeTurnPrompt` put before the request (label, bytes, whether the
+ * block carries an injection warning) and the request itself. The request is cut off at the last request marker; in the
+ * blocks only a head after a blank line outside quote fences starts a block, so a head-looking line in a pasted quote
+ * or in the request is no block. Text before the first known head is one `기타` block.
+ */
+export function splitTurnPrompt(prompt: string): TraceInput[] {
+	const marker = `\n\n${CURRENT_REQUEST_MARKER}\n`;
+	const cutAt = prompt.lastIndexOf(marker);
+	const request = (body: string): TraceInput => ({ label: "현재 요청", bytes: byteLength(body), warned: false });
+	if (cutAt < 0) return [request(prompt)];
+	const blocks = prompt.slice(0, cutAt);
+	const fenced: Array<[number, number]> = [];
+	for (const match of blocks.matchAll(FENCED)) fenced.push([match.index, match.index + match[0].length]);
+	const lastClosed = fenced.at(-1)?.[1] ?? 0;
+	const open = blocks.slice(lastClosed).search(/<<<quoted-[^>\n]*>>>/);
+	if (open >= 0) fenced.push([lastClosed + open, blocks.length]);
+	const starts = [0];
+	for (let at = blocks.indexOf("\n\n"); at >= 0; at = blocks.indexOf("\n\n", at + 1)) {
+		if (fenced.some(([from, to]) => at >= from && at < to)) continue;
+		if (blockHead(blocks, at + 2) !== undefined) starts.push(at + 2);
+	}
+	const inputs = starts.map((start, i): TraceInput => {
+		const piece = blocks.slice(start, i + 1 < starts.length ? (starts[i + 1] as number) - 2 : blocks.length);
+		const head = blockHead(blocks, start);
+		return { label: head?.label ?? "기타", bytes: byteLength(piece), warned: head?.warned ?? false };
+	});
+	return [...inputs, request(prompt.slice(cutAt + marker.length))];
+}
 
 /** The part of the session that belongs to the turn. */
 export interface TranscriptWindow {
@@ -52,6 +139,8 @@ export interface Transcript {
 	/** Its last model call ended the conversation (`stop`) or failed (`error`/`aborted`). */
 	ending?: "stop" | "failed";
 	truncated: boolean;
+	/** The turn's first prompt taken apart (session's own turn only, not a sub-agent's). */
+	inputs?: TraceInput[];
 }
 
 /** The object records of a session `.jsonl`, skipping the torn line omp may be writing. */
@@ -114,12 +203,38 @@ export function readTranscript(
 	let tail: "model" | "other" = "other";
 	/** The last message inside the window: where an unanswered tool call stops and the next model call starts. */
 	let lastIn: number | undefined;
-	for (const entry of readJsonlRecords(file)) {
+	const records = readJsonlRecords(file);
+	/** Entry index (file order) of each answered tool call in the window. */
+	const answeredAt: number[] = [];
+	/** Set by a compaction: the next model call carries how many of the turn's tool results it summarised. */
+	let compacted: number | undefined;
+	for (const [index, entry] of records.entries()) {
 		const at = Date.parse(typeof entry.timestamp === "string" ? entry.timestamp : "");
 		if (Number.isNaN(at)) continue;
 		result.first ??= at;
 		if (entry.type === "model_change" && typeof entry.model === "string") result.model = entry.model;
 		if (at < window.from || at > window.to) continue;
+		if (entry.type === "compaction") {
+			const kept = typeof entry.firstKeptEntryId === "string" ? entry.firstKeptEntryId : undefined;
+			const keptAt = kept === undefined ? -1 : records.findIndex((record) => record.id === kept);
+			compacted = answeredAt.filter((resultAt) => keptAt < 0 || resultAt < keptAt).length;
+			const before = num(entry.tokensBefore);
+			const after = num(entry.tokensAfter);
+			const size =
+				before === undefined && after === undefined
+					? ""
+					: ` ${before === undefined ? "?" : `${Math.round(before / 1000)}k`}→${after === undefined ? "?" : `${Math.round(after / 1000)}k`}`;
+			const method = oneLineText(entry.method, DETAIL_CHARS);
+			result.spans.push({
+				id: `${scope.prefix}${typeof entry.id === "string" ? entry.id : `c${index}`}`,
+				name: `압축${size}${method === undefined ? "" : ` · ${method}`}`,
+				kind: "compaction",
+				status: "done",
+				start: at - origin,
+				end: at - origin,
+			});
+			continue;
+		}
 		const message = entry.type === "message" && isRecord(entry.message) ? entry.message : undefined;
 		if (message === undefined) continue;
 		lastIn = at;
@@ -128,6 +243,10 @@ export function readTranscript(
 				id: `${scope.prefix}${typeof entry.id === "string" ? entry.id : `m${result.spans.length}`}`,
 				...modelSpan(message, at, origin),
 			};
+			if (compacted !== undefined) {
+				span.compactedTools = compacted;
+				compacted = undefined;
+			}
 			result.spans.push(span);
 			result.ending = message.stopReason === "stop" ? "stop" : span.status === "failed" ? "failed" : undefined;
 			tail = "model";
@@ -147,10 +266,25 @@ export function readTranscript(
 			}
 		} else if (message.role === "toolResult" || message.role === "user") {
 			tail = "other";
+			if (message.role === "user" && scope.depth === 0 && result.inputs === undefined) {
+				const prompt = messageText(message);
+				if (prompt.trim() !== "") result.inputs = splitTurnPrompt(prompt);
+			}
 			const tool = typeof message.toolCallId === "string" ? calls.get(message.toolCallId) : undefined;
 			if (tool === undefined) continue;
 			tool.end = at - origin;
 			tool.status = message.isError === true ? "failed" : "done";
+			answeredAt.push(index);
+			tool.resultBytes = byteLength(messageText(message));
+			const truncation =
+				isRecord(message.details) && isRecord(message.details.truncation) ? message.details.truncation : undefined;
+			if (truncation?.truncated === true) {
+				tool.truncated = {
+					by: typeof truncation.truncatedBy === "string" ? truncation.truncatedBy : "",
+					shownLines: num(truncation.outputLines) ?? 0,
+					totalLines: num(truncation.totalLines) ?? 0,
+				};
+			}
 			const first = Array.isArray(message.content) ? message.content.find(isRecord) : undefined;
 			const error = tool.status === "failed" ? text(first?.text, ERROR_CHARS) : undefined;
 			if (error !== undefined) tool.error = error;
@@ -197,6 +331,7 @@ function subAgents(dir: string, window: TranscriptWindow, parent: Scope): TraceS
 		const sub = readTranscript(join(dir, file), window, { depth: parent.depth + 1, prefix: `${id}/` });
 		if (sub.first === undefined || sub.lastIn === undefined) continue;
 		const running = window.live && sub.ending === undefined;
+		const brief = readBrief(join(dir, file));
 		out.push({
 			id,
 			name,
@@ -205,6 +340,7 @@ function subAgents(dir: string, window: TranscriptWindow, parent: Scope): TraceS
 			start: Math.max(sub.first, window.from) - window.origin,
 			...(running ? {} : { end: sub.lastIn - window.origin }),
 			...(sub.model === undefined ? {} : { detail: sub.model, model: sub.model }),
+			...(brief === undefined ? {} : { briefBytes: brief.bytes, briefPreview: brief.preview }),
 			children: sub.spans,
 		});
 	}

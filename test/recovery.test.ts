@@ -141,6 +141,20 @@ describe("recovery rule (2): dispatched rows of a dead process", () => {
 		expect(store.listDeliveries({ originKey: ORIGIN }).map((d) => d.body)).toEqual(["ECHO 이어서"]);
 	});
 
+	test("an uncertain row is left alone by recovery and by a reopened ledger's pending replay list", async () => {
+		store.recordInbound({ originKey: ORIGIN, platformMessageId: "u1", textRef: "불확실", threadRef: "t-u1" });
+		store.markUncertain("u1", "steer_threw");
+		const { opRef } = await dispatchedTurn("m1", "ECHO abc", { finish: true });
+		const result = await recoverDispatched({ store, driverFactory: factory(), log: log() });
+		expect(result).toEqual({ answered: 1, interrupted: 0, continued: 0 });
+		expect(store.getInbound("m1")?.opRef).toBe(opRef);
+		store.close();
+		store = openBotStore(join(dir, "ompbot.db"), clock, "Asia/Seoul");
+		expect(store.getInbound("u1")).toMatchObject({ state: "uncertain", uncertainReason: "steer_threw" });
+		expect(store.listInbound({ state: "pending" })).toEqual([]); // what the boot replay reads
+		expect(drivers.flatMap((driver) => driver.calls).some((call) => call.includes("불확실"))).toBe(false);
+	});
+
 	test("final assistant body after the cursor -> answered + exactly one delivery", async () => {
 		const { opRef } = await dispatchedTurn("m1", "ECHO abc", { finish: true });
 		const result = await recoverDispatched({ store, driverFactory: factory(), log: log() });

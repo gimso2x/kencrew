@@ -6,21 +6,29 @@ import type { LaneHistoryEntry, LaneMeta, LaneStatus } from "../lanes/status";
 import { ompSessionDirFor } from "../omp/session-dir";
 import { newestSessionFile } from "../omp/session-heal";
 import { isRecord } from "../omp/type-guards";
-import { redact } from "../redact";
+import { maskPersonal, redact } from "../redact";
 import { oneLine, readTierConfidence } from "../tasks/docs";
 import type { TaskStatus } from "../tasks/ledger";
 import { agyModelOf } from "../tasks/worker-tier";
 import { hostTimezone } from "../time";
 import type { BoardCard } from "./board";
 import { hasSecretsSegment, isAllowedJobCwd, type JobInfo, jobAllowedRoots, readJobFile } from "./snapshot";
-import { readJsonlRecords, readTranscript, type Transcript } from "./trace-transcript";
+import {
+	BRIEF_PREVIEW_CHARS,
+	maskText,
+	oneLineText,
+	readBrief,
+	readJsonlRecords,
+	readTranscript,
+	type Transcript,
+} from "./trace-transcript";
 
 /**
  * Trace of one turn for the dashboard's waterfall: every model call, tool call and sub-agent of the turn's omp
  * session as a span on the turn's clock. Read-only (one `readonly` database handle, the session files read whole).
  */
 
-export type SpanKind = "agent" | "subagent" | "llm" | "tool";
+export type SpanKind = "agent" | "subagent" | "llm" | "tool" | "compaction";
 export type SpanStatus = "running" | "done" | "failed";
 
 export interface TraceSpan {
@@ -40,8 +48,27 @@ export interface TraceSpan {
 	cost?: number;
 	error?: string;
 	children?: TraceSpan[];
+	/** On the turn's root: the first prompt's blocks and the request (sizes and marks, no text). */
+	inputs?: TraceInput[];
+	/** On a tool: the size of its result, and what the tool cut from it. */
+	resultBytes?: number;
+	truncated?: { by: string; shownLines: number; totalLines: number };
+	/** On the first model call after a compaction: how many of the turn's tool results it only has as a summary. */
+	compactedTools?: number;
+	/** On a sub-agent or worker: its first user message (the brief): size and masked first words. */
+	briefBytes?: number;
+	briefPreview?: string;
+	/** Only the preview of the brief is known (a remote or agy TASK has no session file; `herdr_prompts` keeps 120 chars). */
+	briefPartial?: true;
 	/** Set on a TASK's or lane's span (the workers the turn delegated to); absent on tools and in-turn sub-agents. */
 	worker?: TraceWorker;
+}
+
+/** One part of a turn prompt: what it is (`회상`, `게시판`, `현재 요청`, `기타`…), its size, whether it carries an injection warning. */
+export interface TraceInput {
+	label: string;
+	bytes: number;
+	warned: boolean;
 }
 
 /** What the turn recorded about a worker's tier choice; each part is null when the row has none (or no such column). */
@@ -101,6 +128,7 @@ function turnRoot(main: Transcript, live: boolean, failed: boolean, workers: Tra
 		status: live ? "running" : failed ? "failed" : "done",
 		start: 0,
 		...(live ? {} : { end: lastEnd }),
+		...(main.inputs === undefined ? {} : { inputs: main.inputs }),
 		...(main.model === undefined ? {} : { model: main.model }),
 		children: workers.length === 0 ? main.spans : [...main.spans, ...workers].sort((a, b) => a.start - b.start),
 	};
@@ -239,6 +267,16 @@ interface Worker {
 	/** The bar's end when there is no session to read: absent while it runs. */
 	barEnd: number | undefined;
 	info: TraceWorker;
+	/** What the worker was told: the session's first user message, or a TASK's start preview alone (`partial`). */
+	brief: WorkerBrief | undefined;
+}
+
+export interface WorkerBrief {
+	/** Absent when only the preview is known. */
+	text?: string;
+	bytes?: number;
+	preview: string;
+	partial?: true;
 }
 
 interface TaskRow {
@@ -286,6 +324,9 @@ function findWorkers(
 ): Worker[] {
 	const { from, to } = window;
 	const workers: Worker[] = [];
+	const startPreview = db.query<{ preview: string }, [string, string, number]>(
+		"SELECT preview FROM herdr_prompts WHERE origin_key = ? AND agent = ? AND kind = 'start' AND at >= ? ORDER BY at LIMIT 1",
+	);
 	const prompts = db.query<{ at: number }, [string, string, number]>(
 		"SELECT at FROM herdr_prompts WHERE origin_key = ? AND agent = ? AND kind IN ('start','followup') AND at >= ? ORDER BY at",
 	);
@@ -309,6 +350,11 @@ function findWorkers(
 		const local = task.host === null || task.host === "";
 		const file =
 			!agy && local ? sessionOf(ompSessionDirFor(task.worktree, where.userHome, where.sessionsRoot)) : undefined;
+		const first = file === undefined ? undefined : readBrief(file);
+		const preview =
+			file === undefined
+				? oneLineText(startPreview.get(originKey, task.agent, task.created_at - 60_000)?.preview, BRIEF_PREVIEW_CHARS)
+				: undefined;
 		const finished = task.status === "review" ? task.updated_at : (task.closed_at ?? task.updated_at);
 		workers.push({
 			id: task.task_id,
@@ -318,10 +364,16 @@ function findWorkers(
 			model: task.worker_model,
 			file,
 			barEnd: status === "running" ? undefined : finished,
+			brief:
+				first !== undefined
+					? { text: first.text, bytes: first.bytes, preview: first.preview }
+					: preview === undefined
+						? undefined
+						: { preview, partial: true },
 			info: {
 				source: "task",
 				tier: task.tier,
-				tierReason: task.tier_reason,
+				tierReason: task.tier_reason === null ? null : maskText(task.tier_reason),
 				tierConfidence: readTierConfidence(task.tier_confidence),
 			},
 		});
@@ -338,18 +390,24 @@ function findWorkers(
 		const history = JSON.parse(lane.history) as LaneHistoryEntry[];
 		const closed = lane.status === "working" ? undefined : history.findLast((entry) => entry.event === "closed")?.at;
 		const status = LANE_SPAN_STATUS[lane.status];
+		const laneFile = sessionOf(lane.session_dir);
+		const laneBrief = laneFile === undefined ? undefined : readBrief(laneFile);
 		workers.push({
 			id: meta.laneId ?? lane.name,
 			status,
 			start: lane.created_at,
 			windowEnd: closed ?? now,
 			model: meta.workerModel ?? null,
-			file: sessionOf(lane.session_dir),
+			file: laneFile,
 			barEnd: status === "running" ? undefined : (closed ?? now),
+			brief:
+				laneBrief === undefined
+					? undefined
+					: { text: laneBrief.text, bytes: laneBrief.bytes, preview: laneBrief.preview },
 			info: {
 				source: "lane",
 				tier: meta.tier ?? null,
-				tierReason: meta.tierReason ?? null,
+				tierReason: meta.tierReason === undefined ? null : maskText(meta.tierReason),
 				tierConfidence: readTierConfidence(meta.tierConfidence),
 			},
 		});
@@ -377,6 +435,15 @@ function workerSpan(worker: Worker, turnStart: number): { span: TraceSpan; trunc
 	const start = Math.max(worker.start, turnStart);
 	const running = worker.status === "running";
 	const model = (worker.model ?? undefined) as string | undefined;
+	const brief = worker.brief;
+	const briefFields: Partial<TraceSpan> =
+		brief === undefined
+			? {}
+			: {
+					...(brief.bytes === undefined ? {} : { briefBytes: brief.bytes }),
+					briefPreview: brief.preview,
+					...(brief.partial === true ? { briefPartial: true as const } : {}),
+				};
 	if (worker.file === undefined) {
 		const end = worker.barEnd === undefined ? undefined : Math.max(start, worker.barEnd) - turnStart;
 		return {
@@ -391,6 +458,7 @@ function workerSpan(worker: Worker, turnStart: number): { span: TraceSpan; trunc
 				detail: `${model ?? "모델 미상"} · 단계 기록 없음`,
 				...(model === undefined ? {} : { model }),
 				worker: worker.info,
+				...briefFields,
 			},
 		};
 	}
@@ -421,6 +489,7 @@ function workerSpan(worker: Worker, turnStart: number): { span: TraceSpan; trunc
 			...(shown === undefined ? {} : { detail: shown, model: shown }),
 			children,
 			worker: worker.info,
+			...briefFields,
 		},
 	};
 }
@@ -456,11 +525,38 @@ function readApprovals(
 		.all(originKey, window.from, window.to)
 		.map((row) => ({
 			id: row.approval_id,
-			summary: redact(oneLine(row.summary)).slice(0, APPROVAL_SUMMARY_CHARS),
+			summary: maskPersonal(redact(oneLine(row.summary))).slice(0, APPROVAL_SUMMARY_CHARS),
 			status: row.status === "pending" && row.expires_at <= now ? "expired" : row.status,
 			createdAt: row.created_at,
 			decidedAt: row.decided_at,
 		}));
+}
+
+/** Where inbound row `inboundId`'s turn lives: its session file and window, found on an open read-only handle. */
+function locateTurn(
+	db: Database,
+	inboundId: number,
+):
+	| { ok: true; originKey: string; state: string; startedAt: number; to: number; starts: number[]; file: string }
+	| { ok: false; error: TraceError } {
+	const turn = db
+		.query<{ origin_key: string; state: string; dispatched_at: number | null }, [number]>(
+			"SELECT origin_key, state, dispatched_at FROM inbound WHERE inbound_id = ?",
+		)
+		.get(inboundId);
+	if (turn === null) return { ok: false, error: "unknown_turn" };
+	if (turn.dispatched_at === null) return { ok: false, error: "not_dispatched" };
+	const startedAt = turn.dispatched_at;
+	const starts = turnStarts(db, turn.origin_key);
+	const to = starts.find((at) => at > startedAt) ?? Number.POSITIVE_INFINITY;
+	const origin = db
+		.query<{ session_dir: string; session_file: string | null }, [string]>(
+			"SELECT session_dir, session_file FROM origins WHERE origin_key = ?",
+		)
+		.get(turn.origin_key);
+	const file = origin === null ? undefined : (origin.session_file ?? sessionOf(origin.session_dir));
+	if (file === undefined || !existsSync(file)) return { ok: false, error: "no_session" };
+	return { ok: true, originKey: turn.origin_key, state: turn.state, startedAt, to, starts, file };
 }
 
 /**
@@ -473,26 +569,12 @@ export function readTurnTrace(homeDir: string, inboundId: number, now: number, w
 	if (!existsSync(dbPath)) return { ok: false, error: "no_database" };
 	const db = new Database(dbPath, { readonly: true, strict: true });
 	try {
-		const turn = db
-			.query<{ origin_key: string; state: string; dispatched_at: number | null }, [number]>(
-				"SELECT origin_key, state, dispatched_at FROM inbound WHERE inbound_id = ?",
-			)
-			.get(inboundId);
-		if (turn === null) return { ok: false, error: "unknown_turn" };
-		if (turn.dispatched_at === null) return { ok: false, error: "not_dispatched" };
-		const startedAt = turn.dispatched_at;
-		const starts = turnStarts(db, turn.origin_key);
-		const to = starts.find((at) => at > startedAt) ?? Number.POSITIVE_INFINITY;
-		const origin = db
-			.query<{ session_dir: string; session_file: string | null }, [string]>(
-				"SELECT session_dir, session_file FROM origins WHERE origin_key = ?",
-			)
-			.get(turn.origin_key);
-		const file = origin === null ? undefined : (origin.session_file ?? sessionOf(origin.session_dir));
-		if (file === undefined || !existsSync(file)) return { ok: false, error: "no_session" };
+		const turn = locateTurn(db, inboundId);
+		if (!turn.ok) return turn;
+		const { startedAt, to } = turn;
 		const turnLive = turn.state === "dispatched";
-		const main = readTranscript(file, { from: startedAt, to, live: turnLive, origin: startedAt });
-		const built = findWorkers(db, turn.origin_key, { from: startedAt, to }, starts, now, where).map((worker) =>
+		const main = readTranscript(turn.file, { from: startedAt, to, live: turnLive, origin: startedAt });
+		const built = findWorkers(db, turn.originKey, { from: startedAt, to }, turn.starts, now, where).map((worker) =>
 			workerSpan(worker, startedAt),
 		);
 		const workers = built.map((entry) => entry.span);
@@ -505,7 +587,38 @@ export function readTurnTrace(homeDir: string, inboundId: number, now: number, w
 			live,
 			truncated: main.truncated || built.some((entry) => entry.truncated),
 			root: turnRoot(main, live, turn.state === "failed_notified", workers),
-			approvals: readApprovals(db, turn.origin_key, { from: startedAt, to }, now),
+			approvals: readApprovals(db, turn.originKey, { from: startedAt, to }, now),
+		};
+	} finally {
+		db.close();
+	}
+}
+
+/** What `ompbot trace-inputs` reads of a turn: the session file and window, and the workers it delegated to. */
+export type TurnSource =
+	| {
+			ok: true;
+			file: string;
+			from: number;
+			to: number;
+			workers: Array<{ id: string; start: number; brief: WorkerBrief | undefined }>;
+	  }
+	| { ok: false; error: TraceError };
+
+export function readTurnSource(homeDir: string, inboundId: number, now: number, where: TraceWhere): TurnSource {
+	const dbPath = join(homeDir, "ompbot.db");
+	if (!existsSync(dbPath)) return { ok: false, error: "no_database" };
+	const db = new Database(dbPath, { readonly: true, strict: true });
+	try {
+		const turn = locateTurn(db, inboundId);
+		if (!turn.ok) return turn;
+		const workers = findWorkers(db, turn.originKey, { from: turn.startedAt, to: turn.to }, turn.starts, now, where);
+		return {
+			ok: true,
+			file: turn.file,
+			from: turn.startedAt,
+			to: turn.to,
+			workers: workers.map((worker) => ({ id: worker.id, start: worker.start, brief: worker.brief })),
 		};
 	} finally {
 		db.close();

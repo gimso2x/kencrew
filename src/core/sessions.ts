@@ -1,5 +1,6 @@
-import { closeSync, existsSync, openSync, readdirSync, readSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { closeSync, existsSync, openSync, readdirSync, readSync, realpathSync, statSync } from "node:fs";
+import { join, sep } from "node:path";
+import { CURRENT_REQUEST_MARKER } from "./types";
 
 /** One omp session file of an origin, as listed by `/resume-ompbot`. */
 export interface SavedSession {
@@ -40,6 +41,13 @@ function textOf(content: unknown): string {
 		.join("");
 }
 
+/** The owner's request of a turn prompt that carries context blocks (`composeTurnPrompt`); the text as is without blocks. */
+function requestOf(prompt: string): string {
+	const marker = `\n\n${CURRENT_REQUEST_MARKER}\n`;
+	const at = prompt.indexOf(marker);
+	return at === -1 ? prompt : prompt.slice(at + marker.length);
+}
+
 /** Session id and first user message from the first 64 KiB of a session file (complete lines only). */
 function describe(file: string): { id: string | undefined; preview: string } {
 	let id: string | undefined;
@@ -58,7 +66,7 @@ function describe(file: string): { id: string | undefined; preview: string } {
 		if (record.type === "message" && "message" in record) {
 			const message = record.message as { role?: unknown; content?: unknown } | null;
 			if (message?.role === "user") {
-				preview = textOf(message.content).replace(/\s+/g, " ").trim();
+				preview = requestOf(textOf(message.content)).replace(/\s+/g, " ").trim();
 				break;
 			}
 		}
@@ -70,19 +78,26 @@ function describe(file: string): { id: string | undefined; preview: string } {
 /** Every session file under `<originDir>/e<N>/`, newest first. */
 export function listSavedSessions(originDir: string): SavedSession[] {
 	if (!existsSync(originDir)) return [];
+	const root = realpathSync(originDir);
 	const sessions: SavedSession[] = [];
 	for (const epochDir of readdirSync(originDir)) {
 		if (!/^e\d+$/.test(epochDir)) continue;
 		const dir = join(originDir, epochDir);
+		if (!statSync(dir, { throwIfNoEntry: false })?.isDirectory()) continue;
 		for (const name of readdirSync(dir)) {
 			if (!name.endsWith(".jsonl")) continue;
 			const file = join(dir, name);
+			// Only a regular file of this origin: a FIFO would block the open, a directory or dangling link would throw,
+			// and a link out of the origin's root would list (and pin) another origin's session.
+			const stat = statSync(file, { throwIfNoEntry: false });
+			if (stat?.isFile() !== true) continue;
+			if (!realpathSync(file).startsWith(`${root}${sep}`)) continue;
 			const { id, preview } = describe(file);
 			sessions.push({
 				file,
 				id: id ?? name.slice(0, -".jsonl".length),
 				epochDir,
-				modifiedAt: statSync(file).mtimeMs,
+				modifiedAt: stat.mtimeMs,
 				preview,
 			});
 		}
@@ -90,10 +105,13 @@ export function listSavedSessions(originDir: string): SavedSession[] {
 	return sessions.sort((a, b) => b.modifiedAt - a.modifiedAt);
 }
 
-/** True when the epoch directory holds no session file yet: the next child open creates the origin's first session. */
+/** The resume pointer an agy origin keeps in its epoch directory instead of an omp `.jsonl` (`agy-driver.ts`). */
+const AGY_POINTER = "agy-conversation.json";
+
+/** True when the epoch directory holds no session (an omp `.jsonl` or the agy pointer) yet: the next child open creates the origin's first one. */
 export function epochDirIsFresh(sessionDir: string): boolean {
 	if (!existsSync(sessionDir)) return true;
-	return !readdirSync(sessionDir).some((name) => name.endsWith(".jsonl"));
+	return !readdirSync(sessionDir).some((name) => name.endsWith(".jsonl") || name === AGY_POINTER);
 }
 
 /**

@@ -9,7 +9,13 @@ import { mrkdwnToDiscord } from "../src/discord/format";
 import type { ProcessRunner, RunProcessResult } from "../src/dispatch/omp";
 import { checkTask, digest } from "../src/tasks/checker";
 import { acceptanceItems, docsDirOf, parseSpec, renderProgress, renderSpec } from "../src/tasks/docs";
-import { evaluateTask, runWorktreeChecks, type TaskCheckCache } from "../src/tasks/evaluate";
+import {
+	evaluateTask,
+	ledgerTaskChecks,
+	memoryTaskChecks,
+	runWorktreeChecks,
+	type TaskCheckCache,
+} from "../src/tasks/evaluate";
 import { createTaskHostOps, type TaskHostOps } from "../src/tasks/host";
 import { TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { buildReachedCard } from "../src/tasks/notify";
@@ -21,7 +27,7 @@ import { FakeDiscordTransport } from "./helpers/discord-fake-transport";
 
 const T0 = Date.parse("2026-11-04T01:00:00Z");
 /** The sweeper's in-memory check results; a fresh one per evaluation unless a test shares it. */
-const cache = (): TaskCheckCache => new Map();
+const cache = (): TaskCheckCache => memoryTaskChecks();
 const BUN_TEST = '[check: command ["bun","test"] stdout~" 0 fail"]';
 const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
@@ -33,8 +39,8 @@ interface Task {
 }
 
 /** A registered task whose three documents are complete: every AC checked with `test:` evidence. */
-function task(acceptance: string[], repo = "/r/repo"): Task {
-	const ledger = new TaskLedger(new Database(":memory:", { strict: true }), {
+function task(acceptance: string[], repo = "/r/repo", db = new Database(":memory:", { strict: true })): Task {
+	const ledger = new TaskLedger(db, {
 		timezone: "Asia/Seoul",
 		clock: { now: () => T0 },
 	});
@@ -821,5 +827,107 @@ describe("file checks read the worktree file's bytes (qa-i #126)", () => {
 		} finally {
 			rmSync(g.root, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("[check:] results in the ledger (check_json)", () => {
+	const spec = [`bun test가 통과한다 ${BUN_TEST}`];
+	const stored = (t: Task) => t.ledger.require(t.row.taskId).checks;
+
+	test("AC-2: a new ledger and sweeper over the same disk file reuse the verdict, running nothing", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "task-check-receipts-"));
+		try {
+			const file = join(dir, "ompbot.db");
+			const db = new Database(file, { strict: true });
+			const t = task(spec, "/r/repo", db);
+			const host = fakeHost(t.files, { run: () => ({ code: 1, output: "1 fail" }) });
+			await sweeperFor(t, host).sweeper.check(t.row);
+			expect(host.runs).toHaveLength(1);
+			db.close();
+
+			const reopened = new TaskLedger(new Database(file, { strict: true }), {
+				timezone: "Asia/Seoul",
+				clock: { now: () => T0 },
+			});
+			const again = { ...t, ledger: reopened, row: reopened.require(t.row.taskId) };
+			expect(again.row.checks?.head).toBe(HEAD_A);
+			const second = await sweeperFor(again, host).sweeper.check(again.row);
+			expect(host.runs).toHaveLength(1);
+			expect(second.judgement?.problems).toEqual([expect.stringMatching(/^check AC-1 실패: exit 1: 1 fail$/)]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("AC-4: the merge-time judge runs the checks again and leaves the ledger value alone", async () => {
+		const t = task(spec);
+		const host = fakeHost(t.files);
+		await sweeperFor(t, host).sweeper.check(t.row);
+		const before = stored(t);
+		expect(before?.head).toBe(HEAD_A);
+		expect(host.runs).toHaveLength(1);
+		await evaluateTask(t.ledger.require(t.row.taskId), host.ops, memoryTaskChecks());
+		expect(host.runs).toHaveLength(2);
+		expect(stored(t)).toEqual(before);
+	});
+
+	test("AC-5: a new HEAD runs again and replaces the stored head, even when nothing is left to store", async () => {
+		const t = task(spec);
+		let head = HEAD_A;
+		let timedOut = false;
+		const host = fakeHost(t.files, {
+			head: () => ({ sha: head, clean: true }),
+			run: () => ({ code: timedOut ? null : 0, output: "5 pass\n 0 fail\n", timedOut }),
+		});
+		const { sweeper } = sweeperFor(t, host);
+		await sweeper.check(t.row);
+		expect(stored(t)?.head).toBe(HEAD_A);
+		expect(stored(t)?.results).toHaveLength(1);
+
+		head = HEAD_B;
+		timedOut = true;
+		await sweeper.check(t.ledger.require(t.row.taskId));
+		expect(host.runs).toHaveLength(2);
+		expect(stored(t)).toEqual({ head: HEAD_B, results: [] });
+	});
+
+	test("AC-6: an inconclusive result is not stored and the next judgement runs it again", async () => {
+		const t = task(spec);
+		let timedOut = true;
+		const host = fakeHost(t.files, {
+			run: () => ({ code: timedOut ? null : 0, output: "5 pass\n 0 fail\n", timedOut }),
+		});
+		const { sweeper } = sweeperFor(t, host);
+		await sweeper.check(t.row);
+		expect(stored(t)).toEqual({ head: HEAD_A, results: [] });
+		timedOut = false;
+		await sweeper.check(t.ledger.require(t.row.taskId));
+		expect(host.runs).toHaveLength(2);
+		expect(stored(t)?.results).toHaveLength(1);
+	});
+
+	test("AC-7: a check that moved the worktree leaves no result in the ledger", async () => {
+		const t = task(spec);
+		let reads = 0;
+		const host = fakeHost(t.files, {
+			head: () => {
+				reads += 1;
+				return { sha: reads === 1 ? HEAD_A : HEAD_B, clean: true };
+			},
+		});
+		await evaluateTask(t.row, host.ops, ledgerTaskChecks(t.ledger));
+		expect(host.runs).toHaveLength(1);
+		expect(stored(t)).toEqual({ head: HEAD_A, results: [] });
+	});
+
+	test("an uncommitted worktree defers the checks and keeps what is stored", async () => {
+		const t = task(spec);
+		const host = fakeHost(t.files);
+		await sweeperFor(t, host).sweeper.check(t.row);
+		const before = stored(t);
+		const dirty = fakeHost(t.files, { head: () => ({ sha: HEAD_B, clean: false }) });
+		await evaluateTask(t.row, dirty.ops, ledgerTaskChecks(t.ledger));
+		expect(dirty.runs).toHaveLength(0);
+		expect(stored(t)).toEqual(before);
 	});
 });

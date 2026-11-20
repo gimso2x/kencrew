@@ -1,7 +1,7 @@
 // Text for Discord: core text written as Slack mrkdwn becomes Discord markdown (`mrkdwnToDiscord`), and a delivery body
 // (the model's markdown, which Discord mostly draws as is) becomes messages of at most 2000 characters
 // (`renderDiscordParts`), its valid ```card fences embeds of their own (`renderDiscordMessages`).
-import { cardRuns, validateCard } from "../channel/card";
+import { cardRuns, tableToAscii, validateCard } from "../channel/card";
 import {
 	chunkText,
 	errorText,
@@ -9,13 +9,17 @@ import {
 	fenceCloseRun,
 	fenceOpenRun,
 	REDELIVERED_PREFIX,
+	splitRowCells,
 	tableEndAt,
 } from "../channel/text";
 import { cardToEmbed, type DiscordEmbed } from "./card";
 import { MESSAGE_CONTENT_LIMIT } from "./transport";
 
-/** Fenced blocks and inline code: copied untouched by both conversions. */
-const CODE = /```[\s\S]*?```|`[^`\n]*`/g;
+/**
+ * Fenced blocks and inline code: copied untouched by both conversions. A backtick after a backslash is a literal one
+ * (`escapeDiscordMarkdown`), so it opens no span: escaped owner text is converted like any plain text.
+ */
+const CODE = /(?<!\\)```[\s\S]*?```|(?<!\\)`[^`\n]*`/g;
 
 /** Applies `convert` to the text between code spans only. */
 export function outsideCode(text: string, convert: (plain: string) => string): string {
@@ -63,9 +67,27 @@ export function escapeDiscordMarkdown(text: string): string {
 	return escapeMrkdwn(text.replace(/[\\*_`~|>]/g, "\\$&"));
 }
 
+/** Inline markdown symbols that show literally inside a code fence: `code`, `[label](url)`, `**bold**`, `__bold__`. */
+const CELL_INLINE =
+	/(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)|\[([^\]]+)\]\((?:[^()\n]+|\([^()\n]*\))*\)|\*\*(?=\S)(.+?)(?<=\S)\*\*|(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)/g;
+
+function stripCellMarkdown(cell: string): string {
+	return cell.replace(
+		CELL_INLINE,
+		(match, _ticks, code?: string, linkLabel?: string, boldStar?: string, boldUnder?: string) => {
+			if (code !== undefined) return code;
+			if (linkLabel !== undefined) return stripCellMarkdown(linkLabel);
+			if (boldStar !== undefined) return stripCellMarkdown(boldStar);
+			if (boldUnder !== undefined) return stripCellMarkdown(boldUnder);
+			return match;
+		},
+	);
+}
+
 /**
- * GFM tables (a header row, a `|---|` rule of 3+ hyphens a cell, more rows) outside code fences, each wrapped in a code
- * fence: Discord does not draw tables. Returns the text and the wrapped spans, which a split must keep whole.
+ * GFM tables (a header row, a `|---|` rule of 3+ hyphens a cell, more rows) outside code fences, each aligned by
+ * `displayWidth` and wrapped in a code fence: Discord does not draw tables. Returns the text and the wrapped spans,
+ * which a split must keep whole.
  */
 function fenceTables(text: string): { text: string; spans: Array<[number, number]> } {
 	const lines = text.split("\n");
@@ -88,9 +110,14 @@ function fenceTables(text: string): { text: string; spans: Array<[number, number
 			push(line);
 			continue;
 		}
+		const headers = splitRowCells(line).map(stripCellMarkdown);
+		const rows = lines.slice(i + 2, end).map((row) => {
+			const cells = splitRowCells(row).map(stripCellMarkdown);
+			return headers.map((_, col) => cells[col] ?? "");
+		});
 		const start = offset;
 		push("```");
-		for (const row of lines.slice(i, end)) push(row);
+		for (const row of tableToAscii({ headers, rows }, { rule: true }).split("\n")) push(row);
 		push("```");
 		spans.push([start, offset - 1]);
 		i = end - 1;
@@ -110,8 +137,8 @@ export function renderDiscordParts(body: string, redelivered: boolean, footer?: 
 	return parts.map((part, i) => `${i === 0 ? prefix : ""}${part}${i === parts.length - 1 ? suffix : ""}`);
 }
 
-/** Plain text in parts of at most `limit`: tables fenced and kept whole when they fit, fences closed in each part. */
-function chunkPlain(body: string, limit: number): string[] {
+/** Plain text (Teams reuses it) in parts of at most `limit`: tables fenced and kept whole when they fit, fences closed in each part. */
+export function chunkPlain(body: string, limit: number): string[] {
 	const { text, spans } = fenceTables(body);
 	// A table longer than a message cannot stay whole; it is split like any fenced block.
 	return chunkText(

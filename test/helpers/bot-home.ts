@@ -45,7 +45,8 @@ export function makeHome(
 	const botTokenFile = join(secrets, "discord-bot-token");
 	writeFileSync(botTokenFile, `${["TEST", "discord", "0"].join("-")}\n`, { mode: 0o600 });
 	const ompExecutable = real?.ompExecutable ?? join(dir, "fake-omp");
-	if (!real) writeFileSync(ompExecutable, '#!/bin/sh\necho "omp-stub 0.0.0"\n', { mode: 0o755 });
+	// Answers `--version` the way omp does (`omp/<x.y.z>`), so the omp_runtime gate stays closed.
+	if (!real) writeFileSync(ompExecutable, '#!/bin/sh\necho "omp/0.0.0-stub"\n', { mode: 0o755 });
 	const workspaceDir = join(dir, "workspace");
 	mkdirSync(workspaceDir, { mode: 0o700 });
 	const configPath = join(dir, "config.json");

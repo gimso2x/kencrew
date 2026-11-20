@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { THREAD_CONTEXT_HEADER } from "../src/core/mailbox";
 import { normalizeInbound } from "../src/core/normalize";
 import { OriginRouter, openBotStore, sessionDirFor } from "../src/core/origin";
-import type { InboundRecord } from "../src/core/types";
+import { CURRENT_REQUEST_MARKER, type InboundRecord } from "../src/core/types";
 import { Daemon } from "../src/daemon/daemon";
 import { INTERRUPTED_NOTICE, recoverDispatched } from "../src/daemon/recovery";
 import type { DiscordInteraction, DiscordMessageEvent } from "../src/discord/transport";
@@ -125,7 +125,13 @@ describe("daemon: channel roots are isolated sessions", () => {
 			stopDrainMs: 0,
 			statfs: ROOMY_STATFS, // the [TASK] start's disk check never depends on this machine's free space
 			driverFactory: (origin, sessionDir) => {
-				const driver = new FakeOmpDriver({ sessionDir, store: sessions, holdTurns: hold(origin) });
+				const driver = new FakeOmpDriver({
+					sessionDir,
+					store: sessions,
+					holdTurns: hold(origin),
+					respond: (text, steers) =>
+						`ECHO ${[requestOf(`prompt:${text}`).slice("prompt:".length), ...steers].join(" | ")}`,
+				});
 				drivers.set(origin, driver);
 				return driver;
 			},
@@ -140,8 +146,19 @@ describe("daemon: channel roots are isolated sessions", () => {
 	}
 
 	/** Prompts and steers an origin's omp child received (session bookkeeping calls left out). */
+	/** A prompt reads as its request: the place block a Discord thread's new turn gets in front is not under test here. */
+	const requestOf = (call: string): string => {
+		const at = call.indexOf(`${CURRENT_REQUEST_MARKER}\n`);
+		return at < 0 ? call : `prompt:${call.slice(at + CURRENT_REQUEST_MARKER.length + 1)}`;
+	};
+	const promptCalls = (origin: string) =>
+		driverOf(origin)
+			.calls.filter((call) => call.startsWith("prompt:"))
+			.map(requestOf);
 	const turnCalls = (origin: string) =>
-		driverOf(origin).calls.filter((call) => call.startsWith("prompt:") || call.startsWith("steer:"));
+		driverOf(origin)
+			.calls.filter((call) => call.startsWith("prompt:") || call.startsWith("steer:"))
+			.map(requestOf);
 	const turnStarts = () => logs.count(/event=turn_start /);
 	const steers = () => logs.lines.filter((line) => /event=steer_delivered /.test(line));
 
@@ -286,7 +303,7 @@ describe("daemon: channel roots are isolated sessions", () => {
 
 		expect(daemon.store.listInbound().filter((row) => row.platformMessageId === ref(x))).toHaveLength(1);
 		expect(daemon.store.listOrigins("discord").filter((origin) => origin.endsWith(x))).toEqual([rootOrigin(x)]);
-		expect(driverOf(rootOrigin(x)).calls.filter((call) => call.startsWith("prompt:"))).toEqual(["prompt:중복 테스트"]);
+		expect(promptCalls(rootOrigin(x))).toEqual(["prompt:중복 테스트"]);
 		expect(daemon.store.listDeliveries({ originKey: rootOrigin(x) }).map((d) => [d.threadRef, d.body])).toEqual([
 			[ref(x), "ECHO 중복 테스트"],
 		]);
@@ -337,7 +354,7 @@ describe("daemon: channel roots are isolated sessions", () => {
 		expect(calls).toContain("setModel:fake/beta");
 		expect(calls).toContain("setThinking:high");
 		const prompts = calls.filter((call) => call.startsWith("prompt:"));
-		expect(prompts).toEqual(["prompt:새 루트 질문"]);
+		expect(prompts.map(requestOf)).toEqual(["prompt:새 루트 질문"]);
 		expect(prompts[0]).not.toContain(THREAD_CONTEXT_HEADER);
 	});
 

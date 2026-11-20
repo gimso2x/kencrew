@@ -2,9 +2,9 @@
 // and `[label](url)` Discord uses, so the Discord conversion serves. Cards and tables stay code blocks (no Adaptive
 // Cards in this scope). In: `<at>…</at>` mention tags are cut out and the few HTML entities Teams writes undone.
 import type { OutboundMessage } from "../channel/port";
-import { chunkText, cutCodePointSafe, REDELIVERED_PREFIX } from "../channel/text";
+import { cutCodePointSafe, REDELIVERED_PREFIX } from "../channel/text";
 import { unicodeOfSlackName } from "../discord/emoji";
-import { mrkdwnToDiscord, outsideCode } from "../discord/format";
+import { chunkPlain, mrkdwnToDiscord, outsideCode } from "../discord/format";
 
 /**
  * Characters per Teams message. Teams refuses an Activity near 28 KB; 7000 UTF-16 units stay under it even when every
@@ -26,7 +26,7 @@ function teamsMarkdown(text: string): string {
 export function renderTeamsParts(body: string, redelivered: boolean, footer?: string): string[] {
 	const prefix = redelivered ? `${REDELIVERED_PREFIX}\n` : "";
 	const suffix = footer === undefined ? "" : `\n\n*${footer}*`;
-	const parts = chunkText(teamsMarkdown(body), TEAMS_TEXT_LIMIT - prefix.length - suffix.length);
+	const parts = chunkPlain(teamsMarkdown(body), TEAMS_TEXT_LIMIT - prefix.length - suffix.length);
 	return parts.map((part, i) => `${i === 0 ? prefix : ""}${part}${i === parts.length - 1 ? suffix : ""}`);
 }
 
@@ -35,14 +35,20 @@ export function renderTeamsParts(body: string, redelivered: boolean, footer?: st
  * with — Teams gets no buttons here, so a card is answered in text.
  */
 export function renderOutboundText(msg: OutboundMessage): string {
-	const lines: string[] = [];
-	if (msg.title !== undefined) lines.push(`*${msg.title}*`);
-	lines.push(msg.body ?? msg.text);
-	for (const field of msg.fields ?? []) lines.push(`*${field.label}*: ${field.value}`);
+	const head = msg.title === undefined ? [] : [`*${msg.title}*`];
+	const tail: string[] = [];
+	for (const field of msg.fields ?? []) tail.push(`*${field.label}*: ${field.value}`);
 	const buttons = msg.buttons ?? [];
-	if (buttons.length > 0) lines.push(`선택지: ${buttons.map((button) => button.label).join(" · ")}`);
-	if (msg.buttonsNote !== undefined && (buttons.length > 0 || msg.title !== undefined)) lines.push(msg.buttonsNote);
-	return cutCodePointSafe(teamsMarkdown(lines.join("\n")), TEAMS_TEXT_LIMIT);
+	if (buttons.length > 0) tail.push(`선택지: ${buttons.map((button) => button.label).join(" · ")}`);
+	if (msg.buttonsNote !== undefined && (buttons.length > 0 || msg.title !== undefined)) tail.push(msg.buttonsNote);
+	const before = teamsMarkdown(head.join("\n"));
+	const after = teamsMarkdown(tail.join("\n"));
+	// Only the body is cut, fence-safe, so the title, fields and button words always get through.
+	const overhead = [before, after].filter((part) => part !== "").length;
+	const room = TEAMS_TEXT_LIMIT - before.length - after.length - overhead;
+	const body = chunkPlain(teamsMarkdown(msg.body ?? msg.text), Math.max(room, 1))[0] ?? "";
+	const lines = [...(before === "" ? [] : [before]), body, ...(after === "" ? [] : [after])];
+	return cutCodePointSafe(lines.join("\n"), TEAMS_TEXT_LIMIT);
 }
 
 const ENTITIES: Record<string, string> = { nbsp: " ", amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'", apos: "'" };

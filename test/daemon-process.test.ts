@@ -29,12 +29,12 @@ test("real daemon process: status --json schema, second instance refused, SIGTER
 	const parsed = JSON.parse(status.stdout);
 	parsed.openGates = homeGates(parsed.openGates);
 	expect(parsed).toEqual({
-		ompVersion: "omp-stub 0.0.0",
+		ompVersion: "omp/0.0.0-stub",
 		timezone: "Asia/Seoul",
 		daemonRunning: true,
 		origins: [],
 		ledger: { pending: 0, inflight: 0, confirmed: 0, ambiguous: 0, expired: 0 },
-		inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0 },
+		inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0, uncertain: 0 },
 		monitors: { count: 0, next: null },
 		openGates: [], // makeHome writes no backup stamp; the boot backup writes the first one
 	});

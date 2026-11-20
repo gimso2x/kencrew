@@ -9,6 +9,7 @@ import { DiscordChannel } from "../discord/channel";
 import { DiscordSocketTransport } from "../discord/socket-transport";
 import { FileFakeDiscordTransport } from "../discord/test-transport";
 import type { DiscordTransport } from "../discord/transport";
+import { bootRuntime } from "../lanes/runtime";
 import { createLogger, type Logger } from "../log";
 import { AgyOmpDriver } from "../omp/agy-driver";
 import { withOmpProfile } from "../omp/env";
@@ -19,6 +20,7 @@ import { LogDirError, openLogSink } from "../ops/logfile";
 import { redact } from "../redact";
 import { spawnSystemPrompt } from "../safety/prompt";
 import { indexRuntimeSecrets } from "../safety/secret-index";
+import { NewerSchemaError, SCHEMA_VERSION } from "../store/schema-version";
 import { TeamsBinding } from "../teams/binding";
 import { TeamsChannel } from "../teams/channel";
 import { TeamsConnector } from "../teams/transport";
@@ -38,13 +40,16 @@ export function splitModel(model: string | undefined): { provider?: string; mode
 /**
  * `env` and `baseEnv` of every bot RPC child (chat, lane and monitor turns share the daemon's driver factory). With
  * `ompProfile` the parent env loses `PI_CODING_AGENT_DIR` and gains `OMP_PROFILE`; without it `baseEnv` stays
- * unset, so the driver reads `process.env` exactly as before.
+ * unset, so the driver reads `process.env` exactly as before. `PI_INTENT_TRACING=1`: omp 19 leaves tool-call intents
+ * off in RPC sessions unless configured, and the live progress line shows each tool call by its intent.
+ * `OMP_HOST_DRIVER=kencrew`: the owner's rule-guards extension judges only what reaches the chat (turn answers and
+ * notes next to `wait`/`ask`), not text before ordinary tool calls.
  */
 export function botRpcEnv(
 	ompProfile: string | undefined,
 	base: Record<string, string | undefined> = process.env,
 ): { env: Record<string, string>; baseEnv?: Record<string, string | undefined> } {
-	const env = { OMP_WIKI_NOTE_DISABLE: "1" };
+	const env = { OMP_WIKI_NOTE_DISABLE: "1", PI_INTENT_TRACING: "1", OMP_HOST_DRIVER: "kencrew" };
 	return ompProfile === undefined ? { env } : { env, baseEnv: withOmpProfile(base, ompProfile) };
 }
 
@@ -318,34 +323,18 @@ export async function runDaemon(
 			},
 		);
 	};
-	// Loading omp's RPC client imports @oh-my-pi/pi-utils, whose postmortem hook adds its own SIGTERM/SIGINT/SIGHUP
-	// handlers that exit(143) at once. The daemon must stop its children and settle the ledger first, so it
-	// takes the handlers back at boot and again after every driver start (the first start loads that module).
-	// SIGHUP re-reads config.json (`ompbot reload` does the same over the socket) instead of stopping the daemon.
-	const claimSignals = () => {
-		for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
-			process.removeAllListeners(signal);
-			process.on(signal, () => {
-				if (signal !== "SIGHUP") return shutdown(signal);
-				log.info("signal", { signal });
-				daemon.reloadConfig("sighup");
-			});
-		}
-	};
-	class DaemonRpcDriver extends RpcOmpDriver {
-		override async start(): Promise<void> {
-			await super.start();
-			claimSignals();
-		}
-	}
 	const hostLoad = testHostLoad(env); // test-only idle host, behind OMPBOT_TEST_HOOKS=1
+	const ompVersion = await checkOmpVersion(config, log);
+	// What every review, QA and check receipt of this run is recorded on: omp, the kencrew source commit, OS and arch.
+	const runtime = await bootRuntime({ omp: ompVersion, sourceDir: join(import.meta.dir, "..", ".."), log });
+	log.info("runtime_booted", { omp: runtime.omp, kencrew: runtime.kencrew });
 	const daemon = new Daemon({
 		config,
 		bootConfigText,
 		log,
 		clock,
 		bootId: lock.info.bootId,
-		ompVersion: await checkOmpVersion(config, log),
+		ompVersion,
 		channels: channelBindings(config, env, log),
 		crash: crashHook(env),
 		...(hostLoad === undefined ? {} : { hostLoad }),
@@ -383,7 +372,7 @@ export async function runDaemon(
 						log,
 						originKey: origin,
 					})
-				: new DaemonRpcDriver({
+				: new RpcOmpDriver({
 						ompExecutable: config.ompExecutable,
 						cwd: daemon.cwdFor(origin),
 						sessionDir,
@@ -398,11 +387,30 @@ export async function runDaemon(
 					});
 		},
 	});
-	claimSignals();
+	// The daemon stops its children and settles the ledger before it exits. SIGHUP re-reads config.json (`ompbot
+	// reload` does the same over the socket) instead of stopping the daemon.
+	for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+		process.removeAllListeners(signal);
+		process.on(signal, () => {
+			if (signal !== "SIGHUP") return shutdown(signal);
+			log.info("signal", { signal });
+			daemon.reloadConfig("sighup");
+		});
+	}
 	try {
 		await daemon.start();
 	} catch (error) {
-		log.error("daemon_start_failed", { error: String(error) });
+		if (error instanceof NewerSchemaError) {
+			// One line with both versions and the remedy: `apply` only sees IPC readiness, so journalctl is where this shows.
+			log.error("daemon_fatal", {
+				kind: "newer_schema",
+				db_version: error.dbVersion,
+				code_version: SCHEMA_VERSION,
+				error: error.message,
+			});
+		} else {
+			log.error("daemon_start_failed", { error: String(error) });
+		}
 		await daemon.stop().catch(() => undefined);
 		log.stop();
 		lock.release();

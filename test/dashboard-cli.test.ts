@@ -17,11 +17,13 @@ const SNAPSHOT_KEYS = [
 	"lanes",
 	"herdr",
 	"approvals",
+	"autoChoices",
 	"monitors",
 	"alerts",
 	"gates",
 	"backup",
 	"jobs",
+	"heavyRun",
 	"ompbotCli",
 	"discordGuild",
 ];

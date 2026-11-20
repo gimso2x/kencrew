@@ -20,7 +20,7 @@ export const FAKE_ID_BASE = 900_000_000_000_000_000n;
 const ID_METHODS = /"method":"(createMessage|uploadFile)"/;
 
 /**
- * Test-only transport (the Discord twin of `FileFakeTransport`, for `OMPBOT_TEST_TRANSPORT=<file>` runs): every call is
+ * Test-only transport (the Discord twin of `FileFakeTransport`, for `OMPBOT_TEST_DISCORD_TRANSPORT=<file>` runs): every call is
  * appended to a JSONL file, so a test can count messages across daemon crashes and restarts. Nothing leaves the
  * machine. Message ids stay unique across processes because the sequence resumes from the file.
  */

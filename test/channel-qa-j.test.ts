@@ -28,8 +28,8 @@ describe("discord qa-j", () => {
 	test("30: a CRLF body's closing fence is recognised, so a table after it is fenced", () => {
 		const body = ["```js", "a();", "```", "", "| a | b |", "| --- | --- |", "| 1 | 2 |"].join("\r\n");
 		const out = renderDiscordParts(body, false).join("");
-		expect(out).toContain("```\r\n\r\n```\n| a | b |");
-		expect(out.endsWith("| 1 | 2 |\n```")).toBe(true);
+		expect(out).toContain("```\r\n\r\n```\na | b");
+		expect(out.endsWith("1 | 2\n```")).toBe(true);
 	});
 
 	test("31: a card table cut at 4096 characters closes a longer fence with the same length", () => {

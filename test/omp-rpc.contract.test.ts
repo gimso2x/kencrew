@@ -1,9 +1,9 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, readlinkSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { entryText, type OmpEvent, type OmpFinal } from "../src/omp/driver";
-import { missingRpcMethods, RpcOmpDriver } from "../src/omp/rpc-driver";
+import { RpcOmpDriver } from "../src/omp/rpc-driver";
 import { pickE2eModel } from "./helpers/omp-model";
 
 /**
@@ -104,21 +104,6 @@ function processesTouching(root: string): Array<{ pid: number; cmdline: string }
 	return found;
 }
 
-/** The installed omp's RpcClient class, resolved the way RpcOmpDriver.start() does (no process, no model call). */
-async function installedRpcClient(): Promise<unknown> {
-	const root = dirname(dirname(realpathSync(OMP_EXECUTABLE)));
-	const module = (await import(join(root, "src/modes/rpc/rpc-client.ts"))) as { RpcClient?: unknown };
-	return module.RpcClient;
-}
-
-describe.skipIf(!enabled)("omp rpc contract: client surface", () => {
-	test("RpcClient prototype has onSessionEvent (and every other method ompbot needs): onSessionEvent", async () => {
-		const client = await installedRpcClient();
-		expect(missingRpcMethods(client)).toEqual([]);
-		expect(typeof (client as { prototype: { onSessionEvent: unknown } }).prototype.onSessionEvent).toBe("function");
-	});
-});
-
 describe.skipIf(!enabled || picked?.model === undefined)("omp rpc contract", () => {
 	let root = "";
 	let cwd = "";
@@ -166,6 +151,23 @@ describe.skipIf(!enabled || picked?.model === undefined)("omp rpc contract", () 
 		const leftover = processesTouching(root);
 		rmSync(root, { recursive: true, force: true });
 		expect(leftover).toEqual([]);
+	});
+
+	test("protocol: the executable itself starts in RPC mode, offers protocol 2 and accepts the negotiation", async () => {
+		// Not a Recorder: (b) and (c) take recorders[0] as the (a) driver. afterAll still stops it via drivers.
+		const driver = new RpcOmpDriver({
+			ompExecutable: OMP_EXECUTABLE,
+			cwd,
+			sessionDir: join(root, "sessions", "handshake"),
+			env: { OMP_WIKI_NOTE_DISABLE: "1" },
+		});
+		drivers.push(driver);
+		await driver.start(); // rejects with omp_rpc_unsupported when ready or negotiate_protocol is not v2
+		const pid = driver.pid ?? 0;
+		expect(pid).toBeGreaterThan(0);
+		// The ELF is argv[0]; cli.js runs through its shebang, so it is the interpreter's first argument.
+		expect(readFileSync(`/proc/${pid}/cmdline`, "utf8").split("\0")).toContain(OMP_EXECUTABLE);
+		await driver.stop();
 	});
 
 	test(

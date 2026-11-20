@@ -9,6 +9,7 @@ export interface IntegrityRefusal {
 		| "guard_deletion_without_adversarial_regression"
 		| "unproven_claim_word"
 		| "undeclared_feature_removal"
+		| "commit_identity_mismatch"
 		| "lane_diff_unavailable";
 	excerpt: string;
 	remedy: string;
@@ -24,6 +25,8 @@ export interface IntegrityInput {
 /** Files whose added lines are judged: code only. Markdown/docs are not code and stay exempt; code under docs/ or examples/ is judged. */
 const CODE_EXT =
 	/\.(?:ts|tsx|js|jsx|mjs|cjs|py|sh|bash|zsh|ps1|go|rs|rb|java|kt|kts|scala|groovy|php|c|h|cc|cpp|cxx|hpp|cs|swift|m|mm|dart|lua|pl|ex|exs|zig|vue|svelte|sql|json|toml|yaml|yml|css|scss|html)$/i;
+/** JavaScript-family files: `#name` is a private member there (code) and backtick strings may span lines. */
+const JS_EXT = /\.(?:ts|tsx|js|jsx|mjs|cjs|vue|svelte)$/i;
 const TEST_PATH =
 	/(?:^|\/)(?:tests?|__tests__|specs?)\/|\.(?:test|spec)\.[cm]?[jt]sx?$|(?:^|\/)test_[^/]*\.py$|_test\.(?:go|py|rs)$/i;
 const LINKED_REASON = /(?:#\d+|https?:\/\/)/;
@@ -49,7 +52,8 @@ const EXPORT_DECLARATION =
 	/^\s*export\s+(?:default\s+)?(?:async\s+)?(?:function\b\s*\*?|class\b|abstract\s+class\b|const\b|let\b|var\b|interface\b|type\b|enum\b)\s*([A-Za-z_$][\w$]*)/;
 /** `false &&` / `&& false` / `if (false)` / `if (0)` on comment- and string-free code; a comparison with false is no switch-off. */
 const FEATURE_OFF = /\bif\s*\(\s*(?:false|0)\s*\)|(?<![=!]=\s*|[=!]==\s*)\bfalse\b\s*&&|&&\s*false\b(?!\s*[=!]=)/;
-const MAX_REFUSALS = 8;
+/** How many refusals one verdict reports (a claim is judged again after its remedies are applied). */
+export const MAX_REFUSALS = 8;
 
 interface DiffLine {
 	file: string;
@@ -58,6 +62,8 @@ interface DiffLine {
 	hunk: number;
 	/** Removed lines only: the line's code with comments cut away, read in old-side order within the hunk. */
 	code?: string;
+	/** Removed lines only: the file's new path, so an edit in a renamed file pairs with its added line. */
+	newFile?: string;
 }
 
 const OCTAL_ESCAPE_RUN = /(?:\\[0-3][0-7]{2})+/g;
@@ -120,14 +126,14 @@ function parseDiff(diff: string): { added: DiffLine[]; removed: DiffLine[] } {
 		} else if (line.startsWith("-")) {
 			if (CODE_EXT.test(oldFile)) {
 				const text = line.slice(1);
-				const scan = isUnfinishedMarker(text, oldInBlock);
+				const scan = isUnfinishedMarker(text, oldInBlock, JS_EXT.test(oldFile));
 				// A leading `*` outside a seen block comment may be a continued multiplication, so it stays code.
 				const code = !oldInBlock && /^\s*\*/.test(text) ? text : scan.code;
 				oldInBlock = scan.inBlock;
-				removed.push({ file: oldFile, text, hunk, code });
+				removed.push({ file: oldFile, text, hunk, code, newFile });
 			}
 		} else if (line.startsWith(" ") && inHunk) {
-			oldInBlock = isUnfinishedMarker(line.slice(1), oldInBlock).inBlock;
+			oldInBlock = isUnfinishedMarker(line.slice(1), oldInBlock, JS_EXT.test(oldFile)).inBlock;
 		}
 	}
 	return { added, removed };
@@ -138,9 +144,10 @@ const isBlank = (ch: string | undefined): boolean => ch === undefined || /\s/.te
 /**
  * Text of the trailing comment on a code line, or undefined when the line has none. String literals are skipped, so a
  * "TODO" inside quotes is not a marker; `#`, `--`, `;;` need a whitespace/line-start before them and `%`/`*` only open a
- * comment at the start of the line (modulo and multiplication stay code).
+ * comment at the start of the line (modulo and multiplication stay code). In a JavaScript-family file (`js`) a `#`
+ * right before a name is a private member (`#validate(`), so it is code.
  */
-function commentText(text: string): string | undefined {
+function commentText(text: string, js: boolean): string | undefined {
 	const noCloser = new Set<string>();
 	let leading = true;
 	for (let i = 0; i < text.length; i++) {
@@ -166,7 +173,8 @@ function commentText(text: string): string | undefined {
 		const next = text[i + 1];
 		if ((ch === "/" && (next === "/" || next === "*")) || text.startsWith("<!--", i)) return text.slice(i);
 		const spaced = isBlank(text[i - 1]);
-		if (ch === "#" && spaced && next !== "[" && next !== "!") return text.slice(i);
+		if (ch === "#" && spaced && next !== "[" && next !== "!" && !(js && /[A-Za-z_$]/.test(next ?? "")))
+			return text.slice(i);
 		if (ch === "-" && next === "-" && spaced && isBlank(text[i + 2])) return text.slice(i);
 		if (ch === ";" && next === ";" && spaced) return text.slice(i);
 		if (leading && (ch === "%" || ch === "*")) return text.slice(i);
@@ -177,9 +185,13 @@ function commentText(text: string): string | undefined {
 
 /**
  * Whether the line carries an unfinished-work marker, and its code with comments cut away; `inBlock` carries an open
- * slash-star comment from the line before.
+ * slash-star comment from the line before; `js` = a JavaScript-family file.
  */
-function isUnfinishedMarker(text: string, inBlock: boolean): { marker: boolean; inBlock: boolean; code: string } {
+function isUnfinishedMarker(
+	text: string,
+	inBlock: boolean,
+	js: boolean,
+): { marker: boolean; inBlock: boolean; code: string } {
 	let rest = text;
 	let marker = false;
 	if (inBlock) {
@@ -191,7 +203,7 @@ function isUnfinishedMarker(text: string, inBlock: boolean): { marker: boolean; 
 	// Closed slash-star comments in the middle of the line are cut too, so code after them is still seen.
 	let code = "";
 	for (;;) {
-		const trailing = commentText(rest);
+		const trailing = commentText(rest, js);
 		if (trailing === undefined) return { marker, inBlock: false, code: code + rest };
 		code += rest.slice(0, -trailing.length);
 		const close = trailing.startsWith("/*") ? trailing.indexOf("*/", 2) : -1;
@@ -202,6 +214,31 @@ function isUnfinishedMarker(text: string, inBlock: boolean): { marker: boolean; 
 		marker ||= UNFINISHED.test(trailing.slice(0, close));
 		rest = trailing.slice(close + 2);
 	}
+}
+
+/**
+ * Whether a backtick string is still open after `text` (`open`: it was open before it). A line that starts inside one
+ * is text, not code; quoted strings and comments on the line are skipped so their backticks open nothing.
+ */
+function templateOpenAfter(text: string, open: boolean): boolean {
+	let inside = open;
+	for (let i = 0; i < text.length; i++) {
+		const ch = text[i];
+		if (ch === "\\") i += 1;
+		else if (inside) inside = ch !== "`";
+		else if (ch === "`") inside = true;
+		else if (ch === '"' || ch === "'") {
+			let end = i + 1;
+			while (end < text.length && text[end] !== ch) end += text[end] === "\\" ? 2 : 1;
+			i = end;
+		} else if (ch === "/" && text[i + 1] === "/") return false;
+		else if (ch === "/" && text[i + 1] === "*") {
+			const close = text.indexOf("*/", i + 2);
+			if (close < 0) return false;
+			i = close + 1;
+		}
+	}
+	return inside;
 }
 
 /** Blanks string literals so words inside quotes are not read as code. */
@@ -233,6 +270,8 @@ function refusal(category: IntegrityRefusal["category"], file: string, text: str
 		undeclared_feature_removal:
 			"지운 export/꺼 둔 기능을 되살리거나, 의도한 삭제면 완료 보고에 그 이름을 적으세요(꺼 둔 줄은 같은 줄에 이슈 번호).",
 		unproven_claim_word: "보고의 '통과/검증됨' 주장에 실제 실행한 검증 명령(bun test 등)을 함께 적으세요.",
+		commit_identity_mismatch:
+			"작성자·커미터 이메일을 `taskAutoLand.commitEmails` 허용 목록에 맞추세요(`git commit --amend --reset-author`, 또는 rebase로 작성자 수정).",
 		lane_diff_unavailable:
 			"base 브랜치를 읽지 못해 레인의 변경을 가려낼 수 없습니다. base 브랜치가 저장소에 있는지 확인하고 다시 완료를 알리세요.",
 	};
@@ -251,6 +290,12 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 
 	let blockKey = "";
 	let inBlock = false;
+	let inTemplate = false;
+	/**
+	 * Added lines inside a block comment or a multi-line backtick string: text, not code, so pasting a deleted guard
+	 * there makes its deletion neither a move nor an edit (qa-x #72).
+	 */
+	const inText = new Set<DiffLine>();
 	/** An added test line whose code (comments cut away) declares or asserts a negative case. */
 	let hasAdversarialTest = false;
 	/** The first added line that switches a feature off by a constant condition. */
@@ -260,8 +305,12 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 		if (key !== blockKey) {
 			blockKey = key;
 			inBlock = false;
+			inTemplate = false;
 		}
-		const scan = isUnfinishedMarker(line.text, inBlock);
+		const js = JS_EXT.test(line.file);
+		if (inBlock || inTemplate) inText.add(line);
+		if (js) inTemplate = templateOpenAfter(line.text, inTemplate);
+		const scan = isUnfinishedMarker(line.text, inBlock, js);
 		inBlock = scan.inBlock;
 		if (TEST_PATH.test(line.file) && NEGATIVE_TEST.test(scan.code) && TEST_DECLARATION.test(scan.code))
 			hasAdversarialTest = true;
@@ -281,20 +330,25 @@ export function classifyLaneCompletion(input: IntegrityInput): IntegrityRefusal[
 			featureOff = line;
 	}
 
-	const addedText = new Set(added.map((line) => line.text.trim()));
+	const addedCode = new Set(added.filter((line) => !inText.has(line)).map((line) => line.text.trim()));
 	const deletedGuards = removed.filter((line) => {
 		const code = line.code ?? line.text;
 		return GUARD_WORD.test(code) || NEGATIVE_TEST.test(code);
 	});
-	// A guard edited in place (same file and hunk) only in a plain string or a trailing comment is kept, not deleted:
-	// each added line answers for one deleted guard at most (qa-l #83).
+	// A guard moved as it was (re-added as code anywhere) or edited in place (same file and hunk; a renamed file's new
+	// path) only in a plain string or a trailing comment is kept, not deleted: each added line answers for one deleted
+	// guard at most (qa-l #83, qa-x #73).
 	const paired = new Set<DiffLine>();
 	const stillGone = deletedGuards.filter((line) => {
-		if (addedText.has(line.text.trim())) return false;
+		if (addedCode.has(line.text.trim())) return false;
 		const code = guardCode(line.text);
 		const edit = added.find(
 			(other) =>
-				!paired.has(other) && other.file === line.file && other.hunk === line.hunk && guardCode(other.text) === code,
+				!paired.has(other) &&
+				!inText.has(other) &&
+				other.file === (line.newFile ?? line.file) &&
+				other.hunk === line.hunk &&
+				guardCode(other.text) === code,
 		);
 		if (edit === undefined) return true;
 		paired.add(edit);
@@ -339,22 +393,31 @@ export function laneDiffUnavailableRefusal(error: LaneDiffUnavailable): Integrit
 	return refusal("lane_diff_unavailable", "base", error.message);
 }
 
+/** One commit of the lane's own range: its full id and the two identities git records for it. */
+export interface LaneCommitIdentity {
+	sha: string;
+	author: string;
+	committer: string;
+}
+
+/** The committer GitHub records on a commit made in its web UI: allowed whatever the list says. */
+const GITHUB_COMMITTER = "noreply@github.com";
+
 /**
- * `git diff <from>..sha` of the lane's repository. With a base branch, `from` is the merge-base of that branch's
- * current tip and `sha` — a lane rebased onto a moved base does not answer for the base's commits — unless `baseSha`
- * (a reopened lane's previous claim) is newer and still in `sha`'s history. A base branch that cannot be read throws
- * `LaneDiffUnavailable`; without one, `from` is `baseSha`. "" when the repository, a merge-base with `sha` or the diff
- * cannot be read (the classifier then only sees the claim).
+ * The lane's repository work tree root and where its own commits start (`<from>` of `from..sha`): the merge-base of
+ * the base branch's current tip and `sha` — a lane rebased onto a moved base does not answer for the base's commits —
+ * unless `baseSha` (a reopened lane's previous claim) is newer and still in `sha`'s history. `undefined` when the
+ * repository cannot be read; a base branch whose tip cannot be read throws `LaneDiffUnavailable`.
  */
-export async function collectLaneDiff(
+async function laneRange(
 	laneCwd: string,
 	range: LaneDiffRange,
 	sha: string,
-	git: GitRunner = defaultGit,
-): Promise<string> {
+	git: GitRunner,
+): Promise<{ root: string; from: string | undefined } | undefined> {
 	const top = await git(["-C", laneCwd, "rev-parse", "--show-toplevel"]);
 	const root = top.stdout.trim();
-	if (top.code !== 0 || root === "") return "";
+	if (top.code !== 0 || root === "") return undefined;
 	let from = range.baseSha;
 	if (range.baseBranch !== undefined) {
 		const { baseBranch } = range;
@@ -364,8 +427,8 @@ export async function collectLaneDiff(
 			throw new LaneDiffUnavailable(`base 브랜치 ${baseBranch}의 tip을 읽지 못했습니다`);
 		const base = await git(["-C", root, "merge-base", tipSha, sha]);
 		const mergeBase = base.stdout.trim();
-		// No common history with the claim commit: the diff cannot be read, like any other unreadable diff.
-		if (base.code !== 0 || mergeBase === "") return "";
+		// No common history with the claim commit: the range cannot be read, like any other unreadable range.
+		if (base.code !== 0 || mergeBase === "") return { root, from: undefined };
 		from = mergeBase;
 		const { baseSha } = range;
 		if (baseSha !== undefined && baseSha !== mergeBase) {
@@ -374,19 +437,86 @@ export async function collectLaneDiff(
 			if (newer.code === 0 && inHistory.code === 0) from = baseSha;
 		}
 	}
-	if (from === undefined) return "";
+	return { root, from };
+}
+
+/**
+ * `git diff <from>..sha` of the lane's repository (see `laneRange` for `from`). A base branch that cannot be read
+ * throws `LaneDiffUnavailable`; without one, `from` is `baseSha`. "" when the repository, a merge-base with `sha` or
+ * the diff cannot be read (the classifier then only sees the claim).
+ */
+export async function collectLaneDiff(
+	laneCwd: string,
+	range: LaneDiffRange,
+	sha: string,
+	git: GitRunner = defaultGit,
+): Promise<string> {
+	const resolved = await laneRange(laneCwd, range, sha, git);
+	if (resolved === undefined || resolved.from === undefined) return "";
 	const diff = await git([
 		"-C",
-		root,
+		resolved.root,
 		"-c",
 		"core.quotepath=false",
 		"diff",
 		"--no-ext-diff",
 		"--no-textconv",
 		"--text",
-		`${from}..${sha}`,
+		`${resolved.from}..${sha}`,
 		"--no-color",
 		"--unified=0",
 	]);
 	return diff.code === 0 ? diff.stdout : "";
+}
+
+/**
+ * The author and committer emails of the lane's own commits (`git log <from>..sha`, the same range as its diff), for
+ * `taskAutoLand.commitEmails`. A repository or range that cannot be read yields no commits; a `git log` that fails
+ * throws `LaneDiffUnavailable` (the caller treats it like any other unreadable range).
+ */
+export async function collectLaneCommitIdentities(
+	laneCwd: string,
+	range: LaneDiffRange,
+	sha: string,
+	git: GitRunner = defaultGit,
+): Promise<LaneCommitIdentity[]> {
+	const resolved = await laneRange(laneCwd, range, sha, git);
+	if (resolved === undefined || resolved.from === undefined) return [];
+	const log = await git([
+		"-C",
+		resolved.root,
+		"log",
+		"--no-color",
+		"--format=%H%x09%ae%x09%ce",
+		`${resolved.from}..${sha}`,
+	]);
+	if (log.code !== 0) throw new LaneDiffUnavailable("레인 커밋의 작성자·커미터를 읽지 못했습니다");
+	const identities: LaneCommitIdentity[] = [];
+	for (const line of log.stdout.split("\n")) {
+		const [commit, author, committer] = line.split("\t");
+		if (commit === undefined || author === undefined || committer === undefined) continue;
+		identities.push({ sha: commit.trim(), author: author.trim(), committer: committer.trim() });
+	}
+	return identities;
+}
+
+/**
+ * One refusal per commit whose author or committer email is not in `allowed` (case-insensitive), naming the offending
+ * identities. `noreply@github.com` is allowed as the committer only (GitHub's own web commits).
+ */
+export function commitIdentityRefusals(
+	identities: readonly LaneCommitIdentity[],
+	allowed: readonly string[],
+): IntegrityRefusal[] {
+	const allow = new Set(allowed.map((email) => email.trim().toLowerCase()));
+	const refusals: IntegrityRefusal[] = [];
+	for (const identity of identities) {
+		const wrong: string[] = [];
+		if (!allow.has(identity.author.toLowerCase())) wrong.push(`작성자 <${identity.author}>`);
+		const committer = identity.committer.toLowerCase();
+		if (!allow.has(committer) && committer !== GITHUB_COMMITTER) wrong.push(`커미터 <${identity.committer}>`);
+		if (wrong.length === 0) continue;
+		refusals.push(refusal("commit_identity_mismatch", identity.sha.slice(0, 7), wrong.join(", ")));
+	}
+	return refusals;
 }

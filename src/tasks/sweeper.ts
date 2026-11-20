@@ -1,12 +1,15 @@
 import { createHash } from "node:crypto";
+import { readFileSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { ChannelRegistry } from "../channel/registry";
 import { dispatchEnv, HERDR_INTERRUPT_WAIT_MS, type HerdrAgentStatusResult, type ProcessRunner } from "../dispatch/omp";
 import { confidentBand } from "../lanes/land";
 import { type LastAnswer, questionOf } from "../omp/session-tail";
 import type { FreezeState } from "../ops/freeze";
+import type { TaskCheckRunner } from "./check-runner";
 import type { TaskJudgement } from "./checker";
 import { digest, summarizeJudgement } from "./checker";
-import type { TaskCheckCache, TaskEvaluation } from "./evaluate";
+import { ledgerTaskChecks, type TaskCheckCache, type TaskEvaluation } from "./evaluate";
 import type { TaskGateEnd, TaskGateHooks } from "./gate";
 import type { TaskLandOutcome } from "./land";
 import { type TaskLedger, type TaskRow, type TaskTransitionRow, taskPausedAt } from "./ledger";
@@ -28,6 +31,7 @@ import {
 	formatSpecChangedNotice,
 	formatStaleNotice,
 	formatWorkingSilentNotice,
+	NO_EVIDENCE_LINE,
 	NUDGE_MAX,
 	postCardToThread,
 	postToThread,
@@ -42,7 +46,9 @@ import { restatedHash } from "./resume-check";
 import { agyModelOf } from "./worker-tier";
 
 /** Sweep cadence of the daemon. */
-export const TASK_SWEEP_MS = 5 * 60_000;
+export const TASK_SWEEP_MS = 60_000;
+/** A remote task is judged at most this often (its reads take seconds over ssh), unless a check run just ended. */
+export const REMOTE_JUDGE_MS = 5 * 60_000;
 /** PROGRESS.md untouched this long → the agent gets a reminder (once per interval). */
 export const STALE_REMIND_MS = 30 * 60_000;
 /** ... and this long → the task thread is told once. */
@@ -54,8 +60,8 @@ export const STALE_NOTICE_MS = 2 * 60 * 60_000;
 export const WORKING_SILENT_NOTICE_MS = 45 * 60_000;
 /** A task left in review this long is brought up to the owner again, once per interval. */
 export const REVIEW_REALERT_MS = 24 * 60 * 60_000;
-/** Consecutive unreadable sweeps before the thread is told once. */
-export const READ_FAILURE_NOTICE_AFTER = 3;
+/** A task unreadable this long (since its first failed read) tells the thread once. */
+export const READ_FAILURE_NOTICE_MS = 15 * 60_000;
 const NUDGE_HEAD =
 	"Outcome 판정이 아직 미도달입니다. 아래를 채우거나, 진행할 수 없으면 PROGRESS.md status를 blocked로 바꾸고 사유를 적으세요.";
 /** The prompt a block gets once before it reaches the owner (the worker's `blocked_reason` follows as one line). */
@@ -74,6 +80,18 @@ const TASK_DOCS_PREFIX = "docs/tasks/";
 /** Shared paths an overlap notice names before it counts the rest. */
 const OVERLAP_PATHS_SHOWN = 5;
 
+/** `git -C <worktree> …` for the sweep's read-only questions: stdout, or `undefined` on a failure or timeout. */
+const worktreeGit =
+	(worktree: string, run: ProcessRunner) =>
+	async (...args: string[]): Promise<string | undefined> => {
+		const result = await run(["git", "-C", worktree, ...args], {
+			timeoutMs: 10_000,
+			stdoutCap: 1_000_000,
+			env: dispatchEnv(process.env),
+		});
+		return result.code === 0 && !result.timedOut ? result.stdout : undefined;
+	};
+
 /**
  * Files a local task worktree changes against its base: the branch diff since the merge base plus uncommitted and
  * untracked files, `docs/tasks/**` left out, sorted. The base is `origin/HEAD`, else `main`, else `master`.
@@ -82,14 +100,7 @@ export async function taskChangedPaths(
 	worktree: string,
 	run: ProcessRunner,
 ): Promise<{ ok: true; paths: string[] } | { ok: false; reason: string }> {
-	const git = async (...args: string[]): Promise<string | undefined> => {
-		const result = await run(["git", "-C", worktree, ...args], {
-			timeoutMs: 10_000,
-			stdoutCap: 1_000_000,
-			env: dispatchEnv(process.env),
-		});
-		return result.code === 0 && !result.timedOut ? result.stdout : undefined;
-	};
+	const git = worktreeGit(worktree, run);
 	let base = (await git("symbolic-ref", "--short", "refs/remotes/origin/HEAD"))?.trim();
 	for (const candidate of ["main", "master"]) {
 		if (base !== undefined) break;
@@ -116,6 +127,64 @@ export async function taskChangedPaths(
 		}
 	}
 	return { ok: true, paths: [...paths].filter((path) => !path.startsWith(TASK_DOCS_PREFIX)).sort() };
+}
+
+/** The task's own PROGRESS.md: its content counts as evidence, but only the part other than the `updated` line. */
+const progressPathOf = (taskId: string): string => `docs/tasks/${taskId}/PROGRESS.md`;
+
+/** PROGRESS.md text without its `updated` line: a worker that only rewrote the clock moved nothing else. */
+export function progressWithoutUpdated(text: string): string {
+	return text
+		.split("\n")
+		.filter((line) => !/^\s*updated:/.test(line))
+		.join("\n");
+}
+
+/**
+ * A local task's progress evidence: one hash over what moved in its worktree since the last sweep - `HEAD`, the
+ * uncommitted diff, the untracked files' paths·sizes·mtimes, and PROGRESS.md without its `updated` line. A worker
+ * that rewrites only `updated` leaves the key unchanged, so the stale clock is not pushed back by it
+ * (doc/plans/task-progress-evidence.md). `ok: false` when the worktree cannot be read (remote task, no worktree, a
+ * git failure): the caller then keeps the old time-based behavior.
+ */
+export async function taskProgressEvidence(
+	worktree: string,
+	taskId: string,
+	run: ProcessRunner,
+): Promise<{ ok: true; key: string } | { ok: false; reason: string }> {
+	const progressPath = progressPathOf(taskId);
+	const git = worktreeGit(worktree, run);
+	const head = (await git("rev-parse", "HEAD"))?.trim();
+	if (head === undefined) return { ok: false, reason: "no_head" };
+	// The whole diff, so that a change to a file's content alone moves the key even with the path unchanged.
+	const diff = await git("diff", "HEAD", "--no-ext-diff", "--no-textconv", "--", ".", `:(exclude)${progressPath}`);
+	if (diff === undefined) return { ok: false, reason: "diff_failed" };
+	const untracked = await git("ls-files", "--others", "--exclude-standard", "-z");
+	if (untracked === undefined) return { ok: false, reason: "untracked_failed" };
+	// PROGRESS.md is left out here (its mtime moves with every write), counted through its content below instead.
+	const files = untracked
+		.split("\0")
+		.filter((path) => path !== "" && path !== progressPath)
+		.sort()
+		.map((path) => {
+			try {
+				const stat = statSync(join(worktree, path));
+				return `${path}\t${stat.size}\t${Math.floor(stat.mtimeMs)}`;
+			} catch {
+				return path;
+			}
+		});
+	let body: string;
+	try {
+		body = progressWithoutUpdated(readFileSync(join(worktree, progressPath), "utf8"));
+	} catch {
+		// No PROGRESS.md yet: HEAD, the diff and the untracked files are all the evidence there is.
+		body = "";
+	}
+	const key = createHash("sha256")
+		.update([head, diff, files.join("\n"), body].join("\0"))
+		.digest("hex");
+	return { ok: true, key };
 }
 
 /** Where the nudge count starts: the latest `resume:<ms>` mark of `resumeTask`, else the registration. */
@@ -205,6 +274,8 @@ export interface TaskSweepDeps {
 	 */
 	lastAnswer?(row: TaskRow, sessionPath: string): Promise<LastAnswer | undefined>;
 	channels: ChannelRegistry;
+	/** The daemon's check queue: told each sweep which tasks still count, so a closed task's checks are cancelled. */
+	checkRunner?: Pick<TaskCheckRunner, "retain">;
 	/** The task's herdr board card link for the reached/blocked/stale notices; absent → no board footer. */
 	boardLink?(row: TaskRow): Promise<string | undefined>;
 	/** The dashboard's diff view of the task for the reached card; absent or undefined → no `변경 보기:` line. */
@@ -218,6 +289,12 @@ export interface TaskSweepDeps {
 	 * `undefined` leaves the task out of this sweep's check. Never asked for a remote task. Absent = no overlap check.
 	 */
 	changedPaths?(row: TaskRow): Promise<string[] | undefined>;
+	/**
+	 * The task worktree's progress evidence (`taskProgressEvidence`), compared between `updated` values so that a
+	 * rewrite of the clock alone does not count as progress. `undefined` = no evidence readable (remote task, no
+	 * worktree, a git failure): the `updated` then counts as before. Absent = time-based behavior for every task.
+	 */
+	progressEvidence?(row: TaskRow): Promise<string | undefined>;
 	/**
 	 * Lands the task through the core, or hands it to the thread as "머지해" (`Daemon.autoLand`); what it came to. A task
 	 * in the confident band gets `gate`: the review·QA gate runs first and reports through it (`gating`, `held`).
@@ -253,16 +330,27 @@ export interface TaskCheckResult {
  */
 export class TaskSweeper {
 	readonly #deps: TaskSweepDeps;
+	/** When each remote task was last judged (in memory: a restart judges once at once). */
+	readonly #remoteJudgedAt = new Map<string, number>();
 	/** Consecutive read failures per task (in memory: a restart only delays the alert). */
 	readonly #failures = new Map<string, { count: number; since: number }>();
 	/** Last `updated` value read from each task's PROGRESS.md (in memory: a restart re-reads it once). */
 	readonly #seenUpdated = new Map<string, number>();
+	/** Progress evidence hash last seen for each task (in memory: a restart only takes a new baseline). */
+	readonly #seenEvidence = new Map<string, string>();
+	/**
+	 * The `updated` value whose new reading came with no new evidence: a reminder or notice for that time says so.
+	 * Holds one value per task (the latest ignored one): a later `updated` with evidence clears it.
+	 */
+	readonly #noEvidenceUpdated = new Map<string, number>();
+	/** Tasks whose evidence read threw in this run (in memory): one `task_progress_evidence_failed` per task. */
+	readonly #evidenceFailing = new Set<string>();
 	/** Tasks whose held reminder was already logged during the current freeze (one `task_remind_frozen` per freeze). */
 	readonly #remindHeld = new Set<string>();
 	/** `<task>:<pausedAt>` of the owner pauses already logged as holding a prompt (one `task_remind_paused` per pause). */
 	readonly #pauseLogged = new Set<string>();
-	/** `[check: …]` results per task HEAD (in memory: a restart runs the checks again). */
-	readonly #checks: TaskCheckCache = new Map();
+	/** `[check: …]` results per task HEAD, kept in the ledger (a restart does not run them again). */
+	readonly #checks: TaskCheckCache;
 	/**
 	 * When each task's agent was first seen herdr-`blocked` in its current wait (in memory: a restart may tell the
 	 * owner once more about a wait that is still going on). The wait notice is keyed by it.
@@ -279,20 +367,36 @@ export class TaskSweeper {
 
 	constructor(deps: TaskSweepDeps) {
 		this.#deps = deps;
+		this.#checks = ledgerTaskChecks(deps.ledger);
 	}
 
 	/**
 	 * One pass over every working or blocked task, then over the tasks left in review (a reminder to the owner only).
 	 * A task that throws never stops the others.
 	 */
-	async sweep(): Promise<TaskCheckResult[]> {
+	async sweep(due: ReadonlySet<string> = new Set()): Promise<TaskCheckResult[]> {
 		const results: TaskCheckResult[] = [];
 		const judged = new Set<string>();
+		const startedAt = this.#deps.now();
+		let skippedRemote = 0;
 		this.#prompted.clear();
 		this.#sweepAgents.clear();
 		this.#sweepQuestions.clear();
-		for (const row of this.#deps.ledger.listActive()) {
+		const active = this.#deps.ledger.listActive();
+		this.#deps.checkRunner?.retain(new Set([...active, ...this.#deps.ledger.listInReview()].map((row) => row.taskId)));
+		for (const row of active) {
 			judged.add(row.taskId);
+			const lastRemote = this.#remoteJudgedAt.get(row.taskId);
+			if (
+				row.host !== null &&
+				!due.has(row.taskId) &&
+				lastRemote !== undefined &&
+				startedAt - lastRemote < REMOTE_JUDGE_MS
+			) {
+				skippedRemote += 1;
+				continue;
+			}
+			if (row.host !== null) this.#remoteJudgedAt.set(row.taskId, startedAt);
 			try {
 				results.push(await this.check(row));
 			} catch (error) {
@@ -312,6 +416,11 @@ export class TaskSweeper {
 				this.#deps.log.warn("task_sweep_failed", { task: row.taskId, error: String(error) });
 			}
 		}
+		this.#deps.log.info("task_sweep_done", {
+			ms: this.#deps.now() - startedAt,
+			judged: results.length,
+			skippedRemote,
+		});
 		return results;
 	}
 
@@ -360,7 +469,7 @@ export class TaskSweeper {
 			streak.count += 1;
 			this.#failures.set(row.taskId, streak);
 			log.warn("task_read_failed", { task: row.taskId, count: streak.count, error: evaluation.error });
-			if (streak.count >= READ_FAILURE_NOTICE_AFTER && ledger.recordNotice(row.taskId, `readfail:${streak.since}`)) {
+			if (now - streak.since >= READ_FAILURE_NOTICE_MS && ledger.recordNotice(row.taskId, `readfail:${streak.since}`)) {
 				await this.#post(row, formatReadFailureNotice(row, streak.count, evaluation.error));
 				actions.push("read-failure notice");
 			}
@@ -386,7 +495,19 @@ export class TaskSweeper {
 				log.warn("task_updated_future", { task: row.taskId, updatedAtMs: written, now });
 				progressAt = now;
 			}
-			if (progressAt > (row.progressAt ?? 0)) ledger.setProgressAt(row.taskId, progressAt);
+			// A new `updated` counts as progress only when the worktree moved with it: rewriting PROGRESS.md's clock
+			// alone used to buy a fresh 30 minutes (doc/plans/task-progress-evidence.md). An unreadable worktree
+			// (remote task, no git) keeps the old time-based rule, and so does the first `updated` of a run.
+			const evidence = await this.#progressEvidence(row);
+			const seen = evidence === undefined ? undefined : this.#seenEvidence.get(row.taskId);
+			if (evidence !== undefined) this.#seenEvidence.set(row.taskId, evidence);
+			if (evidence !== undefined && seen !== undefined && seen === evidence) {
+				this.#noEvidenceUpdated.set(row.taskId, written);
+				log.info("task_progress_no_evidence", { task: row.taskId, updatedAtMs: written });
+			} else {
+				this.#noEvidenceUpdated.delete(row.taskId);
+				if (progressAt > (row.progressAt ?? 0)) ledger.setProgressAt(row.taskId, progressAt);
+			}
 		}
 		await this.#restated(row, judgement, actions);
 		if (judgement.specChanged && ledger.recordNotice(row.taskId, `spec:${judgement.specKey}`)) {
@@ -763,6 +884,28 @@ export class TaskSweeper {
 		}
 	}
 
+	/**
+	 * The worktree's progress key for this task (`taskProgressEvidence`, wired by the daemon), or `undefined` when it
+	 * cannot be read: a throw is logged once per task per run, and the caller keeps the time-based behavior.
+	 */
+	async #progressEvidence(row: TaskRow): Promise<string | undefined> {
+		const read = this.#deps.progressEvidence;
+		if (read === undefined) return undefined;
+		let key: string | undefined;
+		try {
+			key = await read(row);
+		} catch (error) {
+			if (!this.#evidenceFailing.has(row.taskId)) {
+				this.#evidenceFailing.add(row.taskId);
+				this.#deps.log.warn("task_progress_evidence_failed", { task: row.taskId, error: String(error) });
+			}
+			return undefined;
+		}
+		if (key === undefined) return undefined;
+		this.#evidenceFailing.delete(row.taskId);
+		return key;
+	}
+
 	async #staleness(
 		row: TaskRow,
 		now: number,
@@ -782,6 +925,9 @@ export class TaskSweeper {
 		const agent = known ?? (await this.#agentStatus(row));
 		this.#sweepAgents.set(row.taskId, agent);
 		const status = agent.ok ? agent.status : undefined;
+		// The latest `updated` moved nothing else: the reminder and notices below say so instead of implying progress.
+		const noEvidence =
+			judgement.updatedAtMs !== undefined && this.#noEvidenceUpdated.get(row.taskId) === judgement.updatedAtMs;
 		// The LOST notice is for the owner, not the agent, so a freeze does not hold it. A resume moves the base.
 		if (status === "gone" && ledger.recordNotice(row.taskId, `lost:${base}`)) {
 			await this.#post(row, buildLostCard(row, this.#deps.ownerUserId, await this.#boardLink(row)));
@@ -881,7 +1027,9 @@ export class TaskSweeper {
 			const minutes = Math.floor(age / 60_000);
 			const text = [
 				`PROGRESS.md가 ${minutes}분 넘게 갱신되지 않았습니다. 지금 단계와 다음 행동을 PROGRESS.md의 updated·current·next에 반영하세요. 한 단계가 30분을 넘으면 30분마다 중간 갱신합니다.`,
+				"`updated`만 바꾸면 진행으로 치지 않으니 current·next에 실제 진척을 적으세요.",
 				...unmetLines(judgement.problems),
+				...(noEvidence ? [NO_EVIDENCE_LINE] : []),
 			].join("\n");
 			if (await this.#remind(row, text)) {
 				ledger.markReminded(row.taskId, now);
@@ -898,14 +1046,17 @@ export class TaskSweeper {
 			const screen = await this.#readAgent(row);
 			await this.#post(
 				row,
-				formatWorkingSilentNotice(row, Math.floor(age / 60_000), screen, await this.#boardLink(row)),
+				formatWorkingSilentNotice(row, Math.floor(age / 60_000), screen, await this.#boardLink(row), noEvidence),
 			);
 			actions.push("working silent notice");
 		}
 		if (pausedAt === undefined && age >= STALE_NOTICE_MS && ledger.recordNotice(row.taskId, `stale2h:${base}`)) {
 			// A question left unanswered must not sink with the stale notice: the owner is mentioned then.
 			const asked = question === undefined ? undefined : this.#deps.ownerUserId;
-			await this.#post(row, formatStaleNotice(row, Math.floor(age / 60_000), await this.#boardLink(row), asked));
+			await this.#post(
+				row,
+				formatStaleNotice(row, Math.floor(age / 60_000), await this.#boardLink(row), asked, noEvidence),
+			);
 			actions.push("stale notice");
 		}
 	}

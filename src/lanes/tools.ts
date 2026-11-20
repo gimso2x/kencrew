@@ -2,6 +2,7 @@ import { LANE_MODEL_TIERS } from "../config";
 import type { HostToolDef } from "../safety/host-tools";
 import { TASK_RISKS } from "../tasks/docs";
 import type { LaneManager } from "./manager";
+import { RESERVATION_AFTER_MAX } from "./reservations";
 
 function stringParam(params: Record<string, unknown>, key: string): string {
 	const value = params[key];
@@ -59,13 +60,41 @@ export function buildWorkStartTool(manager: LaneManager, channel: string, origin
 					maximum: 1,
 					description: "Confidence 0..1 in the tier choice (the judge's conf, when one was asked).",
 				},
+				externalPr: {
+					type: "object",
+					properties: {
+						repo: {
+							type: "string",
+							description: "GitHub owner/name that receives the PR; default: read from the origin remote",
+						},
+						base: { type: "string", description: "PR base branch; default: the lane's base branch" },
+						bodyFile: { type: "string", description: "Repository-relative PR body file; default pr-body.md" },
+						title: { type: "string", description: "PR title; default: the lane title" },
+						pushRemote: {
+							type: "string",
+							description: "git remote to push to; default: the remote of the gh login's fork (made when none)",
+						},
+						branch: { type: "string", description: "Branch to create on the remote; default pr/<laneId>" },
+					},
+					additionalProperties: false,
+					description:
+						"Mark the lane as an external pull request (e.g. a contribution to someone else's repository): it is never merged into its base branch; when it closes, its card offers PR 게시 (owner approval, push to the fork without force, gh pr create), 보류 and 폐기.",
+				},
+				after: {
+					type: "array",
+					items: { type: "string" },
+					minItems: 1,
+					maxItems: RESERVATION_AFTER_MAX,
+					description:
+						"Names of lanes of the same repository that must land first. No lane starts now: the request is reserved with these arguments frozen, and once every one of them has landed the owner gets a start card (nothing starts by itself; a reservation expires after 24 hours).",
+				},
 			},
 			required: ["title", "cwd"],
 			additionalProperties: false,
 		},
 		async execute(params) {
 			const brief = typeof params.brief === "string" ? params.brief : undefined;
-			const lane = await manager.start({
+			const args = {
 				title: stringParam(params, "title"),
 				cwd: stringParam(params, "cwd"),
 				brief,
@@ -76,8 +105,18 @@ export function buildWorkStartTool(manager: LaneManager, channel: string, origin
 				model: params.model,
 				tierReason: params.tierReason,
 				tierConfidence: params.tierConfidence,
-				parentOrigin: originKey,
-			});
+				externalPr: params.externalPr,
+			};
+			if (params.after !== undefined) {
+				const reservation = await manager.reserve({
+					args,
+					after: params.after,
+					originKey,
+					threadRef: manager.store.latestInboundThread(originKey),
+				});
+				return `예약됨 #${reservation.id}: ${reservation.after.join(", ")} 착지 뒤 시작 가능 카드를 올립니다 (24시간 안에 시작하지 않으면 만료). tell the owner the reservation is waiting; no lane was started.`;
+			}
+			const lane = await manager.start({ ...args, parentOrigin: originKey });
 			const link = await manager.threadLink(lane);
 			const started = `lane ${lane.name} started (thread ${lane.threadRef}, origin ${lane.originKey})`;
 			const reply = link === undefined ? started : `${started}; tell the owner the lane thread link: ${link}`;

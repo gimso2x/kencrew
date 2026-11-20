@@ -147,11 +147,11 @@ export function gateText(name: string): { label: string; todo: string } {
 		origin_silent: [`받은 메시지가 ${span(limits.originSilentMs)} 넘게 대기`, "`ompbot status`로 대기 중인 대화 확인"],
 		deliveries_overdue: [`전달이 ${span(limits.deliveryOverdueMs)} 넘게 밀림`, "데몬 로그에서 전달 실패 사유 확인"],
 		monitors_failed: [
-			`최근 ${span(limits.monitorFailureWindowMs)} 안에 모니터 실패`,
-			"`ompbot monitors list`로 실패한 모니터 확인",
+			`최근 ${span(limits.monitorFailureWindowMs)} 안에 실패한 뒤 아직 성공하지 못한 모니터`,
+			"현황판 모니터 화면에서 연속 실패·최근 실행 비고 확인",
 		],
 		monitors_stalled: [`모니터 실행이 ${span(limits.monitorOverdueMs)} 넘게 밀림`, "모니터 실행·drain 상태 확인"],
-		omp_runtime: ["omp 실행 환경 이상", "`omp --version`·`bun --version` 확인"],
+		omp_runtime: ["omp 실행 환경 이상", "`omp --version`이 `omp/<버전>`을 내는지 확인"],
 		frozen: ["동결 켜짐", "동결 사유 확인 뒤 `ompbot unfreeze`"],
 		ledger_unreadable: ["장부(DB)를 읽지 못함", "DB 파일 권한·디스크 확인"],
 		herdr_unreachable: ["herdr에 연결하지 못함", "herdr 서버 상태·`herdr.bin` 설정 확인"],
@@ -662,6 +662,7 @@ export function renderDashboardMain(
 		working: ["진행 중", "is-info"],
 		dispatched: ["진행 중", "is-info"],
 		pending: ["대기", ""],
+		uncertain: ["전달 불확실", "is-warning"],
 		idle: ["쉬는 중", ""],
 		unknown: ["알 수 없음", ""],
 		cancelled: ["취소", ""],
@@ -756,9 +757,11 @@ export function renderDashboardMain(
 	const badgesOf = (entry: Entry): string => {
 		const task = entry.task;
 		const out: string[] = [];
-		// A TASK card shows the TASK's state only; the agent's own state goes in the foot as text (`workerOf`).
-		if (task !== undefined) out.push(state(task.status));
-		else if (entry.card?.unknown) out.push(badge(`알 수 없음 · ${entry.card.status || "?"}`, "is-warning"));
+		// A TASK card shows the TASK's state only; the agent's own state goes in the foot as text (`workerOf`). A
+		// `working` TASK whose agent finished sits in 완료·대기 until the sweep judges its outcome: "판정 대기", not 진행 중.
+		if (task !== undefined) {
+			out.push(task.status === "working" && entry.col === "wait" ? badge("판정 대기", "") : state(task.status));
+		} else if (entry.card?.unknown) out.push(badge(`알 수 없음 · ${entry.card.status || "?"}`, "is-warning"));
 		else if (entry.card !== undefined) out.push(state(entry.card.status));
 		if (isStale(entry, clock)) out.push(badge("방치", ""));
 		if (task !== undefined && entry.card === undefined && task.open) {
@@ -802,6 +805,15 @@ export function renderDashboardMain(
 		return `<span class="card-worker">워커 ${esc(label)}</span>`;
 	};
 	const stateKeyOf = (entry: Entry): string => `${entry.col}:${entry.card?.status ?? ""}:${entry.task?.status ?? ""}`;
+	/**
+	 * A TASK waiting for the owner's review opens its request thread on Discord from the card. The card is a link, so
+	 * this is a span the click handler opens in a new tab (`data-open`), not a nested link.
+	 */
+	const reviewLinkOf = (entry: Entry): string => {
+		if (entry.task?.status !== "review" || !s.flows?.ok) return "";
+		const href = s.flows.items.find((chain) => chain.tasks.some((step) => step.taskId === entry.taskId))?.discordHref;
+		return href ? `<span class="card-discord" data-open="${esc(href)}">디스코드에서 보기 ↗</span>` : "";
+	};
 	/** One inbox card; a 확인 필요 card carries its number on screen (1…9, `order`) and the next line's mark. */
 	const cardOf = (entry: Entry, order = 0): string => {
 		const eyebrow = entry.taskId ? `${entry.taskId} · ${entry.machine}` : entry.machine;
@@ -824,7 +836,7 @@ export function renderDashboardMain(
 						entry.card.lastPrompt.at,
 					)}: ${esc(entry.card.lastPrompt.preview)}</p>`
 				: ""
-		}<div class="card-foot"><span class="badges">${badgesOf(entry)}</span>${workerOf(entry)}<span class="card-time">${ago(
+		}<div class="card-foot"><span class="badges">${badgesOf(entry)}</span>${workerOf(entry)}${reviewLinkOf(entry)}<span class="card-time">${ago(
 			entry.since,
 		)}</span><span class="card-meta">${meta.map((part) => `<span>${esc(part)}</span>`).join("")}</span>${
 			isNext ? '<span class="next-tag">다음</span>' : ""
@@ -1350,7 +1362,7 @@ export function renderDashboardMain(
 				.filter((lane) => hit(lane.title, lane.name, lane.cwd))
 				.map((lane) =>
 					row(lane.name, [state(lane.status)], esc(lane.title), [
-						`${esc(lane.name)} · 갱신 ${at(lane.updatedAt)}`,
+						`${esc(lane.name)} · 갱신 ${at(lane.updatedAt)}${lane.uncertainCount > 0 ? ` · 보류 ${lane.uncertainCount}건` : ""}`,
 						esc(lane.cwd),
 					]),
 				);
@@ -1407,6 +1419,19 @@ export function renderDashboardMain(
 						item.originLabel === null ? "" : esc(item.originLabel),
 					]);
 				});
+			// Questions the deadline answered: read-only rows, the thread link is the only thing to open.
+			const auto = s.autoChoices?.ok
+				? s.autoChoices.items
+						.filter((item) => hit(item.question, item.chosen, item.originKey))
+						.map((item) => {
+							const href = discordThreadHref(s.discordGuild, item.originKey, item.threadRef);
+							const link =
+								href === ""
+									? ""
+									: ` · <a href="${esc(href)}" target="_blank" rel="noopener noreferrer">스레드 보기</a>`;
+							return `<div class="row"><div class="row-main"><p class="row-title">${esc(item.question)}</p><p class="row-sub">→ ${esc(item.chosen)}</p><p class="row-sub">${at(item.at)}${link}</p></div></div>`;
+						})
+				: [];
 			return `${listOf(
 				"승인 대기",
 				rows,
@@ -1418,6 +1443,10 @@ export function renderDashboardMain(
 				decided.length === 0
 					? ""
 					: `<h2 class="list-section">최근 결정 <span class="count-chip">${decided.length}</span></h2><div class="rows" data-list="decided">${decided.join("")}</div>`
+			}${
+				auto.length === 0
+					? ""
+					: `<h2 class="list-section">최근 자동 선택(${s.autoChoices?.ok ? s.autoChoices.days : 7}일) <span class="count-chip">${auto.length}</span></h2><div class="rows" data-list="auto-choices">${auto.join("")}</div>`
 			}`;
 		}
 		if (view === "monitors") {
@@ -2037,9 +2066,21 @@ export function renderDashboardMain(
 			.join("")}${leasts.length === 0 ? "?" : `${roll("lim:sum", Math.min(...leasts), "down")}%`}</span>`;
 		return wrap(parts.map((part) => part.chip).join("") + summary, parts.map((part) => part.tile).join(""));
 	};
+	// The test chip: hidden with nothing running or queued; the queue opens on click.
+	const heavy = s.heavyRun;
+	const heavyChip =
+		heavy?.ok && (heavy.running !== null || heavy.waiting.length > 0)
+			? `<details class="heavy-pop"><summary class="limit-chip" title="전체 테스트(호스트에서 한 번에 하나)">🧪 ${
+					heavy.running === null ? "" : `${esc(heavy.running.label)} ${dur(heavy.running.ageMs)} · `
+				}대기 ${heavy.waiting.length}</summary><ul class="heavy-list">${
+					heavy.waiting.length === 0
+						? "<li>대기 없음</li>"
+						: heavy.waiting.map((item) => `<li>${esc(item.label)} <b>${dur(item.waitedMs)}</b></li>`).join("")
+				}<li class="heavy-note">표시는 대기 시작 순서이고 실제 실행 순서는 보장되지 않습니다.</li></ul></details>`
+			: "";
 	const topbar = `<header class="topbar"><nav class="crumbs" aria-label="위치"><span>ompbot</span><span aria-hidden="true">/</span><span aria-current="page">${esc(
 		viewLabel,
-	)}</span></nav><div class="status-chips" aria-label="봇 상태">${chips.join("")}</div>${limitsPop()}<div class="top-tools">${layoutSeg}<div class="seg" role="group" aria-label="테마">${themeBtn("system", "시스템")}${themeBtn("light", "라이트")}${themeBtn("dark", "다크")}</div><button type="button" class="cmd-trigger" data-cmd-open aria-label="명령 팔레트 열기"><span>명령</span><kbd>⌘K</kbd></button></div></header>`;
+	)}</span></nav><div class="status-chips" aria-label="봇 상태">${chips.join("")}</div>${heavyChip}${limitsPop()}<div class="top-tools">${layoutSeg}<div class="seg" role="group" aria-label="테마">${themeBtn("system", "시스템")}${themeBtn("light", "라이트")}${themeBtn("dark", "다크")}</div><button type="button" class="cmd-trigger" data-cmd-open aria-label="명령 팔레트 열기"><span>명령</span><kbd>⌘K</kbd></button></div></header>`;
 	const content = view === "inbox" ? inboxView() : view === "list" ? listView() : sectionView();
 	return `${topbar}<nav class="sidenav" aria-label="보기">${nav}</nav><main class="view" id="view" aria-label="${esc(
 		viewLabel,
@@ -2303,7 +2344,12 @@ export function renderFlowChain(chain: FlowChainInfo, focus: string, panel: bool
 			)}</b>${took === "" ? "" : `<span>${esc(took)}</span>`}</p>${group.tasks.map(box).join("")}</div>`;
 		})
 		.join("");
-	const body = `<p class="flow-now"><b>지금</b> ${esc(chain.now)}</p><div class="flow-row">${requestBox}${groups}</div>`;
+	// A TASK waiting for the owner's review: its Outcome card is in the request thread, one click away.
+	const review =
+		chain.discordHref !== "" && chain.tasks.some((step) => step.status === "review")
+			? `<p class="flow-review"><a class="button" href="${esc(chain.discordHref)}" target="_blank" rel="noopener noreferrer">디스코드에서 보기</a></p>`
+			: "";
+	const body = `<p class="flow-now"><b>지금</b> ${esc(chain.now)}</p>${review}<div class="flow-row">${requestBox}${groups}</div>`;
 	return panel
 		? `<section class="detail-flow" aria-label="흐름"><h3 class="h3">흐름 <small>${chain.done}/${chain.total} 끝남</small></h3>${body}</section>`
 		: body;
@@ -4434,6 +4480,12 @@ function boot() {
 			const gone = stacked.getAttribute("data-es-card");
 			stack = stack.filter((card) => card.id !== gone);
 			drawStack();
+		}
+		const outbound = target.closest("[data-open]");
+		if (outbound) {
+			event.preventDefault();
+			window.open(outbound.getAttribute("data-open") || "", "_blank", "noopener,noreferrer");
+			return;
 		}
 		const copyBtn = target.closest("[data-copy]");
 		if (copyBtn) {

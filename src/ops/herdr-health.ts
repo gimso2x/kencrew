@@ -1,16 +1,17 @@
 import { join } from "node:path";
 import type { ProcessRunner } from "../dispatch/omp";
-import { TASK_SWEEP_MS } from "../tasks/sweeper";
 import { parseStampFields, parseStampTs, readRegularText, writeAtomic0600 } from "./stamp";
 
 /** `<home>/herdr-health`: the daemon's last local `herdr status server` result, read by the `herdr_unreachable` gate. */
 export const HERDR_HEALTH_FILE = "herdr-health";
-/** Consecutive failed checks before `herdr_unreachable` opens (15 minutes at the 5-minute task sweep). */
+/** The daemon checks herdr this often (every fifth 1-minute task sweep). */
+export const HERDR_HEALTH_CHECK_MS = 5 * 60_000;
+/** Consecutive failed checks before `herdr_unreachable` opens (15 minutes at `HERDR_HEALTH_CHECK_MS`). */
 export const HERDR_UNREACHABLE_AFTER = 3;
 /** `herdr status server` gets this long before the check counts as failed. */
 export const HERDR_HEALTH_TIMEOUT_MS = 10_000;
-/** A stamp older than three task sweeps judges nothing: the daemon stopped checking (a dead daemon is sweep_stalled's). */
-export const HERDR_HEALTH_STALE_MS = 3 * TASK_SWEEP_MS;
+/** A stamp older than three checks judges nothing: the daemon stopped checking (a dead daemon is sweep_stalled's). */
+export const HERDR_HEALTH_STALE_MS = 3 * HERDR_HEALTH_CHECK_MS;
 
 export interface HerdrHealthStamp {
 	ts: Date;

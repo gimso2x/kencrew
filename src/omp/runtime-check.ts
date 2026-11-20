@@ -1,78 +1,172 @@
-import { closeSync, existsSync, openSync, readFileSync, readSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { isRecord } from "./type-guards";
+import { closeSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { buildChildEnv } from "./env";
 
 /**
- * Why the pinned omp install cannot host an RPC child, checked before every spawn and by the `omp_runtime` gate.
- *
- * Both failures come from one upgrade path (2026-10-29, omp 18.13.3): omp raised `engines.bun`, `omp update`
- * installed the package with bun, its launcher check failed on the old bun, and the updater replaced the
- * `~/.bun/bin/omp` symlink with the standalone binary. ompbot then looked for the RPC client next to that binary and
- * every new session failed as `omp_rpc_client_missing`, which named neither cause.
+ * Why `ompExecutable` cannot host an RPC child, checked before every spawn, by the `omp_runtime` gate, `ompbot doctor`
+ * and `ompbot omp trial`. The child is the executable itself (the package's `dist/cli.js` or the standalone binary), so
+ * the only requirement is that it runs and names itself `omp/<x.y.z>`.
  */
 export interface OmpRuntimeProblem {
-	code: "omp_launcher_standalone" | "omp_launcher_unreadable" | "bun_too_old";
+	code: "omp_executable_missing";
 	/** Short `key=value` detail for gates and logs. */
 	detail: string;
 	/** Human-readable cause with the fix. */
 	message: string;
 }
 
-/** Whether `path` starts with a `#!` line (the package's `dist/cli.js`), as opposed to a compiled binary. */
-function isScript(path: string): boolean {
-	const fd = openSync(path, "r");
+const VERSION_TIMEOUT_MS = 15_000;
+const VERSION_LINE = /^omp\/(\d+\.\d+\.\d+\S*)/;
+
+/**
+ * Versions already read, by executable identity (realpath, mtime, size): `cli.js --version` takes about a second and
+ * runs before every child, so an unchanged executable is asked once per process.
+ */
+const knownVersions = new Map<string, string>();
+
+function identity(executable: string): string | OmpRuntimeProblem {
 	try {
-		const head = Buffer.alloc(2);
-		return readSync(fd, head, 0, 2, 0) === 2 && head.toString("latin1") === "#!";
-	} finally {
-		closeSync(fd);
+		const real = realpathSync(executable);
+		const stat = statSync(real);
+		return `${real}\0${stat.mtimeMs}\0${stat.size}`;
+	} catch (error) {
+		const reason = error instanceof Error && "code" in error ? String(error.code) : String(error);
+		return problem(executable, `error=${reason}`, `${executable} cannot be read (${reason})`);
 	}
 }
 
-/**
- * `cliPath` is the realpath of the configured omp executable; `bun` is the bun that will run the child.
- * Returns undefined when the install looks usable (an unparseable manifest is left to the later import checks).
- */
-export function checkOmpRuntime(cliPath: string, bun: string): OmpRuntimeProblem | undefined {
-	const packageRoot = dirname(dirname(cliPath));
-	const manifestPath = join(packageRoot, "package.json");
-	let script: boolean;
-	try {
-		script = existsSync(manifestPath) || isScript(cliPath);
-	} catch (error) {
-		// A directory or an unreadable file in ompExecutable: a problem to report, not an exception that ends the caller.
-		const reason = error instanceof Error && "code" in error ? String(error.code) : String(error);
-		return {
-			code: "omp_launcher_unreadable",
-			detail: `error=${reason} path=${cliPath}`,
-			message: `${cliPath} cannot be read as the omp launcher (${reason}); point ompExecutable at <global node_modules>/@oh-my-pi/pi-coding-agent/dist/cli.js.`,
-		};
-	}
-	if (!script) {
-		return {
-			code: "omp_launcher_standalone",
-			detail: `launcher=standalone path=${cliPath}`,
-			message:
-				`${cliPath} is a standalone omp binary, not the package launcher ompbot drives (omp update replaces the ` +
-				"symlink when the installed bun is older than omp requires). Run `bun upgrade`, then point the executable " +
-				"back at <global node_modules>/@oh-my-pi/pi-coding-agent/dist/cli.js.",
-		};
-	}
+function problem(executable: string, detail: string, cause: string): OmpRuntimeProblem {
+	return {
+		code: "omp_executable_missing",
+		detail: `${detail} path=${executable}`,
+		message: `${cause}; point ompExecutable at an omp executable (\`command -v omp\`, or the standalone binary / dist/cli.js of the package).`,
+	};
+}
 
-	let manifest: unknown;
-	try {
-		manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-	} catch {
+/** The verdict on one `--version` run; a version is remembered under `key`. */
+function verdict(
+	executable: string,
+	key: string,
+	run: { exitCode: number | null; stdout: string; stderr: string },
+): OmpRuntimeProblem | undefined {
+	const version = VERSION_LINE.exec(run.stdout.trim())?.[1];
+	if (run.exitCode === 0 && version !== undefined) {
+		knownVersions.set(key, version);
 		return undefined;
 	}
-	const engines = isRecord(manifest) ? manifest.engines : undefined;
-	const range = isRecord(engines) ? engines.bun : undefined;
-	if (typeof range !== "string") return undefined;
-	const version = Bun.spawnSync([bun, "--version"]).stdout.toString().trim();
-	if (version !== "" && Bun.semver.satisfies(version, range)) return undefined;
-	return {
-		code: "bun_too_old",
-		detail: `bun=${version || "unknown"} need=${range}`,
-		message: `bun ${version || "(version unknown)"} at ${bun} does not satisfy omp's engines.bun ${range}; run \`bun upgrade\`.`,
-	};
+	const shown = (run.stdout.trim() || run.stderr.trim()).split("\n")[0]?.slice(0, 200) ?? "";
+	return problem(
+		executable,
+		`version=unrecognized exit=${run.exitCode ?? "killed"}`,
+		`\`${executable} --version\` did not print omp/<version> (exit ${run.exitCode ?? "killed"}: ${shown || "no output"})`,
+	);
+}
+
+function spawnFailure(executable: string, error: unknown): OmpRuntimeProblem {
+	const reason = error instanceof Error && "code" in error ? String(error.code) : String(error);
+	return problem(executable, `error=${reason}`, `${executable} cannot be run (${reason})`);
+}
+
+/**
+ * Runs `<executable> --version` with `env` (the child's PATH decides which bun runs `cli.js`); by default the
+ * environment an omp child gets, without the bot's `SLACK_`/`OMPBOT_` secrets.
+ */
+export async function checkOmpRuntime(
+	executable: string,
+	env: Record<string, string | undefined> = buildChildEnv(),
+	timeoutMs = VERSION_TIMEOUT_MS,
+): Promise<OmpRuntimeProblem | undefined> {
+	const key = identity(executable);
+	if (typeof key !== "string") return key;
+	if (knownVersions.has(key)) return undefined;
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		// Own process group: on timeout the whole group is killed, because a launcher's grandchild holding stdout open
+		// would keep the read waiting past the limit.
+		const child = Bun.spawn([executable, "--version"], {
+			env,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+			detached: true,
+		});
+		const timedOut = new Promise<"timeout">((resolve) => {
+			timer = setTimeout(() => resolve("timeout"), timeoutMs);
+		});
+		const finished = Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
+		const result = await Promise.race([finished, timedOut]);
+		if (result === "timeout") {
+			try {
+				process.kill(-child.pid, "SIGKILL");
+			} catch {
+				// ESRCH: the group is already gone
+			}
+			await child.exited;
+			return problem(
+				executable,
+				"error=timeout",
+				`\`${executable} --version\` did not finish within ${timeoutMs / 1000}s`,
+			);
+		}
+		const [stdout, stderr, exitCode] = result;
+		return verdict(executable, key, { exitCode, stdout, stderr });
+	} catch (error) {
+		return spawnFailure(executable, error);
+	} finally {
+		// Never fire after a normal exit: the pgid may be reused by then.
+		clearTimeout(timer);
+	}
+}
+
+/** `checkOmpRuntime` for synchronous callers (the gate list); shares its remembered versions. */
+export function checkOmpRuntimeSync(
+	executable: string,
+	env: Record<string, string | undefined> = buildChildEnv(),
+	timeoutMs = VERSION_TIMEOUT_MS,
+): OmpRuntimeProblem | undefined {
+	const key = identity(executable);
+	if (typeof key !== "string") return key;
+	if (knownVersions.has(key)) return undefined;
+	// Output goes to a file, not a pipe: a grandchild holding a pipe open would keep the call waiting past the limit.
+	const dir = mkdtempSync(join(tmpdir(), "ompbot-omp-version-"));
+	const outPath = join(dir, "out");
+	const errPath = join(dir, "err");
+	const outFd = openSync(outPath, "w");
+	const errFd = openSync(errPath, "w");
+	try {
+		// Own process group and SIGKILL (a launcher may ignore SIGTERM): the whole group dies with the timeout.
+		const run = Bun.spawnSync([executable, "--version"], {
+			env,
+			stdin: "ignore",
+			stdout: outFd,
+			stderr: errFd,
+			detached: true,
+			timeout: timeoutMs,
+			killSignal: "SIGKILL",
+		});
+		if (run.exitedDueToTimeout) {
+			try {
+				process.kill(-run.pid, "SIGKILL");
+			} catch {
+				// ESRCH: the group is already gone
+			}
+			return problem(
+				executable,
+				"error=timeout",
+				`\`${executable} --version\` did not finish within ${timeoutMs / 1000}s`,
+			);
+		}
+		return verdict(executable, key, {
+			exitCode: run.exitCode,
+			stdout: readFileSync(outPath, "utf8"),
+			stderr: readFileSync(errPath, "utf8"),
+		});
+	} catch (error) {
+		return spawnFailure(executable, error);
+	} finally {
+		closeSync(outFd);
+		closeSync(errFd);
+		rmSync(dir, { recursive: true, force: true });
+	}
 }

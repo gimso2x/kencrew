@@ -209,6 +209,27 @@ export const redact: Redactor = (text) =>
 			.replace(TOKEN_FIELD_PATTERN, `$1${REDACTED}`),
 	);
 
+export const PERSONAL_MASK = "[PII]";
+
+// Personal data shapes, matched only when no digit touches them (timestamps, snowflakes and hashes keep their digit runs).
+const PERSONAL_PATTERN = new RegExp(
+	[
+		String.raw`[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+`,
+		String.raw`(?<!\d)\d{6}-[1-4]\d{6}(?!\d)`,
+		String.raw`(?<!\d)01[016789][- ]?\d{3,4}[- ]?\d{4}(?!\d)`,
+		String.raw`(?<!\d)0[2-6]\d?[- ]\d{3,4}[- ]\d{4}(?!\d)`,
+	].join("|"),
+	"g",
+);
+
+/**
+ * E-mail addresses, Korean mobile and landline numbers and resident registration numbers as `[PII]`. A separate step
+ * after `redact` (which stays secrets-only, so delivery output is unchanged) and before any cut.
+ */
+export function maskPersonal(text: string): string {
+	return text.replace(PERSONAL_PATTERN, PERSONAL_MASK);
+}
+
 const encoder = new TextEncoder();
 
 export function byteLength(text: string): number {
@@ -228,4 +249,19 @@ export function truncateUtf8(text: string, maxBytes: number): string {
 		end += ch.length;
 	}
 	return text.slice(0, end);
+}
+
+/** Longest suffix of `text` whose UTF-8 encoding fits in `maxBytes`, never splitting a code point. */
+export function truncateUtf8Tail(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	if (byteLength(text) <= maxBytes) return text;
+	let bytes = 0;
+	let start = text.length;
+	for (const ch of [...text].reverse()) {
+		const size = byteLength(ch);
+		if (bytes + size > maxBytes) break;
+		bytes += size;
+		start -= ch.length;
+	}
+	return text.slice(start);
 }

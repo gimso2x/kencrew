@@ -25,6 +25,7 @@ import {
 	reviewIsolationPaths,
 	reviewLane,
 } from "../src/lanes/review";
+import { bootRuntime, overlayHash } from "../src/lanes/runtime";
 import type { LaneRow } from "../src/lanes/status";
 import { defaultGit, type GitRunner } from "../src/lanes/verify";
 import { createLogger } from "../src/log";
@@ -253,6 +254,13 @@ describe("review before auto-merge", () => {
 		expect(call.opts.timeoutMs).toBe(REVIEW.timeoutMs);
 		const after = requireLane(h, lane.name);
 		expect(after.meta.review).toMatchObject({ sha, verdict: "CLEAR", model: MODEL, notes: "diff가 스펙을 충족한다." });
+		expect(after.meta.review?.runtime).toMatchObject({
+			head: sha,
+			os: process.platform,
+			arch: process.arch,
+			overlay: overlayHash(REVIEW_OVERLAY_YAML),
+		});
+		expect(after.meta.checks?.runtime).toMatchObject({ head: sha, os: process.platform, arch: process.arch });
 		expect(after.history.some((entry) => entry.event === "review" && entry.detail === `CLEAR · ${MODEL}`)).toBe(true);
 		expect(counted.calls).toHaveLength(1);
 		expect(after.meta.land?.state).toBe("landed");
@@ -316,6 +324,59 @@ describe("review before auto-merge", () => {
 		expect(requireLane(h, lane.name).meta.land?.state).toBe("pending");
 		expect(cardPosts(h.transport, lane)[0]?.content).toContain(`독립 리뷰 확인 불가(${reason})`);
 		h.close();
+	});
+
+	test("a receipt made on another omp major.minor is reviewed again after a restart; a patch bump is not", async () => {
+		const unknownRuntime = () =>
+			bootRuntime({
+				omp: "unknown",
+				sourceDir: "/nonexistent",
+				git: async () => ({ code: 1, stdout: "", stderr: "" }),
+			});
+		const repo = makeRepo(repos);
+		const fake = says("src/a.ts:1 — 범위 밖\nVERDICT: BLOCK");
+		const policy = { repos: [repo], maxRisk: "L2" as const, review: REVIEW };
+		try {
+			await bootRuntime({ omp: "omp 18.18.7", sourceDir: makeRepo(repos) });
+			const first = harness(fake.run, policy);
+			const post = first.transport.createMessage.bind(first.transport);
+			first.transport.createMessage = async (args) => {
+				if (args.content?.includes("머지 대기")) throw new Error("discord down");
+				return post(args);
+			};
+			const { lane } = await closeLane(first, repo);
+			expect(fake.calls).toHaveLength(1);
+			expect(requireLane(first, lane.name).meta.review?.runtime?.omp).toBe("omp 18.18.7");
+			first.close();
+
+			await bootRuntime({ omp: "omp 18.18.9", sourceDir: makeRepo(repos) });
+			const patched = harness(fake.run, policy);
+			patched.transport.setChannel({ id: rootIdOf(lane), type: 11, parentId: CHANNEL, guildId: GUILD });
+			const post2 = patched.transport.createMessage.bind(patched.transport);
+			patched.transport.createMessage = async (args) => {
+				if (args.content?.includes("머지 대기")) throw new Error("discord down");
+				return post2(args);
+			};
+			await patched.manager.tick();
+			await patched.settle();
+			expect(fake.calls).toHaveLength(1);
+			patched.close();
+
+			await bootRuntime({ omp: "omp 18.19.0", sourceDir: makeRepo(repos) });
+			const minor = harness(fake.run, policy);
+			minor.transport.setChannel({ id: rootIdOf(lane), type: 11, parentId: CHANNEL, guildId: GUILD });
+			await minor.manager.tick();
+			await minor.settle();
+			expect(fake.calls).toHaveLength(2);
+			const redone = requireLane(minor, lane.name);
+			expect(redone.meta.review?.runtime?.omp).toBe("omp 18.19.0");
+			expect(
+				redone.history.some((entry) => entry.event === "review" && entry.detail?.includes("재검사(omp 18.18 → 18.19)")),
+			).toBe(true);
+			minor.close();
+		} finally {
+			await unknownRuntime();
+		}
 	});
 
 	test("AC-5: a receipt for the same commit is not reviewed again when the lane is announced again after a restart", async () => {
@@ -588,6 +649,8 @@ describe("run QA after the review (doc/plans/bot-org-risk-gates.md 단계 3, 레
 		expect(atQa).toEqual({ exists: true, head: sha, laneHead: sha, laneStatus: "" });
 		const after = requireLane(h, lane.name);
 		expect(after.meta.qa).toMatchObject({ sha, verdict: "PASS", findings: ["bun test 통과"], model: QA_MODEL });
+		expect(after.meta.qa?.runtime).toMatchObject({ head: sha, os: process.platform, arch: process.arch });
+		expect(after.meta.qa?.runtime?.overlay).toMatch(/^[0-9a-f]{16}$/);
 		expect(after.history.some((entry) => entry.event === "qa" && entry.detail === `PASS · ${QA_MODEL}`)).toBe(true);
 		expect(laneLandBlockers(after, policy, true, false)).toEqual([]);
 		expect(counted.calls).toHaveLength(1);

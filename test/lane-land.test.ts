@@ -20,7 +20,7 @@ import {
 } from "../src/lanes/land";
 import { CLAIM_GRACE_MS } from "../src/lanes/manager";
 import { appendFollowups } from "../src/lanes/scope";
-import { INCONCLUSIVE_APPROVED, type LaneChanges, type LaneRow } from "../src/lanes/status";
+import { INCONCLUSIVE_APPROVED, type LaneChanges, type LaneReview, type LaneRow } from "../src/lanes/status";
 import { classifyClosedLaneMessage } from "../src/lanes/trigger";
 import { defaultGit, type GitResult, type GitRunner } from "../src/lanes/verify";
 import { createLogger } from "../src/log";
@@ -1545,6 +1545,23 @@ describe("closed → Outcome card and auto-merge (AC-5)", () => {
 		h.close();
 	});
 
+	test("worker- and git-written text on an outcome card is escaped for the platform text format", async () => {
+		const { repo } = repoWithOrigin();
+		const h = laneHarness(home.dir);
+		const { lane } = await closeLane(h, repo);
+		const hostile = "<https://evil.test|click> <!channel> a&b";
+		const escaped = "&lt;https://evil.test|click&gt; &lt;!channel&gt; a&amp;b";
+		const claimed = { ...lane, meta: { ...lane.meta, claim: { repo, commit: "c", summary: hostile, claimedAt: 1 } } };
+		expect(buildLaneOutcomeCard(claimed, { kind: "ask" }).text).toContain(`• ${escaped}`);
+		const blocked = {
+			...lane,
+			meta: { ...lane.meta, land: { state: "blocked" as const, attempts: 0, reason: hostile, cleanup: hostile } },
+		};
+		const text = buildLaneOutcomeCard(blocked, { kind: "result" }).text;
+		expect(text).toContain(`사유: ${escaped}`);
+		expect(text).not.toContain("<!channel>");
+	});
+
 	test("laneLandBlockers names every reason; [] only when none applies", async () => {
 		const { repo } = repoWithOrigin();
 		const h = laneHarness(home.dir);
@@ -1567,6 +1584,54 @@ describe("closed → Outcome card and auto-merge (AC-5)", () => {
 			},
 		};
 		expect(laneLandBlockers(failed, policy, true, false)).toEqual(["재실행 검사 실패 1/1"]);
+		// A receipt made on another runtime holds the merge; the checks' own runtime never does.
+		const identity = { omp: "omp 18.19.0", kencrew: "unknown", os: process.platform, arch: process.arch };
+		const reviewPolicy = { ...policy, review: { model: "m", timeoutMs: 1 } };
+		const now = { identity, review: { model: "m", overlay: "0".repeat(16) } };
+		const receipt = (omp: string, over = {}): LaneReview => ({
+			sha,
+			verdict: "CLEAR",
+			model: "m",
+			at: 1,
+			notes: "",
+			runtime: {
+				head: sha,
+				omp,
+				kencrew: "unknown",
+				os: process.platform,
+				arch: process.arch,
+				overlay: "0".repeat(16),
+			},
+			...over,
+		});
+		const withReview = (review: LaneReview, checksRuntime = identity) => ({
+			...lane,
+			meta: {
+				...lane.meta,
+				review,
+				checks: {
+					...lane.meta.checks,
+					head: sha,
+					results: lane.meta.checks?.results ?? [],
+					runtime: { ...checksRuntime, head: sha },
+				},
+			},
+		});
+		expect(laneLandBlockers(withReview(receipt("omp 18.19.2")), reviewPolicy, true, false, now)).toEqual([]);
+		expect(laneLandBlockers(withReview(receipt("omp 18.18.7")), reviewPolicy, true, false, now)).toEqual([
+			"독립 리뷰 영수증 오래됨(omp 18.18 → 18.19)",
+		]);
+		const earlier = { ...receipt("omp 18.18.7"), runtime: undefined };
+		expect(laneLandBlockers(withReview(earlier), reviewPolicy, true, false, now)).toEqual([]);
+		expect(
+			laneLandBlockers(
+				withReview(receipt("omp 18.19.0"), { ...identity, omp: "omp 1.0.0" }),
+				reviewPolicy,
+				true,
+				false,
+				now,
+			),
+		).toEqual([]);
 		const timedOut = { id: "AC-2", signal: "t", ok: false, detail: "900초 안에 끝나지 않았습니다(확인 불가)" };
 		const inconclusive = {
 			...lane,
@@ -2643,6 +2708,73 @@ describe("lane scope and leftovers (doc/plans/bot-org-risk-gates.md 단계 2)", 
 		expect(reclaimed.meta.scopeViolations).toBeUndefined();
 		expect(reclaimed.meta.scopeError).toBeUndefined();
 		expect(reclaimed.meta.leftovers).toBeUndefined();
+		h.close();
+	});
+});
+
+// doc/plans/qa-tuv-land-races.md: an owner act that lands during an await is honoured after it.
+describe("land races: pause during the core rebase, auto-merge switched off (qa-tuv-land-races)", () => {
+	test("defect 2: a lane paused while the core rebases stays paused: no claim, no close, no merge", async () => {
+		const { repo, base } = repoWithOrigin();
+		const entered = Promise.withResolvers<void>();
+		const gate = Promise.withResolvers<void>();
+		const counted = countingLand();
+		const h = laneHarness(home.dir, {
+			land: counted.land,
+			rebaseGit: async (args) => {
+				if (args.includes("rebase") && !args.includes("--abort")) {
+					entered.resolve();
+					await gate.promise;
+				}
+				return defaultGit(["-c", "user.name=t", "-c", "user.email=t@example.com", ...args]);
+			},
+		});
+		const { lane } = await closeLane(h, repo);
+		const ahead = commitIn(repo, "elsewhere.txt");
+
+		const landing = h.manager.requestLand(lane.name, "owner");
+		await within(entered.promise);
+		await h.manager.pause(lane.name, "owner-message");
+		expect(requireLane(h, lane.name).status).toBe("paused");
+		gate.resolve();
+		await landing;
+		await h.settle();
+
+		const after = requireLane(h, lane.name);
+		expect(after.status).toBe("paused");
+		expect(after.meta.pausedFrom).toBe("working");
+		expect(after.meta.claim).toBeUndefined();
+		expect(after.history.filter((entry) => entry.event === "closed")).toHaveLength(1);
+		expect(counted.calls).toHaveLength(1);
+		expect(headOf(repo, `refs/heads/${base}`)).toBe(ahead);
+		expect(h.logs.some((line) => line.includes("event=lane_core_rebase_superseded"))).toBe(true);
+		h.close();
+	});
+
+	test("defect 4: taskAutoLand switched off while an auto-merge waits: nothing lands, the card asks the owner", async () => {
+		const { repo, bare, base } = repoWithOrigin();
+		const counted = countingLand();
+		let busy = true;
+		let policy: { repos: string[]; maxRisk: "L2" } | undefined = { repos: [repo], maxRisk: "L2" };
+		const h = laneHarness(home.dir, { land: counted.land, autoLandPolicy: () => policy, laneBusy: () => busy });
+		const { lane } = await closeLane(h, repo);
+		expect(requireLane(h, lane.name).meta.land).toMatchObject({ state: "pending", requestedBy: "auto" });
+		const before = headOf(bare, `refs/heads/${base}`);
+
+		policy = undefined;
+		busy = false;
+		await h.manager.tick();
+		await h.settle();
+		expect(counted.calls).toHaveLength(0);
+		const after = requireLane(h, lane.name);
+		expect(after.meta.land?.state).toBe("pending");
+		expect(after.meta.land?.requestedBy).toBeUndefined();
+		const withdrawn = after.history.find((entry) => entry.event === "auto_land_withdrawn");
+		expect(withdrawn?.detail).toContain("자동 머지 꺼짐");
+		expect(headOf(repo, `refs/heads/${base}`)).not.toBe(lane.meta.sha);
+		expect(headOf(bare, `refs/heads/${base}`)).toBe(before);
+		const shown = shownNow(h.transport, cardPosts(h.transport, lane)[0]?.id ?? "");
+		expect(shown.components).toContain(mergeId(lane));
 		h.close();
 	});
 });

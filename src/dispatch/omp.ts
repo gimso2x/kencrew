@@ -178,33 +178,35 @@ export interface OmpPrintResult {
 	timedOut: boolean;
 }
 
+/** The argv of `runOmpPrint` before the `--` and the task: the binary, the flags in the order omp reads them. */
+export function ompPrintArgs(
+	options: Pick<OmpPrintOptions, "ompBin" | "isolation" | "overlayConfig" | "systemPromptAppendix" | "model" | "tools">,
+): string[] {
+	return [
+		options.ompBin,
+		"-p",
+		"--no-session",
+		...(options.isolation === undefined ? [] : ["--config", options.isolation.configPath, ...OMP_ISOLATION_FLAGS]),
+		...(options.overlayConfig === undefined ? [] : ["--config", options.overlayConfig]),
+		"--append-system-prompt",
+		options.systemPromptAppendix,
+		...(options.model === undefined ? [] : ["--model", options.model]),
+		...(options.tools === undefined ? [] : ["--tools", options.tools]),
+	];
+}
+
 /**
  * `omp -p … -- <task>`: one-shot agent run for simple tasks. The task comes last after `--`, so a task starting with
  * `-` is the prompt, never an omp flag. Output is capped; timeout kills the process group.
  */
 export async function runOmpPrint(options: OmpPrintOptions): Promise<OmpPrintResult> {
 	const maxChars = options.maxChars ?? 8_000;
-	const result = await (options.run ?? realProcessRunner)(
-		[
-			options.ompBin,
-			"-p",
-			"--no-session",
-			...(options.isolation === undefined ? [] : ["--config", options.isolation.configPath, ...OMP_ISOLATION_FLAGS]),
-			...(options.overlayConfig === undefined ? [] : ["--config", options.overlayConfig]),
-			"--append-system-prompt",
-			options.systemPromptAppendix,
-			...(options.model === undefined ? [] : ["--model", options.model]),
-			...(options.tools === undefined ? [] : ["--tools", options.tools]),
-			"--",
-			options.task,
-		],
-		{
-			cwd: options.cwd,
-			timeoutMs: options.timeoutMs ?? 600_000,
-			env: { ...withOmpProfile(dispatchEnv(options.inheritedEnv ?? process.env), options.ompProfile), ...options.env },
-			...(options.signal === undefined ? {} : { signal: options.signal }),
-		},
-	);
+	const result = await (options.run ?? realProcessRunner)([...ompPrintArgs(options), "--", options.task], {
+		cwd: options.cwd,
+		timeoutMs: options.timeoutMs ?? 600_000,
+		env: { ...withOmpProfile(dispatchEnv(options.inheritedEnv ?? process.env), options.ompProfile), ...options.env },
+		...(options.signal === undefined ? {} : { signal: options.signal }),
+	});
 	const suffix = result.timedOut ? "\n\n[시간 초과로 중단됨 — 출력 일부만 수집]" : "";
 	// Masked before the cap: a secret straddling the cap would otherwise leave a fragment the shapes no longer match.
 	const output = `${redact(result.stdout.trim()).slice(0, maxChars)}${suffix}`.trim();
@@ -281,6 +283,7 @@ type HerdrAgentList = {
 		agents?: Array<{
 			name?: string;
 			pane_id?: string;
+			tab_id?: string;
 			workspace_id?: string;
 			agent_status?: string;
 			agent_session?: unknown;
@@ -557,32 +560,24 @@ export async function herdrAgentPane(name: string, options: HerdrRunnerOptions =
 }
 
 /**
- * The workspace an agent runs in (`herdr agent list` `workspace_id`): `undefined` when herdr has no such agent (nothing
- * to close); an error when herdr cannot be asked or names no workspace for it.
+ * Ends a closed task's herdr agent. A local task owns its workspace (`herdrCreateWorkspace`), so the workspace is
+ * closed; a remote task is one tab of the host's shared owners workspace ({@link herdrRemoteStart}), so only its tab
+ * is, and the other agents there keep running. No agent of that name: nothing to close. An error when herdr cannot be
+ * asked, names no workspace or tab for it, or refuses the close.
  */
-export async function herdrAgentWorkspace(
+export async function herdrCloseTaskAgent(
 	name: string,
 	options: HerdrRunnerOptions = {},
-): Promise<{ ok: true; workspaceId: string | undefined } | { ok: false; error: string }> {
+): Promise<{ ok: true } | { ok: false; error: string }> {
 	const found = await herdrAgentEntry(name, options);
 	if (!found.ok) return found;
 	const { agent } = found;
-	if (agent === undefined) return { ok: true, workspaceId: undefined };
-	const workspaceId = agent.workspace_id;
-	return typeof workspaceId === "string" && workspaceId !== ""
-		? { ok: true, workspaceId }
-		: { ok: false, error: `agent ${name} has no workspace_id` };
-}
-
-/** `herdr workspace close <id>`: ends the agents running in it. */
-export async function herdrCloseWorkspace(
-	workspaceId: string,
-	options: HerdrRunnerOptions = {},
-): Promise<{ ok: true } | { ok: false; error: string }> {
-	const closed = await herdrRun(["workspace", "close", workspaceId], options);
-	return closed.code === 0
-		? { ok: true }
-		: { ok: false, error: `workspace close failed: ${herdrFailure(closed, 120)}` };
+	if (agent === undefined) return { ok: true };
+	const scope = options.sshTarget === undefined ? "workspace" : "tab";
+	const id = scope === "workspace" ? agent.workspace_id : agent.tab_id;
+	if (typeof id !== "string" || id === "") return { ok: false, error: `agent ${name} has no ${scope}_id` };
+	const closed = await herdrRun([scope, "close", id], options);
+	return closed.code === 0 ? { ok: true } : { ok: false, error: `${scope} close failed: ${herdrFailure(closed, 120)}` };
 }
 
 /** herdr's `agent_status` values (`herdr agent wait --until`), plus `gone` for a name the list does not have. */

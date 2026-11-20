@@ -1,7 +1,16 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, readdirSync, readlinkSync, realpathSync, rmSync, type Stats, writeFileSync } from "node:fs";
+import {
+	existsSync,
+	lstatSync,
+	readdirSync,
+	readlinkSync,
+	realpathSync,
+	rmSync,
+	type Stats,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import type { Logger } from "../log";
 import type { TurnSnapshotInput, TurnSnapshotRow } from "../store/db";
 
@@ -62,6 +71,8 @@ export interface RepoPlan {
 	repo: string;
 	/** Tree the `revert` files come from. */
 	source: string;
+	/** The repository directory no longer exists: nothing can be planned, and the turn can only be closed. */
+	missing?: true;
 	/** The turn committed: no file is touched, only this advice line is shown. */
 	commit?: { before: string; after: string; advice: string };
 	/**
@@ -407,6 +418,12 @@ async function overlapPaths(
 	return { paths: new Set(settled.flatMap((entry) => entry.paths ?? [])) };
 }
 
+/** `value` as one POSIX shell word: as is when it has only safe characters, else in single quotes (a quote becomes `'\''`). */
+function shellQuote(value: string): string {
+	if (/^[\w@%+=:,./-]+$/.test(value)) return value;
+	return `'${value.replaceAll("'", "'\\''")}'`;
+}
+
 /** What `!undo` would do to one row's repository. Never writes: the card and the re-check both read this. */
 export async function planUndo(options: {
 	row: TurnSnapshotRow;
@@ -423,11 +440,13 @@ export async function planUndo(options: {
 			commit: {
 				before: row.headBefore,
 				after: row.headAfter,
-				advice: `git -C ${row.repo} revert --no-edit ${row.headBefore}..${row.headAfter}`,
+				advice: `git -C ${shellQuote(row.repo)} revert --no-edit ${row.headBefore}..${row.headAfter}`,
 			},
 			files: [],
 		};
 	}
+	// A repository the owner moved or deleted has no git to ask: it is reported, so the turn can be closed.
+	if (!existsSync(row.repo)) return { repo: row.repo, source: row.treeBefore, missing: true, files: [] };
 	const [paths, before, after, overlap, fileMode] = await Promise.all([
 		changedPaths(run, row.repo, row.treeBefore, row.treeAfter),
 		treeEntries(run, row.repo, row.treeBefore),
@@ -462,6 +481,7 @@ export async function planUndo(options: {
  * apart, so the card and the answer say so instead of reading like a complete undo.
  */
 export function undoPlanNotes(plan: RepoPlan): string[] {
+	if (plan.missing === true) return [`저장소를 찾을 수 없음: ${plan.repo}`];
 	if (plan.overlapFailed === undefined) return [];
 	return [`겹침 확인 실패: ${plan.repo} — ${plan.overlapFailed}`];
 }
@@ -478,6 +498,24 @@ function lstatOrAbsent(full: string): Stats | undefined {
 		if (code === "ENOENT" || code === "ENOTDIR") return undefined;
 		throw error;
 	}
+}
+
+/**
+ * Whether the directory holding `full` resolves (symlinks followed) outside the repository: a directory the turn's
+ * path runs through was swapped for a link since the snapshot, so touching the file would touch another tree. A parent
+ * that does not exist is not an escape (nothing to delete there; git creates it on restore).
+ */
+function escapesRepo(repoRoot: string, full: string): boolean {
+	let parent: string;
+	try {
+		parent = realpathSync(dirname(full));
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return false;
+		throw error;
+	}
+	const inside = relative(repoRoot, parent);
+	return inside === ".." || inside.startsWith("../") || isAbsolute(inside);
 }
 
 /** Whether every file under the directory `full` (repo-relative `path`) is one the plan deletes as turn-created. */
@@ -503,6 +541,10 @@ export async function applyUndo(plan: RepoPlan, options: { run?: GitRunner } = {
 		if (file.kind !== "revert") continue;
 		try {
 			const full = join(plan.repo, file.path);
+			if (escapesRepo(realpathSync(plan.repo), full)) {
+				done.conflicts.push(file.path);
+				continue;
+			}
 			const stat = lstatOrAbsent(full);
 			if (file.mode === undefined) {
 				if (stat !== undefined && !stat.isFile() && !stat.isSymbolicLink()) {
@@ -546,12 +588,18 @@ export async function removeTurnRefs(
 }
 
 /**
- * `removeTurnRefs` for `ompbot gc`, which runs synchronously: same refs, one `git update-ref -d` each. Rows whose
- * repository is gone are skipped silently (nothing left to release).
+ * `removeTurnRefs` for `ompbot gc`, which runs synchronously: same refs, one `git update-ref -d` each. A row whose
+ * repository is gone has nothing left to release and counts as released; a row whose `update-ref` failed for any other
+ * reason is passed to `onFailure`, so the caller can keep its ledger row to retry.
  */
-export function removeTurnRefsSync(rows: readonly Pick<TurnSnapshotRow, "id" | "repo">[]): string[] {
+export function removeTurnRefsSync(
+	rows: readonly Pick<TurnSnapshotRow, "id" | "repo">[],
+	onFailure?: (id: number) => void,
+): string[] {
 	const removed: string[] = [];
+	const failed = new Set<number>();
 	for (const row of rows) {
+		const repoGone = !existsSync(row.repo);
 		for (const which of ["before", "after"] as const) {
 			const ref = turnRefName(row.id, which);
 			const outcome = Bun.spawnSync(["git", "-C", row.repo, "update-ref", "-d", ref], {
@@ -560,6 +608,10 @@ export function removeTurnRefsSync(rows: readonly Pick<TurnSnapshotRow, "id" | "
 				stderr: "pipe",
 			});
 			if (outcome.exitCode === 0) removed.push(ref);
+			else if (!repoGone && !failed.has(row.id)) {
+				failed.add(row.id);
+				onFailure?.(row.id);
+			}
 		}
 	}
 	return removed;

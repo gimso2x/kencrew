@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { MonitorLedger, MonitorRow } from "./ledger";
-import { type MonitorSpec, MonitorSpecError, parseMonitorSpec, type SpecContext } from "./spec";
+import { type MonitorSpec, MonitorSpecError, parseMonitorSpec, SPEC_KEYS, type SpecContext } from "./spec";
 
 /**
  * Host-independent monitor files (`ompbot monitors export|apply`): one JSON file per monitor holding only the spec
@@ -272,12 +272,27 @@ export function exportMonitors(
 	}
 	let removed = 0;
 	for (const file of readdirSync(dir)) {
-		// A directory named `*.json` is not a stale monitor file.
-		if (!file.endsWith(".json") || written.has(file) || lstatSync(join(dir, file)).isDirectory()) continue;
+		if (!file.endsWith(".json") || written.has(file) || !isMonitorFile(join(dir, file))) continue;
 		rmSync(join(dir, file), { force: true });
 		removed++;
 	}
 	return { written: written.size, removed, warnings };
+}
+
+/**
+ * A stale file export may delete: a regular file (not a directory, FIFO or link) holding a JSON object whose keys are
+ * all monitor spec keys (an empty object included). Any other `*.json` in the directory (a `config.json`, notes)
+ * belongs to the owner and stays.
+ */
+function isMonitorFile(path: string): boolean {
+	if (!lstatSync(path).isFile()) return false;
+	try {
+		const input: unknown = JSON.parse(readFileSync(path, "utf8"));
+		if (typeof input !== "object" || input === null || Array.isArray(input)) return false;
+		return Object.keys(input).every((key) => (SPEC_KEYS as readonly string[]).includes(key));
+	} catch {
+		return false;
+	}
 }
 
 /** `export --dir` cannot be a directory (a file stands there or below its parent); nothing was written. */

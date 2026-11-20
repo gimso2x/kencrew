@@ -10,8 +10,10 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
+	type DiscordMessageUpdate,
 	type DiscordRole,
 	FATAL_CLOSE_CODES,
+	parseChannelInfo,
 } from "./transport";
 
 /** Timer seam: the gateway's heartbeat, reconnect and backoff waits all go through it, so tests drive time by hand. */
@@ -71,6 +73,8 @@ interface ReconnectPlan {
 	newSession: boolean;
 	/** `backoff`: exponential from `backoffBaseMs`; a number: that exact wait; 0: at once. */
 	delay: number | "backoff";
+	/** Wait that replaces an at-once reconnect when one already happened and no session came up since (default: backoff). */
+	repeat?: number;
 }
 
 function withQuery(url: string): string {
@@ -88,12 +92,15 @@ function record(value: unknown): Record<string, unknown> {
  * Hello → heartbeat (first beat after `interval × jitter`) → Identify, or Resume when a session exists. Ready keeps
  * `session_id`, `resume_gateway_url` and every Dispatch's `s`; a lost connection resumes on the resume URL. A beat whose
  * predecessor got no ACK marks a zombie connection: it is closed and resumed. Reconnect (op 7) resumes at once; Invalid
- * Session (op 9) resumes when `d` is true, otherwise identifies anew after 1–5 s. Fatal close codes stop the client.
+ * Session (op 9) resumes when `d` is true, otherwise identifies anew after 1–5 s. Only one at-once reconnect is made
+ * per session: a repeat waits (backoff; 1–5 s for op 9). Fatal close codes stop the client.
  */
 export class DiscordGateway extends SocketBase<{ botUserId: string; applicationId: string }> {
 	readonly #opts: DiscordGatewayOptions;
 	readonly #random: () => number;
 	readonly #intents: number;
+	/** At-once reconnects since the last Ready/Resumed (at most one is allowed). */
+	#immediate = 0;
 	#baseUrl: string | undefined;
 	#sessionId: string | undefined;
 	#resumeUrl: string | undefined;
@@ -128,6 +135,8 @@ export class DiscordGateway extends SocketBase<{ botUserId: string; applicationI
 		this.#clearHeartbeat();
 		this.#clearHello();
 		this.halt(new Error("discord gateway stopped before ready"), 1000);
+		// A later start() identifies anew: resuming a stale session would never answer Ready, so start() never settled.
+		this.#dropSession();
 	}
 
 	#clearHeartbeat(): void {
@@ -264,15 +273,14 @@ export class DiscordGateway extends SocketBase<{ botUserId: string; applicationI
 			case OP.RECONNECT:
 				this.#reconnect("reconnect requested", { newSession: false, delay: 0 });
 				return;
-			case OP.INVALID_SESSION:
-				if (frame.d === true) this.#reconnect("invalid session (resumable)", { newSession: false, delay: 0 });
-				else {
-					this.#reconnect("invalid session", {
-						newSession: true,
-						delay: Math.round(1_000 + this.#random() * 4_000),
-					});
-				}
+			case OP.INVALID_SESSION: {
+				// Discord asks for 1-5 s before the next Identify; a resumable one goes at once the first time only.
+				const wait = Math.round(1_000 + this.#random() * 4_000);
+				if (frame.d === true)
+					this.#reconnect("invalid session (resumable)", { newSession: false, delay: 0, repeat: wait });
+				else this.#reconnect("invalid session", { newSession: true, delay: wait });
 				return;
+			}
 			case OP.DISPATCH:
 				this.#dispatch(frame.t ?? "", frame.d);
 				return;
@@ -310,6 +318,7 @@ export class DiscordGateway extends SocketBase<{ botUserId: string; applicationI
 				this.#sessionId = d.session_id;
 				this.#resumeUrl = d.resume_gateway_url;
 				this.resetBackoff();
+				this.#immediate = 0;
 				this.setUp();
 				this.#opts.onReady?.({ resumed: false });
 				this.resolveFirst({ botUserId: user.id, applicationId: application.id });
@@ -317,6 +326,7 @@ export class DiscordGateway extends SocketBase<{ botUserId: string; applicationI
 			}
 			case "RESUMED":
 				this.resetBackoff();
+				this.#immediate = 0;
 				this.setUp();
 				this.#opts.onReady?.({ resumed: true });
 				return;
@@ -324,11 +334,32 @@ export class DiscordGateway extends SocketBase<{ botUserId: string; applicationI
 			case "MESSAGE_CREATE":
 				this.#run(() => handlers.message(data as DiscordMessageEvent));
 				return;
+			case "MESSAGE_UPDATE":
+				this.#run(() => handlers.messageUpdate?.(data as DiscordMessageUpdate));
+				return;
 			case "INTERACTION_CREATE":
 				this.#run(() => handlers.interaction(data as DiscordInteraction));
 				return;
 			case "GUILD_CREATE":
 				if (Array.isArray(d.roles)) this.#run(() => handlers.roles?.(d.roles as DiscordRole[]));
+				// The entries may lack `guild_id`: the guild itself is their parent (an absent one reads as a DM).
+				for (const list of [d.channels, d.threads]) {
+					if (!Array.isArray(list)) continue;
+					for (const entry of list) {
+						const info = parseChannelInfo(entry, typeof d.id === "string" ? d.id : undefined);
+						if (info !== undefined) this.#run(() => handlers.channel?.(info));
+					}
+				}
+				return;
+			case "CHANNEL_UPDATE":
+			case "THREAD_UPDATE": {
+				const info = parseChannelInfo(data);
+				if (info !== undefined) this.#run(() => handlers.channel?.(info));
+				return;
+			}
+			case "CHANNEL_DELETE":
+			case "THREAD_DELETE":
+				if (typeof d.id === "string") this.#run(() => handlers.channelGone?.(d.id as string));
 				return;
 			case "GUILD_ROLE_CREATE":
 			case "GUILD_ROLE_UPDATE":
@@ -362,7 +393,12 @@ export class DiscordGateway extends SocketBase<{ botUserId: string; applicationI
 		this.#clearHello();
 		if (plan.newSession) this.#dropSession();
 		this.replaceConnection(reason, plan.newSession ? 1000 : RESUMABLE_CLOSE);
-		const delay = plan.delay === "backoff" ? this.nextBackoff() : plan.delay;
+		let delay = plan.delay === "backoff" ? this.nextBackoff() : plan.delay;
+		if (delay === 0) {
+			// One at-once reconnect per session: a gateway or proxy replaying Reconnect frames gets backed off, not stormed.
+			if (this.#immediate > 0) delay = plan.repeat ?? this.nextBackoff();
+			else this.#immediate += 1;
+		}
 		if (delay === 0) void this.connect();
 		else this.scheduleConnect(delay);
 	}

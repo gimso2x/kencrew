@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { join } from "node:path";
+import { openBotStore } from "../src/core/origin";
 import { Daemon } from "../src/daemon/daemon";
+import { readStatusFromDb, renderStatusText } from "../src/daemon/status";
 import type { CreateMessageArgs, EditMessageArgs, MessageTarget, ReactionArgs } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
@@ -317,5 +320,31 @@ describe("an answer that could not be sent", () => {
 		expect(transport.posts((t) => t.startsWith("ANSWER"))).toEqual([]);
 		expect(transport.stuckStatuses()).toEqual([]);
 		expect(transport.eyesLeft()).toEqual([]);
+	});
+});
+
+describe("ompbot status: uncertain inbound", () => {
+	test("the intake line counts uncertain rows as held, and an empty ledger reads uncertain=0", () => {
+		let home: TestHome | undefined;
+		try {
+			home = makeHome("ompbot-status-uncertain-");
+			const dbPath = join(home.dir, "ompbot.db");
+			const store = openBotStore(dbPath, clock, "Asia/Seoul");
+			try {
+				expect(renderStatusText(readStatusFromDb(dbPath, "omp-test 0", "Asia/Seoul"))).toContain("uncertain=0");
+				store.ensureOrigin(ORIGIN, "/s/o1");
+				store.recordInbound({ originKey: ORIGIN, platformMessageId: "u1", textRef: "x" });
+				store.recordInbound({ originKey: ORIGIN, platformMessageId: "u2", textRef: "y" });
+				store.markUncertain("u1", "steer_threw");
+				store.markUncertain("u2", "turn_ended_after_steer");
+			} finally {
+				store.close();
+			}
+			const report = readStatusFromDb(dbPath, "omp-test 0", "Asia/Seoul");
+			expect(report.inbound.uncertain).toBe(2);
+			expect(renderStatusText(report)).toContain("pending=0 dispatched=0 answered=0 failed=0 discarded=0 uncertain=2");
+		} finally {
+			home?.remove();
+		}
 	});
 });

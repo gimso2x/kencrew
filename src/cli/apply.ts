@@ -1,7 +1,9 @@
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { codeRollbackMode, defaultHomeDir, loadConfig } from "../config";
+import { codeRollbackMode, defaultHomeDir, loadConfig, timezoneOfHome } from "../config";
+import { openBotStore } from "../core/origin";
 import { runDoctor } from "../daemon/doctor";
 import { readSweepHeartbeat } from "../daemon/heartbeat";
 import { callDaemon } from "../daemon/ipc";
@@ -10,6 +12,7 @@ import {
 	type ApplyDeps,
 	type ApplyOptions,
 	applyPathEnv,
+	BackupUnusableError,
 	DEFAULT_DRAIN_CUT_MIN,
 	DEFAULT_DRAIN_TIMEOUT_MIN,
 	detachedApplyCommand,
@@ -183,6 +186,27 @@ export function peerApplyOptions(options: ApplyOptions, afterCodeRollback: boole
 }
 
 /**
+ * Opens a throwaway copy of the snapshot with this checkout's code, schema migration included. A ledger the new code
+ * cannot migrate fails the backup step, with nothing drained or restarted (apply 20261120-153002 found out only in the
+ * restarted daemon: a crash loop, then the code rollback).
+ */
+export function checkBackupMigrates(backupFile: string, timezone: string): void {
+	const dir = mkdtempSync(join(tmpdir(), "ompbot-apply-schema-"));
+	try {
+		const copy = join(dir, "ompbot.db");
+		copyFileSync(backupFile, copy);
+		openBotStore(copy, { now: () => Date.now() }, timezone).close();
+	} catch (error) {
+		throw new BackupUnusableError(
+			backupFile,
+			`this code cannot open the ledger snapshot: ${error instanceof Error ? error.message : error}`,
+		);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+/**
  * Everything `runApply` needs for one install: its home, socket, config-driven backup/gates, its unit and, with config
  * `ompProfile`, the profile sync.
  */
@@ -205,7 +229,11 @@ export function homeDeps(homeDir: string, unit: string, pathEnv: string): ApplyD
 				...(cutAfterMin === undefined ? {} : { cutAfterMin }),
 			}),
 		// The db snapshot is what an apply rolls back to; the session bundle is the daily backup's job.
-		backup: () => runBackup({ homeDir, skipBundle: true }),
+		backup: () => {
+			const result = runBackup({ homeDir, skipBundle: true });
+			checkBackupMigrates(result.file, config?.timezone ?? timezoneOfHome(homeDir));
+			return result;
+		},
 		gates: () =>
 			collectGates({
 				homeDir,

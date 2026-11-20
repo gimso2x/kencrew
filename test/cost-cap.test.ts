@@ -9,7 +9,7 @@ import type { InboundRecord } from "../src/core/types";
 import { createLogger } from "../src/log";
 import type { OmpEvent, OmpTurnUsage } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
-import { sessionWindowCost } from "../src/ops/cost-cap";
+import { EntryNotFoundError, sessionWindowCost } from "../src/ops/cost-cap";
 import { redact } from "../src/redact";
 import { openStore, type Store } from "../src/store/db";
 import { localDay } from "../src/time";
@@ -285,7 +285,53 @@ describe("AC-2: daily ledger", () => {
 		writeFileSync(join(stem, "sub-a", "nested-b", "too-deep.jsonl"), usageLine(4_000, 8));
 
 		const got = await sessionWindowCost({ sessionFile, afterEntryId: "u0", from: t0, to: t0 + 10_000 });
-		expect(got).toEqual({ cost: 4, calls: 3 });
+		expect(got).toEqual({ cost: 4, calls: 3, lastEntryId: "a1" });
+	});
+
+	test("sessionWindowCost returns lastEntryId across non-usage entries, ignores session headers, and throws EntryNotFoundError", async () => {
+		const t0 = Date.parse("2026-11-10T12:00:00Z");
+		const at = (ms: number): string => new Date(t0 + ms).toISOString();
+		const sessionFile = join(dir, "sessions", "last-id.jsonl");
+		mkdirSync(dirname(sessionFile), { recursive: true });
+		writeFileSync(
+			sessionFile,
+			`${[
+				{ type: "session", id: "sess-hdr", timestamp: at(-5_000) },
+				{ id: "u0", type: "message", timestamp: at(0), message: { role: "user" } },
+				{
+					id: "mu1",
+					type: "model_usage",
+					timestamp: at(1_000),
+					purpose: "compaction:soft",
+					usage: { cost: { total: 0.5 } },
+				},
+				{ id: "c1", type: "compaction", timestamp: at(2_000) },
+			]
+				.map((record) => JSON.stringify(record))
+				.join("\n")}\n`,
+		);
+		expect(await sessionWindowCost({ sessionFile, afterEntryId: "u0", from: t0, to: t0 + 10_000 })).toEqual({
+			cost: 0.5,
+			calls: 1,
+			lastEntryId: "c1",
+		});
+		expect(await sessionWindowCost({ sessionFile, afterEntryId: "c1", from: t0, to: t0 + 10_000 })).toEqual({
+			cost: 0,
+			calls: 0,
+			lastEntryId: "c1",
+		});
+		await expect(
+			sessionWindowCost({ sessionFile, afterEntryId: "missing", from: t0, to: t0 + 10_000 }),
+		).rejects.toThrow(EntryNotFoundError);
+
+		const headerOnly = join(dir, "sessions", "header-only.jsonl");
+		writeFileSync(headerOnly, `${JSON.stringify({ type: "session", id: "sess-hdr", timestamp: at(0) })}\n`);
+		expect(await sessionWindowCost({ sessionFile: headerOnly, afterEntryId: null, from: t0, to: t0 + 10_000 })).toEqual(
+			{
+				cost: 0,
+				calls: 0,
+			},
+		);
 	});
 
 	test("a child dying mid-turn still adds the turn's live total to the day, once (#49)", async () => {

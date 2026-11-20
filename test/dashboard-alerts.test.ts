@@ -59,7 +59,7 @@ const STATUS: StatusReport = {
 	daemonRunning: true,
 	origins: [{ originKey: "discord/dm/200000000000000001", epoch: 1, ompPid: 42, busy: false }],
 	ledger: { pending: 0, inflight: 0, confirmed: 5, ambiguous: 0, expired: 0 },
-	inbound: { pending: 0, dispatched: 0, answered: 1, failed_notified: 0, discarded: 0 },
+	inbound: { pending: 0, dispatched: 0, answered: 1, failed_notified: 0, discarded: 0, uncertain: 0 },
 	monitors: { count: 0, next: null },
 	openGates: [],
 };

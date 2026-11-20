@@ -144,4 +144,16 @@ describe("tableToAscii", () => {
 		};
 		expect(lines.map(bar)).toEqual([8, 8, 8]);
 	});
+
+	test("rule option inserts a -+- separator under the header while default stays unchanged", () => {
+		const table = {
+			headers: ["도구", "횟수"],
+			rows: [
+				["bash", "10"],
+				["읽기", "7"],
+			],
+		};
+		expect(tableToAscii(table)).toBe("도구 | 횟수\nbash | 10\n읽기 | 7");
+		expect(tableToAscii(table, { rule: true })).toBe("도구 | 횟수\n-----+-----\nbash | 10\n읽기 | 7");
+	});
 });

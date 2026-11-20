@@ -332,6 +332,14 @@ describe("dashboard inbox", () => {
 		expect(lone).toContain("단계 0/3");
 	});
 
+	test("a working TASK whose agent finished shows 판정 대기 in 완료·대기, not 진행 중", () => {
+		const board: BoardView = { ...BOARD, cards: [card("w1:p1", "done", "done", { taskId: "T-20261104-50" })] };
+		const merged = anchor(column(renderDashboardMain(SNAPSHOT, board, NOW), "wait"), 'data-card="w1:p1"');
+		expect(merged).toMatch(/<span class="badge ">판정 대기<\/span>/);
+		expect(merged).not.toContain(">진행 중</span>");
+		expect(merged).toContain("워커 완료");
+	});
+
 	test("AC-5: ?card=, ?task= and ?view= start the page with that detail or view; unknown values say so", async () => {
 		const opened = renderDashboardPage(SNAPSHOT, { board: BOARD, card: "w1:p1" });
 		expect(opened).toContain('<aside id="detail" class="detail is-open"');
@@ -462,7 +470,7 @@ describe("dashboard: Discord", () => {
 			origins: 1,
 			busy: 0,
 			ledger: { pending: 0, inflight: 0, confirmed: 0, ambiguous: 0, expired: 0 },
-			inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0 },
+			inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0, uncertain: 0 },
 			monitors: { count: 0, next: null },
 			openGates: [],
 			heartbeat: { at: "2026-11-04T09:59:50+09:00", ageMs: 10_000, ...heartbeat },
@@ -582,7 +590,7 @@ describe("dashboard polish", () => {
 					origins: 0,
 					busy: 0,
 					ledger: { pending: 0, inflight: 0, confirmed: 0, ambiguous: 0, expired: 0 },
-					inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0 },
+					inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0, uncertain: 0 },
 					monitors: { count: 0, next: null },
 					openGates: [],
 				},

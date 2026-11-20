@@ -76,6 +76,26 @@ export interface LaneChecksInconclusive {
 	lastAt: number;
 }
 
+/** What this process is: the `omp` version, the kencrew source commit (`+dirty`, `unknown`), OS and arch. */
+export interface RuntimeIdentity {
+	omp: string;
+	kencrew: string;
+	os: string;
+	arch: string;
+}
+
+/**
+ * What a review, QA or check run observed (src/lanes/runtime.ts): `head` is the checked worktree's or copy's HEAD, `base`
+ * the base branch tip at the time, `overlay` the content hash of the `--config` overlay, `argv` the `omp -p` arguments
+ * without the prompt (review and QA only). Recorded on receipts and checks; only receipts are judged by it.
+ */
+export interface ReceiptRuntime extends RuntimeIdentity {
+	head: string;
+	base?: string;
+	overlay?: string;
+	argv?: string[];
+}
+
 /**
  * The independent review of a closed lane's claim commit (`taskAutoLand.review`): a receipt for `sha` only — a lane
  * whose `meta.sha` moved on has no receipt. Auto-merge needs `CLEAR`; `BLOCK` and `inconclusive` go to the owner.
@@ -92,6 +112,8 @@ export interface LaneReview {
 	reason?: string;
 	/** The reviewer's `CONFIDENCE` (0–1) in its verdict; absent when it wrote none or a malformed one (older receipts). */
 	confidence?: number;
+	/** What the review ran on; absent on receipts made before it was recorded (they count as current). */
+	runtime?: ReceiptRuntime;
 }
 
 /**
@@ -108,6 +130,8 @@ export interface LaneQa {
 	at: number;
 	/** Why the QA is `inconclusive`. */
 	reason?: string;
+	/** What the QA ran on; absent on receipts made before it was recorded (they count as current). */
+	runtime?: ReceiptRuntime;
 }
 
 /**
@@ -140,6 +164,43 @@ export interface LaneLeftover {
 	blocking: boolean;
 }
 
+/**
+ * A lane whose work goes out as a GitHub pull request instead of a merge into its base branch
+ * (doc/plans/lane-external-pr.md): its Outcome card offers `PR 게시`·`보류`·`폐기`, and `requestLand` refuses it.
+ */
+export interface LaneExternalPr {
+	/** The GitHub `owner/name` that receives the PR. */
+	repo: string;
+	/** The PR's base branch. */
+	base: string;
+	/** The PR body file, relative to the repository top level. */
+	bodyFile: string;
+	title: string;
+	/** The git remote to push to; absent = chosen at publish (the remote of the gh login's fork, else a new fork). */
+	pushRemote?: string;
+	/** The branch the push creates on the remote (`pr/<laneId>`), or the head branch of the PR it continues. */
+	branch: string;
+	/** An open PR this lane continues (`!pr <PR 주소|번호>`); absent = picked at publish (or a new PR). */
+	prNumber?: number;
+}
+
+/**
+ * Where publishing an external PR stands: `asking` waits for the approval card, `held` is the owner's (or a
+ * restart's) hold, `failed` names why, `published` has the PR. `url`·`branch`·`remote`·`sha`·`at` of the last
+ * publish are kept across `!reopen` (a later publish updates the same PR).
+ */
+export interface LanePr {
+	state: "asking" | "held" | "failed" | "published";
+	reason?: string;
+	url?: string;
+	branch?: string;
+	/** The remote (name or URL) the branch was pushed to. */
+	remote?: string;
+	/** The commit the PR branch points at. */
+	sha?: string;
+	at?: number;
+}
+
 /** Runtime facts of a lane that are not registry columns (kept as one JSON column). */
 export interface LaneMeta {
 	/** `⏳ title · mm:ss` message in the lane thread. */
@@ -152,6 +213,11 @@ export interface LaneMeta {
 	baseSha?: string;
 	milestone?: string;
 	claim?: LaneClaim;
+	/**
+	 * The latest `claimedAt` any claim of this lane got (kept after the claim is dropped): the next claim's is later, so
+	 * `claimedAt` names one claim even when two arrive within a millisecond.
+	 */
+	lastClaimedAt?: number;
 	/** Full sha recorded when the claim was verified and the lane closed. */
 	sha?: string;
 	/** What the root / status messages currently show (reconciled on every tick). */
@@ -205,12 +271,22 @@ export interface LaneMeta {
 	 * The last `[check: …]` run, at worktree HEAD `head`; the same HEAD is never checked again, except its timed-out
 	 * (inconclusive) results — `inconclusive` counts those judgements at one HEAD (absent when the run had none).
 	 */
-	checks?: { head: string; results: TaskCheck[]; inconclusive?: LaneChecksInconclusive };
+	checks?: {
+		head: string;
+		results: TaskCheck[];
+		inconclusive?: LaneChecksInconclusive;
+		/** Where the run happened; observed only — the checks are judged by `head` alone. */
+		runtime?: RuntimeIdentity & { head: string; base?: string };
+	};
 	/**
 	 * The merge of a closed worktree lane; absent on lanes without a worktree and before the first close. A lane sent
 	 * back to work by a non-ff landing keeps it (`attempts`) until it closes again; `!reopen` drops it.
 	 */
 	land?: LaneLand;
+	/** This lane's work goes out as a GitHub PR (`ompbot_work_start` `externalPr`, or `!pr` on the closed lane). */
+	externalPr?: LaneExternalPr;
+	/** Publishing that PR (`LaneManager.requestPublish`); `!reopen` keeps only a published one. */
+	pr?: LanePr;
 	/** The state the lane was in when the owner paused it; `paused` only, cleared at resume. */
 	pausedFrom?: Exclude<LaneStatus, "paused" | "closed">;
 	/** When the pause began; the key that keeps the held-work warning and the held-message notice to one each. */

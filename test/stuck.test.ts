@@ -121,4 +121,14 @@ describe("stuck: fingerprint", () => {
 		expect(fingerprint(note(4))).toBe(fingerprint(note(5)));
 		expect(fingerprint(`${base}\n2:other`)).not.toBe(fingerprint(base));
 	});
+
+	test("the counter note is stripped when the path inside it contains a closing bracket", () => {
+		const base = "[/data/app/[id]/page.tsx#7E92]\n1:same";
+		const note = (n: number): string =>
+			`${base}\n\n[You have received this identical output ${n} times. Re-reading '/data/app/[id]/page.tsx' will not change it \u2014 use a narrower selector (path:A-B), or proceed with the edit.]`;
+		const fingerprint = (text: string): string =>
+			toolFingerprint("read", { path: "page.tsx" }, { content: [{ type: "text", text }] }, false);
+		expect(fingerprint(note(3))).toBe(fingerprint(base));
+		expect(fingerprint(note(4))).toBe(fingerprint(note(5)));
+	});
 });

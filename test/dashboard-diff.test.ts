@@ -217,7 +217,7 @@ const SNAPSHOT = {
 		origins: 1,
 		busy: 0,
 		ledger: { pending: 0, inflight: 0, confirmed: 0, ambiguous: 0, expired: 0 },
-		inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0 },
+		inbound: { pending: 0, dispatched: 0, answered: 0, failed_notified: 0, discarded: 0, uncertain: 0 },
 		monitors: { count: 0, next: null },
 		openGates: [],
 	},

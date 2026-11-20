@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import { randomBytes } from "node:crypto";
 import { redact } from "../redact";
+import { checkSchemaVersion } from "../store/schema-version";
 import { type CronSchedule, nextFire, parseCron } from "./cron";
 import { countIncident, resolveIncidents } from "./incidents";
 import {
@@ -419,6 +420,7 @@ export class MonitorLedger {
 		this.#redact = options.redact ?? ((text) => text);
 		this.#onCheckErrorAlert = options.onCheckErrorAlert;
 		this.#canAlert = options.canAlert;
+		checkSchemaVersion(db);
 		migrateMonitorSchema(db);
 	}
 
@@ -995,6 +997,7 @@ export class MonitorLedger {
 /** Standalone connection for the CLI. Unlike `Store` it never touches deliveries or inbound rows; it redacts like the daemon's. */
 export function openMonitorLedger(path: string, clock: MonitorClock = { now: () => Date.now() }): MonitorLedger {
 	const db = new Database(path, { create: true, strict: true });
+	checkSchemaVersion(db);
 	db.run("PRAGMA journal_mode = WAL");
 	db.run("PRAGMA foreign_keys = ON");
 	db.run("PRAGMA busy_timeout = 5000");

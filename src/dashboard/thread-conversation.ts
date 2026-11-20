@@ -3,7 +3,7 @@ import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { newestSessionFile } from "../omp/session-heal";
 import { isRecord } from "../omp/type-guards";
-import { redact } from "../redact";
+import { maskPersonal, redact } from "../redact";
 import { readJsonlRecords } from "./trace-transcript";
 
 /**
@@ -41,9 +41,11 @@ type Json = Record<string, unknown>;
 const timeOf = (entry: Json): number => Date.parse(typeof entry.timestamp === "string" ? entry.timestamp : "");
 const messageOf = (entry: Json): Json | undefined =>
 	entry.type === "message" && isRecord(entry.message) ? entry.message : undefined;
+/** Secrets, then personal data. */
+const mask = (text: string): string => maskPersonal(redact(text));
 /** Masked first, then cut: a secret is never left half-visible by the cut. */
 const cut = (text: string, limit: number): string => {
-	const masked = redact(text);
+	const masked = mask(text);
 	return masked.length > limit ? masked.slice(0, limit) : masked;
 };
 const contentOf = (message: Json): unknown[] =>
@@ -162,7 +164,7 @@ export function readSessionConversation(file: string, before?: string): Extract<
 	);
 
 	const toolPart = (call: Json): ConversationPart => {
-		const name = typeof call.name === "string" ? redact(call.name) : "tool";
+		const name = typeof call.name === "string" ? mask(call.name) : "tool";
 		const args = isRecord(call.arguments) ? call.arguments : {};
 		// omp records the intent beside the args (`intent`); older records only have it as the `i` argument.
 		const intent =
@@ -192,7 +194,7 @@ export function readSessionConversation(file: string, before?: string): Extract<
 			turns.push({
 				role: "user",
 				ts: dialog.user.at,
-				parts: text === "" ? [] : [{ kind: "text", text: redact(text) }],
+				parts: text === "" ? [] : [{ kind: "text", text: mask(text) }],
 			});
 		}
 		const parts: ConversationPart[] = [];
@@ -200,9 +202,9 @@ export function readSessionConversation(file: string, before?: string): Extract<
 			for (const part of contentOf(message)) {
 				if (!isRecord(part)) continue;
 				if (part.type === "text" && typeof part.text === "string" && part.text.trim() !== "") {
-					parts.push({ kind: "text", text: redact(part.text) });
+					parts.push({ kind: "text", text: mask(part.text) });
 				} else if (part.type === "thinking" && typeof part.thinking === "string" && part.thinking.trim() !== "") {
-					parts.push({ kind: "thinking", text: redact(part.thinking) });
+					parts.push({ kind: "thinking", text: mask(part.thinking) });
 				} else if (part.type === "toolCall") {
 					parts.push(toolPart(part));
 				}

@@ -56,6 +56,18 @@ export interface ChannelPort {
 	 * one by themselves (Discord). Absent where a reply to the message is already its thread.
 	 */
 	openThread?(ref: MessageRef, name: string): Promise<void>;
+	/**
+	 * What the platform has already told us about this place (cached, never a network call): channel name, topic and
+	 * thread name for the prompt's context lines. Absent where the platform has none (Discord only).
+	 */
+	conversationContext?(conversationId: string, threadId?: string): ConversationContext | undefined;
+}
+
+/** Name of the channel and thread a conversation sits in, and the channel topic; each only when known. */
+export interface ConversationContext {
+	channelName?: string;
+	topic?: string;
+	threadName?: string;
 }
 
 /**

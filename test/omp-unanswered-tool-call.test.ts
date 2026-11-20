@@ -1,38 +1,50 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readlinkSync } from "node:fs";
-import { join } from "node:path";
-import { ompRoot } from "../src/cli/omp";
-import { defaultHomeDir } from "../src/config";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { CONTINUE_PROMPT } from "../src/daemon/recovery";
 
 /**
  * A turn the planned restart cut leaves its session with an assistant `toolCall` that has no `toolResult`. ompbot does
- * not repair the jsonl: the pinned omp's message transform (pi-ai `providers/transform-messages.ts`) answers such a
+ * not repair the jsonl: the omp's message transform (pi-ai `providers/transform-messages.ts`) answers such a
  * call with a synthetic result before anything reaches a provider. This pins that behaviour to the omp the bot runs
- * (`ompbot omp` current), so an omp upgrade that drops it fails here first.
+ * (`OMPBOT_OMP_EXECUTABLE`, else the omp on PATH), so an omp upgrade that drops it fails here first.
  */
 
 type Message = { role: string; toolCallId?: string; content?: Array<{ type: string; text?: string; id?: string }> };
 type TransformMessages = (messages: Message[], model: Record<string, unknown>) => Message[];
 
-const transformPath = join(
-	ompRoot(defaultHomeDir()),
-	"current",
-	"node_modules",
-	"@oh-my-pi",
-	"pi-ai",
-	"src",
-	"providers",
-	"transform-messages.ts",
-);
+/** The omp the bot runs: `OMPBOT_OMP_EXECUTABLE`, else the omp on PATH. */
+const ompExecutable = process.env.OMPBOT_OMP_EXECUTABLE ?? Bun.which("omp") ?? undefined;
 
-async function pinnedTransform(): Promise<TransformMessages> {
-	if (!existsSync(transformPath)) {
-		throw new Error(
-			`pinned omp missing: ${transformPath} not found — install one with \`ompbot omp install <version>\` and \`ompbot omp use <version>\``,
-		);
+/**
+ * `transform-messages.ts` of the omp's package: its root is the nearest ancestor of the executable's realpath that holds
+ * `package.json` (a standalone ELF has none), and the file is looked up under the package's own
+ * `node_modules/@oh-my-pi/pi-ai`, then at the hoisted `../pi-ai`. Returns the path, or why there is none.
+ */
+function locateTransform(executable: string | undefined): { path: string } | { unavailable: string } {
+	if (executable === undefined) return { unavailable: "no omp executable (OMPBOT_OMP_EXECUTABLE unset, none on PATH)" };
+	let real: string;
+	try {
+		real = realpathSync(executable);
+	} catch {
+		return { unavailable: `${executable} does not exist` };
 	}
-	// Dynamic on purpose: the module lives in the install the bot pins under its home, not in this checkout's deps.
+	let root = dirname(real);
+	while (!existsSync(join(root, "package.json"))) {
+		const parent = dirname(root);
+		if (parent === root) return { unavailable: `${real} is not inside an npm package (standalone binary?)` };
+		root = parent;
+	}
+	const tail = join("src", "providers", "transform-messages.ts");
+	const candidates = [join(root, "node_modules", "@oh-my-pi", "pi-ai", tail), join(root, "..", "pi-ai", tail)];
+	const found = candidates.find((candidate) => existsSync(candidate));
+	return found === undefined ? { unavailable: `transform-messages.ts not found under ${root}` } : { path: found };
+}
+
+const located = locateTransform(ompExecutable);
+
+async function ompTransform(transformPath: string): Promise<TransformMessages> {
+	// Dynamic on purpose: the module lives in the omp install, not in this checkout's deps.
 	const mod: unknown = await import(transformPath);
 	if (
 		typeof mod !== "object" ||
@@ -40,11 +52,9 @@ async function pinnedTransform(): Promise<TransformMessages> {
 		!("transformMessages" in mod) ||
 		typeof mod.transformMessages !== "function"
 	) {
-		throw new Error(
-			`pinned omp ${readlinkSync(join(ompRoot(defaultHomeDir()), "current"))} exports no transformMessages`,
-		);
+		throw new Error(`${transformPath} exports no transformMessages`);
 	}
-	const transform: TransformMessages = mod.transformMessages as TransformMessages; // the pinned pi-ai signature
+	const transform: TransformMessages = mod.transformMessages as TransformMessages; // the omp's pi-ai signature
 	return transform;
 }
 
@@ -104,12 +114,14 @@ const model = {
 	compat: {},
 };
 
-// Fresh installs (and the release export's install check) have no pinned omp yet; a pinned one missing the module still fails.
-const pinned = existsSync(join(ompRoot(defaultHomeDir()), "current"));
-
-describe.skipIf(!pinned)("pinned omp: an unanswered tool call of a cut turn", () => {
+// A standalone binary or a missing omp has no readable transform: the reason is printed and the check is not run.
+describe("omp: an unanswered tool call of a cut turn", () => {
 	test("gets a synthetic tool result right after its assistant message, so every call is paired (no provider call)", async () => {
-		const transformMessages = await pinnedTransform();
+		if ("unavailable" in located) {
+			console.warn(`omp unanswered-tool-call check not run: ${located.unavailable}`);
+			return;
+		}
+		const transformMessages = await ompTransform(located.path);
 		const messages = sessionJsonl.split("\n").map((line): Message => {
 			const entry: unknown = JSON.parse(line);
 			if (typeof entry !== "object" || entry === null || !("message" in entry))

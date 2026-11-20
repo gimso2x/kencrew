@@ -1,5 +1,12 @@
 import { stat } from "node:fs/promises";
-import type { ActionButton, ChannelPort, MessageRef, OutboundMessage, PostTarget } from "../channel/port";
+import type {
+	ActionButton,
+	ChannelPort,
+	ConversationContext,
+	MessageRef,
+	OutboundMessage,
+	PostTarget,
+} from "../channel/port";
 import { cutCodePointSafe } from "../channel/text";
 import { TOP_LEVEL_TS } from "../core/normalize";
 import { type DiscordEmbed, fitEmbed, subtext } from "./card";
@@ -164,8 +171,32 @@ export class DiscordChannel implements ChannelPort {
 		this.#channels.set(info.id, info);
 	}
 
-	/** The channel behind `id`, cached; `undefined` when Discord has none (404 / Unknown Channel). Other errors throw. */
-	async channelInfo(id: string): Promise<DiscordChannelInfo | undefined> {
+	/** Drops what is cached for `id` (a deleted channel or thread). */
+	forget(id: string): void {
+		this.#channels.delete(id);
+	}
+
+	/** Cached name, topic and thread name of this place; nothing is fetched. */
+	conversationContext(conversationId: string, threadId?: string): ConversationContext | undefined {
+		const channel = this.#channels.get(conversationId) ?? undefined;
+		const thread =
+			threadId === undefined || threadId === TOP_LEVEL_TS ? undefined : (this.#channels.get(threadId) ?? undefined);
+		const channelName = channel?.name;
+		const topic = channel?.topic;
+		const threadName = thread !== undefined && THREAD_TYPES.has(thread.type) ? thread.name : undefined;
+		if (channelName === undefined && topic === undefined && threadName === undefined) return undefined;
+		return {
+			...(channelName === undefined ? {} : { channelName }),
+			...(topic === undefined ? {} : { topic }),
+			...(threadName === undefined ? {} : { threadName }),
+		};
+	}
+
+	/**
+	 * The channel behind `id`, cached; `undefined` when Discord has none (404 / Unknown Channel), which is cached too
+	 * unless `remember404` is false. Other errors throw.
+	 */
+	async channelInfo(id: string, remember404 = true): Promise<DiscordChannelInfo | undefined> {
 		const known = this.#channels.get(id);
 		if (known !== undefined) return known ?? undefined;
 		try {
@@ -174,7 +205,7 @@ export class DiscordChannel implements ChannelPort {
 			return info;
 		} catch (err) {
 			if (err instanceof DiscordCallError && err.kind === "definitive" && err.status === 404) {
-				this.#channels.set(id, null);
+				if (remember404) this.#channels.set(id, null);
 				return undefined;
 			}
 			throw err;
@@ -194,7 +225,9 @@ export class DiscordChannel implements ChannelPort {
 	async destination(conversationId: string, threadId?: string): Promise<Destination> {
 		if (threadId === undefined || threadId === TOP_LEVEL_TS) return { channelId: conversationId };
 		if (!this.isDirect(conversationId)) {
-			const info = await this.channelInfo(threadId);
+			// `threadId` may be a plain message id, which has no channel yet: its 404 is not remembered, since the owner
+			// can open a thread from that message later.
+			const info = await this.channelInfo(threadId, false);
 			if (info !== undefined && THREAD_TYPES.has(info.type)) return { channelId: threadId };
 		}
 		return { channelId: conversationId, messageReference: { messageId: threadId } };
@@ -298,7 +331,13 @@ export class DiscordChannel implements ChannelPort {
 			if (!(err instanceof DiscordCallError && err.code === THREAD_EXISTS)) throw err;
 		}
 		const parent = await this.channelInfo(ref.conversationId);
-		this.remember({ id: ref.messageId, type: PUBLIC_THREAD, parentId: ref.conversationId, guildId: parent?.guildId });
+		this.remember({
+			id: ref.messageId,
+			type: PUBLIC_THREAD,
+			parentId: ref.conversationId,
+			guildId: parent?.guildId,
+			name: cutCodePointSafe(name, THREAD_NAME_MAX),
+		});
 	}
 
 	/** `https://discord.com/channels/<guild|@me>/<channel>/<message>`; a thread's starter links into the thread. */

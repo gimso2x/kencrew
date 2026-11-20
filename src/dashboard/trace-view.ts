@@ -1,3 +1,4 @@
+import { esc } from "./html";
 import type { SpanKind, SpanStatus, TraceSpan, TurnTrace } from "./trace";
 
 /** What the waterfall shows besides the trace: the page clock, folds, the focused row and the open details. */
@@ -16,15 +17,9 @@ export interface TraceViewState {
 /**
  * The turn's waterfall: a tree of rows (name, a bar on the turn's clock, duration, cost), the axis, the "now" line and
  * the details of the open span. Patchable in place: every changing piece carries `data-part`, and `data-sig` changes
- * exactly when the rows themselves do. Self-contained (shipped to the page).
+ * exactly when the rows themselves do. Self-contained apart from `esc` (both shipped to the page).
  */
 export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;");
 	if (!answer.ok) {
 		const why: Record<string, string> = {
 			no_database: "DB가 없어 트레이스를 읽지 못했어요",
@@ -34,7 +29,13 @@ export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
 		};
 		return `<p class="note">${esc(why[answer.error] ?? answer.error)}</p>`;
 	}
-	const KIND: Record<SpanKind, string> = { agent: "턴", subagent: "하위 에이전트", llm: "모델 호출", tool: "도구" };
+	const KIND: Record<SpanKind, string> = {
+		agent: "턴",
+		subagent: "하위 에이전트",
+		llm: "모델 호출",
+		tool: "도구",
+		compaction: "압축",
+	};
 	const STATUS: Record<SpanStatus, [string, string]> = {
 		running: ["실행 중", "is-info"],
 		done: ["완료", "is-success"],
@@ -50,6 +51,19 @@ export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
 		return `${Math.floor(ms / 3_600_000)}시간${ms % 3_600_000 >= 60_000 ? ` ${Math.floor((ms % 3_600_000) / 60_000)}분` : ""}`;
 	};
 	const money = (amount: number): string => (amount <= 0 ? "" : `$${amount.toFixed(amount >= 1 ? 2 : 3)}`);
+	const size = (n: number): string => (n >= 1024 ? `${(n / 1024).toFixed(1)}KB` : `${n}B`);
+	/** The marks a row wears after its name: a tool result the tool cut, a call that only has a summary, a brief. */
+	const chips = (span: TraceSpan): string[] => [
+		...(span.truncated === undefined ? [] : [`잘림 ${span.truncated.shownLines}/${span.truncated.totalLines}줄`]),
+		...(span.compactedTools === undefined || span.compactedTools === 0
+			? []
+			: [`압축으로 요약만 ${span.compactedTools}건`]),
+		...(span.briefPartial === true
+			? ["브리프 미리보기만"]
+			: span.briefBytes === undefined
+				? []
+				: [`브리프 ${size(span.briefBytes)}`]),
+	];
 	const count = (n: number): string =>
 		n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${(n / 1e3).toFixed(1)}k` : String(n);
 
@@ -120,6 +134,9 @@ export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
 		const isOpen = state.open === span.id;
 		const name = span.kind === "agent" ? KIND.agent : span.name;
 		const detail = span.kind === "agent" ? state.title : (span.detail ?? "");
+		const marks = chips(span)
+			.map((chip) => `<span class="tw-chip">${esc(chip)}</span>`)
+			.join("");
 		const label = [name, KIND[span.kind], STATUS[span.status][0], dur(own), cost]
 			.filter((part) => part !== "")
 			.join(", ");
@@ -129,7 +146,7 @@ export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
 			span.id === focus ? 0 : -1
 		}" aria-label="${esc(label)}"><span class="tw-name">${
 			kids ? `<span class="tw-twist" data-trace-toggle>${chevron}</span>` : '<span class="tw-twist"></span>'
-		}<i class="tw-sw" aria-hidden="true"></i><span class="tw-label">${esc(name)}</span>${
+		}<i class="tw-sw" aria-hidden="true"></i><span class="tw-label">${esc(name)}</span>${marks}${
 			detail === "" ? "" : `<span class="tw-detail">${esc(detail)}</span>`
 		}${slowest !== undefined && slowest.id === span.id ? '<span class="tw-tag">가장 느림</span>' : ""}</span><span class="tw-track" aria-hidden="true"><i class="tw-bar" data-part="bar" style="--x:${frac(
 			span.start,
@@ -201,6 +218,21 @@ export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
 					]
 				: []),
 			...((sum?.cost ?? 0) > 0 ? [[agent ? "비용 합계" : "비용", esc(money(sum?.cost ?? 0))] as [string, string]] : []),
+			...(picked.inputs === undefined
+				? []
+				: [
+						[
+							"입력",
+							esc(
+								picked.inputs
+									.map((part) => `${part.label}${part.warned ? "(경고)" : ""} ${size(part.bytes)}`)
+									.join(" · "),
+							),
+						] as [string, string],
+					]),
+			...(picked.resultBytes === undefined ? [] : [["결과", esc(size(picked.resultBytes))] as [string, string]]),
+			...chips(picked).map((chip) => ["표지", esc(chip)] as [string, string]),
+			...(picked.briefPreview === undefined ? [] : [["브리프", esc(picked.briefPreview)] as [string, string]]),
 			...(picked.error === undefined
 				? []
 				: [["오류", `<span class="is-error">${esc(picked.error)}</span>`] as [string, string]]),
@@ -215,7 +247,7 @@ export function renderTrace(answer: TurnTrace, state: TraceViewState): string {
 
 	// djb2 of the row ids, folds and the slowest mark: equal means the rows can be patched in place.
 	let hash = 5381;
-	const sigText = `${rows.map((row) => `${row.span.id}:${folded(row.span) ? 1 : 0}`).join(",")}|${slowest?.id ?? ""}`;
+	const sigText = `${rows.map((row) => `${row.span.id}:${folded(row.span) ? 1 : 0}:${chips(row.span).join("/")}`).join(",")}|${slowest?.id ?? ""}`;
 	for (let i = 0; i < sigText.length; i++) hash = ((hash << 5) + hash + sigText.charCodeAt(i)) | 0;
 
 	return `<div class="tw" data-trace data-sig="${(hash >>> 0).toString(36)}-${rows.length}"><div class="tw-head"><h3 class="h3">트레이스</h3><span class="tw-state ${stateTone}" role="status" aria-live="polite" data-part="html"><i class="tw-dot" aria-hidden="true"></i>${stateWord}</span>${
@@ -274,15 +306,9 @@ export function flowDoing(span: TraceSpan): string {
  * The turn as a flow: request → the bot (the turn's root) → one card per delegated worker, the owner's approvals as a
  * branch beside the bot. Cards carry `data-flow-card` and a `data-sig` of their own markup so the page replaces only
  * the cards that changed; worker cards are `[data-flow-worker]` buttons. Shares no selector with the waterfall.
- * Self-contained apart from `flowDoing` (both shipped to the page).
+ * Self-contained apart from `esc` and `flowDoing` (all shipped to the page).
  */
 export function renderFlow(answer: TurnTrace, state: TraceViewState): string {
-	const esc = (value: unknown): string =>
-		String(value ?? "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;");
 	if (!answer.ok) return `<p class="note">${esc(answer.error)}</p>`;
 	const STATUS: Record<SpanStatus, [string, string]> = {
 		running: ["실행 중", "is-info"],

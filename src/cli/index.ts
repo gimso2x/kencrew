@@ -5,7 +5,7 @@ import { ConfigError, defaultHomeDir, loadConfig, type OmpbotConfig, timezoneOfH
 import { escapeControl, runDoctor } from "../daemon/doctor";
 import { callDaemon, IpcNoResponse } from "../daemon/ipc";
 import { runDaemon } from "../daemon/run";
-import { readStatusFromDb, renderStatusText, type StatusReport } from "../daemon/status";
+import { frozenField, readStatusFromDb, renderStatusText, type StatusReport } from "../daemon/status";
 import { readVersion } from "../daemon/tools";
 import { dispatchEnv, herdrSshArgv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
 import { readConfigText } from "../ops/apply";
@@ -26,6 +26,7 @@ import { RESTORE_USAGE, restoreCommand } from "./restore";
 import { SKILLS_USAGE, skillsCommand } from "./skills";
 import { TASKS_USAGE, tasksCommand } from "./tasks";
 import { TEAMS_USAGE, teamsCommand } from "./teams";
+import { TRACE_INPUTS_USAGE, traceInputsCommand } from "./trace-inputs";
 import { UNITS_USAGE, unitsCommand } from "./units";
 
 /** ssh's own ConnectTimeout is 5 s; the whole check gets a little more. */
@@ -60,7 +61,7 @@ ${INIT_USAGE}${UNITS_USAGE}  daemon                         run the bot (single 
   inject --origin discord/<dm|ch>/ID --as-owner --text <t> [--quoted <q>] [--thread <message id>]
   reload                         running daemon re-reads config.json (also SIGHUP): policy fields apply live,
                                  startup-bound fields are listed as restart_required; an invalid file changes nothing
-${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${LANES_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${TEAMS_USAGE}`;
+${DRAIN_USAGE}${APPLY_USAGE}${OMP_USAGE}${RESTORE_USAGE}${MONITORS_USAGE}${TASKS_USAGE}${LANES_USAGE}${SKILLS_USAGE}${DASHBOARD_USAGE}${TRACE_INPUTS_USAGE}${TEAMS_USAGE}`;
 
 /** The fields `renderStatusText` and `--json` readers rely on; a reply without them is not a status report. */
 function isStatusReport(value: unknown): value is StatusReport {
@@ -204,7 +205,8 @@ export async function doctorCommand(
 	const code = await (deps.doctor ?? runDoctor)(homeDir, write, resolve(import.meta.dir, "..", ".."));
 	let config: OmpbotConfig | undefined;
 	try {
-		config = loadConfigIfPresent(homeDir);
+		// runDoctor already reports a broken token file; reading it again here would end the herdr and dispatch checks.
+		config = loadConfigIfPresent(homeDir, { checkTokens: false });
 	} catch {
 		return code;
 	}
@@ -309,11 +311,24 @@ function hostLoadDeps(env: Record<string, string | undefined>): GatesCommandDeps
 	return hostLoad === undefined ? {} : { hostLoad };
 }
 
-/** `ompbot gates`: exit 1 when a gate is open, or with `--strict` also when one cannot be judged (`unknown`). */
+/** `ompbot gates`: exit 1 when a gate is open, or with `--strict` also when one cannot be judged (`unknown`); exit 2 when the config cannot be read, so no gate was judged. */
 export function gatesCommand(args: string[], homeDir: string, deps: GatesCommandDeps = {}): number {
 	const { values } = parseArgs({ args, options: { json: { type: "boolean" }, strict: { type: "boolean" } } });
 	// A db-only home (no config.json) has no omp to check; the omp_runtime gate is then omitted.
-	const config = loadConfigIfPresent(homeDir);
+	let config: OmpbotConfig | undefined;
+	try {
+		config = loadConfigIfPresent(homeDir);
+	} catch (error) {
+		if (!(error instanceof ConfigError)) throw error;
+		// No verdict: exit 2 keeps this apart from "a gate is open" (1) and "all closed" (0), and the last line still
+		// says so for an alerting tool that shows only it.
+		if (values.json === true) {
+			process.stdout.write(`${JSON.stringify({ error: error.code, message: error.message, gates: [] })}\n`);
+		} else {
+			process.stdout.write(`gates_done error=${error.code} detail=${JSON.stringify(error.message)}\n`);
+		}
+		return 2;
+	}
 	const gates = collectGates({
 		homeDir,
 		now: (deps.now ?? Date.now)(),
@@ -353,6 +368,14 @@ async function statusCommand(args: string[], homeDir: string, hostLoad?: Partial
 		const dbPath = join(homeDir, "ompbot.db");
 		if (!existsSync(dbPath)) {
 			process.stderr.write(`status: no daemon at ${socketPath} and no database at ${dbPath}\n`);
+			// A home before its first boot can still be frozen: the freeze is a file, not a ledger row.
+			const { frozen } = frozenField(homeDir);
+			if (values.json === true) process.stdout.write(`${JSON.stringify({ frozen })}\n`);
+			else if (frozen !== undefined) {
+				process.stdout.write(
+					`FROZEN · ${frozen.since} · ${frozen.by}${frozen.reason === "" ? "" : ` · ${frozen.reason}`}\n`,
+				);
+			}
 			return 1;
 		}
 		// The database is the report; a db-only (recovery) home or broken token files must not hide it.
@@ -551,6 +574,8 @@ export async function runCli(argv: string[], env: Record<string, string | undefi
 				return skillsCommand(rest, env);
 			case "dashboard":
 				return await dashboardCommand(rest, homeDir);
+			case "trace-inputs":
+				return traceInputsCommand(rest, homeDir, env);
 			case "teams":
 				return await teamsCommand(rest, homeDir);
 			default:

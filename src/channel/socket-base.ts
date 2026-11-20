@@ -199,9 +199,5 @@ export abstract class SocketBase<TFirst = void> {
 		this.#reconnectTimer = undefined;
 	}
 
-	protected get reconnectPending(): boolean {
-		return this.#reconnectTimer !== undefined;
-	}
-
 	protected abstract connect(): Promise<void>;
 }

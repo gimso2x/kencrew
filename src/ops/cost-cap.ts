@@ -15,9 +15,26 @@ const SUB_AGENT_DEPTH = 2;
 export interface WindowCost {
 	cost: number;
 	calls: number;
+	/** Last entry id read in the main session file, when any entry carries one. */
+	lastEntryId?: string;
+}
+
+/** `sessionWindowCost` could not find `afterEntryId` inside an existing session file. */
+export class EntryNotFoundError extends Error {
+	constructor(entryId: string, sessionFile: string) {
+		super(`entry ${entryId} not in ${sessionFile}`);
+		this.name = "EntryNotFoundError";
+	}
 }
 
 const num = (value: unknown): number => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+
+function entryIdOf(record: unknown): string | undefined {
+	if (typeof record !== "object" || record === null) return undefined;
+	const r = record as { type?: unknown; id?: unknown };
+	if (r.type === "session") return undefined;
+	return typeof r.id === "string" && r.id !== "" ? r.id : undefined;
+}
 
 /** `$12.34` — every owner-facing cost text of this module. */
 export function usd(value: number): string {
@@ -70,11 +87,16 @@ export async function sessionWindowCost(input: {
 			if (typeof record !== "object" || record === null || !("id" in record)) return false;
 			return record.id === input.afterEntryId;
 		});
-		if (index === -1) throw new Error(`entry ${input.afterEntryId} not in ${input.sessionFile}`);
+		if (index === -1) throw new EntryNotFoundError(input.afterEntryId, input.sessionFile);
 		start = index + 1;
 	}
 	const totals: WindowCost = { cost: 0, calls: 0 };
+	let lastEntryId: string | undefined;
 	for (const [index, record] of records.entries()) {
+		const id = entryIdOf(record);
+		if (id !== undefined && (input.afterEntryId !== null ? index >= start - 1 : inWindow(record))) {
+			lastEntryId = id;
+		}
 		const usage = usageOf(record);
 		if (usage === undefined) continue;
 		if (index < start) continue;
@@ -82,6 +104,7 @@ export async function sessionWindowCost(input: {
 		totals.calls += 1;
 		totals.cost += num(usage.cost?.total);
 	}
+	if (lastEntryId !== undefined) totals.lastEntryId = lastEntryId;
 
 	const stem = input.sessionFile.replace(/\.jsonl$/, "");
 	if (stem === input.sessionFile || !existsSync(stem)) return totals;

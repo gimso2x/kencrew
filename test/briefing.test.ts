@@ -65,7 +65,7 @@ const snapshot = (extra: Partial<DashboardSnapshot> = {}): DashboardSnapshot => 
 		origins: 2,
 		busy: 1,
 		ledger: { pending: 0, inflight: 1, confirmed: 9, ambiguous: 0, expired: 0 },
-		inbound: { pending: 0, dispatched: 1, answered: 9, failed_notified: 0, discarded: 0 },
+		inbound: { pending: 0, dispatched: 1, answered: 9, failed_notified: 0, discarded: 0, uncertain: 0 },
 		monitors: { count: 2, next: null },
 		openGates: [],
 		commit: "abc1234",

@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import type { ConversationContext } from "../channel/port";
 import type { LaneSessionOps } from "../lanes/manager";
 import type { Logger } from "../log";
 import type { OmpState, TodoPhase } from "../omp/driver";
@@ -30,6 +31,8 @@ export interface OriginRouterDeps {
 	usageProvider?: MailboxDeps["usageProvider"];
 	/** Passed to every mailbox: the `!distill` answer; see `MailboxDeps`. */
 	distillProvider?: MailboxDeps["distillProvider"];
+	/** Per origin: the cached place of a chat origin (see `MailboxDeps.conversationContext`); `undefined`: none. */
+	conversationContext?: (originKey: string) => ConversationContext | undefined;
 	/** Passed to every mailbox: whether a turn prompt may carry channel-scoped recall; see `MailboxDeps`. */
 	recallEnabled?: MailboxDeps["recallEnabled"];
 	/** Passed to every mailbox: whether a child gets ompbot host tools; see `MailboxDeps.hostTools`. */
@@ -106,7 +109,8 @@ export class OriginRouter {
 	mailbox(originKey: string): OriginMailbox {
 		let mailbox = this.#mailboxes.get(originKey);
 		if (!mailbox) {
-			const { sessionsRoot, isHeld, onHeldWork, initialTodos, isAttached, boardNotice, ...rest } = this.#deps;
+			const { sessionsRoot, isHeld, onHeldWork, initialTodos, isAttached, boardNotice, conversationContext, ...rest } =
+				this.#deps;
 			mailbox = new OriginMailbox({
 				...rest,
 				originKey,
@@ -117,6 +121,7 @@ export class OriginRouter {
 				...(initialTodos === undefined ? {} : { initialTodos: () => initialTodos(originKey) }),
 				...(isAttached === undefined ? {} : { isAttached: () => isAttached(originKey) }),
 				...(boardNotice === undefined ? {} : { boardNotice: () => boardNotice(originKey) }),
+				...(conversationContext === undefined ? {} : { conversationContext: () => conversationContext(originKey) }),
 			});
 			if (this.#dispatchStopped) mailbox.stopDispatching();
 			this.#mailboxes.set(originKey, mailbox);

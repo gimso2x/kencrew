@@ -132,6 +132,7 @@ function memoryApprovalStore(): ApprovalStore {
 				mirrorRef: null,
 			});
 		},
+		addAutoChoice: () => undefined,
 		getApproval: (id) => rows.get(id),
 		setApprovalMirrorRef: (id, mirrorRef) => {
 			const row = rows.get(id);

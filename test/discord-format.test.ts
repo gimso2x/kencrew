@@ -1,5 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { FENCE_RESERVE, REDELIVERED_PREFIX } from "../src/channel/text";
+import { displayWidth, FENCE_RESERVE, REDELIVERED_PREFIX } from "../src/channel/text";
 import * as discordCard from "../src/discord/card";
 import { mrkdwnToDiscord, renderDiscordMessages, renderDiscordParts } from "../src/discord/format";
 import { MESSAGE_CONTENT_LIMIT } from "../src/discord/transport";
@@ -41,7 +41,7 @@ describe("renderDiscordParts", () => {
 		const body = "표입니다\n\n| 도구 | 횟수 |\n|---|---|\n| bash | 10 |\n\n끝";
 		const [part, ...rest] = renderDiscordParts(body, false);
 		expect(rest).toHaveLength(0);
-		expect(part).toBe("표입니다\n\n```\n| 도구 | 횟수 |\n|---|---|\n| bash | 10 |\n```\n\n끝");
+		expect(part).toBe("표입니다\n\n```\n도구 | 횟수\n-----+-----\nbash | 10\n```\n\n끝");
 	});
 
 	test("a table already inside a code fence is not wrapped twice", () => {
@@ -116,6 +116,7 @@ describe("renderDiscordParts", () => {
 
 	test("a fenced table right before a code fence: the table stays whole, the fence uncut", () => {
 		const table = "| 도구 | 횟수 |\n|---|---|\n| bash | 10 |";
+		const aligned = "도구 | 횟수\n-----+-----\nbash | 10";
 		const budget = MESSAGE_CONTENT_LIMIT - FENCE_RESERVE;
 		for (let at = budget - 90; at <= budget + 2; at++) {
 			const parts = renderDiscordParts(
@@ -125,7 +126,7 @@ describe("renderDiscordParts", () => {
 			expect(parts.length, `at ${at}`).toBeGreaterThan(1);
 			expectFencesWhole(parts, `at ${at}`);
 			expect(
-				parts.some((part) => part.includes(`\`\`\`\n${table}\n\`\`\``)),
+				parts.some((part) => part.includes(`\`\`\`\n${aligned}\n\`\`\``)),
 				`at ${at}: table whole`,
 			).toBe(true);
 		}
@@ -160,7 +161,7 @@ describe("renderDiscordMessages", () => {
 describe("qa50b K-9: tables without outer pipes", () => {
 	test("a GFM table without leading/trailing pipes is fenced too", () => {
 		const body = "name | value\n--- | ---\na | 1\nb | 2";
-		expect(renderDiscordParts(body, false)).toEqual([`\`\`\`\n${body}\n\`\`\``]);
+		expect(renderDiscordParts(body, false)).toEqual(["```\nname | value\n-----+------\na    | 1\nb    | 2\n```"]);
 	});
 
 	test("a line with a pipe over a plain --- rule (no pipe, one cell) stays text", () => {
@@ -172,8 +173,78 @@ describe("qa50b K-9: tables without outer pipes", () => {
 describe("renderDiscordParts qa-i low", () => {
 	test("a fence opened and closed on one line does not stop a later table from being fenced", () => {
 		const body = "```bash npm test```\n\n| a | b |\n| --- | --- |\n| 1 | 2 |";
-		expect(renderDiscordParts(body, false)).toEqual([
-			"```bash npm test```\n\n```\n| a | b |\n| --- | --- |\n| 1 | 2 |\n```",
+		expect(renderDiscordParts(body, false)).toEqual(["```bash npm test```\n\n```\na | b\n--+--\n1 | 2\n```"]);
+	});
+});
+
+describe("table alignment and inline markdown stripping", () => {
+	test("Hangul and ASCII columns align on the same displayWidth with a rule row under the header", () => {
+		const body = "| 도구 | 횟수 |\n|---|---|\n| bash | 10 |\n| 읽기 | 7 |";
+		const [part, ...rest] = renderDiscordParts(body, false);
+		expect(rest).toHaveLength(0);
+		expect(part).toBe("```\n도구 | 횟수\n-----+-----\nbash | 10\n읽기 | 7\n```");
+		const inner = (part ?? "").split("\n").slice(1, -1);
+		expect(inner[1]).toBe("-----+-----");
+		const pipeColumns = [inner[0], inner[2], inner[3]].map((line) =>
+			displayWidth((line ?? "").slice(0, (line ?? "").indexOf("|"))),
+		);
+		expect(pipeColumns).toEqual([5, 5, 5]);
+	});
+
+	test("strips **bold**, __bold__, `code`, [label](url) inside cells before measuring width; keeps others as-is", () => {
+		const body = [
+			"| **항목** | __상태__ | `값` | [문서](https://x.test/a_(b)) |",
+			"|---|---|---|---|",
+			"| **굵게** | __밑줄__ | `코드` | [이름](https://x) |",
+			"| *기울임* | a__b__c | `__proto__` | ~~취소~~ |",
+			"| **[링크](https://x)** | [`코드링크`](https://y) | a \\| b | _유지_ |",
+		].join("\n");
+		const [part] = renderDiscordParts(body, false);
+		const inner = (part ?? "").split("\n").slice(1, -1);
+		expect(inner).toEqual([
+			"항목     | 상태     | 값        | 문서",
+			"---------+----------+-----------+---------",
+			"굵게     | 밑줄     | 코드      | 이름",
+			"*기울임* | a__b__c  | __proto__ | ~~취소~~",
+			"링크     | 코드링크 | a | b     | _유지_",
 		]);
+		const widths = [inner[0], inner[2], inner[3]].map((line) =>
+			[...(line ?? "").matchAll(/\|/g)].map((m) => displayWidth((line ?? "").slice(0, m.index))),
+		);
+		expect(widths).toEqual([
+			[9, 20, 32],
+			[9, 20, 32],
+			[9, 20, 32],
+		]);
+	});
+
+	test("pads short rows with empty cells and drops extra cells past the header width", () => {
+		const body = "| a | b | c |\n|---|---|---|\n| 1 |\n| 1 | 2 | 3 | 4 |";
+		expect(renderDiscordParts(body, false)).toEqual(["```\na | b | c\n--+---+--\n1 |   |\n1 | 2 | 3\n```"]);
+	});
+
+	test("keeps an aligned table under 2000 chars whole even when alignment expands it past original length", () => {
+		const table = [
+			"| col1 | col2 |",
+			"|---|---|",
+			`| ${"가".repeat(30)} | 1 |`,
+			...Array.from({ length: 15 }, (_, i) => `| r${i} | v${i} |`),
+		].join("\n");
+		const prefix = "a".repeat(1900 - table.length);
+		const parts = renderDiscordParts(`${prefix}\n\n${table}\n\n끝`, false);
+		expect(parts.length).toBeGreaterThan(1);
+		for (const part of parts) expect(part.length).toBeLessThanOrEqual(MESSAGE_CONTENT_LIMIT);
+		expect(parts.some((part) => part.includes("col1") && part.includes("r14") && part.includes("v14"))).toBe(true);
+	});
+
+	test("splits an aligned table exceeding 2000 chars cleanly with closed fences per part", () => {
+		const rows = Array.from({ length: 90 }, (_, i) => `| 행${String(i).padStart(2, "0")} | ${"내용".repeat(10)} |`);
+		const body = ["| 번호 | 설명 |", "|---|---|", ...rows].join("\n");
+		const parts = renderDiscordParts(body, false);
+		expect(parts.length).toBeGreaterThan(1);
+		for (const part of parts) {
+			expect(part.length).toBeLessThanOrEqual(MESSAGE_CONTENT_LIMIT);
+			expect((part.match(/```/g) ?? []).length % 2).toBe(0);
+		}
 	});
 });

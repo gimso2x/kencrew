@@ -54,7 +54,7 @@ kencrew는 Discord·Teams(하나만 또는 둘 다)의 DM·채널에서 받은 �
 
 > AI 코딩 에이전트에게 설치를 맡기려면 [AI 에이전트에게 설치 맡기기](docs/guide.md#ai-에이전트에게-설치-맡기기)의 프롬프트를 붙여넣으세요.
 
-**1. omp 준비** — 봇을 돌릴 계정에서 합니다. 단독 바이너리 omp는 쓸 수 없습니다.
+**1. omp 준비** — 봇을 돌릴 계정에서 합니다. `bun install -g`로 받은 omp든 단독 실행 파일이든 쓸 수 있습니다.
 
 ```sh
 bun install -g @oh-my-pi/pi-coding-agent   # omp가 없을 때만
@@ -101,7 +101,7 @@ loginctl enable-linger "$USER"   # (선택) 로그아웃·재부팅 뒤에도 �
 <tr><td width="190"><b>💬 스레드마다 독립 세션</b></td><td>DM·채널·스레드마다 컨텍스트가 섞이지 않는 omp 세션이 열립니다. 일하는 중에 끼워 넣기(steer)와 줄 세우기(<code>!followup</code>), 이미지·문서 첨부, 산출물 파일 업로드, 모델·thinking 전환, 컨텍스트 압축, 옛 세션 이어가기까지 대화창(Discord·Teams) 안에서 합니다. 과거를 가리키는 말("저번에", "어제")에는 같은 대화 공간의 지난 기록을 찾아 붙입니다. 대화 에이전트는 omp가 기본이고 Antigravity CLI(<code>"agent": "agy"</code>)로 바꿀 수 있습니다. 대화 턴이 바꾼 파일은 <code>!undo</code>로 되돌립니다(아래).</td></tr>
 <tr><td><b>🔐 승인 게이트</b></td><td>카드는 되돌리기 어렵거나 밖으로 나가는 일(데이터 삭제·강제 push·키 변경·남이 쓰는 서비스 반영·공개 게시) 앞에서만 띄웁니다. 커밋·비공개 저장소 push·재시작·위임처럼 되돌릴 수 있는 일은 묻지 않고 하고, 보고에 되돌리는 법을 적습니다. 카드에는 할 일·이유·영향·되돌릴 수 없는 이유가 정리되고, 밖으로 공개되는 일은 <code>🌐 외부 공개</code> 카드로 따로 드러납니다. 승인 채널에 올린 카드는 요청 스레드에도 사본으로 뜨고, 시간 초과로 끝난 카드에는 <code>다시 요청</code> 버튼이 남습니다. 승인은 SQLite 장부에 영속되고, 더블클릭·재시작·시간 초과를 모두 안전한 쪽(거부·만료)으로 처리합니다.</td></tr>
 <tr><td><b>❓ 질문 카드</b></td><td>omp가 선택지를 묻는 창(select·confirm·input·editor·<code>ask</code>)을 띄우면 그 스레드에 버튼 카드가 올라옵니다. 버튼을 누르거나 카드 스레드에 답장하면 그대로 omp의 답이 되고, 열린 질문이 하나뿐일 때는 같은 대화의 다음 일반 메시지가 그 질문의 답이 됩니다. 마감까지 답이 없으면 omp와 같은 기본값으로 끝나고(<code>ask</code>는 추천 선택지, 없으면 첫 선택지로 자동 선택), 비밀값 입력 창은 채팅으로 받지 않고 바로 취소합니다. <a href="docs/guide.md#질문-카드">질문 카드</a> 참고.</td></tr>
-<tr><td><b>🧑‍🏭 작업 위임</b></td><td><code>ompbot_dispatch</code>로 단발 실행(<code>omp -p</code>)하거나 herdr 워커를 로컬·원격(ssh)에 띄웁니다(herdr는 선택 설치). herdr를 켜면 <code>[TASK]</code>를 붙여 워크트리·브랜치·스펙·진행 문서가 한 번에 만들어지고, 5분 스윕이 LLM 없이 수락기준 × 커밋·테스트 증거로 Outcome을 판정합니다. 위험한 지시는 내보내기 전에 걸러 승인을 받습니다.</td></tr>
+<tr><td><b>🧑‍🏭 작업 위임</b></td><td><code>ompbot_dispatch</code>로 단발 실행(<code>omp -p</code>)하거나 herdr 워커를 로컬·원격(ssh)에 띄웁니다(herdr는 선택 설치). herdr를 켜면 <code>[TASK]</code>를 붙여 워크트리·브랜치·스펙·진행 문서가 한 번에 만들어지고, 1분 스윕이 LLM 없이 수락기준 × 커밋·테스트 증거로 Outcome을 판정합니다. 위험한 지시는 내보내기 전에 걸러 승인을 받습니다.</td></tr>
 <tr><td><b>🛤️ 작업 레인</b></td><td><code>작업: &lt;제목&gt; @&lt;경로&gt;</code>나 <code>ompbot_work_start</code>로 긴 일을 자기 스레드·worktree·브랜치(<code>lane/L-YYYYMMDD-NN</code>)를 가진 별도 omp 세션에 맡깁니다(동시 4개). 수락기준은 첫 턴의 할 일 목록으로 심기고, 레인은 커밋한 뒤 <code>ompbot_claim_done</code>을 불러야 닫히며 코어가 <code>[check: …]</code>를 직접 다시 돌려 확인합니다. 레인끼리와 오너 대화는 <b>레인 게시판</b>(<code>ompbot_board_post</code>·<code>ompbot_board_read</code>)으로 고치는 파일·인터페이스 변경·찾은 결함을 나눕니다. 닫히면 Outcome 카드의 <code>머지</code>·<code>폐기</code> 버튼으로 끝냅니다.</td></tr>
 <tr><td><b>🤝 피어 봇·여러 설치본</b></td><td>같은 체크아웃으로 홈(<code>OMPBOT_HOME</code>)과 유닛만 나눠 두 번째 봇을 띄웁니다(<code>units render --instance</code>). 다른 공급자 모델을 쓰는 검증자 봇을 <code>channels.discord.peerBots</code>로 등록하면 같은 스레드에서 서로 멘션해 스펙·결과를 교차 검토하고, 핑퐁 상한(<code>peerHopLimit</code>)과 무응답 알림(<code>peerSilenceAlert</code>)이 폭주와 침묵을 막습니다. <code>apply</code>는 같은 체크아웃의 다른 설치본까지 차례로 반영합니다.</td></tr>
 <tr><td><b>⏰ 모니터</b></td><td>cron · 지정 시각 · 스크립트 조건 · 파일 변경 · webhook 다섯 가지 트리거로 에이전트를 깨웁니다. 변화가 없으면 조용히 넘어가고(<code>[SILENT]</code>, 해시 억제, wake gate), 실패는 10분·1시간·4시간 간격으로 재시도한 뒤 인시던트로 묶어 한 번만 알립니다. cron에 스크립트(<code>command</code>)를 달면 모델 턴 없이 그 출력을 글자 그대로 올립니다(<code>deliver: "verbatim"</code>).</td></tr>
@@ -128,7 +128,7 @@ flowchart LR
     P["피어 봇(검증자)<br/>다른 OMPBOT_HOME"]
   end
   W["herdr 워커<br/>로컬 · 원격 ssh"]
-  O <-->|"Socket Mode · Gateway"| D
+  O <-->|"Gateway"| D
   D <-->|"omp --mode rpc"| S
   M --> D
   G --> D
@@ -196,7 +196,7 @@ Teams와 함께 쓰거나 이미 설치한 봇에 Discord를 더할 때:
 | **시작하기** | [요구 사항](docs/guide.md#요구-사항) · [설치](docs/guide.md#설치) · [설정 파일](docs/guide.md#5-설정-파일-ompbotconfigjson) · [서비스 등록](docs/guide.md#7-서비스-등록) · [AI 에이전트에게 설치 맡기기](docs/guide.md#ai-에이전트에게-설치-맡기기) · [Discord 봇 만들기](docs/discord.md) |
 | **쓰기** | [대화](docs/guide.md#대화) · [명령](docs/guide.md#명령) · [승인](docs/guide.md#승인) · [질문 카드](docs/guide.md#질문-카드) · [페르소나와 답변 형식](docs/guide.md#페르소나와-답변-형식) · [agy 에이전트](docs/guide.md#agy-에이전트) · [Discord](docs/guide.md#discord선택) |
 | **맡기기** | [작업 위임](docs/guide.md#작업-위임) · [`[TASK]` 상태 문서](docs/guide.md#task-상태-문서) · [`[TASK]` 자동 머지](docs/guide.md#task-자동-머지) · [작업 레인](docs/guide.md#작업-레인) · [모니터](docs/guide.md#모니터) |
-| **운영** | [CLI](docs/guide.md#운영) · [현황판(dashboard)](docs/guide.md#현황판) · [봇 전용 omp](docs/guide.md#봇-전용-omp-버전-고정과-프로필) · [재시작과 drain](docs/guide.md#재시작과-drain) · [건강 게이트](docs/guide.md#건강-게이트와-자가-보고) · [백업](docs/guide.md#백업) · [동결](docs/guide.md#동결킬스위치) |
+| **운영** | [CLI](docs/guide.md#운영) · [현황판(dashboard)](docs/guide.md#현황판) · [봇 전용 omp](docs/guide.md#봇-전용-omp-프로필과-업데이트-시험) · [재시작과 drain](docs/guide.md#재시작과-drain) · [건강 게이트](docs/guide.md#건강-게이트와-자가-보고) · [백업](docs/guide.md#백업) · [동결](docs/guide.md#동결킬스위치) |
 | **보안** | [보안 메모](docs/guide.md#보안-메모) — 오너 게이트, 비밀 마스킹, 격리의 한계 · [취약점 보고](SECURITY.md) |
 | **기여** | [CONTRIBUTING.md](CONTRIBUTING.md) |
 

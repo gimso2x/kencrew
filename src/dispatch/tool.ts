@@ -285,7 +285,8 @@ export function buildDispatchTool(deps: DispatchToolDeps): HostToolDef {
 			const problem = taskTextProblem(task);
 			if (problem !== undefined) throw new Error(problem);
 			// herdr's `agent prompt <name> <task>` has no `--` before the task: a leading `-` would be read as an option.
-			if (task.startsWith("-") && (mode === "herdr" || host !== undefined || params.taskSpec !== undefined))
+			// A taskSpec task goes inside the prompt it builds (`buildTaskPrompt`), never first, so it may start with `-`.
+			if (task.startsWith("-") && params.taskSpec === undefined && (mode === "herdr" || host !== undefined))
 				throw new Error(
 					"herdr로 보내는 task는 `-`로 시작할 수 없습니다(옵션으로 읽힙니다). 첫 글자를 바꿔 다시 보내세요",
 				);

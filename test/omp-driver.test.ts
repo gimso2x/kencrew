@@ -1,7 +1,7 @@
 import { afterAll, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { createLogger } from "../src/log";
 import {
 	type OmpDialogAnswerer,
@@ -13,14 +13,9 @@ import {
 } from "../src/omp/driver";
 import { buildChildEnv } from "../src/omp/env";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
-import {
-	leafIdViaCursor,
-	missingRpcMethods,
-	REQUIRED_RPC_METHODS,
-	RpcOmpDriver,
-	tapExtensionUi,
-} from "../src/omp/rpc-driver";
+import { ExtensionUiTap, leafIdViaCursor, RpcOmpDriver } from "../src/omp/rpc-driver";
 import { redact } from "../src/redact";
+import { FakeOmpPeer, fakeOmpExecutable } from "./helpers/fake-omp-rpc";
 
 const tempDirs: string[] = [];
 function tempDir(prefix: string): string {
@@ -61,58 +56,65 @@ test("RpcOmpDriver fails fast with omp_executable_missing (no spawn, no retry)",
 	expect(driver.pid).toBeUndefined();
 });
 
-test("RpcOmpDriver fails with bun_missing when bun cannot be found", async () => {
-	const dir = tempDir("ompbot-nobun-");
+test("RpcOmpDriver refuses an executable whose --version is not omp/<x.y.z>, before any spawn", async () => {
+	const dir = tempDir("ompbot-notomp-");
+	const peer = new FakeOmpPeer();
 	const driver = new RpcOmpDriver({
-		ompExecutable: process.execPath, // exists and is executable; bun lookup fails before any spawn
+		ompExecutable: fakeOmpExecutable(dir, "1.4.4"),
 		cwd: dir,
 		sessionDir: join(dir, "s"),
-		baseEnv: { PATH: join(dir, "empty") },
+		spawn: peer.spawn,
 	});
 	const error = await driver.start().catch((e: unknown) => e);
-	expect(error).toBeInstanceOf(OmpDriverError);
-	expect(error).toMatchObject({ code: "bun_missing" });
+	expect(error).toMatchObject({ code: "omp_executable_missing" });
+	expect(String(error)).toContain("did not print omp/<version>");
+	expect(peer.spawned).toEqual([]);
 });
 
-/** `<pkg>/dist/cli.js` launcher plus a manifest pinning `engines.bun`, without omp's sources. */
-function enginesPackage(bunRange: string): string {
-	const root = tempDir("ompbot-pkg-");
-	mkdirSync(join(root, "dist"));
-	writeFileSync(join(root, "package.json"), JSON.stringify({ engines: { bun: bunRange } }));
-	const cli = join(root, "dist", "cli.js");
-	writeFileSync(cli, "#!/usr/bin/env bun\n");
-	chmodSync(cli, 0o755);
-	return cli;
-}
-
-test("RpcOmpDriver names a standalone omp binary instead of omp_rpc_client_missing", async () => {
-	const dir = tempDir("ompbot-standalone-");
-	mkdirSync(join(dir, "bin"));
-	const omp = join(dir, "bin", "omp");
-	writeFileSync(omp, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01]));
-	chmodSync(omp, 0o755);
+test("RpcOmpDriver starts the executable itself (no bun in front) with the RPC argv and the child env", async () => {
+	const dir = tempDir("ompbot-argv-");
+	const peer = new FakeOmpPeer();
+	const ompExecutable = fakeOmpExecutable(dir);
 	const driver = new RpcOmpDriver({
-		ompExecutable: omp,
-		cwd: dir,
+		ompExecutable,
+		cwd: join(dir, "ws"),
 		sessionDir: join(dir, "s"),
-		bunExecutable: process.execPath,
+		provider: "p",
+		model: "m",
+		thinking: "low",
+		overlayConfig: "/o.yml",
+		extraArgs: ["--append-system-prompt", "S"],
+		env: { OMP_WIKI_NOTE_DISABLE: "1" },
+		baseEnv: { PATH: process.env.PATH, SLACK_BOT_TOKEN: "xoxb-TEST-0" },
+		spawn: peer.spawn,
 	});
-	const error = await driver.start().catch((e: unknown) => e);
-	expect(error).toMatchObject({ code: "omp_launcher_standalone" });
-});
-
-test("RpcOmpDriver refuses a bun older than omp's engines.bun, and passes one that satisfies it", async () => {
-	const dir = tempDir("ompbot-engines-");
-	const options = { cwd: dir, sessionDir: join(dir, "s"), bunExecutable: process.execPath };
-	const tooOld = await new RpcOmpDriver({ ...options, ompExecutable: enginesPackage(">=999.0.0") })
-		.start()
-		.catch((e: unknown) => e);
-	expect(tooOld).toMatchObject({ code: "bun_too_old" });
-	// A satisfied engine moves on to the RPC client lookup, which this fake package lacks.
-	const satisfied = await new RpcOmpDriver({ ...options, ompExecutable: enginesPackage(`>=${Bun.version}`) })
-		.start()
-		.catch((e: unknown) => e);
-	expect(satisfied).toMatchObject({ code: "omp_rpc_client_missing" });
+	await driver.start();
+	try {
+		expect(peer.spawned[0]?.argv).toEqual([
+			ompExecutable,
+			"--mode",
+			"rpc",
+			"--no-title",
+			"--provider",
+			"p",
+			"--model",
+			"m",
+			"--session-dir",
+			join(dir, "s"),
+			"--config",
+			"/o.yml",
+			"--thinking",
+			"low",
+			"--append-system-prompt",
+			"S",
+		]);
+		expect(peer.spawned[0]?.options).toEqual({
+			cwd: join(dir, "ws"),
+			env: { PATH: process.env.PATH ?? "", OMP_WIKI_NOTE_DISABLE: "1" },
+		});
+	} finally {
+		await driver.stop();
+	}
 });
 
 test("FakeOmpDriver: entriesSince is strict and returns leafId", async () => {
@@ -226,150 +228,51 @@ test("leafIdViaCursor propagates other errors and leaves the cache untouched", a
 	expect(cache.since).toBe("e1");
 });
 
-/** Feed a fully-buffered stdout stand-in to `tapExtensionUi`; both callbacks collect synchronously. */
-function lineStream(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
-	return new ReadableStream<Uint8Array>({
-		start(controller) {
-			for (const chunk of chunks) controller.enqueue(chunk);
-			controller.close();
-		},
-	});
-}
-
-async function tapped(stream: ReadableStream<Uint8Array>): Promise<{
-	events: OmpEvent[];
-	replies: Array<Record<string, unknown>>;
-}> {
+/** An `ExtensionUiTap` with its events and replies collected; `untilReplies` resolves once `count` were written. */
+function uiTap(answer?: OmpDialogAnswerer) {
 	const events: OmpEvent[] = [];
-	const replies: Array<Record<string, unknown>> = [];
-	await tapExtensionUi(
-		stream,
-		(event) => events.push(event),
-		(frame) => replies.push(frame),
-	);
-	return { events, replies };
-}
-
-async function until(condition: () => boolean, timeoutMs = 2000): Promise<void> {
-	const deadline = performance.now() + timeoutMs;
-	while (!condition()) {
-		if (performance.now() > deadline) throw new Error("condition not met before timeout");
-		await Bun.sleep(1);
-	}
-}
-
-test("tapExtensionUi without an answerer emits events from chunk-split lines and instantly cancels every dialog", async () => {
-	const encoder = new TextEncoder();
-	const dialogs = ["select", "confirm", "input", "editor", "ask"];
-	const payload = [
-		...dialogs.map((method, index) => JSON.stringify({ type: "extension_ui_request", method, id: `u${index + 1}` })),
-		JSON.stringify({ type: "extension_ui_request", method: "status_widget", id: "u9" }), // answerable: no cancel
-		JSON.stringify({ type: "message.update", seq: 3 }), // not a UI request: no event
-		"",
-	].join("\n");
-	const bytes = encoder.encode(payload);
-	// Irregular slices so JSON tokens are cut mid-way across chunk boundaries.
-	const { events, replies } = await tapped(
-		lineStream([bytes.slice(0, 5), bytes.slice(5, 6), bytes.slice(6, 31), bytes.slice(31)]),
-	);
-	expect(events).toEqual([
-		...dialogs.map((method, index) => ({ type: "extension_ui_request", method, id: `u${index + 1}` })),
-		{ type: "extension_ui_request", method: "status_widget", id: "u9" },
-	]);
-	expect(replies).toEqual(
-		dialogs.map((_method, index) => ({ type: "extension_ui_response", id: `u${index + 1}`, cancelled: true })),
-	);
-});
-
-test("tapExtensionUi ignores noise, malformed JSON lines, and frames without the request type", async () => {
-	const encoder = new TextEncoder();
-	const payload = [
-		"plain child log line",
-		JSON.stringify({ type: "other", note: 'mentions "extension_ui_request" but is not one' }),
-		'{"type":"extension_ui_request","method":"select","id":"truncated', // complete line, incomplete JSON
-		JSON.stringify({ type: "extension_ui_request" }), // no method/id: emitted once, never answered
-		'{"type":"extension_ui_request","method":"confirm","id":"tail"', // no trailing newline: never parsed
-	].join("\n");
-	const { events, replies } = await tapped(lineStream([encoder.encode(payload)]));
-	expect(events).toEqual([{ type: "extension_ui_request", method: undefined, id: undefined }]);
-	expect(replies).toEqual([]);
-});
-
-test("tapExtensionUi reassembles UTF-8 sequences split across chunks", async () => {
-	const encoder = new TextEncoder();
-	const line = `${JSON.stringify({ type: "extension_ui_request", method: "ask", id: "물음표" })}\n`;
-	const bytes = encoder.encode(line);
-	// Split one byte into the 3-byte "물" sequence: the streaming decoder must hold the partial character.
-	const split = encoder.encode('{"type":"extension_ui_request","method":"ask","id":"').length + 1;
-	const { events, replies } = await tapped(lineStream([bytes.slice(0, split), bytes.slice(split)]));
-	expect(events).toEqual([{ type: "extension_ui_request", method: "ask", id: "물음표" }]);
-	expect(replies).toEqual([{ type: "extension_ui_response", id: "물음표", cancelled: true }]);
-});
-
-test("tapExtensionUi swallows stream errors after processing earlier chunks", async () => {
-	let controller!: ReadableStreamDefaultController<Uint8Array>;
-	const stream = new ReadableStream<Uint8Array>({
-		start(c) {
-			controller = c;
-		},
-	});
-	const events: OmpEvent[] = [];
-	const replies: Array<Record<string, unknown>> = [];
-	const tap = tapExtensionUi(
-		stream,
-		(event) => events.push(event),
-		(frame) => replies.push(frame),
-	);
-	controller.enqueue(new TextEncoder().encode('{"type":"extension_ui_request","method":"select","id":"u1"}\n'));
-	await Bun.sleep(5); // let the chunk drain before the child's stdout dies
-	controller.error(new Error("child died"));
-	await expect(tap).resolves.toBeUndefined();
-	expect(events).toEqual([{ type: "extension_ui_request", method: "select", id: "u1" }]);
-	expect(replies).toEqual([{ type: "extension_ui_response", id: "u1", cancelled: true }]);
-});
-
-/** A live stdout stand-in: frames are written one line at a time while the tap runs. */
-function liveTap(answer: OmpDialogAnswerer) {
-	let controller!: ReadableStreamDefaultController<Uint8Array>;
-	const stream = new ReadableStream<Uint8Array>({
-		start(c) {
-			controller = c;
-		},
-	});
 	const replies: Array<Record<string, unknown>> = [];
 	let wanted: { count: number; resolve: () => void } | undefined;
-	const tap = tapExtensionUi(
-		stream,
-		() => undefined,
+	const tap = new ExtensionUiTap(
+		(event) => events.push(event),
 		(frame) => {
 			replies.push(frame);
 			if (wanted !== undefined && replies.length >= wanted.count) wanted.resolve();
 		},
 		answer,
 	);
-	const send = (frame: Record<string, unknown>) =>
-		controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: "extension_ui_request", ...frame })}\n`));
-	/** Resolves once `count` responses were written. */
+	const send = (frame: Record<string, unknown>) => tap.frame({ type: "extension_ui_request", ...frame });
 	const untilReplies = (count: number): Promise<void> => {
 		if (replies.length >= count) return Promise.resolve();
 		const reached = Promise.withResolvers<void>();
 		wanted = { count, resolve: reached.resolve };
 		return reached.promise;
 	};
-	return {
-		replies,
-		untilReplies,
-		send,
-		close: () => {
-			controller.close();
-			return tap;
-		},
-	};
+	return { tap, events, replies, send, untilReplies };
 }
 
-test("tapExtensionUi hands dialogs to the answerer and writes its response; undefined, a throw or a bad frame is cancelled", async () => {
+test("ExtensionUiTap without an answerer emits every request and instantly cancels every dialog", () => {
+	const { tap, events, replies, send } = uiTap();
+	const dialogs = ["select", "confirm", "input", "editor", "ask"];
+	dialogs.forEach((method, index) => {
+		send({ method, id: `u${index + 1}` });
+	});
+	send({ method: "status_widget", id: "u9" }); // answerable: no cancel
+	tap.frame({ type: "message.update", seq: 3 }); // not a UI request: no event
+	send({}); // no method/id: emitted once, never answered
+	expect(events).toEqual([
+		...dialogs.map((method, index) => ({ type: "extension_ui_request", method, id: `u${index + 1}` })),
+		{ type: "extension_ui_request", method: "status_widget", id: "u9" },
+		{ type: "extension_ui_request", method: undefined, id: undefined },
+	]);
+	expect(replies).toEqual(
+		dialogs.map((_method, index) => ({ type: "extension_ui_response", id: `u${index + 1}`, cancelled: true })),
+	);
+});
+
+test("ExtensionUiTap hands dialogs to the answerer and writes its response; undefined, a throw or a bad frame is cancelled", async () => {
 	const seen: string[] = [];
-	const live = liveTap(async (request) => {
+	const live = uiTap(async (request) => {
 		seen.push(request.method);
 		if (request.method === "select") return { value: request.options[1] ?? "" };
 		if (request.method === "confirm") return undefined;
@@ -381,7 +284,7 @@ test("tapExtensionUi hands dialogs to the answerer and writes its response; unde
 	live.send({ method: "select", id: "u4", title: "t" }); // no options: never reaches the answerer
 	live.send({ method: "notify", id: "u5", message: "hi" }); // not a dialog: no response
 	await live.untilReplies(4);
-	await live.close();
+	live.tap.close();
 	expect(seen).toEqual(["select", "confirm", "input"]);
 	expect(new Set(live.replies.map((frame) => JSON.stringify(frame)))).toEqual(
 		new Set(
@@ -395,23 +298,22 @@ test("tapExtensionUi hands dialogs to the answerer and writes its response; unde
 	);
 });
 
-test("tapExtensionUi: a select frame carries omp's selectionMarker to the answerer, and none when omp sends none", async () => {
+test("ExtensionUiTap: a select frame carries omp's selectionMarker to the answerer, and none when omp sends none", async () => {
 	const seen: unknown[] = [];
-	const live = liveTap(async (request) => {
+	const live = uiTap(async (request) => {
 		seen.push(request.method === "select" ? request.selectionMarker : "n/a");
 		return { cancelled: true };
 	});
 	live.send({ method: "select", id: "u1", title: "t", options: ["a"], selectionMarker: "checkbox" });
 	live.send({ method: "select", id: "u2", title: "t", options: ["a"] });
 	await live.untilReplies(2);
-	await live.close();
 	expect(new Set(seen)).toEqual(new Set(["checkbox", undefined]));
 });
 
-test("tapExtensionUi: omp's cancel aborts the waiting answer and its late response is never written", async () => {
+test("ExtensionUiTap: omp's cancel aborts the waiting answer and its late response is never written", async () => {
 	const late = Promise.withResolvers<OmpDialogResponse>();
 	const aborted = Promise.withResolvers<void>();
-	const live = liveTap(async (_request, signal) => {
+	const live = uiTap(async (_request, signal) => {
 		signal.addEventListener("abort", () => aborted.resolve(), { once: true });
 		return late.promise;
 	});
@@ -420,281 +322,117 @@ test("tapExtensionUi: omp's cancel aborts the waiting answer and its late respon
 	await aborted.promise;
 	late.resolve({ value: "a" });
 	await late.promise;
-	await live.close();
 	expect(live.replies).toEqual([]);
 });
 
-/**
- * Source of the RpcClient stand-in written into a fake omp package tree: `RpcOmpDriver.start()` imports
- * `<packageRoot>/src/modes/rpc/rpc-client.ts` resolved from the realpath of `ompExecutable`, so the fixture must
- * provide the full method surface `missingRpcMethods()` checks. Tests reach the live instance through the static
- * `instances` list and drive prompt resolution by hand to reproduce the wire races.
- */
-const FAKE_RPC_CLIENT_SOURCE = `
-// Unit-test stand-in for omp's RpcClient. The full method surface is required because missingRpcMethods()
-// checks the prototype before the driver accepts the module.
-type Listener = (payload: unknown) => void;
+test("ExtensionUiTap: close() aborts every waiting answer (the child is gone)", async () => {
+	const aborted = Promise.withResolvers<void>();
+	const live = uiTap(async (_request, signal) => {
+		signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+		return Promise.withResolvers<OmpDialogResponse>().promise;
+	});
+	live.send({ method: "confirm", id: "u1", title: "t", message: "m" });
+	live.tap.close();
+	await aborted.promise;
+	expect(live.replies).toEqual([]);
+});
 
-export class RpcClient {
-	static instances: RpcClient[] = [];
-	options: unknown;
-	eventListener: Listener | undefined;
-	sessionListener: Listener | undefined;
-	promptResultListener: Listener | undefined;
-	promptCounter = 0;
-	promptDeferred = new Map<string, { resolve: (value: string) => void; reject: (error: unknown) => void }>();
-	autoResolvePrompts = true;
-	lastAssistantText = "fake assistant text";
-
-	constructor(options: unknown) {
-		RpcClient.instances.push(this);
-		this.options = options;
-	}
-
-	stopCalls = 0;
-	async start(): Promise<void> {}
-	async stop(): Promise<void> {
-		this.stopCalls += 1;
-	}
-
-	onEvent(listener: Listener): () => void {
-		this.eventListener = listener;
-		return () => {
-			this.eventListener = undefined;
-		};
-	}
-
-	// Like omp's RpcClient, the session listener receives every frame (agent events included), not only session-only ones.
-	onSessionEvent(listener: Listener): () => void {
-		this.sessionListener = listener;
-		return () => {
-			this.sessionListener = undefined;
-		};
-	}
-
-	emitSessionEvent(event: unknown): void {
-		this.sessionListener?.(event);
-	}
-
-	onPromptResult(listener: Listener): () => void {
-		this.promptResultListener = listener;
-		return () => {
-			this.promptResultListener = undefined;
-		};
-	}
-
-	prompt(_message: string): Promise<string> {
-		this.promptCounter += 1;
-		const opRef = "op-" + String(this.promptCounter);
-		return new Promise<string>((resolve, reject) => {
-			this.promptDeferred.set(opRef, { resolve, reject });
-			if (this.autoResolvePrompts) resolve(opRef);
-		});
-	}
-
-	emitPromptResult(frame: unknown): void {
-		this.promptResultListener?.(frame);
-	}
-
-	resolvePrompt(opRef: string): void {
-		this.promptDeferred.get(opRef)?.resolve(opRef);
-	}
-
-	async steer(_message: string): Promise<void> {}
-	// Command types sent, as omp's RpcClient frames them (\`{ type }\`), for the abort calls.
-	sentTypes: string[] = [];
-	async abort(): Promise<void> {
-		this.sentTypes.push("abort");
-	}
-	async abortAndRestoreQueue(): Promise<unknown> {
-		this.sentTypes.push("abort_and_restore_queue");
-		return { steering: [{ text: "steered" }], followUp: [] };
-	}
-	async newSession(): Promise<{ cancelled: boolean }> {
-		return { cancelled: false };
-	}
-	async openSession(_sessionDir: string): Promise<{ cancelled: boolean; resumed: boolean; sessionId: string }> {
-		return { cancelled: false, resumed: false, sessionId: "fake-session" };
-	}
-	// Merged into get_state's answer (e.g. a contextUsage).
-	stateExtra: Record<string, unknown> = {};
-	async getState(): Promise<Record<string, unknown>> {
-		return {
-			sessionId: "fake-session",
-			isStreaming: false,
-			isCompacting: false,
-			isSettled: true,
-			queuedMessageCount: 0,
-			messageCount: 0,
-			...this.stateExtra,
-		};
-	}
-	async getEntries(_since?: string): Promise<Record<string, unknown>> {
-		return { entries: [], leafId: null };
-	}
-	async getLastAssistantText(): Promise<string | null> {
-		return this.lastAssistantText;
-	}
-	async switchSession(_sessionPath: string): Promise<{ cancelled: boolean }> {
-		return { cancelled: false };
-	}
-	async getAvailableModels(): Promise<Array<{ provider: string; id: string }>> {
-		return [];
-	}
-	async setModel(provider: string, modelId: string): Promise<{ provider: string; id: string }> {
-		return { provider, id: modelId };
-	}
-	async getAvailableThinkingLevels(): Promise<string[]> {
-		return [];
-	}
-	async setThinkingLevel(_level: string): Promise<void> {}
-	async compact(_customInstructions?: string): Promise<{ summary: string; tokensBefore: number }> {
-		return { summary: "", tokensBefore: 0 };
-	}
-	async setTodos(_phases: unknown): Promise<void> {}
-	async btw(_question: string): Promise<unknown> {
-		return { id: "btw-1", status: "running" };
-	}
-	async cancelBtw(_recordId?: string): Promise<boolean> {
-		return true;
-	}
-	onBtwRecord(_listener: Listener): () => void {
-		return () => undefined;
-	}
-}
-`;
-
-interface FakeRpcClient {
-	autoResolvePrompts: boolean;
-	stopCalls: number;
-	sentTypes: string[];
-	stateExtra: Record<string, unknown>;
-	emitSessionEvent(event: unknown): void;
-	emitPromptResult(frame: unknown): void;
-	resolvePrompt(opRef: string): void;
-}
-
-interface FakeRpcClientModule {
-	RpcClient: { instances: FakeRpcClient[] };
-}
-
-/**
- * Minimal omp install layout that satisfies `RpcOmpDriver.start()` without spawning anything: an executable at
- * `<root>/bin/omp` (only realpath'ed and stat'ed), the fixture rpc-client module, and a stub `@oh-my-pi/pi-utils`
- * for `Bun.resolveSync`. Paths are derived from the realpath so the test imports the exact module the driver does.
- */
-function fakeOmpPackage(
-	dir: string,
-	options: { spawnChild?: boolean } = {},
-): { ompExecutable: string; clientModule: string; utilsModule: string } {
-	const bin = join(dir, "fake-omp-pkg", "bin");
-	mkdirSync(bin, { recursive: true });
-	const ompExecutable = join(bin, "omp");
-	writeFileSync(ompExecutable, "#!/bin/sh\nexit 1\n"); // never executed; only realpath'ed and stat'ed
-	chmodSync(ompExecutable, 0o755);
-	const root = dirname(dirname(realpathSync(ompExecutable)));
-	const clientModule = join(root, "src/modes/rpc/rpc-client.ts");
-	mkdirSync(dirname(clientModule), { recursive: true });
-	writeFileSync(
-		clientModule,
-		options.spawnChild === true
-			? FAKE_RPC_CLIENT_SOURCE.replace(
-					"async start(): Promise<void> {}",
-					"async start(): Promise<void> { (this.options as { spawn(args: string[]): unknown }).spawn([]); }",
-				)
-			: FAKE_RPC_CLIENT_SOURCE,
-	);
-	const utilsDir = join(root, "node_modules/@oh-my-pi/pi-utils");
-	mkdirSync(utilsDir, { recursive: true });
-	writeFileSync(
-		join(utilsDir, "package.json"),
-		JSON.stringify({ name: "@oh-my-pi/pi-utils", version: "0.0.0-fake", type: "module", main: "index.js" }),
-	);
-	const utilsModule = join(utilsDir, "index.js");
-	writeFileSync(
-		utilsModule,
-		options.spawnChild === true
-			? [
-					"// A child that never exits; what the driver writes to its stdin is kept in `written`, and `stdout.push`",
-					"// writes a raw text to its stdout.",
-					"export const written = [];",
-					"export const stdout = { push: undefined };",
-					"export const ptree = { spawn() { return {",
-					"  pid: 4242, stdin: { write(data) { written.push(String(data)); } },",
-					"  stdout: new ReadableStream({ start(c) { stdout.push = (text) => c.enqueue(new TextEncoder().encode(text)); } }),",
-					"  peekStderr: () => '', kill() {}, exited: new Promise(() => {}),",
-					"}; } };",
-					"",
-				].join("\n")
-			: "export const ptree = { spawn() { throw new Error('ptree.spawn is not expected in unit tests'); } };\n",
-	);
-	return { ompExecutable, clientModule, utilsModule };
-}
-
-test("RpcOmpDriver buffers a final that arrives before prompt() resolves, then delivers it on admission", async () => {
-	const dir = tempDir("ompbot-fakeomp-");
-	const tree = fakeOmpPackage(dir);
+/** A driver over a fake peer, with its finals, warn log lines and a barrier that proves earlier stdout was read. */
+async function startPeerDriver(peer = new FakeOmpPeer()) {
+	const dir = tempDir("ompbot-peer-");
+	const warns: string[] = [];
 	const driver = new RpcOmpDriver({
-		ompExecutable: tree.ompExecutable,
-		cwd: dir,
+		ompExecutable: fakeOmpExecutable(dir),
+		cwd: join(dir, "ws"),
 		sessionDir: join(dir, "s"),
-		bunExecutable: process.execPath, // tests already run under bun
+		spawn: peer.spawn,
+		log: createLogger({ sink: (line) => warns.push(line), clock: { now: () => 0 }, redact }),
 	});
 	await driver.start();
+	const finals: OmpFinal[] = [];
+	const finalWaiters: Array<{ count: number; resolve: () => void }> = [];
+	driver.onFinal((final) => {
+		finals.push(final);
+		for (const waiter of finalWaiters.filter((w) => finals.length >= w.count)) waiter.resolve();
+	});
+	/** Resolves once `count` finals arrived. */
+	const untilFinals = (count: number): Promise<void> => {
+		if (finals.length >= count) return Promise.resolve();
+		const reached = Promise.withResolvers<void>();
+		finalWaiters.push({ count, resolve: reached.resolve });
+		return reached.promise;
+	};
+	let barrier = 0;
+	/** Resolves once every line written so far was read: a notify frame pushed last comes back as an event. */
+	const readAll = (): Promise<void> => {
+		const id = `barrier-${++barrier}`;
+		const seen = Promise.withResolvers<void>();
+		const off = driver.onEvent((event) => {
+			if (event.type === "extension_ui_request" && event.id === id) {
+				off();
+				seen.resolve();
+			}
+		});
+		peer.push({ type: "extension_ui_request", method: "notify", id });
+		return seen.promise;
+	};
+	return { driver, peer, finals, untilFinals, warns, readAll };
+}
+
+const promptResult = (id: string, status: string, extra: Record<string, unknown> = {}) => ({
+	type: "prompt_result",
+	id,
+	agentInvoked: true,
+	status,
+	sessionSettled: true,
+	...extra,
+});
+
+test("RpcOmpDriver buffers a final that arrives before prompt() resolves, then delivers it on admission", async () => {
+	const peer = new FakeOmpPeer();
+	peer.replies.set("prompt", () => "hold");
+	const { driver, finals, untilFinals, readAll } = await startPeerDriver(peer);
 	try {
-		const fixture = (await import(tree.clientModule)) as FakeRpcClientModule;
-		const client = fixture.RpcClient.instances.at(-1);
-		if (!client) throw new Error("fake RpcClient was not constructed");
-		client.autoResolvePrompts = false;
-		const finals: OmpFinal[] = [];
-		driver.onFinal((final) => finals.push(final));
 		let promptSettled = false;
 		const promptPromise = driver.prompt("hello");
 		void promptPromise.then(
 			() => (promptSettled = true),
 			() => (promptSettled = true),
 		);
+		const command = await peer.command((c) => c.type === "prompt");
+		const opRef = command.id ?? "";
 
-		// The wire result lands before client.prompt() resolves: it must be buffered, not delivered.
-		client.emitPromptResult({ id: "op-1", status: "completed" });
-		await Bun.sleep(10);
+		// The wire result lands before the prompt response: it must be buffered, not delivered.
+		peer.push(promptResult(opRef, "completed"));
+		await readAll();
 		expect(promptSettled).toBe(false);
 		expect(finals).toEqual([]);
 
-		client.resolvePrompt("op-1");
-		expect(await promptPromise).toBe("op-1");
-		await until(() => finals.length > 0);
-		expect(finals[0]).toEqual({ opRef: "op-1", status: "completed", text: "fake assistant text" });
+		peer.respond(command, { data: { agentInvoked: true } });
+		expect(await promptPromise).toBe(opRef);
+		await untilFinals(1);
+		expect(finals[0]).toEqual({ opRef, status: "completed", text: "fake assistant text" });
 
 		// Same race with an error result: buffered, then delivered with the mapped error message.
-		const promptPromise2 = driver.prompt("second");
-		client.emitPromptResult({ id: "op-2", status: "error", error: { message: "boom" } });
-		client.resolvePrompt("op-2");
-		expect(await promptPromise2).toBe("op-2");
-		await until(() => finals.length > 1);
-		expect(finals[1]).toEqual({ opRef: "op-2", status: "error", text: "", error: "boom" });
+		const second = driver.prompt("second");
+		const command2 = await peer.command((c) => c.type === "prompt" && c.id !== opRef);
+		peer.push(promptResult(command2.id ?? "", "error", { error: { message: "boom" } }));
+		peer.respond(command2, { data: {} });
+		expect(await second).toBe(command2.id ?? "");
+		await untilFinals(2);
+		expect(finals[1]).toEqual({ opRef: command2.id ?? "", status: "error", text: "", error: "boom" });
 	} finally {
 		await driver.stop();
 	}
 });
 
-test("RpcOmpDriver session event: forwards retry/fallback session events once and drops agent events the agent listener already delivers", async () => {
-	const dir = tempDir("ompbot-fakeomp-");
-	const tree = fakeOmpPackage(dir);
-	const driver = new RpcOmpDriver({
-		ompExecutable: tree.ompExecutable,
-		cwd: dir,
-		sessionDir: join(dir, "s"),
-		bunExecutable: process.execPath,
-	});
+test("RpcOmpDriver forwards retry/fallback session events once and agent events through the agent listener", async () => {
+	const { driver, peer, readAll } = await startPeerDriver();
 	const received: OmpEvent[] = [];
-	driver.onEvent((event) => received.push(event));
-	await driver.start();
+	driver.onEvent((event) => {
+		if (event.type !== "extension_ui_request") received.push(event);
+	});
 	try {
-		const fixture = (await import(tree.clientModule)) as FakeRpcClientModule;
-		const client = fixture.RpcClient.instances.at(-1);
-		if (!client) throw new Error("fake RpcClient was not constructed");
-
 		const retry = {
 			type: "auto_retry_start",
 			attempt: 1,
@@ -702,19 +440,13 @@ test("RpcOmpDriver session event: forwards retry/fallback session events once an
 			delayMs: 500,
 			errorMessage: "429 rate_limit_error",
 		};
-		client.emitSessionEvent(retry);
-		expect(received).toEqual([retry]);
-
-		// omp's session listener also sees agent events; forwarding them would double every tool_execution_start.
-		client.emitSessionEvent({ type: "tool_execution_start", toolName: "bash" });
-		client.emitSessionEvent({ type: "message_update" });
-		expect(received).toEqual([retry]);
-
+		const tool = { type: "tool_execution_start", toolName: "bash" };
 		const end = { type: "auto_retry_end", success: false, attempt: 3 }; // malformed on purpose: no finalError
 		const fallback = { type: "retry_fallback_applied", from: "zai/a", to: "zai/b", role: "default", reason: "429" };
-		client.emitSessionEvent(end);
-		client.emitSessionEvent(fallback);
-		expect(received).toEqual([retry, end, fallback]);
+		for (const frame of [retry, tool, { type: "notice", text: "n" }, end, fallback]) peer.push(frame);
+		await readAll();
+		// tool_execution_start once (agent listener only), notice not forwarded at all.
+		expect(received).toEqual([retry, tool, end, fallback]);
 	} finally {
 		await driver.stop();
 	}
@@ -723,20 +455,18 @@ test("RpcOmpDriver session event: forwards retry/fallback session events once an
 test("RpcOmpDriver opts in to the ask dialog only when an answerer is injected", async () => {
 	const optIns: unknown[] = [];
 	for (const answerDialog of [undefined, async () => ({ value: "x" })] as const) {
-		const dir = tempDir("ompbot-fakeomp-");
-		const tree = fakeOmpPackage(dir, { spawnChild: true });
+		const dir = tempDir("ompbot-ask-");
+		const peer = new FakeOmpPeer();
 		const driver = new RpcOmpDriver({
-			ompExecutable: tree.ompExecutable,
+			ompExecutable: fakeOmpExecutable(dir),
 			cwd: dir,
 			sessionDir: join(dir, "s"),
-			bunExecutable: process.execPath,
+			spawn: peer.spawn,
 			...(answerDialog === undefined ? {} : { answerDialog }),
 		});
 		await driver.start();
 		try {
-			const utils = (await import(tree.utilsModule)) as { written: string[] };
-			const frames = utils.written.map((line) => JSON.parse(line) as { type?: string; enabled?: unknown });
-			optIns.push(...frames.filter((frame) => frame.type === "set_ask_dialog").map((frame) => frame.enabled));
+			optIns.push((await peer.command((c) => c.type === "set_ask_dialog")).enabled);
 		} finally {
 			await driver.stop();
 		}
@@ -744,196 +474,148 @@ test("RpcOmpDriver opts in to the ask dialog only when an answerer is injected",
 	expect(optIns).toEqual([false, true]);
 });
 
-test("missingRpcMethods names onSessionEvent when the RpcClient class lacks it", () => {
-	class Old {}
-	for (const name of REQUIRED_RPC_METHODS) {
-		if (name !== "onSessionEvent") Object.defineProperty(Old.prototype, name, { value: () => undefined });
-	}
-	expect(missingRpcMethods(Old)).toEqual(["onSessionEvent"]);
-});
-
-/** A started driver over the non-spawning fake package and its fake RpcClient. */
-async function startFakeClientDriver(): Promise<{ driver: RpcOmpDriver; client: FakeRpcClient }> {
-	const dir = tempDir("ompbot-fakeomp-");
-	const tree = fakeOmpPackage(dir);
-	const driver = new RpcOmpDriver({
-		ompExecutable: tree.ompExecutable,
-		cwd: dir,
-		sessionDir: join(dir, "s"),
-		bunExecutable: process.execPath,
-	});
-	await driver.start();
-	// The fixture module is written to a temp dir at run time: no static import can name it.
-	const fixture = (await import(tree.clientModule)) as FakeRpcClientModule;
-	const client = fixture.RpcClient.instances.at(-1);
-	if (!client) throw new Error("fake RpcClient was not constructed");
-	return { driver, client };
-}
-
 test("RpcOmpDriver.abortAndClearQueue sends abort_and_restore_queue (not a plain abort) and drops the returned queue", async () => {
-	const { driver, client } = await startFakeClientDriver();
+	const { driver, peer } = await startPeerDriver();
 	try {
 		expect(await driver.abortAndClearQueue()).toBeUndefined();
-		expect(client.sentTypes).toEqual(["abort_and_restore_queue"]);
+		const types = peer.commands.map((c) => c.type);
+		expect(types).toContain("abort_and_restore_queue");
+		expect(types).not.toContain("abort");
 	} finally {
 		await driver.stop();
 	}
 });
 
 test("RpcOmpDriver.state() moves contextUsage into context and never makes up a 0", async () => {
-	const { driver, client } = await startFakeClientDriver();
+	const peer = new FakeOmpPeer();
+	let extra: Record<string, unknown> = {};
+	peer.replies.set("get_state", () => ({
+		data: {
+			sessionId: "fake-session",
+			isStreaming: false,
+			isCompacting: false,
+			isSettled: true,
+			queuedMessageCount: 0,
+			messageCount: 0,
+			...extra,
+		},
+	}));
+	const { driver } = await startPeerDriver(peer);
 	try {
-		client.stateExtra = { contextUsage: { tokens: 123000, contextWindow: 1000000, percent: 12.3 } };
+		extra = { contextUsage: { tokens: 123000, contextWindow: 1000000, percent: 12.3 } };
 		expect((await driver.state()).context).toEqual({ tokens: 123000, window: 1000000, percent: 12.3 });
 
-		client.stateExtra = {};
+		extra = {};
 		expect("context" in (await driver.state())).toBe(false);
 
-		client.stateExtra = { contextUsage: { tokens: null, contextWindow: 1000000, percent: null } };
+		extra = { contextUsage: { tokens: null, contextWindow: 1000000, percent: null } };
 		expect((await driver.state()).context).toEqual({ tokens: null, window: 1000000, percent: null });
 
-		client.stateExtra = { contextUsage: { tokens: "123000", contextWindow: 1000000, percent: 12.3 } };
+		extra = { contextUsage: { tokens: "123000", contextWindow: 1000000, percent: 12.3 } };
 		expect((await driver.state()).context).toEqual({ tokens: null, window: 1000000, percent: null });
 
-		client.stateExtra = { contextUsage: { tokens: 0, contextWindow: 0, percent: 0 } };
+		extra = { contextUsage: { tokens: 0, contextWindow: 0, percent: 0 } };
 		expect("context" in (await driver.state())).toBe(false);
 	} finally {
 		await driver.stop();
 	}
 });
 
-/** A driver over the spawning fake package, its fake RpcClient, a raw stdout writer and the warn logs. */
-async function startStreamDriver(): Promise<{
-	driver: RpcOmpDriver;
-	client: FakeRpcClient;
-	push: (text: string) => void;
-	finals: OmpFinal[];
-	warns: string[];
-	/** Resolves once every line written so far was read: a dialog frame pushed last comes back as an event. */
-	readAll: () => Promise<void>;
-}> {
-	const dir = tempDir("ompbot-fakeomp-");
-	const tree = fakeOmpPackage(dir, { spawnChild: true });
-	const warns: string[] = [];
-	const driver = new RpcOmpDriver({
-		ompExecutable: tree.ompExecutable,
-		cwd: dir,
-		sessionDir: join(dir, "s"),
-		bunExecutable: process.execPath,
-		log: createLogger({ sink: (line) => warns.push(line), clock: { now: () => 0 }, redact }),
-	});
-	await driver.start();
-	const fixture = (await import(tree.clientModule)) as FakeRpcClientModule;
-	const client = fixture.RpcClient.instances.at(-1);
-	const utils = (await import(tree.utilsModule)) as { stdout: { push: (text: string) => void } };
-	if (!client) throw new Error("fake RpcClient was not constructed");
-	const finals: OmpFinal[] = [];
-	driver.onFinal((final) => finals.push(final));
-	let barrier = 0;
-	const readAll = (): Promise<void> => {
-		const id = `barrier-${++barrier}`;
-		const seen = Promise.withResolvers<void>();
-		const off = driver.onEvent((event) => {
-			if (event.type === "extension_ui_request" && (event as { id?: unknown }).id === id) {
-				off();
-				seen.resolve();
-			}
-		});
-		utils.stdout.push(`${JSON.stringify({ type: "extension_ui_request", method: "notify", id })}\n`);
-		return seen.promise;
-	};
-	return { driver, client, push: (text) => utils.stdout.push(text), finals, warns, readAll };
-}
-
-test("an unreadable stdout line during a prompt ends it with an error final and stops the child (#88)", async () => {
+test("an unreadable stdout line during a prompt is logged and skipped; the turn still ends with its own result (#88)", async () => {
 	for (const broken of ["{ this is not json", "null", "[1,2,3]"]) {
-		const { driver, client, push, finals } = await startStreamDriver();
+		const { driver, peer, finals, untilFinals, warns, readAll } = await startPeerDriver();
 		try {
 			const opRef = await driver.prompt("hi");
-			push(`${broken}\n`);
-			await until(() => finals.length > 0, 1000);
-			expect(finals, broken).toEqual([
-				{ opRef, status: "error", text: "", error: expect.stringContaining("omp stream unreadable") },
-			]);
-			expect(client.stopCalls, broken).toBe(1);
+			peer.push(`${broken}\n`);
+			await readAll();
+			expect(finals, broken).toEqual([]);
+			expect(
+				warns.filter((line) => line.includes("omp_stream_unreadable")),
+				broken,
+			).toHaveLength(1);
+			peer.push(promptResult(opRef, "completed"));
+			await untilFinals(1);
+			expect(finals, broken).toEqual([{ opRef, status: "completed", text: "fake assistant text" }]);
+			expect(peer.signals, broken).toEqual([]);
 		} finally {
 			await driver.stop();
 		}
 	}
 });
 
-test("blank lines and unknown event types do not end a turn; its own result still does (#88)", async () => {
-	const { driver, client, push, finals, warns, readAll } = await startStreamDriver();
+test("blank lines and unknown event types are neither logged nor routed (#88)", async () => {
+	const { driver, peer, finals, untilFinals, warns, readAll } = await startPeerDriver();
 	try {
 		const opRef = await driver.prompt("hi");
-		push(
+		peer.push(
 			`\n   \n${JSON.stringify({ type: "totally_unknown_event_type", payload: 1 })}\n${JSON.stringify({ type: 12345 })}\n`,
 		);
 		await readAll();
 		expect(finals).toEqual([]);
 		expect(warns.filter((line) => line.includes("omp_stream_unreadable"))).toEqual([]);
-		client.emitPromptResult({ id: opRef, status: "completed" });
-		await until(() => finals.length > 0, 1000);
+		peer.push(promptResult(opRef, "completed"));
+		await untilFinals(1);
 		expect(finals).toEqual([{ opRef, status: "completed", text: "fake assistant text" }]);
-		expect(client.stopCalls).toBe(0);
 	} finally {
 		await driver.stop();
 	}
 });
-
-test("an unreadable line with no prompt running is only logged (#88)", async () => {
-	const { driver, client, push, finals, warns, readAll } = await startStreamDriver();
-	try {
-		push("garbage line\n");
-		await readAll();
-		expect(finals).toEqual([]);
-		expect(client.stopCalls).toBe(0);
-		expect(warns.filter((line) => line.includes("omp_stream_unreadable"))).toHaveLength(1);
-	} finally {
-		await driver.stop();
-	}
-});
-
-const frameLine = (frame: Record<string, unknown>): string => `${JSON.stringify(frame)}\n`;
 
 test("qa-h n79: a local slash command (agentInvoked:false) ends with its command_output, not the last assistant text", async () => {
-	const { driver, client, push, finals, readAll } = await startStreamDriver();
+	const peer = new FakeOmpPeer();
+	let local = true;
+	peer.replies.set("prompt", () => (local ? { data: { agentInvoked: false } } : "hold"));
+	const { driver, finals, untilFinals } = await startPeerDriver(peer);
 	try {
-		// Admitted first: omp writes the output, then answers the prompt; no prompt_result follows.
-		const opRef = await driver.prompt("/usage");
-		push(frameLine({ type: "command_output", text: "Usage: 12 requests" }));
-		push(frameLine({ type: "command_output", text: "Cost: $0.10" }));
-		push(frameLine({ id: opRef, type: "response", command: "prompt", success: true, data: { agentInvoked: false } }));
-		await until(() => finals.length > 0, 1000);
+		// omp writes the output, then answers the prompt; no prompt_result follows.
+		const pending = driver.prompt("/usage");
+		peer.push({ type: "command_output", text: "Usage: 12 requests" });
+		peer.push({ type: "command_output", text: "Cost: $0.10" });
+		const opRef = await pending;
+		await untilFinals(1);
 		expect(finals).toEqual([{ opRef, status: "completed", text: "Usage: 12 requests\nCost: $0.10" }]);
 
-		// Read before prompt() resolves: held until admission, like a prompt_result. No output → "".
-		client.autoResolvePrompts = false;
+		// No output → "".
+		local = false;
 		const second = driver.prompt("/clear-todos");
-		push(frameLine({ id: "op-2", type: "response", command: "prompt", success: true, data: { agentInvoked: false } }));
-		await readAll();
-		expect(finals).toHaveLength(1);
-		client.resolvePrompt("op-2");
-		expect(await second).toBe("op-2");
-		await until(() => finals.length > 1, 1000);
-		expect(finals[1]).toEqual({ opRef: "op-2", status: "completed", text: "" });
+		const command = await peer.command((c) => c.type === "prompt" && c.id !== opRef);
+		peer.respond(command, { data: { agentInvoked: false } });
+		expect(await second).toBe(command.id ?? "");
+		await untilFinals(2);
+		expect(finals[1]).toEqual({ opRef: command.id ?? "", status: "completed", text: "" });
 	} finally {
 		await driver.stop();
 	}
 });
 
 test("qa-h n79: an ordinary prompt response (no agentInvoked:false) still waits for its prompt_result", async () => {
-	const { driver, client, push, finals, readAll } = await startStreamDriver();
+	const { driver, peer, finals, untilFinals, readAll } = await startPeerDriver();
 	try {
 		const opRef = await driver.prompt("hi");
-		push(frameLine({ id: opRef, type: "response", command: "prompt", success: true }));
-		push(frameLine({ id: opRef, type: "response", command: "prompt", success: true, data: { agentInvoked: true } }));
+		peer.push({ id: opRef, type: "response", command: "prompt", success: true, data: { agentInvoked: true } });
 		await readAll();
 		expect(finals).toEqual([]);
-		client.emitPromptResult({ id: opRef, status: "completed" });
-		await until(() => finals.length > 0, 1000);
+		peer.push(promptResult(opRef, "completed"));
+		await untilFinals(1);
 		expect(finals).toEqual([{ opRef, status: "completed", text: "fake assistant text" }]);
 	} finally {
+		await driver.stop();
+	}
+});
+
+test("RpcOmpDriver reports the child's own exit as unexpected and stop()'s exit as expected", async () => {
+	for (const how of ["crash", "stop"] as const) {
+		const { driver, peer } = await startPeerDriver();
+		const exits: Array<{ code: number | null; expected: boolean }> = [];
+		const exited = Promise.withResolvers<void>();
+		driver.onExit((info) => {
+			exits.push({ code: info.code, expected: info.expected });
+			exited.resolve();
+		});
+		if (how === "crash") peer.exit(7);
+		else await driver.stop();
+		await exited.promise;
+		expect(exits, how).toEqual([how === "crash" ? { code: 7, expected: false } : { code: 143, expected: true }]);
 		await driver.stop();
 	}
 });

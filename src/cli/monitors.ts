@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { oneLine } from "../channel/text";
@@ -162,11 +163,25 @@ export async function monitorsCommand(args: string[], homeDir: string): Promise<
 		// A home without a usable config takes the zone a config without `timezone` gets.
 		defaultTimezone: config?.timezone ?? hostTimezone(),
 	};
-	if (sub === "export" || sub === "apply") return portableCommand(sub, rest, homeDir, ctx);
-	if (sub !== "add" && sub !== "list" && sub !== "show" && sub !== "update" && sub !== "remove" && sub !== "test") {
+	if (
+		sub !== "export" &&
+		sub !== "apply" &&
+		sub !== "add" &&
+		sub !== "list" &&
+		sub !== "show" &&
+		sub !== "update" &&
+		sub !== "remove" &&
+		sub !== "test"
+	) {
 		process.stderr.write(`usage: ompbot monitors <add|list|show|update|remove|test|export|apply>\n${MONITORS_USAGE}`);
 		return 2;
 	}
+	// The ledger file is created on open, which fails with a raw SQLite error when the directory is not there.
+	if (!existsSync(homeDir)) {
+		process.stderr.write("monitors: home not initialized\n");
+		return 1;
+	}
+	if (sub === "export" || sub === "apply") return portableCommand(sub, rest, homeDir, ctx);
 	// `list --json` is a flag, every other subcommand takes the JSON text.
 	const listJson = sub === "list" && rest.includes("--json");
 	const { values, positionals } = parseArgs({

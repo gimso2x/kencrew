@@ -1,7 +1,8 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { TASK_RISKS, type TaskRisk } from "../tasks/docs";
 import { type AutoLandPolicy, checkBlockers, type LaneReviewConfident } from "../tasks/notify";
-import { formatConfidence } from "./review";
+import { formatConfidence, REVIEW_OVERLAY_YAML } from "./review";
+import { currentRuntime, gateChangedOf, overlayHash, receiptStale } from "./runtime";
 import {
 	INCONCLUSIVE_APPROVED,
 	INTEGRITY_APPROVED,
@@ -9,6 +10,7 @@ import {
 	type LaneReview,
 	type LaneRow,
 	OWNER_ACCEPTED,
+	type RuntimeIdentity,
 } from "./status";
 import { defaultGit, type GitResult, type GitRunner, gitRunner, hiddenChanges } from "./verify";
 import { DEFAULT_LANE_RISK } from "./worktree";
@@ -465,10 +467,15 @@ export function createLaneLander(deps: LanderDeps): LandLane {
 	};
 }
 
+/** `laneLandBlockers` reason of a lane whose work goes out as a GitHub PR (`meta.externalPr`). */
+export const EXTERNAL_PR_LANE = "외부 PR 레인";
+
 /** `laneLandBlockers` reasons of the independent review (`taskAutoLand.review`); all start with `독립 리뷰`. */
 export const REVIEW_MISSING = "독립 리뷰 없음";
 export const REVIEW_BLOCK = "독립 리뷰 BLOCK";
 export const REVIEW_INCONCLUSIVE = "독립 리뷰 확인 불가";
+/** A receipt made on another runtime (`receiptStale`); the reason follows in parentheses. */
+export const REVIEW_STALE = "독립 리뷰 영수증 오래됨";
 /** A `CLEAR` receipt of a lane in the confident band whose confidence is missing or under `minConfidence`. */
 export const reviewUnsure = (confidence: number | undefined, minConfidence: number, risk: string): string =>
 	`독립 리뷰 CLEAR(${confidence === undefined ? "확신도 없음" : `확신도 ${formatConfidence(confidence)} < ${formatConfidence(minConfidence)}`}, 위험 ${risk})`;
@@ -477,6 +484,52 @@ export const reviewUnsure = (confidence: number | undefined, minConfidence: numb
 export const QA_MISSING = "실행 QA 없음";
 export const QA_FAIL = "실행 QA FAIL";
 export const QA_INCONCLUSIVE = "실행 QA 확인 불가";
+export const QA_STALE = "실행 QA 영수증 오래됨";
+
+/** What a receipt is compared against: this process's runtime and the model and overlay the policy asks for now. */
+export interface ReceiptNow {
+	identity: RuntimeIdentity;
+	review?: { model: string; overlay: string };
+	/** `overlay` is `undefined` when `qa.overlay` cannot be read now (nothing to compare). */
+	qa?: { model: string; overlay: string | undefined };
+}
+
+/** `ReceiptNow` of `policy` (reads `qa.overlay`'s content: a receipt's overlay hash covers it). */
+export function receiptNowOf(policy: AutoLandPolicy): ReceiptNow {
+	let qaOverlay: string | undefined;
+	if (policy.qa !== undefined) {
+		try {
+			qaOverlay = overlayHash(REVIEW_OVERLAY_YAML, readFileSync(policy.qa.overlay, "utf8"));
+		} catch {
+			qaOverlay = undefined;
+		}
+	}
+	return {
+		identity: currentRuntime(),
+		...(policy.review === undefined
+			? {}
+			: { review: { model: policy.review.model, overlay: overlayHash(REVIEW_OVERLAY_YAML) } }),
+		...(policy.qa === undefined ? {} : { qa: { model: policy.qa.model, overlay: qaOverlay } }),
+	};
+}
+
+/**
+ * Why `receipt` was made on a runtime that no longer counts (`undefined`: it counts, or there is none). The gate-source
+ * part reads what `primeGateChanges` cached: callers prime the receipts first.
+ */
+export function receiptStaleOf(
+	kind: "review" | "qa",
+	receipt: LaneReview | LaneQa | undefined,
+	now: ReceiptNow,
+): string | undefined {
+	if (receipt === undefined) return undefined;
+	const expected = kind === "review" ? now.review : now.qa;
+	return receiptStale(kind, receipt, now.identity, {
+		model: expected?.model,
+		overlay: expected?.overlay,
+		gateSourceChanged: gateChangedOf(receipt.runtime?.kencrew),
+	});
+}
 
 /**
  * Whether `taskAutoLand.qa` is set and `risk` (a lane's `DEFAULT_LANE_RISK` without one, a task's own) is at its
@@ -512,12 +565,15 @@ export function receiptBlockers(
 	sha: string | undefined,
 	risk: TaskRisk,
 	policy: AutoLandPolicy,
+	now: ReceiptNow = receiptNowOf(policy),
 ): string[] {
 	const blockers: string[] = [];
 	const band = confidentBand(risk, policy);
 	if (policy.review !== undefined) {
 		const { review } = receipts;
+		const stale = receiptStaleOf("review", review, now);
 		if (review === undefined || review.sha !== sha) blockers.push(REVIEW_MISSING);
+		else if (stale !== undefined) blockers.push(`${REVIEW_STALE}(${stale})`);
 		else if (review.verdict === "BLOCK") blockers.push(REVIEW_BLOCK);
 		else if (review.verdict === "inconclusive") blockers.push(`${REVIEW_INCONCLUSIVE}(${review.reason ?? "?"})`);
 		else if (band !== undefined && !(review.confidence !== undefined && review.confidence >= band.minConfidence)) {
@@ -526,7 +582,9 @@ export function receiptBlockers(
 	}
 	if (laneQaRisk(risk, policy)) {
 		const { qa } = receipts;
+		const stale = receiptStaleOf("qa", qa, now);
 		if (qa === undefined || qa.sha !== sha) blockers.push(QA_MISSING);
+		else if (stale !== undefined) blockers.push(`${QA_STALE}(${stale})`);
 		else if (qa.verdict === "FAIL") blockers.push(QA_FAIL);
 		else if (qa.verdict === "inconclusive") blockers.push(`${QA_INCONCLUSIVE}(${qa.reason ?? "?"})`);
 	}
@@ -543,15 +601,19 @@ export function receiptBlockers(
  * risk reason only: it is never reviewed, so a missing review is no reason of its own. Files of the claim outside the
  * lane's `scope`, a scope check that failed, and leftovers the claim marked `blocking` hold the merge too. With
  * `policy.qa` a reviewable lane at its `minRisk` or above needs the claim commit's `PASS` QA receipt; an unreviewable
- * one gets no QA reason (it is never run). Without `policy.qa` nothing here changes.
+ * one gets no QA reason (it is never run). Without `policy.qa` nothing here changes. A receipt made on another runtime
+ * (`receiptStale`) holds the merge until it is re-made.
  */
 export function laneLandBlockers(
 	lane: LaneRow,
 	policy: AutoLandPolicy,
 	repoMatched: boolean,
 	frozen: boolean,
+	now: ReceiptNow = receiptNowOf(policy),
 ): string[] {
 	const blockers: string[] = [];
+	// An external PR lane is published as a PR, never merged into its base branch (doc/plans/lane-external-pr.md 설계 4).
+	if (lane.meta.externalPr !== undefined) blockers.push(EXTERNAL_PR_LANE);
 	if (!repoMatched) blockers.push("저장소가 taskAutoLand.repos 밖");
 	const risk = lane.meta.risk ?? DEFAULT_LANE_RISK;
 	const band = confidentBand(lane.meta.risk, policy);
@@ -580,7 +642,7 @@ export function laneLandBlockers(
 	if (blocking > 0) blockers.push(`막는 남은 일 ${blocking}개`);
 	if (!unreviewable) {
 		const receipts = { review: lane.meta.review, qa: lane.meta.qa };
-		blockers.push(...receiptBlockers(receipts, lane.meta.sha, risk, policy));
+		blockers.push(...receiptBlockers(receipts, lane.meta.sha, risk, policy, now));
 	}
 	if (frozen) blockers.push("동결 중");
 	return blockers;

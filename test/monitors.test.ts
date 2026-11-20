@@ -911,6 +911,16 @@ describe("monitors: cron command (verbatim, no turn)", () => {
 		expect(stages().every((stage) => stage === "failed_no_retry")).toBe(true);
 	});
 
+	test("with a Discord alert channel the failure notice goes there instead of the owner DM", async () => {
+		const ALERT = "300000000000000077";
+		store.setAlertChannel({ discord: ALERT });
+		const monitor = commandMonitor('#!/bin/sh\necho "agy quota exhausted"\nexit 3\n');
+		clock.advance(MINUTE);
+		await run();
+		const rows = store.listDeliveries({ originKey: monitorOrigin(monitor.id) });
+		expect(rows.map((row) => row.threadRef)).toEqual([`${ALERT}:-`]);
+	});
+
 	test("a command past its timeoutMs is killed and fails with `timed out after <n>s`", async () => {
 		const pidFile = join(dir, "pid");
 		// Real 1 s (the smallest timeoutMs): this exercises the runner's own timer and a real SIGKILL of the group.

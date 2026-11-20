@@ -73,6 +73,8 @@ export type LaneHarnessExtra = Partial<
 		| "completionNudges"
 		| "pidAlive"
 		| "wikiNotes"
+		| "requestApproval"
+		| "prTools"
 	>
 > & {
 	driver?: LaneDriverFactory;

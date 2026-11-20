@@ -481,6 +481,7 @@ const flowOf = (tasks: Array<{ id: string; created: string; closed?: string }>):
 	total: tasks.length,
 	here: tasks.find((task) => task.closed === undefined)?.id ?? null,
 	now: "지금 줄",
+	discordHref: "",
 	tasks: tasks.map((task) => ({
 		taskId: task.id,
 		title: `title ${task.id}`,
@@ -548,6 +549,52 @@ const bandOf = (html: string): string[] => {
 			`${match[2]}${match[1] === undefined ? "" : `:${match[1].trim().slice(3)}`}${match[4] === "flow-here-chip" ? "+here" : ""}`,
 	);
 };
+
+describe("owner review link in a flow", () => {
+	const href = "https://discord.com/channels/100000000000000001/100000000000000003"; // gitleaks:allow (fake snowflake)
+	const base = flowOf([{ id: "T-1", created: at("10:00:00") }]);
+	const reviewing = { ...base, tasks: base.tasks.map((step) => ({ ...step, status: "review" as const })) };
+	const button = `<a class="button" href="${href}" target="_blank" rel="noopener noreferrer">디스코드에서 보기</a>`;
+
+	test("a TASK waiting for review links its request thread on Discord, in the flow view and in a panel", () => {
+		expect(renderFlowChain({ ...reviewing, discordHref: href }, "", false)).toContain(button);
+		expect(renderFlowChain({ ...reviewing, discordHref: href }, "T-1", true)).toContain(button);
+	});
+
+	test("the inbox card of a TASK waiting for review opens the thread without nesting a link", async () => {
+		const snapshot = await buildSnapshot(deps());
+		if (!snapshot.flows?.ok) throw new Error("no flows");
+		const flows = snapshot.flows.items.map((item) => (item.threadRef === "A" ? { ...item, discordHref: href } : item));
+		const inbox = renderDashboardPage({ ...snapshot, flows: { ok: true, items: flows } }, {});
+		const cardOf = (id: string) =>
+			new RegExp(`<a class="card[^"]*"[^>]*data-row="${id}"[\\s\\S]*?</a>`).exec(inbox)?.[0] ?? "";
+		// T-A3 waits for review; T-A2 in the same thread is still being built.
+		expect(cardOf("T-A3")).toContain(`<span class="card-discord" data-open="${href}">디스코드에서 보기 ↗</span>`);
+		expect(cardOf("T-A2")).not.toContain("card-discord");
+	});
+
+	test("no link without a review TASK or without a Discord thread", () => {
+		expect(renderFlowChain({ ...base, discordHref: href }, "", false)).not.toContain("flow-review");
+		expect(renderFlowChain(reviewing, "", false)).not.toContain("flow-review");
+	});
+
+	test("the snapshot links a chain only when its thread is a Discord thread with the one server id", async () => {
+		const guild = "100000000000000001"; // gitleaks:allow (fake snowflake)
+		const ref = "300000000000000001:300000000000000065"; // gitleaks:allow (fake snowflake)
+		const db = new Database(dbPath, { strict: true });
+		db.run("UPDATE tasks SET thread_ref = ? WHERE thread_ref = 'A'", [ref]);
+		db.close();
+		const withGuilds = async (guildIds: string[]) =>
+			flowsOf(
+				await buildSnapshot({ ...deps(), config: { channels: { discord: { guildIds } } } as SnapshotDeps["config"] }),
+			);
+		const one = await withGuilds([guild]);
+		expect(chain(one, ref).discordHref).toBe(`https://discord.com/channels/${guild}/300000000000000065`);
+		// Letter refs are no Discord thread; several servers leave the server unknown.
+		expect(chain(one, "B").discordHref).toBe("");
+		expect(chain(await withGuilds([guild, "100000000000000002"]), ref).discordHref).toBe("");
+	});
+});
 
 describe("parallel groups in a flow", () => {
 	test("AC-1: the qa50 times draw three groups of 3 · 3 · 2 with 12분 and 5시간 1분 between them", () => {

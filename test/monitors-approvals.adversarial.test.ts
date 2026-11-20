@@ -808,6 +808,7 @@ describe("ApprovalBroker races", () => {
 			setApprovalMirrorRef: () => false,
 			replyApproval: () => false,
 			expirePendingApprovals: () => [],
+			addAutoChoice: () => undefined,
 		};
 		const { broker, done, ts } = await start({ store: failing });
 		expect(broker.handleAction(click("approve", ts))).toBe(true);
@@ -825,6 +826,7 @@ describe("ApprovalBroker races", () => {
 			setApprovalMirrorRef: (id, mirrorRef) => real.setApprovalMirrorRef(id, mirrorRef),
 			replyApproval: (id, ts, text, now) => real.replyApproval(id, ts, text, now),
 			expirePendingApprovals: (now, due) => real.expirePendingApprovals(now, due),
+			addAutoChoice: (input) => real.addAutoChoice(input),
 		};
 		const { broker, done, ts } = await start({ store: flaky });
 		// An approval the ledger could not confirm grants nothing (fable IMP-11); the request stays open for the owner.

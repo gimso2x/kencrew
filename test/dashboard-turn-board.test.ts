@@ -186,6 +186,33 @@ describe("turn board snapshot", () => {
 		]);
 	});
 
+	test("an uncertain row keeps its thread open and in attention, shows as 전달 불확실 and counts on a lane", async () => {
+		const LANE = "ompbot/work/fix-login";
+		const chat = "discord/ch/300000000000000001/t/100000000000000001";
+		seed([
+			{ origin: chat, text: "읽었는지 모르는 요청", state: "uncertain", createdAt: NOW - 5 * MINUTE },
+			{ origin: LANE, text: "레인 입력", state: "uncertain", createdAt: NOW - 4 * MINUTE },
+			{ origin: LANE, text: "레인 입력 2", state: "uncertain", createdAt: NOW - 3 * MINUTE },
+		]);
+		const db = new Database(join(home, "ompbot.db"), { strict: true });
+		db.run(
+			`INSERT INTO lanes (name, title, thread_ref, origin_key, cwd, session_dir, status, history, meta, created_at, updated_at)
+			 VALUES ('fix-login', '로그인 고치기', '300000000000000001:100000000000000009', ?, '/srv/repo-l-1', '/srv/s', 'working', '[]', '{}', ?, ?)`,
+			[LANE, NOW, NOW],
+		);
+		db.close();
+		const snapshot = await buildSnapshot(deps());
+		if (!snapshot.turns.ok) throw new Error(`turns section failed: ${snapshot.turns.error}`);
+		expect(snapshot.turns.items.map((turn) => turn.state)).toEqual(["uncertain", "uncertain", "uncertain"]);
+		const thread = snapshot.turns.threads.find((item) => item.originKey === chat);
+		expect([thread?.column, thread?.openCount, thread?.latest.state]).toEqual(["attention", 1, "uncertain"]);
+		if (!snapshot.lanes.ok) throw new Error(`lanes section failed: ${snapshot.lanes.error}`);
+		expect(snapshot.lanes.items.map((lane) => [lane.name, lane.uncertainCount])).toEqual([["fix-login", 2]]);
+		const html = renderDashboardMain(snapshot, undefined, NOW, { view: "turns" });
+		expect(html).toContain("전달 불확실");
+		expect(renderDashboardMain(snapshot, undefined, NOW, { view: "lanes" })).toContain("보류 2건");
+	});
+
 	test("messages steered into one running turn read as one run with merged messages, not a queue", async () => {
 		const origin = "discord/ch/300000000000000007/t/100000000000000001";
 		const sent = (text: string, ago: number, opRef: string): Row => ({

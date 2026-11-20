@@ -12,6 +12,7 @@ import {
 	MESSAGE_CONTENT_LIMIT,
 	type MessageReference,
 	type MessageTarget,
+	parseChannelInfo,
 	type ReactionArgs,
 	type RespondInteractionArgs,
 	type StartThreadArgs,
@@ -173,7 +174,8 @@ export class DiscordRest {
 			// Per-interaction keys never repeat: drop expired entries so they do not pile up.
 			for (const [other, reset] of this.#blocked) if (reset <= now) this.#blocked.delete(other);
 			this.#blocked.set(key, this.#now() + resetAfter);
-		} else {
+		} else if ((this.#blocked.get(key) ?? 0) <= now) {
+			// Only an expired block goes: a response that was in flight when a 429 set one must not lift it.
 			this.#blocked.delete(key);
 		}
 
@@ -323,16 +325,9 @@ export class DiscordRest {
 
 /** A channel object as the adapter caches it. */
 function channelInfo(value: unknown, what: string): DiscordChannelInfo {
-	const body = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
-	if (typeof body.id !== "string" || typeof body.type !== "number") {
-		throw new DiscordCallError("ambiguous", `${what} returned no channel`);
-	}
-	return {
-		id: body.id,
-		type: body.type,
-		...(typeof body.parent_id === "string" ? { parentId: body.parent_id } : {}),
-		...(typeof body.guild_id === "string" ? { guildId: body.guild_id } : {}),
-	};
+	const info = parseChannelInfo(value);
+	if (info === undefined) throw new DiscordCallError("ambiguous", `${what} returned no channel`);
+	return info;
 }
 
 /** The `id` of a created message or thread; a 2xx without one leaves the outcome unknown. */

@@ -9,7 +9,6 @@ import { type InboundRecord, parseCommand, promptTextOf } from "../src/core/type
 import { createLogger } from "../src/log";
 import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
-import { missingRpcMethods, REQUIRED_RPC_METHODS } from "../src/omp/rpc-driver";
 import { redact } from "../src/redact";
 import type { Store } from "../src/store/db";
 
@@ -115,6 +114,8 @@ describe("command parsing", () => {
 		expect(parseCommand("!queue drop 1")).toEqual({ kind: "queue", arg: "drop 1" });
 		expect(parseCommand("/queue-ompbot drop 2")).toEqual({ kind: "queue", arg: "drop 2" });
 		expect(parseCommand("!queue now")).toEqual({ kind: "queue", arg: "now" });
+		expect(parseCommand("!queue close 1")).toEqual({ kind: "queue", arg: "close 1" });
+		expect(parseCommand("/queue-ompbot retry 2")).toEqual({ kind: "queue", arg: "retry 2" });
 		expect(parseCommand("/new-ompbot please")).toBeUndefined();
 		expect(parseCommand("/model 이거 어때")).toBeUndefined();
 		expect(parseCommand("모델 바꿔 !model")).toBeUndefined();
@@ -404,29 +405,6 @@ describe("④ queue and followup", () => {
 		expect(await send("!queue 지워줘")).toContain("사용법");
 		expect(await send("!queue")).toContain("drop <번호>");
 		expect(store.listInbound({ originKey: ORIGIN, state: "pending" })).toHaveLength(1);
-	});
-});
-
-describe("⑤ omp compatibility check", () => {
-	test("reports exactly the RpcClient methods ompbot needs but the class lacks", () => {
-		class Partial {
-			prompt(): void {}
-			steer(): void {}
-		}
-		const missing = missingRpcMethods(Partial);
-		expect(missing).not.toContain("prompt");
-		expect(missing).toContain("compact");
-		expect(missing).toHaveLength(REQUIRED_RPC_METHODS.length - 2);
-		class Full {}
-		for (const name of REQUIRED_RPC_METHODS) Object.defineProperty(Full.prototype, name, { value: () => undefined });
-		expect(missingRpcMethods(Full)).toEqual([]);
-		expect(missingRpcMethods(undefined)).toEqual([...REQUIRED_RPC_METHODS]);
-	});
-
-	test("the todo and side-question calls are checked at start too, not at the first /btw or lane todo", () => {
-		expect(missingRpcMethods(class {})).toEqual(
-			expect.arrayContaining(["setTodos", "btw", "cancelBtw", "onBtwRecord"]),
-		);
 	});
 });
 

@@ -59,7 +59,7 @@ import {
 	threadRefOf,
 } from "../core/normalize";
 import { parseChatOrigin } from "../core/origin-key";
-import { parseCommand, TAKES_ARG } from "../core/types";
+import { parseCommand, parsePurposeCommand, TAKES_ARG } from "../core/types";
 import type { Logger } from "../log";
 import { type BackfillCursors, type BackfillTarget, DiscordBackfill, snowflakeTime } from "./backfill";
 import { type Destination, type DiscordChannel, PUBLIC_THREAD, THREAD_EXISTS, THREAD_NAME_MAX } from "./channel";
@@ -71,12 +71,17 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
+	type DiscordMessageUpdate,
 	DiscordRateLimitedError,
 	type DiscordTransport,
 } from "./transport";
 
 /** Message types the bot reads: a plain message and a reply. Everything else is a system message. */
 const READ_TYPES: ReadonlySet<number> = new Set([0, 19]);
+/** An owner edit counts only this long after the original post; later ones are dropped. */
+const EDIT_WINDOW_MS = 30 * 60_000;
+/** First line of an edited owner message's text: the model sees an edit, not a new request. */
+const EDIT_MARKER = "[오너가 앞 글을 고쳤다 — 이미 답했다면 바뀐 부분만 반영한다]";
 const DM_CHANNEL = 1;
 /** Interaction type of a message component (button click). */
 const MESSAGE_COMPONENT = 3;
@@ -319,6 +324,7 @@ export class DiscordAdapter implements ChannelAdapter {
 	async start(): Promise<void> {
 		const handlers: DiscordHandlers = {
 			message: (event) => this.handleMessage(event),
+			messageUpdate: (event) => this.handleMessageUpdate(event),
 			interaction: (interaction) => this.handleInteraction(interaction),
 			// A new session lost the events in between (a resume replays them). The first Ready comes before start()
 			// has the bot id: that one is the daemon's own startup recover().
@@ -328,6 +334,8 @@ export class DiscordAdapter implements ChannelAdapter {
 			fatal: (error) => {
 				if (this.#startReturned) this.#onFatal?.(error);
 			},
+			channel: (info) => this.#port.remember(info),
+			channelGone: (id) => this.#port.forget(id),
 			roles: (roles) => {
 				for (const role of roles) {
 					// Gateway payloads are not validated upstream: a role that is not an object is skipped.
@@ -520,6 +528,31 @@ export class DiscordAdapter implements ChannelAdapter {
 		);
 	}
 
+	/**
+	 * An owner's edit of a message the bot recorded (doc/plans/discord-message-edit.md): taken once as a new owner
+	 * input under the original's keys, led by `EDIT_MARKER`. Anything else a `MESSAGE_UPDATE` carries (embed refresh,
+	 * partial payload, an edit of a message the bot never took or of a command, a late edit) is dropped.
+	 */
+	async handleMessageUpdate(update: DiscordMessageUpdate): Promise<void> {
+		await guardInbound(this.#log, { channel: update.channel_id, id: update.id }, this.#onInboundFailure, async () => {
+			const { type, content, author, edited_timestamp: editedAt } = update;
+			const drop = (reason: string) =>
+				this.#log.info("inbound_dropped", { reason, channel: update.channel_id, id: update.id });
+			if (type === undefined || content === undefined || author === undefined || typeof editedAt !== "string") {
+				return drop("edit_partial");
+			}
+			const event: DiscordMessageEvent = { ...update, type, content, author, edited_timestamp: editedAt };
+			if (!isOwner(author.id, this.#owner)) return drop("not_owner");
+			const editedMs = Date.parse(editedAt);
+			if (Number.isNaN(editedMs)) return drop("edit_partial");
+			if (editedMs - snowflakeTime(event.id) > EDIT_WINDOW_MS) return drop("edit_too_late");
+			if (parseCommand(content) !== undefined || parsePurposeCommand(content) !== undefined) {
+				return drop("edit_command");
+			}
+			await this.#processMessage(event, [], false, undefined, editedAt);
+		});
+	}
+
 	#drop(event: DiscordMessageEvent, reason: string, peer?: string): IngestOutcome {
 		this.#log.info("inbound_dropped", { reason, channel: event.channel_id, id: event.id, ...(peer && { peer }) });
 		return "dropped";
@@ -553,6 +586,7 @@ export class DiscordAdapter implements ChannelAdapter {
 		quoted: readonly string[],
 		injected = false,
 		onThread?: () => void,
+		editedAt?: string,
 	): Promise<IngestOutcome> {
 		if (!READ_TYPES.has(event.type)) return this.#drop(event, "subtype");
 		const botUserId = await this.#ready;
@@ -579,9 +613,26 @@ export class DiscordAdapter implements ChannelAdapter {
 			if (info.parentId !== undefined && info.type !== 0) {
 				conversationId = info.parentId;
 				threadId = event.channel_id;
+				// Warm the parent (cached per channel) so the prompt can name it; a failed lookup costs only that line.
+				await this.#port.channelInfo(conversationId).catch((err: unknown) => {
+					this.#log.warn("channel_info_failed", { channel: conversationId, error: errorText(err) });
+				});
 			}
 			// The log channel is a ledger, not a conversation: nothing said there or in its threads reaches omp.
 			if (conversationId === this.#logChannel) return this.#drop(event, "log_channel");
+		}
+		// Only an original taken as plain owner input can be edited: a card reply the card consumed leaves no row.
+		if (editedAt !== undefined) {
+			const original = threadRefOf(conversationId, event.id);
+			if (this.#core.hasInbound?.(original) !== true) return this.#drop(event, "edit_no_original");
+			// A command is never run again: an original that was one stays one, whatever it was fixed into.
+			const originalText = this.#core.inboundText?.(original);
+			if (
+				originalText !== undefined &&
+				(parseCommand(originalText) !== undefined || parsePurposeCommand(originalText) !== undefined)
+			) {
+				return this.#drop(event, "edit_command");
+			}
 		}
 		const spot: MessageSpot = { channelId: event.channel_id, messageId: event.id };
 		let text = event.content;
@@ -595,7 +646,10 @@ export class DiscordAdapter implements ChannelAdapter {
 				(!repliesToBot && (event.mentions?.some((user) => user.id === botUserId) ?? false));
 			for (const token of tokens) text = text.split(token).join(" ");
 			text = text.trim();
-			const cardReply = await this.#processCardReply(event, conversationId, threadId, text, spot, injected);
+			const cardReply =
+				editedAt === undefined
+					? await this.#processCardReply(event, conversationId, threadId, text, spot, injected)
+					: undefined;
 			if (cardReply !== undefined) return cardReply;
 			// A message that mentions a peer bot but not this bot is meant for the peer, whatever the channel policy says.
 			const forPeer =
@@ -617,9 +671,14 @@ export class DiscordAdapter implements ChannelAdapter {
 			});
 			if (!addressed) return this.#drop(event, "not_addressed");
 		} else {
-			const cardReply = await this.#processCardReply(event, conversationId, undefined, text, spot, injected);
+			const cardReply =
+				editedAt === undefined
+					? await this.#processCardReply(event, conversationId, undefined, text, spot, injected)
+					: undefined;
 			if (cardReply !== undefined) return cardReply;
 		}
+		if (editedAt !== undefined)
+			return this.#recordEdit(event, text, { conversationId, threadId, dm, botUserId }, spot, editedAt);
 		const replyContext = this.#replyContext(event.referenced_message, botUserId);
 		// A forward's text is the snapshots', fenced like any shared message; their files are not fetched.
 		const snapshots = event.message_snapshots ?? [];
@@ -672,6 +731,51 @@ export class DiscordAdapter implements ChannelAdapter {
 			inbound = { ...final.inbound, originKey: inbound.originKey };
 		}
 		const recorded = inbound;
+		return recordInbound(this.#core, this.#log, recorded, (thread, showStatus) =>
+			this.#beginStatus(recorded.threadRef, thread.channel, thread.threadTs, spot, recorded.originKey, {
+				showStatus,
+				typing: showStatus,
+			}),
+		);
+	}
+
+	/**
+	 * The edit as an owner input. `normalizeInbound` sees the original id and the edited text only, so the origin key
+	 * and thread ref come out as the original's; then the id gets its `#edit:` tail (a redelivery is a duplicate) and the
+	 * text its marker. A channel root's edit goes into the thread the original opened; none is opened here.
+	 */
+	async #recordEdit(
+		event: DiscordMessageEvent,
+		text: string,
+		place: { conversationId: string; threadId: string | undefined; dm: boolean; botUserId: string },
+		spot: MessageSpot,
+		editedAt: string,
+	): Promise<IngestOutcome> {
+		const { conversationId, dm, botUserId } = place;
+		let threadTs = place.threadId;
+		if (!dm && threadTs === undefined) {
+			if (this.#core.knowsThread?.(threadRefOf(conversationId, event.id)) !== true)
+				return this.#drop(event, "edit_no_thread");
+			threadTs = event.id;
+		}
+		const gate = normalizeInbound({
+			userId: event.author.id,
+			botUserId,
+			ownerUserId: this.#owner,
+			text,
+			quoted: [],
+			channel: conversationId,
+			ts: event.id,
+			threadTs,
+			channelType: dm ? "im" : "channel",
+			platform: "discord",
+		});
+		if (!gate.accept) return this.#drop(event, gate.reason);
+		const recorded = {
+			...gate.inbound,
+			platformMessageId: `${gate.inbound.platformMessageId}#edit:${editedAt}`,
+			text: `${EDIT_MARKER}\n${gate.inbound.text}`,
+		};
 		return recordInbound(this.#core, this.#log, recorded, (thread, showStatus) =>
 			this.#beginStatus(recorded.threadRef, thread.channel, thread.threadTs, spot, recorded.originKey, {
 				showStatus,
@@ -813,9 +917,10 @@ export class DiscordAdapter implements ChannelAdapter {
 		text: string,
 		known = this.#core.knowsThread?.(threadRefOf(conversationId, event.id)) === true,
 	): Promise<void> {
+		let name: string | undefined;
 		if (!known) {
 			const line = progressLine(text.split("\n")[0] ?? "");
-			const name = (line === "" ? "ompbot" : line).slice(0, THREAD_NAME_MAX);
+			name = (line === "" ? "ompbot" : line).slice(0, THREAD_NAME_MAX);
 			try {
 				await this.#transport.startThread({ channelId: conversationId, messageId: event.id, name });
 			} catch (err) {
@@ -834,7 +939,13 @@ export class DiscordAdapter implements ChannelAdapter {
 				}
 			}
 		}
-		this.#port.remember({ id: event.id, type: PUBLIC_THREAD, parentId: conversationId, guildId: event.guild_id });
+		this.#port.remember({
+			id: event.id,
+			type: PUBLIC_THREAD,
+			parentId: conversationId,
+			guildId: event.guild_id,
+			name: name ?? this.#port.conversationContext(conversationId, event.id)?.threadName,
+		});
 	}
 
 	/**

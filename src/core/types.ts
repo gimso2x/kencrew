@@ -66,7 +66,7 @@ export const PEER_FAILURE_MARK = "응답 실패(";
 
 /** Ledger op refs of chat commands and bookkeeping answers: not a prompt that reached omp. */
 export const COMMAND_OP_REF = new RegExp(
-	`^(failed|lane|task|home|notify|${(Object.keys(COMMAND_TEXT) as CommandKind[]).join("|")}):`,
+	`^(failed|lane|task|home|purpose|notify|${(Object.keys(COMMAND_TEXT) as CommandKind[]).join("|")}):`,
 );
 
 /**
@@ -81,6 +81,29 @@ export const TEAMS_GROUP_HOME_REFUSED_TEXT =
 
 export function isHomeCommand(text: string): boolean {
 	return text.trim() === HOME_COMMAND;
+}
+
+/**
+ * `!용도 <글>` sets the purpose memo of the channel (or, typed inside a thread, of that thread), `!용도` shows it,
+ * `!용도 지우기` clears it (doc/plans/channel-purpose-memo.md). Typed text only, like `!home`; a memo is background for
+ * new turns, never an instruction, and answered without a model turn.
+ */
+export const PURPOSE_COMMAND = "!용도";
+export const PURPOSE_CLEAR_ARG = "지우기";
+export const PURPOSE_MAX_CHARS = 500;
+
+/** The argument of a `!용도` message (`""` when bare); undefined when the text is no such command. */
+export function parsePurposeCommand(text: string): { arg: string } | undefined {
+	const match = /^!용도(?:\s+([\s\S]*))?$/.exec(text.trim());
+	return match ? { arg: (match[1] ?? "").trim() } : undefined;
+}
+
+/** Why `memo` cannot be stored as a purpose memo; null when it can (one line of 1..500 chars, no control characters). */
+export function purposeMemoError(memo: string): string | null {
+	if (memo === "" || [...memo].length > PURPOSE_MAX_CHARS) {
+		return `⚠️ 용도 메모는 1~${PURPOSE_MAX_CHARS}자여야 합니다.`;
+	}
+	return /\p{Cc}/u.test(memo) ? "⚠️ 용도 메모는 제어문자 없이 한 줄로 적어 주세요." : null;
 }
 
 /** Kinds that take an argument after the command word; the others only count when they are the whole message. */

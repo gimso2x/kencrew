@@ -7,7 +7,7 @@ import type { OmpEvent } from "../src/omp/driver";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { ledgerDay } from "../src/ops/cost-cap";
 import { redact } from "../src/redact";
-import { discordBinding, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
+import { discordBinding, GUILD, makeHome, OWNER_DM, type TestHome, WaitingDiscordTransport } from "./helpers/bot-home";
 
 const ORIGIN = `discord/dm/${OWNER_DM}`;
 const MINUTE = 60_000;
@@ -120,6 +120,19 @@ describe("daily cap: a warning, not a brake", () => {
 		await d.sweep();
 		expect(gateNotices()).toHaveLength(1);
 		expect(ownerNoticeCount()).toBe(0);
+	});
+
+	test("with channels.discord.alertChannelId the gate notice goes to that channel, not the owner DM", async () => {
+		const ALERT = "300000000000000077";
+		const discord = home.config.channels.discord;
+		if (discord === undefined) throw new Error("no discord config");
+		home.config = { ...home.config, channels: { discord: { ...discord, alertChannelId: ALERT } } };
+		transport.setChannel({ id: ALERT, type: 0, guildId: GUILD });
+		const { daemon: d } = await overCap();
+		clock.t += 3 * MINUTE;
+		await d.sweep();
+		await transport.waitForPosts((text) => text.includes("cost_cap"));
+		expect(transport.posts((text) => text.includes("cost_cap")).map((post) => post.channelId)).toEqual([ALERT]);
 	});
 
 	test("!budget answers today's total, its top origins and both ceilings", async () => {

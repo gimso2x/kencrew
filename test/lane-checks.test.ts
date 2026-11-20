@@ -96,6 +96,7 @@ describe("a lane claim re-runs the acceptance checks in its worktree (AC-4)", ()
 				{ id: "AC-1", ok: true },
 				{ id: "AC-2", ok: true },
 			],
+			runtime: { head: sha, os: process.platform, arch: process.arch },
 		});
 		await h.settle();
 		h.close();
@@ -377,6 +378,7 @@ describe("a timed-out check is inconclusive, not a violation", () => {
 				{ id: "AC-1", signal: 'command ["sh","-c","test -f a.txt"]', ok: true, detail: "exit 0" },
 				{ id: "AC-2", signal: 'command ["sh","-c","exit 0 # slow"]', ok: true, detail: "exit 0" },
 			],
+			runtime: { head: sha, omp: "unknown", kencrew: "unknown", os: process.platform, arch: process.arch },
 		});
 		expect(closed?.meta.land?.autoLandHeld).toBeUndefined();
 		expect(asked.asked).toHaveLength(0);

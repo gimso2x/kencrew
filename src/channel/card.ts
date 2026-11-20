@@ -6,7 +6,7 @@
 import { CardSpecError, standardComponentDefinitions, toCard } from "@json-render/chat";
 import type { CardChild, CardElement } from "chat";
 import { isRecord } from "../omp/type-guards";
-import { displayWidth } from "./text";
+import { displayWidth, fenceCloseRun, fenceOpenRun } from "./text";
 
 export type { CardElement } from "chat";
 
@@ -50,8 +50,7 @@ export function splitCards(body: string): CardSegment[] {
 		const line = lines[i] ?? "";
 		if (fenceRun > 0) {
 			text.push(line);
-			const close = /^(`{3,})\s*$/.exec(line);
-			if (close !== null && (close[1]?.length ?? 0) >= fenceRun) fenceRun = 0;
+			if ((fenceCloseRun(line) ?? 0) >= fenceRun) fenceRun = 0;
 			continue;
 		}
 		if (cards < MAX_CARDS && /^```card\s*$/.test(line)) {
@@ -69,7 +68,7 @@ export function splitCards(body: string): CardSegment[] {
 				continue;
 			}
 		}
-		if (line.startsWith("```")) fenceRun = /^`+/.exec(line)?.[0].length ?? 3;
+		fenceRun = fenceOpenRun(line) ?? 0;
 		text.push(line);
 	}
 	if (text.length > 0) segments.push({ kind: "text", text: text.join("\n") });
@@ -316,21 +315,32 @@ export function validateCard(json: string): ValidatedCard {
 	}
 }
 
-/** A fixed-width table: columns padded to their widest cell by display width (Hangul = 2), ` | ` between them. */
-export function tableToAscii(table: { headers: readonly string[]; rows: ReadonlyArray<readonly string[]> }): string {
+/**
+ * A fixed-width table: columns padded to their widest cell by display width (Hangul = 2), ` | ` between them.
+ * With `rule: true`, inserts a `---+---` rule row directly under the header row.
+ */
+export function tableToAscii(
+	table: { headers: readonly string[]; rows: ReadonlyArray<readonly string[]> },
+	options?: { rule?: boolean },
+): string {
 	const rows = [table.headers, ...table.rows];
-	const widths = table.headers.map((_, column) => Math.max(...rows.map((row) => displayWidth(row[column] ?? ""))));
-	return rows
-		.map((row) =>
-			row
-				.map((cell, column) => {
-					const text = cell ?? "";
-					return text + " ".repeat(Math.max(0, (widths[column] ?? 0) - displayWidth(text)));
-				})
-				.join(" | ")
-				.trimEnd(),
-		)
-		.join("\n");
+	// A loop, not `Math.max(...)`: a spread of a huge table's rows overflows the argument stack.
+	const widths = table.headers.map((_, column) => {
+		let widest = 0;
+		for (const row of rows) widest = Math.max(widest, displayWidth(row[column] ?? ""));
+		return widest;
+	});
+	const lines = rows.map((row) =>
+		row
+			.map((cell, column) => {
+				const text = cell ?? "";
+				return text + " ".repeat(Math.max(0, (widths[column] ?? 0) - displayWidth(text)));
+			})
+			.join(" | ")
+			.trimEnd(),
+	);
+	if (options?.rule) lines.splice(1, 0, widths.map((width) => "-".repeat(width)).join("-+-"));
+	return lines.join("\n");
 }
 
 /** A chart as its title over an ASCII table of its values (pie: label/value; others: one column per series). */

@@ -1,14 +1,5 @@
-import { afterEach, describe, expect, test } from "bun:test";
-import {
-	chmodSync,
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	realpathSync,
-	rmSync,
-	statSync,
-	writeFileSync,
-} from "node:fs";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ConfigError, loadConfig, type OmpbotConfig } from "../src/config";
@@ -17,8 +8,13 @@ import { botRpcEnv, rpcOverlayFor, teamsGroupOverlayPath } from "../src/daemon/r
 import { dispatchEnv, type RunProcessOptions, runOmpPrint } from "../src/dispatch/omp";
 import { buildDispatchTool } from "../src/dispatch/tool";
 import { buildChildEnv } from "../src/omp/env";
-import { REQUIRED_RPC_METHODS, RpcOmpDriver, type RpcOmpDriverOptions } from "../src/omp/rpc-driver";
+import { RpcOmpDriver, type RpcOmpDriverOptions } from "../src/omp/rpc-driver";
 import { teamsAlias } from "../src/teams/types";
+import { FakeOmpPeer, fakeOmpExecutable } from "./helpers/fake-omp-rpc";
+
+const SESSIONS = mkdtempSync(join(tmpdir(), "ompbot-profile-sessions-"));
+const SESSION_DIR = join(SESSIONS, "s");
+afterAll(() => rmSync(SESSIONS, { recursive: true, force: true }));
 
 /** A parent env with every key the profile wiring touches: an inherited agent dir and bot secrets (fake values). */
 const BASE = {
@@ -40,85 +36,26 @@ afterEach(() => {
 	for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-/** RpcClient stand-in: every method `missingRpcMethods` checks; `start()` spawns the child once through `options.spawn`. */
-function fakeClientSource(): string {
-	const generic = REQUIRED_RPC_METHODS.filter(
-		(name) => !["start", "stop", "onEvent", "onSessionEvent", "onPromptResult"].includes(name),
-	).map((name) => `\t${name}() { return Promise.resolve({}); }`);
-	return [
-		"export class RpcClient {",
-		"\tconstructor(options) { this.options = options; }",
-		// Like omp's own client: `--mode rpc` then the driver's `args` (`--no-title`, `--config …`, extra args).
-		'\tstart() { this.options.spawn(["--mode", "rpc", ...(this.options.args ?? [])]); return Promise.resolve(); }',
-		"\tstop() { return Promise.resolve(); }",
-		"\tonEvent() { return () => {}; }",
-		"\tonSessionEvent() { return () => {}; }",
-		"\tonPromptResult() { return () => {}; }",
-		...generic,
-		"}",
-		"",
-	].join("\n");
-}
-
-/**
- * A fake omp install that `RpcOmpDriver.start()` accepts; its `ptree.spawn` records the argv and env of the child the
- * driver would start (the real ones: built by the driver itself) and returns a child that never exits.
- */
-function fakeOmpInstall(): { ompExecutable: string; utilsModule: string } {
-	const dir = tempDir("ompbot-profile-rpc-");
-	const bin = join(dir, "pkg", "bin");
-	mkdirSync(bin, { recursive: true });
-	const ompExecutable = join(bin, "omp");
-	writeFileSync(ompExecutable, "#!/bin/sh\nexit 1\n");
-	chmodSync(ompExecutable, 0o755);
-	const root = dirname(dirname(realpathSync(ompExecutable)));
-	const client = join(root, "src/modes/rpc/rpc-client.ts");
-	mkdirSync(dirname(client), { recursive: true });
-	writeFileSync(client, fakeClientSource());
-	const utilsDir = join(root, "node_modules/@oh-my-pi/pi-utils");
-	mkdirSync(utilsDir, { recursive: true });
-	writeFileSync(
-		join(utilsDir, "package.json"),
-		JSON.stringify({ name: "@oh-my-pi/pi-utils", version: "0.0.0-fake", type: "module", main: "index.js" }),
-	);
-	const utilsModule = join(utilsDir, "index.js");
-	writeFileSync(
-		utilsModule,
-		[
-			"export const spawned = [];",
-			"export const ptree = { spawn(cmd, options) { spawned.push({ cmd, env: options.env }); return {",
-			"  pid: 4242, stdin: { write() {} }, stdout: new ReadableStream({ start() {} }),",
-			"  peekStderr: () => '', kill() {}, exited: new Promise(() => {}),",
-			"}; } };",
-			"",
-		].join("\n"),
-	);
-	return { ompExecutable, utilsModule };
-}
-
-/** The argv and env of the child a real `RpcOmpDriver` starts with `options` (on a fake install). */
+/** The argv and env of the child a real `RpcOmpDriver` starts with `options` (on an in-memory omp peer). */
 async function rpcChild(
 	options: Omit<RpcOmpDriverOptions, "ompExecutable" | "cwd" | "sessionDir">,
 ): Promise<{ cmd: string[]; env: Record<string, string> }> {
-	const install = fakeOmpInstall();
 	const work = tempDir("ompbot-profile-cwd-");
+	const peer = new FakeOmpPeer();
 	const driver = new RpcOmpDriver({
-		ompExecutable: install.ompExecutable,
+		ompExecutable: fakeOmpExecutable(work),
 		cwd: join(work, "ws"),
-		sessionDir: join(work, "s"),
-		bunExecutable: process.execPath,
+		// Same for every call, so argv comparisons see only what the options change.
+		sessionDir: SESSION_DIR,
+		spawn: peer.spawn,
 		...options,
 	});
 	await driver.start();
 	try {
-		// Runtime path: the fixture module is written into a fresh temp dir per call.
-		const utils = (await import(install.utilsModule)) as {
-			spawned: Array<{ cmd: string[]; env: Record<string, string> }>;
-		};
-		const child = utils.spawned.at(-1);
+		const child = peer.spawned.at(-1);
 		if (child === undefined) throw new Error("the driver did not spawn a child");
-		// The install path differs per call; the argv after it is what the comparison is about.
-		return { cmd: child.cmd.slice(2), env: child.env };
+		// The executable path differs per call; the argv after it is what the comparison is about.
+		return { cmd: child.argv.slice(1), env: child.options.env };
 	} finally {
 		await driver.stop();
 	}
@@ -143,12 +80,20 @@ const PRINT = { task: "요약", cwd: "/ws", systemPromptAppendix: "FLOORS", ompB
 
 describe("AC-1: without ompProfile the children are what they were", () => {
 	test("the daemon's rpc options are the old literal and the spawned child env/argv match the old options", async () => {
-		expect(botRpcEnv(undefined, BASE)).toEqual({ env: { OMP_WIKI_NOTE_DISABLE: "1" } });
-		const before = await rpcChild({ model: "m", env: { OMP_WIKI_NOTE_DISABLE: "1" }, extraArgs: ["--x"] });
+		expect(botRpcEnv(undefined, BASE)).toEqual({
+			env: { OMP_WIKI_NOTE_DISABLE: "1", PI_INTENT_TRACING: "1", OMP_HOST_DRIVER: "kencrew" },
+		});
+		const before = await rpcChild({
+			model: "m",
+			env: { OMP_WIKI_NOTE_DISABLE: "1", PI_INTENT_TRACING: "1", OMP_HOST_DRIVER: "kencrew" },
+			extraArgs: ["--x"],
+		});
 		const after = await rpcChild({ model: "m", ...botRpcEnv(undefined, BASE), extraArgs: ["--x"] });
 		expect(after).toEqual(before);
 		// No baseEnv: the child env is the daemon's own process env minus bot secrets, as before.
-		expect(after.env).toEqual(buildChildEnv({ OMP_WIKI_NOTE_DISABLE: "1" }));
+		expect(after.env).toEqual(
+			buildChildEnv({ OMP_WIKI_NOTE_DISABLE: "1", PI_INTENT_TRACING: "1", OMP_HOST_DRIVER: "kencrew" }),
+		);
 	});
 
 	test("runOmpPrint keeps the inherited agent dir, adds no OMP_PROFILE and keeps its argv", async () => {
@@ -169,7 +114,7 @@ describe("AC-2: ompProfile reaches every bot omp child", () => {
 		expect(child.env).not.toHaveProperty("PI_CODING_AGENT_DIR");
 		expect(child.env).not.toHaveProperty("SLACK_BOT_TOKEN");
 		expect(child.env).not.toHaveProperty("OMPBOT_HOME");
-		expect(child.env).toMatchObject({ OMP_WIKI_NOTE_DISABLE: "1", FOO: "1", PATH: BASE.PATH });
+		expect(child.env).toMatchObject({ OMP_WIKI_NOTE_DISABLE: "1", PI_INTENT_TRACING: "1", FOO: "1", PATH: BASE.PATH });
 		expect(child.cmd).toEqual(plain.cmd);
 	});
 
@@ -329,7 +274,18 @@ describe("ompConfigOverlay: one --config for every omp child of the install", ()
 			overlayConfig: overlay,
 			extraArgs: ["--x"],
 		});
-		expect(child.cmd).toEqual(["--mode", "rpc", "--no-title", "--config", overlay, "--x"]);
+		expect(child.cmd).toEqual([
+			"--mode",
+			"rpc",
+			"--no-title",
+			"--model",
+			"m",
+			"--session-dir",
+			SESSION_DIR,
+			"--config",
+			overlay,
+			"--x",
+		]);
 		const argv = await simpleDispatchArgv(overlay);
 		expect(argv.slice(0, 6)).toEqual(["omp", "-p", "--no-session", "--config", overlay, "--append-system-prompt"]);
 		expect(argv.slice(-2)).toEqual(["--", "빌드 상태 요약"]);
@@ -341,7 +297,7 @@ describe("ompConfigOverlay: one --config for every omp child of the install", ()
 		for (const origin of [...ORIGINS, GROUP]) expect(rpcOverlayFor(config, origin)).toBeUndefined();
 		// The daemon spreads `rpcOverlayFor`'s result only when defined: the options are the old literal.
 		const before = await rpcChild({ model: "m", env: { OMP_WIKI_NOTE_DISABLE: "1" }, extraArgs: ["--x"] });
-		expect(before.cmd).toEqual(["--mode", "rpc", "--no-title", "--x"]);
+		expect(before.cmd).toEqual(["--mode", "rpc", "--no-title", "--model", "m", "--session-dir", SESSION_DIR, "--x"]);
 		const argv = await simpleDispatchArgv(undefined);
 		expect(argv.slice(0, 4)).toEqual(OLD_PRINT_ARGV);
 		expect(argv).toHaveLength(7);
@@ -376,7 +332,8 @@ describe("ompConfigOverlay: one --config for every omp child of the install", ()
 
 test("a child whose dialogs reach the owner runs as rpc-ui (omp's ask tool needs a UI session); others stay rpc", async () => {
 	const headless = await rpcChild({ model: "m", extraArgs: ["--x"] });
-	expect(headless.cmd).toEqual(["--mode", "rpc", "--no-title", "--x"]);
+	const rest = ["--no-title", "--model", "m", "--session-dir", SESSION_DIR, "--x"];
+	expect(headless.cmd).toEqual(["--mode", "rpc", ...rest]);
 	const answered = await rpcChild({ model: "m", extraArgs: ["--x"], answerDialog: async () => ({ value: "x" }) });
-	expect(answered.cmd).toEqual(["--mode", "rpc", "--mode", "rpc-ui", "--no-title", "--x"]);
+	expect(answered.cmd).toEqual(["--mode", "rpc-ui", ...rest]);
 });

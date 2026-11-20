@@ -120,7 +120,8 @@ describe("DiscordRest", () => {
 	test("reaction emoji are URL-encoded into the path; edit, delete, threads and history hit their routes", async () => {
 		server = startServer((req) => {
 			if (req.method === "GET" && req.path.endsWith("/messages")) return Response.json([]);
-			if (req.method === "GET") return Response.json({ id: CHANNEL, type: 11, parent_id: "5", guild_id: "6" });
+			if (req.method === "GET")
+				return Response.json({ id: CHANNEL, type: 11, parent_id: "5", guild_id: "6", name: "스레드", topic: 9 });
 			if (req.path.endsWith("/threads")) return Response.json({ id: "333" });
 			return new Response(null, { status: 204 });
 		});
@@ -130,7 +131,13 @@ describe("DiscordRest", () => {
 		await client.editMessage({ channelId: CHANNEL, messageId: "2", content: "x", components: [] });
 		await client.deleteMessage({ channelId: CHANNEL, messageId: "2" });
 		expect(await client.startThread({ channelId: CHANNEL, messageId: "2", name: "질문" })).toEqual({ id: "333" });
-		expect(await client.getChannel(CHANNEL)).toEqual({ id: CHANNEL, type: 11, parentId: "5", guildId: "6" });
+		expect(await client.getChannel(CHANNEL)).toEqual({
+			id: CHANNEL,
+			type: 11,
+			parentId: "5",
+			guildId: "6",
+			name: "스레드",
+		});
 		expect(await client.listMessages({ channelId: CHANNEL, after: "10", limit: 100 })).toEqual([]);
 		const encoded = encodeURIComponent("👀");
 		expect(server.seen.map((r) => `${r.method} ${r.path}${r.search}`)).toEqual([
@@ -143,6 +150,30 @@ describe("DiscordRest", () => {
 			`GET /api/v10/channels/${CHANNEL}/messages?after=10&limit=100`,
 		]);
 		expect(JSON.parse(server.seen[2]?.body ?? "")).toEqual({ content: "x", components: [] });
+	});
+
+	test("a success response that arrives after a 429 does not lift the block", async () => {
+		let release: (res: Response) => void = () => {};
+		const slow = new Promise<Response>((resolve) => {
+			release = resolve;
+		});
+		let calls = 0;
+		const fetchImpl = (() => {
+			calls++;
+			return calls === 1 ? slow : Promise.resolve(Response.json({ retry_after: 10 }, { status: 429 }));
+		}) as unknown as typeof fetch;
+		const client = new DiscordRest({ token: TOKEN, baseUrl: "http://discord.invalid", fetchImpl, now: () => 1_000 });
+		const first = client.createMessage({ channelId: CHANNEL, content: "slow" });
+		expect(await caught(client.createMessage({ channelId: CHANNEL, content: "limited" }))).toBeInstanceOf(
+			DiscordRateLimitedError,
+		);
+		release(Response.json({ id: "900" }));
+		await first;
+		expect(client.blockedUntil()).toBe(11_000);
+		expect(await caught(client.createMessage({ channelId: CHANNEL, content: "again" }))).toBeInstanceOf(
+			DiscordRateLimitedError,
+		);
+		expect(calls).toBe(2);
 	});
 
 	test("Remaining 0 with Reset-After blocks the same route locally until the reset passes", async () => {

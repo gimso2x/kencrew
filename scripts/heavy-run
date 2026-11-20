@@ -1,0 +1,138 @@
+#!/usr/bin/env bun
+// Usage: scripts/heavy-run [--max-wait <seconds>] -- <argv…>
+// Runs argv while holding the host-wide heavy-run lock (see src/heavy-run.ts); the exit code is argv's.
+// `--locked -- <argv>` is the internal entry point `flock` starts once it holds the lock.
+// (bun drops a leading `--` itself, so the separator is optional right after the script name.)
+import { spawn } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import {
+	HEAVY_RUN_BUSY_CODE,
+	HEAVY_RUN_HELD_ENV,
+	HEAVY_RUN_STATE_ENV,
+	heavyRunLabel,
+	heavyRunPaths,
+	markHeavyRunRunning,
+	readHeavyRunStates,
+	stateFile,
+	removeHeavyRunState,
+	writeHeavyRunState,
+} from "../src/heavy-run";
+
+const DEFAULT_MAX_WAIT_S = 1800;
+const NOTICE_MS = 30_000;
+/** flock's "could not lock" exit code; the wait ran out (the locked entry never runs then). */
+const FLOCK_TIMEOUT_CODE = 253;
+const USAGE = "usage: heavy-run [--max-wait <seconds>] -- <argv…>";
+
+const args = process.argv.slice(2);
+let maxWait = DEFAULT_MAX_WAIT_S;
+let locked = false;
+while (args[0] === "--max-wait" || args[0] === "--locked") {
+	if (args[0] === "--locked") {
+		locked = true;
+		args.shift();
+	} else {
+		maxWait = Number(args[1]);
+		args.splice(0, 2);
+	}
+}
+if (args[0] === "--") args.shift();
+const argv = args;
+if (argv.length === 0 || !Number.isFinite(maxWait) || maxWait < 0) {
+	process.stderr.write(`${USAGE}\n`);
+	process.exit(2);
+}
+
+const paths = heavyRunPaths();
+
+/** Runs argv; it dies with this process (pdeathsig), so a killed locked entry takes its command along. */
+function runCommand(): Promise<number> {
+	const { promise, resolve } = Promise.withResolvers<number>();
+	const child = spawn("setpriv", ["--pdeathsig=kill", ...argv], { stdio: "inherit" });
+	for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) process.on(signal, () => child.kill(signal));
+	child.on("error", () => resolve(127));
+	child.on("close", (code, signal) => resolve(code ?? (signal === null ? 1 : 128)));
+	return promise;
+}
+
+if (locked) {
+	// Under the lock now: the runner's state file becomes running (with this pid), then argv runs.
+	const file = process.env[HEAVY_RUN_STATE_ENV];
+	if (file !== undefined) markHeavyRunRunning(file, process.pid, Date.now());
+	process.exit(await runCommand());
+}
+
+if (process.env[HEAVY_RUN_HELD_ENV] === paths.lock) process.exit(await runCommand());
+
+mkdirSync(paths.states, { recursive: true });
+writeFileSync(paths.lock, "", { flag: "a" });
+writeHeavyRunState(paths, {
+	pid: process.pid,
+	cwd: process.cwd(),
+	argv,
+	label: heavyRunLabel(process.cwd()),
+	state: "waiting",
+	since: Date.now(),
+});
+
+const self = Bun.fileURLToPath(import.meta.url);
+// Own process group, so SIGTERM/SIGINT reach flock and everything under it. pdeathsig on flock: a runner killed while
+// still waiting must not leave a flock that later takes the lock for nobody (a locked entry already running keeps it).
+const child = spawn(
+	"setpriv",
+	[
+		"--pdeathsig=kill",
+		"flock",
+		"-w",
+		String(Math.max(1, Math.ceil(maxWait))),
+		"-E",
+		String(FLOCK_TIMEOUT_CODE),
+		paths.lock,
+		process.execPath,
+		self,
+		"--locked",
+		"--",
+		...argv,
+	],
+	{
+		stdio: "inherit",
+		detached: true,
+		env: { ...process.env, [HEAVY_RUN_HELD_ENV]: paths.lock, [HEAVY_RUN_STATE_ENV]: stateFile(paths, process.pid) },
+	},
+);
+
+const notice = setInterval(() => {
+	const states = readHeavyRunStates(paths);
+	if (states.some((state) => state.pid === process.pid && state.state === "running")) return;
+	const running = states.find((state) => state.state === "running");
+	const waiting = states.filter((state) => state.state === "waiting").length;
+	const what = running === undefined ? "?" : `${running.label} ${Math.round((Date.now() - running.since) / 1000)}초`;
+	process.stderr.write(`heavy-run: 대기 중(대기 ${waiting}개), 실행 중 ${what}\n`);
+}, NOTICE_MS);
+
+for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const)
+	process.on(signal, () => {
+		try {
+			process.kill(-(child.pid as number), signal);
+		} catch {
+			// the group is already gone
+		}
+	});
+
+function cleanup(code: number): never {
+	clearInterval(notice);
+	removeHeavyRunState(paths, process.pid);
+	process.exit(code);
+}
+child.on("error", (error) => {
+	process.stderr.write(`heavy-run: ${error.message}\n`);
+	cleanup(1);
+});
+child.on("close", (code, signal) => {
+	// 253 from the locked entry itself would be argv's own exit code; the timeout is told apart by the state it never reached.
+	if (code === FLOCK_TIMEOUT_CODE && !readHeavyRunStates(paths).some((s) => s.pid === process.pid && s.state === "running")) {
+		process.stderr.write(`heavy-run: busy (${maxWait}초 넘게 기다렸습니다)\n`);
+		cleanup(HEAVY_RUN_BUSY_CODE);
+	}
+	cleanup(code ?? (signal === null ? 1 : 128));
+});

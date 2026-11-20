@@ -10,6 +10,7 @@ import {
 } from "../dispatch/omp";
 import type { CommitCheck } from "./checker";
 import { TASK_PATH_PATTERN } from "./docs";
+import { isFullTestArgv } from "./full-test";
 
 export type HostResult<T> = { ok: true; value: T } | { ok: false; error: string };
 
@@ -112,6 +113,10 @@ export interface TaskHostOptions {
 	run?: ProcessRunner;
 	inheritedEnv?: Record<string, string | undefined>;
 }
+
+/** Seconds a `[check:]` run may wait for the heavy-run lock beyond its own timeout: expiry then always ends as `timedOut`. */
+const HEAVY_RUN_WAIT_SLACK_S = 60;
+const HEAVY_RUN = "scripts/heavy-run";
 
 /** PATH assignment a remote `[check:]` line exports first; double quotes so the remote shell expands `$HOME`/`$PATH`. */
 const REMOTE_CHECK_PATH = 'PATH="$HOME/.local/bin:$PATH"';
@@ -387,12 +392,25 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 		async runCheck({ worktree, argv, timeoutMs, signal }) {
 			assertPath(worktree);
 			const stop = signal === undefined ? {} : { signal };
+			// A whole-suite run queues on the host's heavy-run lock, but only where the worktree has the runner (a repository
+			// without it, or an old commit such as proven-red's parent, runs as before). The wait ends after the check's own
+			// timeout, so a spent wait is always `timedOut` (inconclusive), never an exit 75 cached as the check's result.
+			const queued = isFullTestArgv(argv)
+				? [HEAVY_RUN, "--max-wait", String(Math.ceil(timeoutMs / 1000) + HEAVY_RUN_WAIT_SLACK_S), "--", ...argv]
+				: undefined;
 			// Locally the argv is the process itself; ssh joins its arguments into one remote shell line, so every
-			// argument is single-quoted there and the shell only sees `cd <worktree> && <argv>`. A non-interactive ssh
+			// argument is single-quoted there and the shell only sees `cd <worktree> && <argv>` (a queued run picks the
+			// runner or the bare argv with an `if` on the remote worktree). A non-interactive ssh
 			// shell skips the profile that puts `~/.local/bin` (npm, node, bun shims) on PATH, so the line adds it first.
 			const result =
 				sshTarget === undefined
-					? await run(argv, { cwd: worktree, timeoutMs, env, stdoutCap: CHECK_STDOUT_CAP, ...stop })
+					? await run(queued !== undefined && existsSync(`${worktree}/${HEAVY_RUN}`) ? queued : argv, {
+							cwd: worktree,
+							timeoutMs,
+							env,
+							stdoutCap: CHECK_STDOUT_CAP,
+							...stop,
+						})
 					: await run(
 							sshCommand(sshTarget, [
 								"export",
@@ -401,7 +419,22 @@ export function createTaskHostOps(options: TaskHostOptions = {}): TaskHostOps & 
 								"cd",
 								remoteShellQuote(worktree),
 								"&&",
-								...argv.map(remoteShellQuote),
+								...(queued === undefined
+									? argv.map(remoteShellQuote)
+									: [
+											"if",
+											"[",
+											"-x",
+											HEAVY_RUN,
+											"];",
+											"then",
+											...queued.map(remoteShellQuote),
+											";",
+											"else",
+											...argv.map(remoteShellQuote),
+											";",
+											"fi",
+										]),
 							]),
 							{ timeoutMs, stdoutCap: CHECK_STDOUT_CAP, ...stop },
 						);

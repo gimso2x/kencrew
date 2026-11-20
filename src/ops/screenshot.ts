@@ -2,7 +2,7 @@ import { lstatSync, statSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { type ProcessRunner, realProcessRunner } from "../dispatch/omp";
+import { dispatchEnv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
 
 /** Default width of the one-page briefing drawing (the spec's 1080px column). */
 export const BRIEFING_WIDTH = 1080;
@@ -113,7 +113,7 @@ async function capture(
 
 /** Runs one chromium stage: a timeout or a non-zero exit becomes a thrown message carrying the browser's own words. */
 async function stage(run: ProcessRunner, cmd: string[], opts: RenderPngOptions, doing: string): Promise<StageResult> {
-	const result = await run(cmd, { timeoutMs: opts.timeoutMs });
+	const result = await run(cmd, { timeoutMs: opts.timeoutMs, env: dispatchEnv(process.env) });
 	if (result.timedOut) throw new Error(`브리핑 ${doing} 시간 초과(${opts.timeoutMs}ms): 프로세스를 중단했습니다`);
 	if (result.code !== 0) throw new Error(`브리핑 ${doing} 실패: ${reasonOf(result)}`);
 	return {

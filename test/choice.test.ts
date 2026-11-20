@@ -3,7 +3,7 @@ import type { ActionButton, ChannelPort, MessageRef, OutboundMessage, PostTarget
 import { buttonRows } from "../src/discord/channel";
 import { createLogger } from "../src/log";
 import type { OmpDialogAnswerer, OmpDialogResponse } from "../src/omp/driver";
-import { tapExtensionUi } from "../src/omp/rpc-driver";
+import { ExtensionUiTap } from "../src/omp/rpc-driver";
 import { redact } from "../src/redact";
 import {
 	ApprovalBroker,
@@ -102,7 +102,9 @@ class ManualTimers implements ApprovalTimers {
 
 function memoryStore(): ApprovalStore & {
 	rows: Map<string, { status: string; replyTs: string | null; replyText: string | null }>;
+	autoChoices: Array<Parameters<ApprovalStore["addAutoChoice"]>[0]>;
 } {
+	const autoChoices: Array<Parameters<ApprovalStore["addAutoChoice"]>[0]> = [];
 	const rows = new Map<
 		string,
 		{
@@ -119,6 +121,10 @@ function memoryStore(): ApprovalStore & {
 	>();
 	return {
 		rows,
+		autoChoices,
+		addAutoChoice: (input) => {
+			autoChoices.push(input);
+		},
 		createApproval: (input) => {
 			rows.set(input.approvalId, {
 				status: "pending",
@@ -170,7 +176,7 @@ function memoryStore(): ApprovalStore & {
 	};
 }
 
-/** omp's stdout as a live stream through `tapExtensionUi`, answered by real choice cards on a recording port. */
+/** omp's decoded dialog frames through `ExtensionUiTap`, answered by real choice cards on a recording port. */
 function harness(timezone = "Asia/Seoul") {
 	clock.t = START;
 	const port = new RecordingPort();
@@ -193,20 +199,12 @@ function harness(timezone = "Asia/Seoul") {
 		answered.push(response);
 		return response;
 	};
-	let controller!: ReadableStreamDefaultController<Uint8Array>;
-	const stream = new ReadableStream<Uint8Array>({
-		start(c) {
-			controller = c;
-		},
-	});
-	const tap = tapExtensionUi(
-		stream,
+	const tap = new ExtensionUiTap(
 		() => undefined,
 		(frame) => replies.push(frame),
 		answerer,
 	);
-	const send = (frame: Record<string, unknown>): void =>
-		controller.enqueue(new TextEncoder().encode(`${JSON.stringify({ type: "extension_ui_request", ...frame })}\n`));
+	const send = (frame: Record<string, unknown>): void => tap.frame({ type: "extension_ui_request", ...frame });
 	/** The card's first version: buttons attached, or the post itself for a reply-only card. */
 	const card = (withButtons: boolean) =>
 		port.writes.waitFor((w) =>
@@ -219,10 +217,8 @@ function harness(timezone = "Asia/Seoul") {
 	/** The n-th card is open (registered, buttons attached): the broker logs `choice_requested` right after. */
 	const requested = (n: number) =>
 		logs.waitFor(() => logs.items.filter((line) => line.includes("choice_requested")).length >= n);
-	const close = async () => {
-		controller.close();
-		await tap;
-	};
+	// The child is gone: the cards still waiting are closed.
+	const close = async () => tap.close();
 	return { port, timers, store, broker, logs, replies, answered, send, card, finalEdit, click, requested, close };
 }
 

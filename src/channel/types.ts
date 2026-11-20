@@ -108,6 +108,10 @@ export interface CoreSink {
 		| undefined;
 	/** Whether the bot already takes part in this thread, so an unaddressed owner reply in a channel thread counts. */
 	knowsThread?(threadRef: string): boolean;
+	/** Whether this platform message id (`<conversation>:<message id>`) was recorded as inbound: an edit needs its original. */
+	hasInbound?(platformMessageId: string): boolean;
+	/** The text the inbound row of this platform message id was recorded with (`undefined`: no such row). */
+	inboundText?(platformMessageId: string): string | undefined;
 	/** True while a restart drain holds dispatch: a message taken now waits for the next process (no typing shown). */
 	isDraining?(): boolean;
 }

@@ -28,7 +28,7 @@ export interface CheckInput {
 	 * Runs the `[check: …]` signals of the snapshot in the task worktree (injected by the sweep only). Called once all
 	 * other conditions are met; absent → checks are not run and the judgement stands on the documents alone.
 	 */
-	runChecks?(checks: readonly TaskCheckRequest[]): Promise<TaskChecksRun>;
+	runChecks?(checks: readonly TaskCheckRequest[]): Promise<TaskChecksRun | TaskChecksPending>;
 	/**
 	 * The task branch's diff since its docs commit, for the lane integrity classifier (injected by the sweep only, like
 	 * `runChecks`). Called once all other conditions are met, before the checks; absent → the diff is not read.
@@ -60,6 +60,14 @@ export interface TaskCheck extends TaskCheckRequest {
 
 /** `deferred`: the checks were not run (e.g. uncommitted changes) and this is why; otherwise every result at `head`. */
 export type TaskChecksRun = { deferred: string } | { head: string; results: TaskCheck[] };
+
+/**
+ * The checks are queued or running outside the judgement (`TaskCheckRunner`): the judgement does not wait for them and
+ * is not reached. Unlike `deferred`, this is nothing for the worker to fix, so it never becomes a problem.
+ */
+export interface TaskChecksPending {
+	pending: string;
+}
 
 const CHECK_DETAIL_MAX = 120;
 
@@ -123,7 +131,9 @@ export interface TaskJudgement {
 	acceptance: Array<{ id: string; text: string; checked: boolean }>;
 	/** PROGRESS.md steps as written, for display (not part of the judgement). */
 	steps: Array<{ id: string; text: string; done: boolean }>;
-	/** Human-readable unmet conditions; empty exactly when `reached`. */
+	/** Why the judgement waits on `[check: …]` that are queued or running (`check 실행 중`); absent otherwise. */
+	pendingChecks?: string;
+	/** Human-readable unmet conditions the worker can fix; empty when `reached` (or while `pendingChecks`). */
 	problems: string[];
 }
 
@@ -230,13 +240,17 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 	const requests = taskChecksOf(input.snapshot);
 	let checkRun: { head: string; results: TaskCheck[] } | undefined;
 	let blockedChecksPassHead: string | undefined;
+	let pendingChecks: string | undefined;
 	// A task blocked with nothing else unmet still gets its checks run (cached per HEAD): a block caused by the check
 	// environment (a tool missing on the check PATH) clears on its own once the checks pass, instead of waiting for a
 	// manual resume. The result only marks the judgement; the block itself stays the agent's to lift.
 	const blockedOnly = blocked && problems.length === 1;
 	if (requests.length > 0 && (problems.length === 0 || blockedOnly) && input.runChecks !== undefined) {
 		const run = await input.runChecks(requests);
-		if (blockedOnly) {
+		if ("pending" in run) {
+			// Not an unmet condition: the block (if any) is the only problem, and the worker is told nothing.
+			if (!blockedOnly) pendingChecks = run.pending;
+		} else if (blockedOnly) {
 			if (!("deferred" in run) && run.results.every((result) => result.ok)) blockedChecksPassHead = run.head;
 		} else if ("deferred" in run) problems.push(run.deferred);
 		else {
@@ -248,7 +262,7 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 
 	const steps: ProgressStep[] = progress?.steps ?? [];
 	const updatedAt = progress?.updated ?? "";
-	const reached = problems.length === 0;
+	const reached = problems.length === 0 && pendingChecks === undefined;
 	return {
 		reached,
 		acChecked: input.snapshot.filter((item) => checkedIds.has(item.id)).length,
@@ -291,6 +305,7 @@ export async function checkTask(input: CheckInput): Promise<TaskJudgement> {
 			checked: checkedIds.has(item.id),
 		})),
 		steps: steps.map((step) => ({ id: step.id, text: step.text, done: step.done })),
+		...(pendingChecks === undefined ? {} : { pendingChecks }),
 		problems,
 	};
 }

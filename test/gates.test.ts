@@ -22,7 +22,6 @@ import {
 } from "../src/ops/gates";
 import { HERDR_HEALTH_FILE, HERDR_HEALTH_STALE_MS, HerdrHealthProbe, readHerdrHealth } from "../src/ops/herdr-health";
 import { IDLE_HOST_LOAD, testHostLoad } from "../src/ops/host-resources";
-import { TASK_SWEEP_MS } from "../src/tasks/sweeper";
 import { localDay } from "../src/time";
 
 let home: string;
@@ -686,6 +685,26 @@ describe("collectGates", () => {
 		expect(gateState("monitors_failed").state).toBe("closed");
 	});
 
+	test("a monitor that succeeded after its recent failed_no_retry has recovered and does not gate", () => {
+		writeStamp(0);
+		const insert =
+			"INSERT INTO monitor_events (monitor_id, slot_at, stage, created_at, updated_at) VALUES ('m1', ?, ?, ?, ?)";
+		seedDb((db) => {
+			db.run("INSERT INTO monitors (id, name, enabled, created_at, updated_at) VALUES ('m1', '회고', 1, ?, ?)", [
+				now,
+				now,
+			]);
+			db.run(insert, [now - 3_600_000, "failed_no_retry", now - 3_600_000, now - 3_600_000]);
+			db.run(insert, [now - 1_800_000, "no_report", now - 1_800_000, now - 1_800_000]);
+		});
+		expect(gateState("monitors_failed")).toEqual({ state: "closed", detail: "failed_recent=0" });
+		// A failure after the success opens it again.
+		const db = new Database(join(home, "ompbot.db"), { strict: true });
+		db.run(insert, [now - 600_000, "failed_no_retry", now - 600_000, now - 600_000]);
+		db.close();
+		expect(gateState("monitors_failed")).toEqual({ state: "open", detail: "failed_recent=1" });
+	});
+
 	test("three recent [turn failed] notices open turns_failing; fewer or older ones do not", () => {
 		writeStamp(0);
 		seedDb((db) => {
@@ -744,19 +763,17 @@ describe("collectGates", () => {
 		expect(gateState("backup_age").state).toBe("open");
 	});
 
-	test("omp_runtime opens for a too-old bun or a missing omp, closes for a usable install, and is omitted without omp", () => {
+	test("omp_runtime opens for a non-omp or missing executable, closes for one answering omp/<x.y.z>, and is omitted without omp", () => {
 		const runtimeGate = (ompExecutable: string) =>
 			collectGates({ homeDir: home, now, ompExecutable }).find((g) => g.name === "omp_runtime");
-		const launcher = (bunRange: string) => {
-			const root = mkdtempSync(join(home, "pkg-"));
-			mkdirSync(join(root, "dist"));
-			writeFileSync(join(root, "package.json"), JSON.stringify({ engines: { bun: bunRange } }));
-			writeFileSync(join(root, "dist", "cli.js"), "#!/usr/bin/env bun\n");
-			return join(root, "dist", "cli.js");
+		const executable = (version: string) => {
+			const root = mkdtempSync(join(home, "bin-"));
+			writeFileSync(join(root, "omp"), `#!/bin/sh\necho ${version}\n`, { mode: 0o755 });
+			return join(root, "omp");
 		};
-		expect(runtimeGate(launcher(">=999.0.0"))).toMatchObject({ state: "open" });
-		expect(runtimeGate(launcher(">=999.0.0"))?.detail).toStartWith("bun_too_old ");
-		expect(runtimeGate(launcher(`>=${Bun.version}`))).toMatchObject({ state: "closed", detail: "ok" });
+		expect(runtimeGate(executable("1.4.4"))).toMatchObject({ state: "open" });
+		expect(runtimeGate(executable("1.4.4"))?.detail).toStartWith("omp_executable_missing version=unrecognized");
+		expect(runtimeGate(executable("omp/19.0.0"))).toMatchObject({ state: "closed", detail: "ok" });
 		expect(runtimeGate(join(home, "no-such-omp"))).toMatchObject({ state: "open" });
 		expect(collectGates({ homeDir: home, now }).some((g) => g.name === "omp_runtime")).toBe(false);
 	});
@@ -855,7 +872,7 @@ describe("herdr_unreachable (herdr-health stamp)", () => {
 		});
 		stamp(HERDR_HEALTH_STALE_MS + 1_000, 5);
 		expect(herdrGate()).toMatchObject({ state: "closed", detail: "stamp=stale" });
-		expect(HERDR_HEALTH_STALE_MS).toBe(3 * TASK_SWEEP_MS);
+		expect(HERDR_HEALTH_STALE_MS).toBe(15 * 60_000);
 	});
 
 	test("the probe counts consecutive failed status checks, resets on success, and continues the streak after a restart", async () => {

@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, realpathSync, statSync } from "node:fs";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { connect } from "node:net";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -47,15 +47,29 @@ export async function countOmpModels(
 			stdout: "pipe",
 			stderr: "ignore",
 			stdin: "ignore",
+			// Own process group: a launcher's grandchild holding stdout open would keep the read waiting past the limit.
+			detached: true,
 			env: withOmpProfile(buildChildEnv({}, base), ompProfile),
 		});
 	} catch (error) {
 		return `cannot run ${ompExecutable} (${(error as NodeJS.ErrnoException).code ?? String(error)})`;
 	}
-	const timer = setTimeout(() => proc.kill("SIGKILL"), timeoutMs);
+	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const [out, code] = await Promise.all([new Response(proc.stdout).text(), proc.exited]);
-		if (proc.signalCode === "SIGKILL") return `timeout after ${timeoutMs / 1000}s`;
+		const timedOut = new Promise<"timeout">((resolve) => {
+			timer = setTimeout(() => resolve("timeout"), timeoutMs);
+		});
+		const result = await Promise.race([Promise.all([new Response(proc.stdout).text(), proc.exited]), timedOut]);
+		if (result === "timeout") {
+			try {
+				process.kill(-proc.pid, "SIGKILL");
+			} catch {
+				// ESRCH: the group is already gone
+			}
+			await proc.exited;
+			return `timeout after ${timeoutMs / 1000}s`;
+		}
+		const [out, code] = result;
 		if (code !== 0) return `omp models exited ${code}`;
 		const parsed = JSON.parse(out) as { models?: unknown };
 		return Array.isArray(parsed.models) ? parsed.models.length : "unparsable output";
@@ -270,27 +284,16 @@ export async function runDoctor(
 			);
 		}
 
-		// The same check the RPC driver runs before every spawn, so a fresh install with the standalone binary or a
-		// too-old bun fails here instead of on the first DM. Skipped when omp or bun is missing (reported elsewhere)
-		// and for agent "agy", which never spawns omp; an unreadable launcher (a directory, no permission) is a
-		// failed line, not an exception that ends the whole report.
-		const runtimeBun = Bun.which("bun");
-		if ((config.agent ?? "omp") === "omp" && runtimeBun !== null && existsSync(config.ompExecutable)) {
-			try {
-				const cliPath = realpathSync(config.ompExecutable);
-				const problem = checkOmpRuntime(cliPath, runtimeBun);
-				report(
-					problem === undefined,
-					"omp runtime",
-					problem === undefined ? `launcher=${cliPath}` : `${problem.code} ${problem.message}`,
-				);
-			} catch (error) {
-				report(
-					false,
-					"omp runtime",
-					`${config.ompExecutable} unreadable (${(error as NodeJS.ErrnoException).code ?? String(error)})`,
-				);
-			}
+		// The same check the RPC driver runs before every spawn, so an executable that does not answer `--version` as
+		// omp fails here instead of on the first DM. Skipped when omp is missing (reported above) and for agent "agy",
+		// which never spawns omp; a directory or an unreadable file is a failed line, not an exception.
+		if ((config.agent ?? "omp") === "omp" && existsSync(config.ompExecutable)) {
+			const problem = await checkOmpRuntime(config.ompExecutable);
+			report(
+				problem === undefined,
+				"omp runtime",
+				problem === undefined ? `executable=${config.ompExecutable}` : `${problem.code} ${problem.message}`,
+			);
 		}
 
 		if ((config.agent ?? "omp") === "omp" && existsSync(config.ompExecutable)) {

@@ -32,6 +32,7 @@ function redactMessage(msg: OutboundMessage): OutboundMessage {
  */
 function redacting(port: ChannelPort): ChannelPort {
 	const openThread = port.openThread?.bind(port);
+	const conversationContext = port.conversationContext?.bind(port);
 	return {
 		platform: port.platform,
 		post: (target, msg) => port.post(target, redactMessage(msg)),
@@ -46,6 +47,7 @@ function redacting(port: ChannelPort): ChannelPort {
 		permalink: (ref) => port.permalink(ref),
 		mentionUser: (userId) => port.mentionUser(userId),
 		...(openThread === undefined ? {} : { openThread: (ref, name) => openThread(ref, redact(name)) }),
+		...(conversationContext === undefined ? {} : { conversationContext }),
 	};
 }
 

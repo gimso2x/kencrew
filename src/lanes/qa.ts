@@ -9,7 +9,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { isAbsolute, join, resolve } from "node:path";
-import { type ProcessRunner, runOmpPrint } from "../dispatch/omp";
+import { ompPrintArgs, type ProcessRunner, runOmpPrint } from "../dispatch/omp";
 import type { Logger } from "../log";
 import { redact } from "../redact";
 import type { LaneQaPolicy } from "../tasks/notify";
@@ -21,7 +21,8 @@ import {
 	laneSubject,
 	REVIEW_OVERLAY_YAML,
 } from "./review";
-import type { LaneQa, LaneRow } from "./status";
+import { argvForReceipt, overlayHash, receiptRuntime } from "./runtime";
+import type { LaneQa, LaneRow, ReceiptRuntime } from "./status";
 import { defaultGit, type GitRunner } from "./verify";
 
 /**
@@ -169,6 +170,7 @@ export interface GateQaInput {
 export async function runQa(input: GateQaInput, deps: LaneQaDeps): Promise<LaneQa> {
 	const { subject, policy } = input;
 	const { sha } = subject;
+	let runtime: ReceiptRuntime | undefined;
 	const receipt = (verdict: LaneQa["verdict"], findings: string[], reason?: string): LaneQa => ({
 		sha,
 		verdict,
@@ -176,6 +178,7 @@ export async function runQa(input: GateQaInput, deps: LaneQaDeps): Promise<LaneQ
 		model: policy.model,
 		at: deps.now(),
 		...(reason === undefined ? {} : { reason }),
+		...(runtime === undefined ? {} : { runtime }),
 	});
 	const inconclusive = (reason: string): LaneQa => receipt("inconclusive", [], reason);
 	const { repo, worktree } = subject;
@@ -194,11 +197,22 @@ export async function runQa(input: GateQaInput, deps: LaneQaDeps): Promise<LaneQ
 			// No install in the copy: the lane worktree's dependencies are linked when it has them.
 			const modules = worktree === undefined ? undefined : join(worktree, "node_modules");
 			if (modules !== undefined && existsSync(modules)) symlinkSync(modules, join(copy, "node_modules"));
+			// The copy's own HEAD is what runs: it must be the commit the receipt is bound to.
+			const copyHead = await git(["-C", copy, "rev-parse", "HEAD"]);
+			const head = copyHead.stdout.trim();
+			if (copyHead.code !== 0 || head !== sha)
+				return inconclusive(`QA 사본 HEAD ${head.slice(0, 12)}가 클레임 커밋이 아님`);
+			let policyOverlay: string;
+			try {
+				policyOverlay = readFileSync(policy.overlay, "utf8");
+			} catch {
+				return inconclusive("QA 오버레이 읽기 실패");
+			}
 			mkdirSync(deps.overlaysDir, { recursive: true, mode: 0o700 });
 			chmodSync(deps.overlaysDir, 0o700);
 			writeFileSync(overlay, REVIEW_OVERLAY_YAML, { mode: 0o600 });
 			chmodSync(overlay, 0o600);
-			const result = await runOmpPrint({
+			const printOptions = {
 				task: qaPrompt(subject, copy),
 				cwd: copy,
 				isolation: { configPath: overlay },
@@ -212,7 +226,18 @@ export async function runQa(input: GateQaInput, deps: LaneQaDeps): Promise<LaneQ
 				...(deps.run === undefined ? {} : { run: deps.run }),
 				...(deps.inheritedEnv === undefined ? {} : { inheritedEnv: deps.inheritedEnv }),
 				...(deps.ompProfile === undefined ? {} : { ompProfile: deps.ompProfile }),
+			};
+			const baseTip =
+				subject.baseBranch === undefined
+					? undefined
+					: await git(["-C", repo, "rev-parse", "--verify", "-q", `refs/heads/${subject.baseBranch}^{commit}`]);
+			runtime = receiptRuntime({
+				head,
+				...(baseTip?.code === 0 && baseTip.stdout.trim() !== "" ? { base: baseTip.stdout.trim() } : {}),
+				overlay: overlayHash(REVIEW_OVERLAY_YAML, policyOverlay),
+				argv: argvForReceipt(ompPrintArgs(printOptions)),
 			});
+			const result = await runOmpPrint(printOptions);
 			if (input.signal?.aborted === true) return inconclusive("중단됨");
 			if (result.timedOut) return inconclusive("시간 초과");
 			if (result.code !== 0) return inconclusive(`종료 코드 ${result.code ?? "없음"}`);

@@ -3,7 +3,10 @@ export const BACKOFF_CAP_MS = 5 * 60_000;
 export const MAX_DEFINITIVE_FAILURES = 5;
 export const FRESHNESS_MS = 24 * 60 * 60_000;
 
-export type InboundState = "pending" | "dispatched" | "answered" | "failed_notified" | "discarded";
+export type InboundState = "pending" | "dispatched" | "answered" | "failed_notified" | "discarded" | "uncertain";
+
+/** Why a row was parked as `uncertain`: the input may already have reached the omp child, so it is never replayed. */
+export type UncertainReason = "steer_threw" | "turn_ended_after_steer" | "dispatch_record_failed";
 export type DeliveryState = "pending" | "inflight" | "confirmed" | "failed_ambiguous" | "expired";
 
 export type StoreErrorCode = "invalid_transition" | "not_found" | "unknown_origin" | "invalid_argument";
@@ -18,9 +21,13 @@ export class StoreError extends Error {
 	}
 }
 
-/** Inbound transitions. answered / failed_notified / discarded are terminal. */
+/**
+ * Inbound transitions. answered / failed_notified / discarded are terminal. `uncertain` leaves only by the owner:
+ * back to pending (retry) or discarded (close); never straight to dispatched.
+ */
 export const INBOUND_TRANSITIONS: Record<InboundState, readonly InboundState[]> = {
-	pending: ["dispatched", "discarded"],
+	pending: ["dispatched", "discarded", "uncertain"],
+	uncertain: ["pending", "discarded"],
 	dispatched: ["answered", "failed_notified", "discarded"],
 	answered: [],
 	failed_notified: [],

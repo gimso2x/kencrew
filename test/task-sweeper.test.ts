@@ -33,7 +33,6 @@ import {
 	BLOCK_RETRY_MAX,
 	BLOCK_RETRY_WAIT_MS,
 	BLOCKED_CHECKS_PASS_HEAD,
-	READ_FAILURE_NOTICE_AFTER,
 	REVIEW_REALERT_MS,
 	STALE_NOTICE_MS,
 	STALE_REMIND_MS,
@@ -638,21 +637,47 @@ describe("TaskSweeper", () => {
 		expect(r.reminders).toHaveLength(1);
 	});
 
-	test("read failures are logged, never a verdict; the third in a row tells the thread once", async () => {
+	test("read failures are logged, never a verdict; a failure lasting 15 minutes tells the thread once", async () => {
 		const r = rig();
 		r.next.value = { ok: false, error: "host unreachable" };
-		for (let i = 1; i < READ_FAILURE_NOTICE_AFTER; i++) await r.sweeper.sweep();
+		for (let i = 0; i < 15; i++) {
+			await r.sweeper.sweep();
+			r.clock.ms += MIN;
+		}
 		expect(posts(r)).toHaveLength(0);
 		expect(r.ledger.require(r.row.taskId).status).toBe("working");
 		await r.sweeper.sweep();
 		await r.sweeper.sweep();
 		expect(posts(r)).toHaveLength(1);
-		expect(textOf(posts(r)[0])).toContain("3회 연속 읽지 못했습니다");
+		expect(textOf(posts(r)[0])).toContain("16회 연속 읽지 못했습니다");
 		expect(r.reminders).toEqual([]);
 
 		r.next.value = { ok: true, judgement: reachedJudgement() };
 		await r.sweeper.sweep();
 		expect(r.ledger.require(r.row.taskId).status).toBe("review");
+	});
+
+	test("the sweep cadence is one minute; a remote task is judged every five minutes unless its checks just ended", async () => {
+		expect(TASK_SWEEP_MS).toBe(MIN);
+		const r = rig({}, { host: "wsl" });
+		await r.sweeper.sweep();
+		expect(r.evaluations.count).toBe(1);
+		for (let i = 1; i < 5; i++) {
+			r.clock.ms += MIN;
+			await r.sweeper.sweep();
+		}
+		expect(r.evaluations.count).toBe(1);
+		r.clock.ms += MIN;
+		await r.sweeper.sweep();
+		expect(r.evaluations.count).toBe(2);
+		r.clock.ms += MIN;
+		await r.sweeper.sweep(new Set([r.row.taskId]));
+		expect(r.evaluations.count).toBe(3);
+		expect(r.infos.filter((entry) => entry.event === "task_sweep_done")).toHaveLength(7);
+		expect(r.infos.findLast((entry) => entry.event === "task_sweep_done")?.fields).toMatchObject({
+			judged: 1,
+			skippedRemote: 0,
+		});
 	});
 
 	test("an evaluator that throws counts as a read failure and does not stop other tasks", async () => {
@@ -1126,13 +1151,14 @@ describe("TaskSweeper", () => {
 		expect(lines[0]).toBe(
 			"PROGRESS.md가 60분 넘게 갱신되지 않았습니다. 지금 단계와 다음 행동을 PROGRESS.md의 updated·current·next에 반영하세요. 한 단계가 30분을 넘으면 30분마다 중간 갱신합니다.",
 		);
-		expect(lines.slice(1)).toEqual([
+		expect(lines[1]).toBe("`updated`만 바꾸면 진행으로 치지 않으니 current·next에 실제 진척을 적으세요.");
+		expect(lines.slice(2)).toEqual([
 			`- AC-1: ${"가".repeat(194)}`,
 			...problems.slice(1, 8).map((problem) => `- ${problem}`),
 			"- …외 2개",
 		]);
 		// The nudge carries the same list.
-		expect((r.reminders[0] ?? "").split("\n").slice(1)).toEqual(lines.slice(1));
+		expect((r.reminders[0] ?? "").split("\n").slice(1)).toEqual(lines.slice(2));
 	});
 
 	test("AC-4: ever-changing unmet conditions get exactly NUDGE_MAX nudges, then one owner notice; a resume counts anew", async () => {

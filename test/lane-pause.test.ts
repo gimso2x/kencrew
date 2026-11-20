@@ -767,3 +767,85 @@ describe("the pause/resume buttons ride the status message (AC-5)", () => {
 		h.close();
 	});
 });
+
+// doc/plans/qa-tuv-land-races.md: an owner act (pause, a new claim) that lands between an await and its result wins.
+describe("land races: the owner's act during an await wins (qa-tuv-land-races)", () => {
+	test("defect 1: a claim made while the previous claim's git check runs is judged itself, not overwritten", async () => {
+		const first = Promise.withResolvers<VerifyResult>();
+		const judged: string[] = [];
+		const h = laneHarness(home.dir, {
+			verify: async (claim) => {
+				judged.push(claim.commit);
+				if (judged.length === 1) return first.promise;
+				return { ok: false, reasons: ["두 번째 클레임 판정"] };
+			},
+		});
+		const repo = makeRepo(repos);
+		const lane = await h.manager.start({ title: "claim-race", cwd: repo, channel: CHANNEL });
+		await h.settle();
+		const settled = h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "a".repeat(40), summary: "x" });
+		await until(() => judged.length === 1);
+		// The lane claims again in the same millisecond while the first check still runs.
+		await h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "b".repeat(40), summary: "y" });
+		expect(h.store.getLane(lane.name)?.meta.claim?.commit).toBe("b".repeat(40));
+
+		first.resolve({ ok: false, reasons: ["첫 클레임 판정"] });
+		await settled;
+		await h.settle();
+		expect(judged).toEqual(["a".repeat(40), "b".repeat(40)]);
+		const notDone = h.store.getLane(lane.name)?.history.filter((entry) => entry.event === "not_done") ?? [];
+		expect(notDone.map((entry) => entry.detail)).toEqual(["두 번째 클레임 판정"]);
+		h.close();
+	});
+
+	test("defect 1: a stale verdict that passes does not close the lane on the older commit", async () => {
+		const first = Promise.withResolvers<VerifyResult>();
+		const second = Promise.withResolvers<VerifyResult>();
+		const judged: string[] = [];
+		const h = laneHarness(home.dir, {
+			verify: async (claim) => {
+				judged.push(claim.commit);
+				return judged.length === 1 ? first.promise : second.promise;
+			},
+		});
+		const repo = makeRepo(repos);
+		const lane = await h.manager.start({ title: "claim-race-pass", cwd: repo, channel: CHANNEL });
+		await h.settle();
+		const settled = h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "a".repeat(40), summary: "x" });
+		await until(() => judged.length === 1);
+		await h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "b".repeat(40), summary: "y" });
+
+		first.resolve({ ok: true, sha: "a".repeat(40) });
+		await settled;
+		await until(() => judged.length === 2);
+		const between = h.store.getLane(lane.name);
+		expect(between?.status).toBe("done-claimed");
+		expect(between?.meta.sha).toBeUndefined();
+		second.resolve({ ok: false, reasons: ["두 번째 클레임 판정"] });
+		await h.settle();
+		expect(h.store.getLane(lane.name)?.status).toBe("not-done");
+		h.close();
+	});
+
+	test("defect 3: resuming a lane paused with a pending claim sends no resume prompt (no new turn)", async () => {
+		const gate = Promise.withResolvers<VerifyResult>();
+		const h = laneHarness(home.dir, { verify: async () => gate.promise });
+		const repo = makeRepo(repos);
+		const lane = await h.manager.start({ title: "resume-claimed-quiet", cwd: repo, channel: CHANNEL });
+		await h.settle();
+		const settled = h.manager.claimDone(lane.originKey, { repo: lane.cwd, commit: "d".repeat(40), summary: "x" });
+		await until(() => h.store.getLane(lane.name)?.status === "done-claimed");
+		await h.manager.pause(lane.name, "owner-message");
+		await h.settle();
+
+		const outcome = await h.manager.resume(lane.name, "button");
+		await h.settle();
+		expect(outcome.text).toContain("재개했습니다");
+		expect(h.store.getLane(lane.name)?.status).toBe("done-claimed");
+		const sent = [...h.steers(lane.originKey), ...h.prompts(lane.originKey)];
+		expect(sent.some((text) => text.includes("오너가 재개했습니다"))).toBe(false);
+		gate.resolve({ ok: true, sha: "d".repeat(40) });
+		await settled;
+		h.close();
+	});
+});

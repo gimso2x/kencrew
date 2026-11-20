@@ -109,7 +109,8 @@ function unreadable(err: unknown): boolean {
  */
 export class DiscordBackfill extends SingleFlightBackfill {
 	readonly #deps: DiscordBackfillDeps;
-	readonly #quarantined = new Set<string>();
+	/** Channel → epoch ms it was quarantined at; an entry older than `QUARANTINE_RETRY_MS` is dropped when next asked. */
+	readonly #quarantined = new Map<string, number>();
 	readonly #attempts = new Map<string, number>();
 
 	constructor(deps: DiscordBackfillDeps) {
@@ -154,16 +155,20 @@ export class DiscordBackfill extends SingleFlightBackfill {
 	}
 
 	#isQuarantined(channelId: string): boolean {
-		if (this.#quarantined.has(channelId)) return true;
-		const at = Number(this.#deps.cursors.getCursor(discordQuarantineKey(channelId)));
-		if (!Number.isFinite(at) || this.#deps.now() - at >= QUARANTINE_RETRY_MS) return false;
-		this.#quarantined.add(channelId);
+		const at =
+			this.#quarantined.get(channelId) ?? Number(this.#deps.cursors.getCursor(discordQuarantineKey(channelId)));
+		if (!Number.isFinite(at) || this.#deps.now() - at >= QUARANTINE_RETRY_MS) {
+			this.#quarantined.delete(channelId);
+			return false;
+		}
+		this.#quarantined.set(channelId, at);
 		return true;
 	}
 
 	#quarantine(key: string, channelId: string, error: string): void {
-		this.#quarantined.add(channelId);
-		this.#deps.cursors.setCursor(discordQuarantineKey(channelId), String(this.#deps.now()));
+		const at = this.#deps.now();
+		this.#quarantined.set(channelId, at);
+		this.#deps.cursors.setCursor(discordQuarantineKey(channelId), String(at));
 		this.#deps.log.warn("backfill_quarantined", { target: key, error });
 	}
 

@@ -57,6 +57,12 @@ async function endUnanswered(
 	return kind === "timeout" ? { cancelled: true, timedOut: true } : { cancelled: true };
 }
 
+/** A multi-select row's marker: its checkbox state, or "▶" for an action row (Done, Other) past `markableCount`. */
+function checkMarkOf(request: Extract<OmpDialogRequest, { method: "select" }>, index: number): string {
+	if (index >= (request.markableCount ?? request.options.length)) return "▶";
+	return request.checkedIndices?.includes(index) === true ? "☑" : "☐";
+}
+
 async function answerSelect(
 	broker: ApprovalBroker,
 	origin: ApprovalOrigin,
@@ -70,14 +76,19 @@ async function answerSelect(
 		const at = option.indexOf(DESCRIPTION_SEP);
 		return at > 0 ? option.slice(0, at) : option;
 	});
-	const described = heads.some((head, index) => head !== options[index]);
+	const multi = request.selectionMarker === "checkbox";
+	const rows = options.map((option, index) => {
+		const description = request.descriptions?.[index];
+		const row = description === undefined ? option : `${option}${DESCRIPTION_SEP}${description}`;
+		return multi && request.checkedIndices !== undefined ? `${checkMarkOf(request, index)} ${row}` : row;
+	});
+	const described = rows.some((row, index) => row !== heads[index]);
 	const text = asButtons
-		? `❓ ${request.title}\n${described ? `${numbered(options)}\n` : ""}${REPLY_HINT}`
-		: `❓ ${request.title}\n${numbered(options)}\n번호로 이 스레드에 답장해 주세요`;
+		? `❓ ${request.title}\n${described ? `${numbered(rows)}\n` : ""}${REPLY_HINT}`
+		: `❓ ${request.title}\n${numbered(rows)}\n번호로 이 스레드에 답장해 주세요`;
 	// omp's own "other" row is its last row. Without one (a tool approval) or in a multi-select (omp marks its rows
 	// "checkbox"; a required one has no "Done" row to tell it by) a text naming no option is not an answer: the card
 	// refuses it and stays open. A blank text never picks "Other": omp would reopen its input loop on it.
-	const multi = request.selectionMarker === "checkbox";
 	const other = !multi && options.at(-1)?.endsWith(OTHER_ROW_SUFFIX) === true ? options.at(-1) : undefined;
 	const card = await broker.choose(
 		origin,
@@ -292,6 +303,7 @@ async function answerAsk(
 		if (result.kind === "cancelled") return endUnanswered(card, "cancelled", ASK_FALLBACK);
 		if (result.kind === "timeout") {
 			const untouched = answers.every((answer) => answer === undefined);
+			const autoPicked: Array<{ question: string; chosen: string }> = [];
 			// omp's own fallback, so the card says what omp picks.
 			questions.forEach((question, q) => {
 				if (answers[q] !== undefined) return;
@@ -299,7 +311,9 @@ async function answerAsk(
 				const pick = Math.min(Math.max(question.recommended ?? 0, 0), question.options.length - 1);
 				const label = question.options[pick]?.label;
 				answers[q] = { selectedOptions: label === undefined ? [] : [label] };
+				if (label !== undefined) autoPicked.push({ question: question.question, chosen: label });
 			});
+			broker.recordAutoChoices(origin, autoPicked);
 			// Nothing answered: omp fills every question itself and marks the result `timedOut` for the model.
 			// Partly answered: the owner's answers go back as they are, the rest as omp would fill them.
 			await card.close(`${ASK_TIMEOUT_LINE} — ${summary()}`, untouched ? undefined : summary());

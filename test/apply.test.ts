@@ -23,6 +23,7 @@ import {
 	type ApplyOptions,
 	type ApplyOutcome,
 	type ApplyReceipt,
+	BackupUnusableError,
 	CODE_ROLLBACK_JOURNAL,
 	createApplyLock,
 	detachedApplyCommand,
@@ -42,6 +43,7 @@ import {
 import type { BackupResult } from "../src/ops/backup";
 import { DEPS_MARKER, depsHash, ensureDeps, INSTALL_LOCK_FILE, INSTALL_LOCK_WAIT_MS } from "../src/ops/deps";
 import type { Gate } from "../src/ops/gates";
+import { SCHEMA_VERSION } from "../src/store/schema-version";
 
 const HEAD = "a".repeat(40);
 const PREV = "b".repeat(40);
@@ -615,6 +617,20 @@ describe("runApply execution", () => {
 		expect(receipt.steps.at(-1)).toMatchObject({ name: "backup", ok: false });
 		expect(restartCommands(world)).toHaveLength(0);
 	});
+
+	test("a snapshot the schema check refuses still lands in the receipt", async () => {
+		const world = makeWorld();
+		const file = join(home, "backups", "ompbot-20261030-050000.db");
+		const deps = makeDeps(world, {
+			backup: () => {
+				throw new BackupUnusableError(file, "this code cannot open the ledger snapshot: x");
+			},
+		});
+		const { exitCode, receipt } = await runApply(base, deps);
+		expect(exitCode).toBe(1);
+		expect(receipt.backupFile).toBe(file);
+		expect(receipt.steps.at(-1)).toMatchObject({ name: "backup", ok: false });
+	});
 });
 
 describe("runApply config copies", () => {
@@ -769,6 +785,16 @@ describe("apply backup wiring (C-02)", () => {
 		expect(existsSync(result.file)).toBe(true);
 		expect(result.bundle).toBeUndefined();
 		expect(readdirSync(join(home, "backups")).filter((name) => name.startsWith("ompbot-bundle-"))).toEqual([]);
+	});
+
+	test("deps.backup() fails on a ledger this code cannot open, before anything restarts, and leaves no copy", () => {
+		rmSync(join(home, "config.json"));
+		const db = new Database(join(home, "ompbot.db"));
+		db.run(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+		db.close();
+
+		expect(() => homeDeps(home, "ompbot", "/usr/bin").backup()).toThrow("this code cannot open the ledger snapshot");
+		expect(readdirSync(tmpdir()).filter((name) => name.startsWith("ompbot-apply-schema-"))).toEqual([]);
 	});
 });
 

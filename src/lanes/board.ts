@@ -178,6 +178,9 @@ export function buildBoardTools(
 	];
 }
 
+/** Head of the one-line board notice in a turn prompt. */
+export const BOARD_NOTICE_HEAD = "[ompbot 게시판]";
+
 /**
  * New posts of others in `originKey`'s channels since what it read or was told: one head line (count, channels) and
  * no body. Undefined when there is none, when the origin has no board, or for a closed lane. `commit` moves the
@@ -195,7 +198,7 @@ export function boardNoticeFor(store: Store, originKey: string): BoardNotice | u
 	if (hits.length === 0) return undefined;
 	const total = hits.reduce((sum, hit) => sum + hit.count, 0);
 	return {
-		block: `[ompbot 게시판] 새 글 ${total}개 (${hits.map((hit) => hit.channel).join(", ")}) — 필요하면 ompbot_board_read`,
+		block: `${BOARD_NOTICE_HEAD} 새 글 ${total}개 (${hits.map((hit) => hit.channel).join(", ")}) — 필요하면 ompbot_board_read`,
 		commit: () => {
 			for (const hit of hits) store.markLaneBoardNoticed(originKey, hit.channel, hit.maxId);
 		},

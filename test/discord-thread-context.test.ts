@@ -4,6 +4,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { THREAD_CONTEXT_HEADER } from "../src/core/mailbox";
 import { Daemon } from "../src/daemon/daemon";
+import type { DiscordBinding } from "../src/discord/binding";
 import type { DiscordMessageEvent } from "../src/discord/transport";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
@@ -198,5 +199,19 @@ describe("daemon: Discord thread context", () => {
 		await discord.waitForPosts((text) => text.includes("ECHO"));
 		expect(prompts()[0] ?? "").not.toContain(THREAD_CONTEXT_HEADER);
 		expect(discord.calls.filter((call) => call.method === "listMessages")).toEqual([]);
+	});
+});
+
+describe("readThread root", () => {
+	test("a parent-channel message that is not the thread's root is not returned as the root", async () => {
+		const transport = new WaitingDiscordTransport();
+		// The thread's starting post was deleted: the first message after THREAD - 1 is an unrelated later one.
+		transport.history.set(CH, [
+			{ id: "1300000000000000999", channel_id: CH, author: { id: HUMAN }, content: "UNRELATED", type: 0 },
+		]);
+		const binding = discordBinding(transport) as DiscordBinding;
+		expect(await binding.readThread(CH, THREAD, 1)).toEqual([]);
+		transport.history.set(CH, [{ id: THREAD, channel_id: CH, author: { id: BOT }, content: "ROOT", type: 0 }]);
+		expect((await binding.readThread(CH, THREAD, 1)).map((message) => message.ts)).toEqual([THREAD]);
 	});
 });

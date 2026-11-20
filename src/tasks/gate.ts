@@ -1,9 +1,18 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { MessageRef } from "../channel/port";
-import { laneQaRisk, QA_INCONCLUSIVE, REVIEW_INCONCLUSIVE, receiptBlockers } from "../lanes/land";
+import {
+	laneQaRisk,
+	QA_INCONCLUSIVE,
+	REVIEW_INCONCLUSIVE,
+	type ReceiptNow,
+	receiptBlockers,
+	receiptNowOf,
+	receiptStaleOf,
+} from "../lanes/land";
 import { type GateSlot, qaDepsOf, runQa, untilAborted } from "../lanes/qa";
 import { type GateSubject, type LaneReviewDeps, reviewSubject } from "../lanes/review";
+import { primeGateChanges, runtimeKey } from "../lanes/runtime";
 import type { LaneQa, LaneReview } from "../lanes/status";
 import { defaultGit, type GitRunner } from "../lanes/verify";
 import type { Logger } from "../log";
@@ -18,7 +27,9 @@ import type { AutoLandPolicy } from "./notify";
  * (doc/plans/task-review-qa-gate.md): the lanes' `reviewSubject`·`runQa` on the task's branch tip, one at a time in the
  * slot the lanes share, receipts kept in `tasks.gate_json` per tip. A `CLEAR` of at least `minConfidence` starts the
  * QA, a `PASS` lands the task through the core (`land`), anything else ends with the reasons. Each kind starts at most
- * `GATE_STARTS_MAX` times per tip (notice keys `gate:<sha>:<kind>:<n>`), so a gate cut off by restarts gives up.
+ * `GATE_STARTS_MAX` times per tip and runtime (notice keys `gate:<sha>:<rt>:<kind>:<n>`, `rt` = `gateRuntimeKey`), so a
+ * gate cut off by restarts gives up — and a receipt made on another runtime (`receiptStale`) is made again on the same
+ * tip without the earlier starts counting.
  */
 
 export const GATE_STARTS_MAX = 2;
@@ -28,16 +39,37 @@ export type GateKind = "review" | "qa";
 /** What the gate does next for a tip: run one kind, or stop with the reasons (`[]` = the receipts let it land). */
 export type TaskGateStep = { run: GateKind } | { blockers: string[] };
 
-/** The gate's order for the task at `sha`: review → `CLEAR` (confident) → QA → `PASS`. */
-export function taskGateStep(gate: TaskGate | null, sha: string, risk: TaskRisk, policy: AutoLandPolicy): TaskGateStep {
+/**
+ * The gate's order for the task at `sha`: review → `CLEAR` (confident) → QA → `PASS`. A receipt for another tip, or
+ * made on a runtime that no longer counts (`receiptStale`), is made again.
+ */
+export function taskGateStep(
+	gate: TaskGate | null,
+	sha: string,
+	risk: TaskRisk,
+	policy: AutoLandPolicy,
+	now: ReceiptNow = receiptNowOf(policy),
+): TaskGateStep {
 	const receipts = gate ?? {};
-	if (policy.review !== undefined && receipts.review?.sha !== sha) return { run: "review" };
+	const { review, qa } = receipts;
+	if (policy.review !== undefined && (review?.sha !== sha || receiptStaleOf("review", review, now) !== undefined)) {
+		return { run: "review" };
+	}
 	const { qa: _qa, ...reviewOnly } = policy;
-	const reviewed = receiptBlockers(receipts, sha, risk, reviewOnly);
+	const reviewed = receiptBlockers(receipts, sha, risk, reviewOnly, now);
 	if (reviewed.length > 0) return { blockers: reviewed };
-	if (laneQaRisk(risk, policy) && receipts.qa?.sha !== sha) return { run: "qa" };
-	return { blockers: receiptBlockers(receipts, sha, risk, policy) };
+	if (laneQaRisk(risk, policy) && (qa?.sha !== sha || receiptStaleOf("qa", qa, now) !== undefined)) {
+		return { run: "qa" };
+	}
+	return { blockers: receiptBlockers(receipts, sha, risk, policy, now) };
 }
+
+/** The `rt` of the gate's notice keys: the runtime, models and overlays a receipt made now would be bound to. */
+export const gateRuntimeKey = (now: ReceiptNow): string =>
+	runtimeKey({
+		model: `${now.review?.model ?? ""}|${now.qa?.model ?? ""}`,
+		overlay: `${now.review?.overlay ?? ""}|${now.qa?.overlay ?? ""}`,
+	});
 
 /** The reason of a kind whose starts ran out without a receipt. */
 export const exhaustedReason = (kind: GateKind): string =>
@@ -134,11 +166,14 @@ export class TaskGateRunner {
 	async decide(row: TaskRow, hooks: TaskGateHooks, policy: AutoLandPolicy): Promise<TaskLandOutcome | undefined> {
 		const tip = await taskTip(this.#deps.git ?? defaultGit, row);
 		if (tip === undefined) return { state: "held", reasons: ["작업 브랜치 끝 커밋을 읽지 못함"] };
-		const step = taskGateStep(row.gate, tip.sha, row.risk, policy);
+		await primeGateChanges(row.gate ?? {});
+		const now = receiptNowOf(policy);
+		const rt = gateRuntimeKey(now);
+		const step = taskGateStep(row.gate, tip.sha, row.risk, policy, now);
 		if ("blockers" in step) return step.blockers.length === 0 ? undefined : { state: "held", reasons: step.blockers };
 		if (this.#running.has(row.taskId)) return { state: "in_flight" };
-		if (!this.#claimStart(row.taskId, tip.sha, step.run)) {
-			const told = this.#deps.ledger.recordNotice(row.taskId, `gate:${tip.sha}:exhausted`);
+		if (!this.#claimStart(row.taskId, tip.sha, rt, step.run)) {
+			const told = this.#deps.ledger.recordNotice(row.taskId, `gate:${tip.sha}:${rt}:exhausted`);
 			return { state: "held", reasons: told ? [exhaustedReason(step.run)] : [] };
 		}
 		const abort = new AbortController();
@@ -157,8 +192,11 @@ export class TaskGateRunner {
 	async pending(row: TaskRow, policy: AutoLandPolicy): Promise<boolean> {
 		if (this.#running.has(row.taskId)) return false;
 		const tip = await taskTip(this.#deps.git ?? defaultGit, row);
-		if (tip === undefined || `gate:${tip.sha}:exhausted` in row.notices) return false;
-		return "run" in taskGateStep(row.gate, tip.sha, row.risk, policy);
+		if (tip === undefined) return false;
+		await primeGateChanges(row.gate ?? {});
+		const now = receiptNowOf(policy);
+		if (`gate:${tip.sha}:${gateRuntimeKey(now)}:exhausted` in row.notices) return false;
+		return "run" in taskGateStep(row.gate, tip.sha, row.risk, policy, now);
 	}
 
 	/** Aborts the task's running gate and waits until it ended (nothing recorded); at once when none runs. */
@@ -175,9 +213,9 @@ export class TaskGateRunner {
 		await Promise.all([...this.#running.keys()].map((taskId) => this.abort(taskId)));
 	}
 
-	#claimStart(taskId: string, sha: string, kind: GateKind): boolean {
+	#claimStart(taskId: string, sha: string, rt: string, kind: GateKind): boolean {
 		for (let n = 1; n <= GATE_STARTS_MAX; n++) {
-			if (this.#deps.ledger.recordNotice(taskId, `gate:${sha}:${kind}:${n}`)) return true;
+			if (this.#deps.ledger.recordNotice(taskId, `gate:${sha}:${rt}:${kind}:${n}`)) return true;
 		}
 		return false;
 	}
@@ -208,12 +246,13 @@ export class TaskGateRunner {
 					kind === "review" ? { review: receipt as LaneReview } : { qa: receipt as LaneQa },
 				).gate;
 				log.info("task_gate_recorded", { task: row.taskId, kind, sha: subject.sha, verdict: receipt.verdict });
-				const step = taskGateStep(gate, subject.sha, row.risk, policy);
+				const now = receiptNowOf(policy);
+				const step = taskGateStep(gate, subject.sha, row.risk, policy, now);
 				if ("blockers" in step) {
 					blockers = step.blockers;
 					break;
 				}
-				if (!this.#claimStart(row.taskId, subject.sha, step.run)) {
+				if (!this.#claimStart(row.taskId, subject.sha, gateRuntimeKey(now), step.run)) {
 					blockers = [exhaustedReason(step.run)];
 					break;
 				}

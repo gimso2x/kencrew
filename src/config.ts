@@ -55,6 +55,11 @@ export interface DiscordChannelConfig {
 	/** Server text channel that receives the approval cards of Discord requests; absent: the asking conversation. */
 	escalationChannelId?: string;
 	/**
+	 * Server text channel for the owner alerts (gate open/close, failing or stalled turns, stuck dispatch, provider
+	 * limits, failed monitors) instead of the owner home (DM); absent: the owner home. Never the log channel.
+	 */
+	alertChannelId?: string;
+	/**
 	 * Applied once at daemon start as the bot's global display name (`PATCH /users/@me`): what DMs and nickname-less
 	 * servers show instead of the ASCII username. 1-32 characters. A server nickname still wins over it.
 	 */
@@ -204,6 +209,9 @@ const CODE_ROLLBACK_MODES = ["push", "detach", "off"] as const;
 export type CodeRollbackMode = (typeof CODE_ROLLBACK_MODES)[number];
 const DEFAULT_CODE_ROLLBACK: CodeRollbackMode = "detach";
 
+/** A commit identity email (`taskAutoLand.commitEmails`): one `@`, no blanks around it. */
+const EMAIL_SHAPE = /^[^\s@]+@[^\s@]+$/;
+
 /** The code rollback mode of a home's config (`DEFAULT_CODE_ROLLBACK` without config or setting). */
 export function codeRollbackMode(config: Pick<OmpbotConfig, "apply"> | undefined): CodeRollbackMode {
 	return config?.apply?.codeRollback ?? DEFAULT_CODE_ROLLBACK;
@@ -343,6 +351,8 @@ export interface OmpbotConfig {
 		maxRisk?: TaskRisk;
 		review?: { model: string; timeoutMs?: number; confident?: LaneReviewConfident };
 		qa?: { minRisk?: TaskRisk; overlay: string; model: string; timeoutMs?: number };
+		/** Per repository (absolute path): the author/committer emails a lane's commits may carry (case-insensitive). */
+		commitEmails?: Record<string, string[]>;
 	};
 	/**
 	 * Work lanes. `completionNudges`: after a lane turn ends with no done claim the core nudges the lane this many
@@ -417,6 +427,8 @@ export interface OmpbotConfig {
 	};
 }
 
+/** The keys of a `dispatchHosts` entry; a typo (`workdir`) must not silently fall back to the default. */
+const DISPATCH_HOST_KEYS = new Set(["ssh", "workDir", "herdrBin", "ompArgs"]);
 /** A `dispatchHosts.<h>.ssh` target: not an ssh option (no leading `-`), no whitespace or control character (NUL throws in spawn). */
 export const DISPATCH_SSH = /^[^\s-][^\s\p{Cc}]*$/u;
 /** A `dispatchHosts.<h>.workDir` / `herdrBin`: non-empty (an empty word would reach the remote command) and no control character (NUL throws in spawn). */
@@ -527,6 +539,7 @@ const DISCORD_KEYS: Record<string, true> = {
 	laneChannelId: true,
 	logChannelId: true,
 	escalationChannelId: true,
+	alertChannelId: true,
 	displayName: true,
 	peerBots: true,
 };
@@ -561,10 +574,13 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 	const laneChannelId = record.laneChannelId === undefined ? undefined : snowflake("laneChannelId");
 	const logChannelId = record.logChannelId === undefined ? undefined : snowflake("logChannelId");
 	const escalationChannelId = record.escalationChannelId === undefined ? undefined : snowflake("escalationChannelId");
-	// Inbound in the log channel is dropped, so it cannot also be where cards are answered, lanes open or chats run.
+	const alertChannelId = record.alertChannelId === undefined ? undefined : snowflake("alertChannelId");
+	// Inbound in the log channel is dropped, so it cannot also be where cards are answered, lanes open, chats run or
+	// alerts are answered.
 	if (
 		logChannelId !== undefined &&
 		(logChannelId === escalationChannelId ||
+			logChannelId === alertChannelId ||
 			logChannelId === laneChannelId ||
 			mentionFreeChannels?.includes(logChannelId) === true)
 	) {
@@ -615,6 +631,7 @@ function parseDiscordChannel(configPath: string, value: unknown, home: string): 
 		...(laneChannelId === undefined ? {} : { laneChannelId }),
 		...(logChannelId === undefined ? {} : { logChannelId }),
 		...(escalationChannelId === undefined ? {} : { escalationChannelId }),
+		...(alertChannelId === undefined ? {} : { alertChannelId }),
 		...(displayName === undefined ? {} : { displayName }),
 		...(peerBots === undefined ? {} : { peerBots }),
 	};
@@ -1017,6 +1034,9 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 				invalid(configPath, `dispatchHosts.${name}.herdrBin`);
 			}
 			optionalArgList(configPath, record, "ompArgs", `dispatchHosts.${name}.ompArgs`);
+			for (const key of Object.keys(record)) {
+				if (!DISPATCH_HOST_KEYS.has(key)) invalid(configPath, `dispatchHosts.${name}.${key}`);
+			}
 		}
 		// A name is printed into doctor lines and reports; a control character in it could forge a line there.
 		if (Object.keys(hosts ?? {}).some((name) => /[\p{Cc}\p{Cf}]/u.test(name))) {
@@ -1056,6 +1076,9 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		if (record?.keep !== undefined && (!Number.isSafeInteger(record.keep) || (record.keep as number) < 1)) {
 			invalid(configPath, "offsite.keep");
 		}
+		for (const key of Object.keys(record ?? {})) {
+			if (key !== "ssh" && key !== "remoteDir" && key !== "keep") invalid(configPath, `offsite.${key}`);
+		}
 		offsite = {
 			ssh: record?.ssh as string,
 			remoteDir,
@@ -1071,6 +1094,9 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		}
 		if (record?.api !== undefined && (typeof record.api !== "string" || !/^https?:\/\/\S+$/.test(record.api))) {
 			invalid(configPath, "herdrBoard.api");
+		}
+		for (const key of Object.keys(record ?? {})) {
+			if (key !== "url" && key !== "api") invalid(configPath, `herdrBoard.${key}`);
 		}
 	}
 
@@ -1088,8 +1114,28 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			invalid(configPath, "taskAutoLand.maxRisk");
 		}
 		for (const key of Object.keys(record)) {
-			if (key !== "repos" && key !== "maxRisk" && key !== "review" && key !== "qa") {
+			if (key !== "repos" && key !== "maxRisk" && key !== "review" && key !== "qa" && key !== "commitEmails") {
 				invalid(configPath, `taskAutoLand.${key}`);
+			}
+		}
+		let commitEmails: Record<string, string[]> | undefined;
+		if (record.commitEmails !== undefined) {
+			const emailsRecord = asRecord(record.commitEmails);
+			if (emailsRecord === undefined) invalid(configPath, "taskAutoLand.commitEmails");
+			commitEmails = {};
+			for (const [repo, emails] of Object.entries(emailsRecord)) {
+				// A repository key is an absolute path (a wrong one would silently never match a lane's repository).
+				if (!isAbsolute(repo)) invalid(configPath, `taskAutoLand.commitEmails.${repo}`);
+				if (!Array.isArray(emails) || emails.length === 0) {
+					invalid(configPath, `taskAutoLand.commitEmails.${repo}`);
+				}
+				const list = emails as unknown[];
+				list.forEach((email, i) => {
+					if (typeof email !== "string" || !EMAIL_SHAPE.test(email.trim())) {
+						invalid(configPath, `taskAutoLand.commitEmails.${repo}.${i}`);
+					}
+				});
+				commitEmails[repo.replace(/(?<=.)\/+$/, "")] = (list as string[]).map((email) => email.trim());
 			}
 		}
 		let qa: NonNullable<OmpbotConfig["taskAutoLand"]>["qa"];
@@ -1176,6 +1222,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 			...(maxRisk === undefined ? {} : { maxRisk: maxRisk as TaskRisk }),
 			...(review === undefined ? {} : { review }),
 			...(qa === undefined ? {} : { qa }),
+			...(commitEmails === undefined ? {} : { commitEmails }),
 		};
 	}
 
@@ -1184,6 +1231,7 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 	if (herdrRaw !== undefined) {
 		const record = asRecord(herdrRaw);
 		if (record === undefined) invalid(configPath, "herdr");
+		for (const key of Object.keys(record)) if (key !== "bin") invalid(configPath, `herdr.${key}`);
 		const bin = optionalString(configPath, record, "bin", "herdr.bin");
 		if (bin !== undefined && !isAbsolute(bin)) invalid(configPath, "herdr.bin");
 		herdr = bin === undefined ? {} : { bin };
@@ -1254,10 +1302,15 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 		) {
 			invalid(configPath, "wikiNotes.repos");
 		}
-		const home = (path: string): string => resolve(path.startsWith("~") ? join(homedir(), path.slice(1)) : path);
-		wikiNotes = { client: home(client as string) };
-		if (agentDir !== undefined) wikiNotes.agentDir = home(agentDir as string);
-		if (repos !== undefined) wikiNotes.repos = (repos as string[]).map(home);
+		// Only `~` and `~/…` mean this user's home; `~other/x` must not be re-read as a directory under it.
+		const home = (path: string, field: string): string => {
+			if (path === "~" || path.startsWith("~/")) return resolve(join(homedir(), path.slice(1)));
+			if (path.startsWith("~")) invalid(configPath, `wikiNotes.${field}`);
+			return resolve(path);
+		};
+		wikiNotes = { client: home(client as string, "client") };
+		if (agentDir !== undefined) wikiNotes.agentDir = home(agentDir as string, "agentDir");
+		if (repos !== undefined) wikiNotes.repos = (repos as string[]).map((repo) => home(repo, "repos"));
 	}
 
 	const briefingRaw = root.briefing;
@@ -1374,6 +1427,27 @@ export function loadConfig(homeDir: string = defaultHomeDir(), options: { checkT
 				invalid(configPath, `dashboard.${key}`);
 			}
 		}
+	}
+
+	// One address, one listener: a second bind on it fails at start (the daemon logs it and runs on without one).
+	// Teams listens on its default address only when `channels.teams` is configured.
+	const listeners: Array<[string, string, number]> = [];
+	const addressOf = (host: string): string => (host === "localhost" ? "127.0.0.1" : host);
+	if (channels.teams !== undefined) {
+		const teamsListen = parseLoopbackListen(channels.teams.listen);
+		if (teamsListen !== undefined)
+			listeners.push(["channels.teams.listen", addressOf(teamsListen.hostname), teamsListen.port]);
+	}
+	for (const [name, block] of [
+		["webhook", webhook],
+		["dashboard", dashboard],
+	] as const) {
+		const record = asRecord(block);
+		if (record === undefined) continue;
+		const address = addressOf((record.bind as string | undefined) ?? "127.0.0.1");
+		const taken = listeners.some(([, host, port]) => host === address && port === record.port);
+		if (taken) invalid(configPath, `${name}.port`);
+		listeners.push([`${name}.port`, address, record.port as number]);
 	}
 
 	const candidatesRaw = root.candidates;

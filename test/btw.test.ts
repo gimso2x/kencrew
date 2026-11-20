@@ -1,16 +1,17 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { OriginRouter, openBotStore } from "../src/core/origin";
 import { type InboundRecord, parseCommand, promptTextOf } from "../src/core/types";
 import { NamespacedDriver } from "../src/daemon/opref";
 import { createLogger } from "../src/log";
 import { OmpDriverError } from "../src/omp/driver";
 import { FakeOmpDriver, type FakeOmpDriverOptions, FakeSessionStore } from "../src/omp/fake-driver";
-import { REQUIRED_RPC_METHODS, RpcOmpDriver } from "../src/omp/rpc-driver";
+import { RpcOmpDriver } from "../src/omp/rpc-driver";
 import { redact } from "../src/redact";
 import type { Store } from "../src/store/db";
+import { FakeOmpPeer, fakeOmpExecutable } from "./helpers/fake-omp-rpc";
 
 const ORIGIN = "discord/dm/200000000000000001";
 const clock = { now: () => 1_000_000 };
@@ -233,51 +234,6 @@ describe("AC-4 no turn, unsupported driver, missing question", () => {
 	});
 });
 
-/**
- * RpcClient stand-in for `RpcOmpDriver.start()` (it imports `<packageRoot>/src/modes/rpc/rpc-client.ts`): every
- * required method is a no-op, and the side-question surface is driven by hand — `btw()` stays open until
- * `answerBtw`/`failBtw`, `emitBtwRecord` plays a `btw_record` frame.
- */
-const FAKE_RPC_CLIENT_SOURCE = `
-export class RpcClient {
-	static instances = [];
-	btwCalls = [];
-	cancelCalls = [];
-	listeners = new Set();
-	listenersAtBtwCall = -1;
-	response = Promise.withResolvers();
-	constructor() {
-		RpcClient.instances.push(this);
-	}
-	onBtwRecord(listener) {
-		this.listeners.add(listener);
-		return () => this.listeners.delete(listener);
-	}
-	emitBtwRecord(record) {
-		for (const listener of [...this.listeners]) listener(record);
-	}
-	btw(...args) {
-		this.btwCalls.push(args);
-		this.listenersAtBtwCall = this.listeners.size;
-		return this.response.promise;
-	}
-	answerBtw(record) {
-		this.response.resolve(record);
-	}
-	failBtw(message) {
-		this.response.reject(Object.assign(new Error(message), { name: "RpcCommandError" }));
-	}
-	async cancelBtw(...args) {
-		this.cancelCalls.push(args);
-		return true;
-	}
-}
-for (const name of ${JSON.stringify(REQUIRED_RPC_METHODS)}) {
-	if (Object.hasOwn(RpcClient.prototype, name)) continue;
-	RpcClient.prototype[name] = name.startsWith("on") ? () => () => undefined : async () => undefined;
-}
-`;
-
 interface BtwRecord {
 	id: string;
 	status: string;
@@ -285,14 +241,32 @@ interface BtwRecord {
 	error?: string;
 }
 
-interface FakeRpcClient {
-	btwCalls: unknown[][];
-	cancelCalls: unknown[][];
-	listeners: Set<unknown>;
-	listenersAtBtwCall: number;
-	emitBtwRecord(record: BtwRecord): void;
-	answerBtw(record: BtwRecord): void;
-	failBtw(message: string): void;
+/**
+ * The side-question wire of an in-memory omp peer: the `btw` command stays open until `answerBtw`/`failBtw`,
+ * `emitBtwRecord` writes a `btw_record` frame; frames keep their stdout order, as on the real pipe.
+ */
+class BtwPeer extends FakeOmpPeer {
+	constructor() {
+		super();
+		this.replies.set("btw", () => "hold");
+	}
+	get btwCalls(): unknown[] {
+		return this.commands.filter((c) => c.type === "btw").map((c) => c.question);
+	}
+	get cancelCalls(): unknown[][] {
+		return this.commands
+			.filter((c) => c.type === "btw_cancel")
+			.map((c) => (c.recordId === undefined ? [] : [c.recordId]));
+	}
+	emitBtwRecord(record: BtwRecord): void {
+		this.push({ type: "btw_record", record });
+	}
+	async answerBtw(record: BtwRecord): Promise<void> {
+		this.respond(await this.command((c) => c.type === "btw"), { data: { record } });
+	}
+	async failBtw(message: string): Promise<void> {
+		this.respond(await this.command((c) => c.type === "btw"), { error: message });
+	}
 }
 
 const record = (id: string, status: string, answer = "", error?: string): BtwRecord =>
@@ -301,36 +275,19 @@ const record = (id: string, status: string, answer = "", error?: string): BtwRec
 describe("AC-5 RpcOmpDriver.btw", () => {
 	let root: string;
 	let driver: RpcOmpDriver;
-	let client: FakeRpcClient;
+	let client: BtwPeer;
 
 	async function startDriver(btwTimeoutMs?: number): Promise<void> {
 		root = mkdtempSync(join(tmpdir(), "ompbot-btw-rpc-"));
-		const bin = join(root, "pkg", "bin");
-		mkdirSync(bin, { recursive: true });
-		const ompExecutable = join(bin, "omp");
-		writeFileSync(ompExecutable, "#!/bin/sh\nexit 1\n"); // never executed; only realpath'ed and stat'ed
-		chmodSync(ompExecutable, 0o755);
-		const packageRoot = dirname(dirname(realpathSync(ompExecutable)));
-		const clientModule = join(packageRoot, "src/modes/rpc/rpc-client.ts");
-		mkdirSync(dirname(clientModule), { recursive: true });
-		writeFileSync(clientModule, FAKE_RPC_CLIENT_SOURCE);
-		const utilsDir = join(packageRoot, "node_modules/@oh-my-pi/pi-utils");
-		mkdirSync(utilsDir, { recursive: true });
-		writeFileSync(join(utilsDir, "package.json"), JSON.stringify({ name: "@oh-my-pi/pi-utils", main: "index.js" }));
-		writeFileSync(join(utilsDir, "index.js"), "export const ptree = { spawn() { throw new Error('no spawn'); } };\n");
+		client = new BtwPeer();
 		driver = new RpcOmpDriver({
-			ompExecutable,
+			ompExecutable: fakeOmpExecutable(root),
 			cwd: root,
 			sessionDir: join(root, "s"),
-			bunExecutable: process.execPath,
+			spawn: client.spawn,
 			...(btwTimeoutMs === undefined ? {} : { btwTimeoutMs }),
 		});
 		await driver.start();
-		// Dynamic import: the fixture module is written to a temp dir above, the same instance the driver loaded.
-		const fixture = (await import(clientModule)) as { RpcClient: { instances: FakeRpcClient[] } };
-		const instance = fixture.RpcClient.instances.at(-1);
-		if (!instance) throw new Error("fake RpcClient was not constructed");
-		client = instance;
 	}
 
 	afterEach(async () => {
@@ -341,16 +298,14 @@ describe("AC-5 RpcOmpDriver.btw", () => {
 	test("subscribes before asking and returns the trimmed answer of the complete record", async () => {
 		await startDriver();
 		const answer = driver.btw("질문");
-		expect(client.btwCalls).toEqual([["질문"]]);
-		expect(client.listenersAtBtwCall).toBe(1);
+		await client.command((c) => c.type === "btw");
+		expect(client.btwCalls).toEqual(["질문"]);
 		client.emitBtwRecord(record("r1", "running"));
-		client.answerBtw(record("r1", "running"));
-		await Promise.resolve(); // the response continuation runs before the next frame, as on the wire
+		await client.answerBtw(record("r1", "running"));
 		client.emitBtwRecord(record("r2", "complete", "다른 곁질문"));
 		client.emitBtwRecord(record("r1", "running", "부분"));
 		client.emitBtwRecord(record("r1", "complete", "  답입니다\n"));
 		expect(await answer).toBe("답입니다");
-		expect(client.listeners.size).toBe(0);
 		expect(client.cancelCalls).toEqual([]);
 	});
 
@@ -360,16 +315,14 @@ describe("AC-5 RpcOmpDriver.btw", () => {
 		client.emitBtwRecord(record("r0", "complete", "남의 답"));
 		client.emitBtwRecord(record("r1", "running"));
 		client.emitBtwRecord(record("r1", "complete", "먼저 온 답"));
-		client.answerBtw(record("r1", "running"));
+		await client.answerBtw(record("r1", "running"));
 		expect(await answer).toBe("먼저 온 답");
-		expect(client.listeners.size).toBe(0);
 	});
 
 	test("an empty answer becomes (빈 답)", async () => {
 		await startDriver();
 		const answer = driver.btw("질문");
-		client.answerBtw(record("r1", "running"));
-		await Promise.resolve();
+		await client.answerBtw(record("r1", "running"));
 		client.emitBtwRecord(record("r1", "complete", "  \n"));
 		expect(await answer).toBe("(빈 답)");
 	});
@@ -380,35 +333,33 @@ describe("AC-5 RpcOmpDriver.btw", () => {
 			const answer = driver.btw("질문");
 			client.emitBtwRecord(record("r1", "running"));
 			client.emitBtwRecord(record("r1", status, "", "모델 호출 실패"));
-			client.answerBtw(record("r1", "running"));
+			await client.answerBtw(record("r1", "running"));
 			const error = await answer.catch((caught: unknown) => caught);
 			expect(error).toBeInstanceOf(OmpDriverError);
 			expect(String(error)).toContain(status);
 			expect(String(error)).toContain("모델 호출 실패");
-			expect(client.listeners.size).toBe(0);
 		});
 	}
 
 	test("a rejected btw() command rejects with OmpDriverError", async () => {
 		await startDriver();
 		const answer = driver.btw("질문");
-		client.failBtw("A /btw question is still running; cancel it first");
+		await client.failBtw("A /btw question is still running; cancel it first");
 		const error = await answer.catch((caught: unknown) => caught);
 		expect(error).toBeInstanceOf(OmpDriverError);
 		expect(String(error)).toContain("still running");
 		expect(client.cancelCalls).toEqual([]);
-		expect(client.listeners.size).toBe(0);
 	});
 
 	test("a timeout after the id is known cancels that record", async () => {
 		await startDriver(5);
 		const answer = driver.btw("질문");
-		client.answerBtw(record("r1", "running"));
+		await client.answerBtw(record("r1", "running"));
 		const error = await answer.catch((caught: unknown) => caught);
 		expect(error).toBeInstanceOf(OmpDriverError);
 		expect(String(error)).toContain("btw timeout");
+		await client.command((c) => c.type === "btw_cancel");
 		expect(client.cancelCalls).toEqual([["r1"]]);
-		expect(client.listeners.size).toBe(0);
 	});
 
 	test("a timeout before the btw() response cancels without an id", async () => {
@@ -416,7 +367,7 @@ describe("AC-5 RpcOmpDriver.btw", () => {
 		const error = await driver.btw("질문").catch((caught: unknown) => caught);
 		expect(error).toBeInstanceOf(OmpDriverError);
 		expect(String(error)).toContain("btw timeout");
+		await client.command((c) => c.type === "btw_cancel");
 		expect(client.cancelCalls).toEqual([[]]);
-		expect(client.listeners.size).toBe(0);
 	});
 });

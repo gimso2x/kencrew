@@ -145,7 +145,7 @@ describe("AC-2: one alert per thread and peer", () => {
 		expect(alert?.threadRef).toBe(`${CONV}:${THREAD}`);
 		expect(alert?.originKey).toBe(threadOrigin());
 		expect(alert?.state).toBe("pending");
-		expect(alert?.body).toBe(`<@${OWNER}> ⚠️ 뮤즈 무응답 13분 — VM이 잠든 것 같으니 앱을 열어 주세요`);
+		expect(alert?.body).toBe(`<@${OWNER}> ⚠️ 뮤즈 무응답 13분 — 재시작·VM 교체 뒤 복원 중일 수 있습니다`);
 		// The first call (call_id 1, delivery `first`) names the alert.
 		expect(calls()[0]?.delivery_id).toBe(first);
 		expect(alert?.opRef).toBe(`${PEER_SILENCE_OP_PREFIX}1`);

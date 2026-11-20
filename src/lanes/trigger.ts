@@ -2,6 +2,7 @@ import { parseCommand, promptTextOf } from "../core/types";
 import type { TodoPhase } from "../omp/driver";
 import type { AcceptanceItem } from "../tasks/docs";
 import { withoutCheckTail } from "../tasks/signals";
+import { isGithubRepo } from "./pr";
 import type { LaneLandState } from "./status";
 
 export interface LaneTrigger {
@@ -36,8 +37,36 @@ export function isOwnerAcceptText(text: string): boolean {
 	return text.trim() === "닫아";
 }
 
+/** `!pr` in a closed lane's thread: the GitHub repository and/or the open PR the lane's work goes to. */
+export type PrCommand = { repo?: string; prNumber?: number } | { problem: string };
+
+const PR_NUMBER_MAX = 1_000_000_000;
+
+/**
+ * `!pr`, `!pr owner/name`, `!pr <https://github.com/owner/name/pull/N>`, `!pr owner/name#N` or `!pr N` / `!pr #N`
+ * as the whole message (doc/plans/lane-external-pr.md 설계 1); `undefined` for any other message.
+ */
+export function parsePrCommand(text: string): PrCommand | undefined {
+	const match = /^!pr(?:[ \t]+(\S+))?$/.exec(text.trim());
+	if (match === null) return undefined;
+	const arg = match[1]?.replace(/^<(.*)>$/, "$1");
+	if (arg === undefined) return {};
+	const pull =
+		/^https:\/\/github\.com\/([^/\s]+\/[^/\s]+)\/pull\/(\d+)\/?(?:[?#]\S*)?$/i.exec(arg) ??
+		/^([^/\s#]+\/[^/\s#]+)#(\d+)$/.exec(arg);
+	const repo = pull?.[1] ?? (/^[^/\s#]+\/[^/\s#]+$/.test(arg) ? arg : undefined);
+	const digits = pull?.[2] ?? /^#?(\d+)$/.exec(arg)?.[1];
+	const prNumber = digits === undefined ? undefined : Number(digits);
+	if ((repo === undefined && prNumber === undefined) || (repo !== undefined && !isGithubRepo(repo))) {
+		return { problem: `\`!pr\` 뒤에는 owner/name, PR 주소, owner/name#번호 또는 PR 번호를 적어 주세요: ${arg}` };
+	}
+	if (prNumber !== undefined && (prNumber < 1 || prNumber > PR_NUMBER_MAX))
+		return { problem: `PR 번호가 아닙니다: ${arg}` };
+	return { ...(repo === undefined ? {} : { repo }), ...(prNumber === undefined ? {} : { prNumber }) };
+}
+
 /** What an owner message does in a closed lane's thread (`classifyClosedLaneMessage`). */
-export type ClosedLaneMessage = "reopen" | "control" | "question" | "land" | "discard";
+export type ClosedLaneMessage = "reopen" | "control" | "question" | "land" | "discard" | "pr";
 
 /**
  * What an owner message does in a closed lane's thread: `!reopen` reopens it; a chat command without work in it
@@ -49,6 +78,7 @@ export type ClosedLaneMessage = "reopen" | "control" | "question" | "land" | "di
  */
 export function classifyClosedLaneMessage(text: string, landState?: LaneLandState): ClosedLaneMessage {
 	if (isReopenCommand(text)) return "reopen";
+	if (parsePrCommand(text) !== undefined) return "pr";
 	if (landState === "pending" || landState === "blocked") {
 		const whole = text.trim();
 		if (whole === "머지해") return "land";
@@ -86,6 +116,8 @@ export function buildLanePrompt(input: {
 	acceptance: readonly AcceptanceItem[];
 	/** Other open lanes of the same repository when this one starts: the lane board is read first. */
 	sameRepoLanes?: ReadonlyArray<{ name: string; title: string }>;
+	/** The lane's work goes out as a GitHub PR (`meta.externalPr`). */
+	externalPr?: { repo: string; base: string; bodyFile: string } | undefined;
 }): string {
 	const brief = input.brief?.trim();
 	const sameRepo = input.sameRepoLanes ?? [];
@@ -123,6 +155,12 @@ export function buildLanePrompt(input: {
 		"- 고치기 전에 `git status`로 브랜치와 커밋 안 된 변경을 확인하세요. 내가 만들지 않은 변경은 지우거나 덮어쓰지 말고 진행 보고에 적으세요.",
 		"- 컨텍스트 압축·재시작·재개 뒤에는 요약만 믿지 말고 이 지시의 작업·수락기준과 지금 worktree 상태(`git status`, `git log`)를 다시 읽고 이어 가세요. 끝났는지 확실하지 않은 외부 효과(push·배포·메시지)는 확인하기 전에 다시 실행하지 마세요.",
 		`- 머지·push·브랜치 전환은 하지 마세요. ${input.branch}를 ${input.baseBranch}에 합치는 일은 코어와 오너가 합니다.`,
+		...(input.externalPr === undefined
+			? []
+			: [
+					`- 이 레인은 외부 PR용입니다(${input.externalPr.repo}:${input.externalPr.base}). push·PR 생성·base 머지는 하지 마세요. PR 본문은 \`${input.externalPr.bodyFile}\`에 써서 커밋하세요. 게시는 코어가 오너 승인 뒤 합니다.`,
+				]),
+		"- 전체 테스트는 `bun run test`로 한다(호스트에서 한 번에 하나씩 줄을 선다). 수정 중에는 고친 파일의 테스트만 돌린다.",
 		"- 중요한 단계(마일스톤)를 끝낼 때마다 host tool `ompbot_lane_progress`({text})로 한 줄 보고하세요.",
 		"- 오너 결정이 필요하면 `ompbot_lane_progress`를 `needsOwner: true`와 함께 부르고 질문을 적은 뒤 턴을 끝내세요. 완료 주장 없이 끝난 턴에는 코어가 자동 재촉을 보내지만, 이 경우에는 보내지 않습니다.",
 		"- 작업을 마치면 변경을 모두 커밋한 뒤 host tool `ompbot_claim_done`({repo, commit, summary})을 호출하세요. repo는 위 프로젝트 디렉터리의 절대경로, commit은 커밋 sha(worktree HEAD)입니다.",

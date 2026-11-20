@@ -8,7 +8,6 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
-	realpathSync,
 	rmSync,
 	statSync,
 	symlinkSync,
@@ -85,16 +84,17 @@ class FakeClock {
 
 /** Fake driver whose events, steer failures and prompt failures the test controls. */
 class OpsDriver extends FakeOmpDriver {
-	failSteers = 0;
+	/** Rejects the next cursor reads: nothing was sent yet, so the mailbox leaves the row pending. */
+	failLeafIds = 0;
 	failPrompts = 0;
 	readonly #listeners = new Set<(event: OmpEvent) => void>();
 
-	override async steer(text: string): Promise<void> {
-		if (this.failSteers > 0) {
-			this.failSteers--;
+	override async leafId(): Promise<string | null> {
+		if (this.failLeafIds > 0) {
+			this.failLeafIds--;
 			throw new Error("steer refused");
 		}
-		return super.steer(text);
+		return super.leafId();
 	}
 
 	override async prompt(text: string): Promise<string> {
@@ -197,7 +197,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		await router.route(msg("second"));
 		const driver = drivers[0];
 		if (!driver) throw new Error("no driver was started");
-		driver.failSteers = 1;
+		driver.failLeafIds = 1;
 		await router.route(msg("third"));
 		driver.crash(137);
 		await router.mailbox(ORIGIN).sweepIdle(); // runs behind the exit handler on the actor's chain
@@ -441,7 +441,7 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		await untilLine(() => lines.some((l) => l.includes("event=turn_start")));
 		const first = drivers[0];
 		if (!first) throw new Error("no driver was started");
-		first.failSteers = 1; // the steer fails: the row stays pending behind the running turn
+		first.failLeafIds = 1; // the steer cannot start: the row stays pending behind the running turn
 		await fire();
 
 		clock.advance(MONITOR_STALL_ABORT_MS);
@@ -669,6 +669,8 @@ describe("event log lines and stall detection (mailbox, fake clock)", () => {
 		for (const message of [
 			ZAI_LIMIT_ERROR,
 			"429 Too Many Requests",
+			"Too Many Requests",
+			"rate-limit exceeded",
 			"You exceeded your quota",
 			"Usage limit reached",
 			"rate_limit",
@@ -1381,19 +1383,16 @@ describe("ompbot doctor omp runtime check", () => {
 		return lines.find((line) => line.includes("omp runtime"));
 	}
 
-	function launcher(bunRange: string): string {
-		const root = mkdtempSync(join(dir, "pkg-"));
-		mkdirSync(join(root, "dist"));
-		writeFileSync(join(root, "package.json"), JSON.stringify({ engines: { bun: bunRange } }));
-		writeFileSync(join(root, "dist", "cli.js"), "#!/usr/bin/env bun\n", { mode: 0o755 });
-		return join(root, "dist", "cli.js");
+	function executable(version: string): string {
+		const root = mkdtempSync(join(dir, "bin-"));
+		writeFileSync(join(root, "omp"), `#!/bin/sh\necho ${version}\n`, { mode: 0o755 });
+		return join(root, "omp");
 	}
 
-	test("a standalone binary or a too-old bun fails; the package launcher with a satisfied bun passes", async () => {
-		expect(await runtimeLine(process.execPath)).toStartWith("fail omp runtime: omp_launcher_standalone ");
-		expect(await runtimeLine(launcher(">=999.0.0"))).toStartWith("fail omp runtime: bun_too_old ");
-		const ok = launcher(`>=${Bun.version}`);
-		expect(await runtimeLine(ok)).toBe(`ok omp runtime: launcher=${realpathSync(ok)}`);
+	test("an executable that does not answer omp/<x.y.z> fails; one that does (cli.js or a standalone binary) passes", async () => {
+		expect(await runtimeLine(executable("1.4.4"))).toStartWith("fail omp runtime: omp_executable_missing ");
+		const ok = executable("omp/19.0.0");
+		expect(await runtimeLine(ok)).toBe(`ok omp runtime: executable=${ok}`);
 	}, 30_000);
 
 	test("an ompExecutable that is a directory is a failed line, and the rest of the report still runs", async () => {
@@ -1418,7 +1417,7 @@ describe("ompbot doctor omp runtime check", () => {
 		await runDoctor(dir, (line) => lines.push(line), undefined, OFFLINE_DOCTOR);
 		// checkOmpRuntime reports the directory as a problem (the same code the gate and the RPC driver give).
 		expect(lines.find((line) => line.includes("omp runtime"))).toStartWith(
-			`fail omp runtime: omp_launcher_unreadable ${folder} cannot be read`,
+			`fail omp runtime: omp_executable_missing ${folder} cannot be run`,
 		);
 		expect(lines.some((line) => line.includes("backup bundle"))).toBe(true);
 		expect(lines.some((line) => line.startsWith("fail discord users/@me: "))).toBe(true);
@@ -2063,6 +2062,50 @@ describe("ompbot gc: thread-scoped sessions", () => {
 		expect(result.threadOriginsRemoved).toEqual([]);
 		expect(existsSync(sessionOf("discord/ch/300000000000000001/t/50"))).toBe(true);
 		expect(hasOrigin("discord/ch/300000000000000001/t/50")).toBe(true);
+	});
+});
+
+describe("ompbot gc: uncertain inbound keeps its origin", () => {
+	let home: TestHome;
+	const THREAD = "discord/ch/300000000000000001/t/50";
+	const dirOf = () => sessionDirFor(join(home.dir, "sessions"), THREAD, 1);
+	const options = () => ({ homeDir: home.dir, retentionDays: 30, now: Date.now() });
+
+	beforeEach(() => {
+		home = makeHome("ompbot-ops-gc-uncertain-");
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		store.ensureOrigin(THREAD, dirOf());
+		store.recordInbound({ originKey: THREAD, platformMessageId: "u1", textRef: "x" });
+		store.markUncertain("u1", "steer_threw");
+		store.close();
+		// An expired thread session: old files and old origin row, so only the uncertain row can keep it.
+		mkdirSync(dirOf(), { recursive: true });
+		const file = join(dirOf(), "session.jsonl");
+		writeFileSync(file, "{}\n");
+		const old = new Date(Date.now() - 60 * DAY_MS);
+		for (const path of [file, dirOf(), dirname(dirOf())]) utimesSync(path, old, old);
+		const db = new Database(join(home.dir, "ompbot.db"), { strict: true });
+		db.run("UPDATE origins SET updated_at = ? WHERE origin_key = ?", [old.getTime(), THREAD]);
+		db.close();
+	});
+
+	afterEach(() => home.remove());
+
+	test("dry-run and a real run both retain it; after the owner closes the row the usual rule removes it", () => {
+		const dry = gcSessions({ ...options(), dryRun: true });
+		expect(dry.retained).toContain(dirname(dirOf()));
+		expect(dry.threadOriginsRemoved).toEqual([]);
+		const real = gcSessions(options());
+		expect(real.retained).toContain(dirname(dirOf()));
+		expect(real.threadOriginsRemoved).toEqual([]);
+		expect(existsSync(dirOf())).toBe(true);
+
+		const store = openBotStore(join(home.dir, "ompbot.db"), { now: () => Date.now() }, "Asia/Seoul");
+		store.discard("u1", "queue:close");
+		store.close();
+		const after = gcSessions(options());
+		expect(after.threadOriginsRemoved).toEqual([THREAD]);
+		expect(existsSync(dirOf())).toBe(false);
 	});
 });
 

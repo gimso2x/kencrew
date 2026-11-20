@@ -425,7 +425,7 @@ describe("unix socket", () => {
 					ambiguous: 0,
 					expired: 0,
 				},
-				inbound: { pending: 0, dispatched: 0, answered: 1, failed_notified: 0, discarded: 0 },
+				inbound: { pending: 0, dispatched: 0, answered: 1, failed_notified: 0, discarded: 0, uncertain: 0 },
 				monitors: { count: 0, next: null },
 				openGates: [], // makeHome writes no backup stamp; the boot backup writes the first one
 			},

@@ -27,7 +27,6 @@ import {
 	platformOfConversationId,
 	REMOVED_PLATFORM_PREFIX,
 } from "../core/origin-key";
-import { stuckStopText } from "../core/stuck";
 import {
 	COMMAND_OP_REF,
 	COMMAND_TEXT,
@@ -44,8 +43,7 @@ import { boardCardLink, diffViewLink } from "../dispatch/board";
 import {
 	herdrAgentPane,
 	herdrAgentStatus,
-	herdrAgentWorkspace,
-	herdrCloseWorkspace,
+	herdrCloseTaskAgent,
 	herdrInterruptAgent,
 	herdrPromptExisting,
 	herdrReadAgent,
@@ -60,6 +58,7 @@ import { classifyLaneControl } from "../lanes/control";
 import { confidentBand, createLaneLander, type LandLane } from "../lanes/land";
 import { DEFAULT_COMPLETION_NUDGES, LaneInputError, LaneManager } from "../lanes/manager";
 import { createGateSlot } from "../lanes/qa";
+import { parseReservationActionId, type ReservationAction } from "../lanes/reservations";
 import { isLaneOrigin, type LaneRow } from "../lanes/status";
 import { buildLaneTools, buildWorkStartTool } from "../lanes/tools";
 import {
@@ -69,6 +68,7 @@ import {
 	isOwnerAcceptText,
 	type LaneTrigger,
 	parseLaneTrigger,
+	parsePrCommand,
 } from "../lanes/trigger";
 import type { ClaimEvidence, VerifyResult } from "../lanes/verify";
 import type { Logger } from "../log";
@@ -94,7 +94,7 @@ import { formatCacheMissNotice, formatColdCacheNotice } from "../ops/cache-monit
 import { type DailyBudgetState, dailyBudgetState, ledgerDay, renderBudget } from "../ops/cost-cap";
 import { createFreezeProbe, type FreezeState } from "../ops/freeze";
 import { collectGates, type GateState, gateOptionsFromConfig } from "../ops/gates";
-import { HerdrHealthProbe } from "../ops/herdr-health";
+import { HERDR_HEALTH_CHECK_MS, HerdrHealthProbe } from "../ops/herdr-health";
 import { diskHeadroom, type HostLoadReader, type StatfsReader } from "../ops/host-resources";
 import { pruneMediaFiles } from "../ops/media";
 import { BRIEFING_TIMEOUT_MS, BRIEFING_WIDTH, renderPng } from "../ops/screenshot";
@@ -124,9 +124,10 @@ import {
 	type PeerCallPolicy,
 	Store,
 } from "../store/db";
+import { TaskCheckRunner } from "../tasks/check-runner";
 import { notePrompt } from "../tasks/dispatch";
 import { docsDirOf } from "../tasks/docs";
-import { evaluateTask } from "../tasks/evaluate";
+import { evaluateTask, ledgerTaskChecks, memoryTaskChecks, runCheckJob } from "../tasks/evaluate";
 import { type TaskGateHooks, TaskGateRunner } from "../tasks/gate";
 import { resolveTaskHost } from "../tasks/host";
 import { landTask, type TaskLandDeps, type TaskLandOutcome, type TaskLandResult, taskLandHold } from "../tasks/land";
@@ -144,7 +145,7 @@ import {
 	taskLandNote,
 } from "../tasks/notify";
 import { repoMatchesCommonDir } from "../tasks/repo-match";
-import { TASK_SWEEP_MS, TaskSweeper, taskChangedPaths } from "../tasks/sweeper";
+import { TASK_SWEEP_MS, TaskSweeper, taskChangedPaths, taskProgressEvidence } from "../tasks/sweeper";
 import { TeamsGraphClient } from "../teams/graph";
 import { localIso, offsetLabel } from "../time";
 import { WikiNotes } from "../wiki/notes";
@@ -282,7 +283,7 @@ export interface DaemonOptions {
 	 * sweep; default {@link runBackup}. Tests inject a failing one.
 	 */
 	bootBackup?: (options: BackupOptions) => BackupResult;
-	/** [TASK] sweep cadence (default 5 minutes); 0 disables it (tests call `sweepTasks()` directly). */
+	/** [TASK] sweep cadence (default 1 minute); 0 disables it (tests call `sweepTasks()` directly). */
 	taskSweepMs?: number;
 	/**
 	 * Sweep retry cadence for stranded pending rows (default {@link PENDING_RETRY_MS}); a pending row older than
@@ -481,10 +482,19 @@ export class Daemon {
 	#lastWikiFlushAt = 0;
 	/** `<task>:<reason>` of every overlap check a task was left out of, logged once each (memory only). */
 	readonly #overlapSkipped = new Set<string>();
+	/** `<task>:<reason>` of every progress-evidence read a task was left out of, logged once each (memory only). */
+	readonly #evidenceSkipped = new Set<string>();
 	/** Threads told "재시작 뒤에 처리" for an owner message held by the current drain: once per thread per drain. */
 	readonly #drainDeferNoticed = new Set<string>();
 	#lastTaskSweepAt = 0;
+	#lastHerdrHealthAt = 0;
 	#taskSweeping = false;
+	/** A sweep was asked for while one ran (a check job ended): it runs once more right after. */
+	#taskSweepAgain = false;
+	/** Tasks whose check job just ended: the next sweep judges them whatever their cadence. */
+	readonly #taskSweepDue = new Set<string>();
+	/** The `[check: …]` queue of local tasks (herdr on only): the sweep asks it for checks instead of running them. */
+	#checkRunner: TaskCheckRunner | undefined;
 	/** Local `herdr status server` check on the task sweep cadence (herdr on only); feeds `herdr_unreachable`. */
 	#herdrHealth: HerdrHealthProbe | undefined;
 	/** Background lane tick / mailbox idle sweep in flight: the sweep never awaits them, and never overlaps them. */
@@ -576,13 +586,17 @@ export class Daemon {
 	}
 
 	/**
-	 * The owner's notice conversation (`ownerHome()`) and the adapter that reaches it. No home yet (the owner has not
-	 * written anywhere) is logged as `owner_notice_unroutable` with the notice that could not go out; a home on a
-	 * platform without a bound adapter as `owner_channel_unbound`.
+	 * The owner's notice conversation and the adapter that reaches it: `channels.discord.alertChannelId` when set and
+	 * Discord is bound, else `ownerHome()`. No home yet (the owner has not written anywhere) is logged as
+	 * `owner_notice_unroutable` with the notice that could not go out; a home on a platform without a bound adapter as
+	 * `owner_channel_unbound`.
 	 */
 	#ownerTarget(notice: string): { adapter: ChannelAdapter; channel: string } | undefined {
 		const store = this.#store;
 		if (store === undefined) return undefined;
+		const alertChannel = this.#options.config.channels.discord?.alertChannelId;
+		const discord = alertChannel === undefined ? undefined : this.#adapters.get("discord");
+		if (alertChannel !== undefined && discord !== undefined) return { adapter: discord, channel: alertChannel };
 		const home = store.ownerHome();
 		if (home === undefined) {
 			this.#log.warn("owner_notice_unroutable", { notice });
@@ -902,6 +916,7 @@ export class Daemon {
 			config.timezone,
 		);
 		store.setPeerCallPolicy(peerCallPolicyOf(config));
+		store.setAlertChannel({ discord: config.channels.discord?.alertChannelId });
 		this.#store = store;
 		// The wiki result notes; `config.wikiNotes` is read on every use, so a reload turns them on or off.
 		const wikiNotes = new WikiNotes({
@@ -1029,6 +1044,14 @@ export class Daemon {
 			briefingProvider: (originKey, threadRef) => this.#brief(originKey, threadRef),
 			restartProvider: (originKey, threadRef) => restart.request(originKey, threadRef),
 			distillProvider: (originKey) => this.#distill(originKey),
+			// Discord conversations only (DMs, lanes, monitors and Teams have no cached place): the port's cache, no call.
+			conversationContext: (originKey) => {
+				const ref = parseChatOrigin(originKey);
+				if (ref?.platform !== "discord" || ref.kind !== "ch") return undefined;
+				return this.#options.channels
+					.find((binding) => binding.port.platform === "discord")
+					?.port.conversationContext?.(ref.conversationId, ref.threadId);
+			},
 			// Read on every turn and every `!undo`: a reload changes the repository list without a restart. The real git
 			// runs here: no `run` is passed, so the daemon never gains a test seam in production.
 			turnUndo: {
@@ -1053,11 +1076,6 @@ export class Daemon {
 			onCacheMiss: (info) => this.#postThreadNotices([info.threadRef], formatCacheMissNotice(info)),
 			onColdCache: (info) => this.#postThreadNotices([info.threadRef], formatColdCacheNotice(info)),
 			onSessionMismatch: (info) => this.#postThreadNotices([info.threadRef], formatSessionMismatchNotice(info)),
-			// A monitor's failed turn already retries with backoff through its own failure path: no thread post.
-			onStuckLoop: (info) => {
-				if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
-				this.#postThreadNotices([info.threadRef], redact(stuckStopText(info.toolName, info.count)));
-			},
 			// A monitor's turn has no thread to warn: the log line is its record.
 			onTurnCostCap: (info) => {
 				if (info.originKey.startsWith(MONITOR_ORIGIN_PREFIX)) return;
@@ -1139,6 +1157,9 @@ export class Daemon {
 			...(this.#options.pidAlive === undefined ? {} : { pidAlive: this.#options.pidAlive }),
 			frozen: this.#frozen,
 			approvals: { request: (channel, summary) => this.#approval.request(channel, summary) },
+			// An external PR's approval goes through `ask` with the lane thread as origin (escalation channel, pointer).
+			requestApproval: ({ channel, summary, detail, origin, signal }) =>
+				this.#approval.ask(channel, summary, { signal, detail, origin }),
 			// taskAutoLand is a live setting: `ompbot reload` turns lane auto-merge on or off for the next close.
 			autoLandPolicy: () => this.#autoLandPolicy(),
 			// An apply that reverted the code holds auto-merge until the next ok apply (`<home>/autoland.hold`).
@@ -1229,6 +1250,16 @@ export class Daemon {
 					const refusal = closedAs === "reopen" ? this.#lanes?.reopenRefusal(lane) : undefined;
 					if (closedAs === "land" || closedAs === "discard") {
 						void this.#settleLaneCommand(row, lane.name, { kind: closedAs });
+						return {};
+					}
+					// `!pr …` marks the closed lane's work as a GitHub PR; the lane session never sees it.
+					const prCommand = closedAs === "pr" ? parsePrCommand(message.text) : undefined;
+					if (prCommand !== undefined) {
+						void this.#settleLaneCommand(
+							row,
+							lane.name,
+							"problem" in prCommand ? { kind: "refused", text: prCommand.problem } : { kind: "pr", ...prCommand },
+						);
 						return {};
 					}
 					if (lane.status === "not-done" && isOwnerAcceptText(message.text)) {
@@ -1331,6 +1362,8 @@ export class Daemon {
 				return this.#router?.draining === true && command !== "restart" ? DRAIN_DEFERRED_COMMAND_TEXT : undefined;
 			},
 			knowsThread: (threadRef) => store.getLaneByThread(threadRef) !== undefined || store.hasInboundThread(threadRef),
+			hasInbound: (platformMessageId) => store.getInbound(platformMessageId) !== undefined,
+			inboundText: (platformMessageId) => store.getInbound(platformMessageId)?.textRef,
 			isDraining: () => this.#router?.draining === true,
 			// The thread of an approval card is `<card channel>:<card ts>` — the ledger's approval id.
 			onCardReply: ({ threadRef, platformMessageId, text, injected }) => {
@@ -1345,6 +1378,9 @@ export class Daemon {
 				if (taskId !== undefined) return this.#handleTaskMerge(taskId, channel, messageTs);
 				const recommended = parseTaskRecommendActionId(actionId);
 				if (recommended !== undefined) return this.#handleTaskRecommend(recommended, value, channel, messageTs);
+				const reservationAction = parseReservationActionId(actionId);
+				if (reservationAction !== undefined)
+					return this.#handleReservationButton(reservationAction, channel, messageTs);
 				const laneAction = parseLaneActionId(actionId);
 				if (laneAction !== undefined) return this.#handleLaneButton(laneAction, channel, messageTs);
 				log.info("action_ignored", { action: actionId, user: userId });
@@ -1455,12 +1491,26 @@ export class Daemon {
 				run: herdrRun ?? realProcessRunner,
 				now: () => this.#clock.now(),
 			});
+			const checkRunner = new TaskCheckRunner({
+				execute: async (taskId, signal) => {
+					const row = store.tasks.get(taskId);
+					if (row === undefined || row.host !== null || !["working", "blocked", "review"].includes(row.status)) {
+						return { kind: "skipped" };
+					}
+					return runCheckJob(row, resolveTaskHost(null, undefined), ledgerTaskChecks(store.tasks), signal);
+				},
+				onDone: (taskId) => this.#requestTaskSweep(taskId),
+				now: () => this.#clock.now(),
+				log,
+			});
+			this.#checkRunner = checkRunner;
 			this.#taskSweeper = new TaskSweeper({
 				ledger: store.tasks,
 				// dispatchHosts is a reloadable field: read the live config, not the boot snapshot.
 				frozen: this.#frozen,
+				checkRunner,
 				evaluate: (row, checks) =>
-					evaluateTask(row, resolveTaskHost(row.host, this.#options.config.dispatchHosts), checks),
+					evaluateTask(row, resolveTaskHost(row.host, this.#options.config.dispatchHosts), checks, checkRunner),
 				remind: async (row, text) => {
 					const entry = row.host === null ? undefined : this.#options.config.dispatchHosts?.[row.host];
 					const sent = await herdrPromptExisting(row.agent, text, {
@@ -1534,6 +1584,18 @@ export class Daemon {
 					if (!this.#overlapSkipped.has(key)) {
 						this.#overlapSkipped.add(key);
 						log.info("task_overlap_skipped", { task: row.taskId, reason: changed.reason });
+					}
+					return undefined;
+				},
+				// A remote task's worktree is on another machine: its evidence is not collected (spec 범위 밖).
+				progressEvidence: async (row) => {
+					if (row.host !== null) return undefined;
+					const evidence = await taskProgressEvidence(row.worktree, row.taskId, realProcessRunner);
+					if (evidence.ok) return evidence.key;
+					const key = `${row.taskId}:${evidence.reason}`;
+					if (!this.#evidenceSkipped.has(key)) {
+						this.#evidenceSkipped.add(key);
+						log.info("task_progress_evidence_skipped", { task: row.taskId, reason: evidence.reason });
 					}
 					return undefined;
 				},
@@ -1635,7 +1697,10 @@ export class Daemon {
 	async #settleLaneCommand(
 		row: InboundRow,
 		name: string,
-		command: { kind: "land" | "discard" | "accept" } | { kind: "refused"; text: string },
+		command:
+			| { kind: "land" | "discard" | "accept" }
+			| { kind: "refused"; text: string }
+			| { kind: "pr"; repo?: string; prNumber?: number },
 	): Promise<void> {
 		await this.#settleOwn("lane", "lane_command", row, async () => {
 			try {
@@ -1643,6 +1708,11 @@ export class Daemon {
 				if (!lanes) throw new Error("lanes unavailable");
 				if (command.kind === "refused") return `⚠️ ${command.text}`;
 				if (command.kind === "accept") return (await lanes.acceptByOwner(name)).text;
+				if (command.kind === "pr") {
+					const { kind: _pr, ...given } = command;
+					const outcome = await lanes.attachExternalPr(name, given);
+					return outcome.handled ? outcome.text : `⚠️ ${outcome.text}`;
+				}
 				return (command.kind === "land" ? await lanes.requestLand(name, "owner") : await lanes.discard(name)).text;
 			} catch (error) {
 				this.#log.error("lane_command_failed", { lane: name, command: command.kind, error: String(error) });
@@ -1824,9 +1894,13 @@ export class Daemon {
 					? await lanes.requestLand(name, "owner")
 					: kind === "discard"
 						? await lanes.discard(name)
-						: kind === "pause"
-							? await lanes.pause(name, "button")
-							: await lanes.resume(name, "button");
+						: kind === "publish"
+							? await lanes.requestPublish(name)
+							: kind === "hold"
+								? await lanes.hold(name)
+								: kind === "pause"
+									? await lanes.pause(name, "button")
+									: await lanes.resume(name, "button");
 		this.#log.info(outcome.handled ? `lane_${kind}_requested` : `lane_${kind}_ignored`, { lane: name });
 		if (kind === "pause" || kind === "resume" || kind === "session") {
 			// The status message changes, but the owner clicked: the answer tells what was re-read.
@@ -1849,14 +1923,58 @@ export class Daemon {
 			.catch((error: unknown) => this.#log.warn("lane_button_reply_failed", { lane: name, error: String(error) }));
 	}
 
+	/**
+	 * A `▶ 시작` / `✖ 취소` click on a lane reservation card (the adapter already refused every user but the owner). The
+	 * card is redrawn without buttons once the reservation has left `waiting`/`ready`; a refusal that leaves it standing
+	 * is told in its thread.
+	 */
+	async #handleReservationButton(
+		action: ReservationAction,
+		channel: string | undefined,
+		messageTs: string | undefined,
+	): Promise<void> {
+		const lanes = this.#lanes;
+		const store = this.#store;
+		if (lanes === undefined || store === undefined) return;
+		const outcome =
+			action.kind === "start" ? await lanes.startReservation(action.id) : lanes.cancelReservation(action.id);
+		this.#log.info(outcome.handled ? `lane_reservation_${action.kind}` : `lane_reservation_${action.kind}_ignored`, {
+			reservation: action.id,
+		});
+		const state = store.getLaneReservation(action.id)?.state;
+		const standing = state === "waiting" || state === "ready";
+		const port = channel === undefined ? undefined : this.#channels.forConversation(channel)?.port;
+		if (!standing && port !== undefined && channel !== undefined && messageTs !== undefined) {
+			await port
+				.edit(
+					{ platform: port.platform, conversationId: channel, messageId: messageTs },
+					{ text: outcome.handled ? outcome.text : `⚠️ ${outcome.text}`, buttons: [] },
+				)
+				.catch((error: unknown) =>
+					this.#log.warn("lane_reservation_card_edit_failed", { reservation: action.id, error: String(error) }),
+				);
+			return;
+		}
+		if (outcome.handled) return;
+		const reservation = store.getLaneReservation(action.id);
+		const route = reservation === undefined ? undefined : this.#channels.forThreadRef(reservation.threadRef);
+		if (route === undefined) return;
+		await route.port
+			.post(route.target, { text: `⚠️ ${outcome.text}` })
+			.catch((error: unknown) =>
+				this.#log.warn("lane_reservation_reply_failed", { reservation: action.id, error: String(error) }),
+			);
+	}
+
 	/** `taskAutoLand` as the [TASK] sweep and the lanes apply it (`maxRisk` defaults to L2); `undefined` = off. */
 	#autoLandPolicy(): AutoLandPolicy | undefined {
 		const policy = this.#options.config.taskAutoLand;
 		if (policy === undefined) return undefined;
-		const { review, qa } = policy;
+		const { review, qa, commitEmails } = policy;
 		return {
 			repos: policy.repos,
 			maxRisk: policy.maxRisk ?? "L2",
+			...(commitEmails === undefined ? {} : { commitEmails }),
 			...(qa === undefined
 				? {}
 				: {
@@ -2381,7 +2499,10 @@ export class Daemon {
 		if (interval <= 0 || now - this.#lastTaskSweepAt < interval) return;
 		this.#lastTaskSweepAt = now;
 		void this.sweepTasks();
-		void this.checkHerdrHealth();
+		if (now - this.#lastHerdrHealthAt >= HERDR_HEALTH_CHECK_MS) {
+			this.#lastHerdrHealthAt = now;
+			void this.checkHerdrHealth();
+		}
 	}
 
 	/** One local herdr reachability check (herdr on, with or without tasks): writes the `herdr-health` stamp. */
@@ -2400,12 +2521,26 @@ export class Daemon {
 		if (this.#taskSweeping || this.#taskSweeper === undefined || this.#stopped) return;
 		this.#taskSweeping = true;
 		try {
-			await this.#taskSweeper.sweep();
-		} catch (error) {
-			this.#log.error("task_sweep_failed", { error: String(error) });
+			do {
+				this.#taskSweepAgain = false;
+				const due = new Set(this.#taskSweepDue);
+				this.#taskSweepDue.clear();
+				try {
+					await this.#taskSweeper.sweep(due);
+				} catch (error) {
+					this.#log.error("task_sweep_failed", { error: String(error) });
+				}
+			} while (this.#taskSweepAgain && !this.#stopped);
 		} finally {
 			this.#taskSweeping = false;
 		}
+	}
+
+	/** A check job of `taskId` ended: sweep now, or right after the sweep in flight; the next cadence is not waited for. */
+	#requestTaskSweep(taskId: string): void {
+		this.#taskSweepDue.add(taskId);
+		if (this.#taskSweeping) this.#taskSweepAgain = true;
+		else void this.sweepTasks();
 	}
 
 	/** Hourly, not per-sweep: inbound attachments are context for one turn, kept 24h, then deleted. */
@@ -2669,6 +2804,7 @@ export class Daemon {
 		this.#options.config = plan.next;
 		// `channels` is a restart key, so `plan.next` still carries the Discord values the daemon started with.
 		this.#store?.setLogChannel({ discord: plan.next.channels.discord?.logChannelId });
+		this.#store?.setAlertChannel({ discord: plan.next.channels.discord?.alertChannelId });
 		if (plan.changed.includes("peerSilenceAlert")) this.#store?.setPeerCallPolicy(peerCallPolicyOf(plan.next));
 		this.#broker?.setEscalationChannel({ discord: plan.next.channels.discord?.escalationChannelId });
 		// Of the top-level keys only the peer hop cap reaches the adapter (its own policy is under `channels.discord`).
@@ -3007,7 +3143,8 @@ export class Daemon {
 				await wikiNotes?.taskDraft(row);
 				return land(request, hooks);
 			},
-			judge: (task) => evaluateTask(task, resolveTaskHost(null, undefined), new Map()),
+			stopChecks: (taskId) => this.#checkRunner?.cancel(taskId) ?? Promise.resolve(),
+			judge: (task) => evaluateTask(task, resolveTaskHost(null, undefined), memoryTaskChecks()),
 			holdReason: () => {
 				const fresh = store.tasks.get(row.taskId);
 				return taskLandHold(fresh, {
@@ -3037,25 +3174,40 @@ export class Daemon {
 
 	/**
 	 * After a core landing closed the task: the thread reaction follows the ledger (as `tasks_sync`), and the task's
-	 * herdr workspace is closed. A failure is logged and becomes a card line; the landing stands.
+	 * herdr agent is closed. A failure is logged and becomes a card line; the landing stands.
 	 */
 	async #afterTaskLanded(row: TaskRow): Promise<string[]> {
-		const log = this.#log;
-		const notes: string[] = [];
 		const status = this.#store?.tasks.get(row.taskId)?.status ?? "done";
-		await setStatusReaction(this.#channels, log, row.threadRef, status);
+		await setStatusReaction(this.#channels, this.#log, row.threadRef, status);
+		const failed = await this.#closeTaskAgent(row);
+		return failed === undefined ? [] : [`herdr 워커 정리 실패: ${failed.slice(0, 160)}`];
+	}
+
+	/**
+	 * Ends a closed task's herdr agent where it runs (`herdrCloseTaskAgent`: a local task's workspace, a remote task's
+	 * tab over the host's ssh), so a finished worker's omp does not stay up. Undefined when nothing failed; a failure is
+	 * logged (`task_agent_close_failed`) and returned.
+	 */
+	async #closeTaskAgent(row: TaskRow): Promise<string | undefined> {
 		const config = this.#options.config;
-		if (config.herdr === undefined) return notes;
+		// dispatchHosts is a reloadable field: read the live config, not the boot snapshot.
+		const entry = row.host === null ? undefined : config.dispatchHosts?.[row.host];
+		if (row.host === null ? config.herdr === undefined : entry === undefined) return undefined;
 		const herdrRun = this.#options.herdrRun;
-		const options = { cwd: config.workspaceDir, ...(herdrRun === undefined ? {} : { run: herdrRun }) };
-		const found = await herdrAgentWorkspace(row.agent, options);
-		const closed =
-			!found.ok || found.workspaceId === undefined ? found : await herdrCloseWorkspace(found.workspaceId, options);
-		if (!closed.ok) {
-			log.warn("task_land_workspace_close_failed", { task: row.taskId, agent: row.agent, error: closed.error });
-			notes.push(`herdr 워크스페이스 정리 실패: ${closed.error.slice(0, 160)}`);
-		}
-		return notes;
+		const closed = await herdrCloseTaskAgent(row.agent, {
+			cwd: config.workspaceDir,
+			...(entry === undefined ? {} : { sshTarget: entry.ssh }),
+			...(entry?.herdrBin === undefined ? {} : { herdrBin: entry.herdrBin }),
+			...(herdrRun === undefined ? {} : { run: herdrRun }),
+		});
+		if (closed.ok) return undefined;
+		this.#log.warn("task_agent_close_failed", {
+			task: row.taskId,
+			agent: row.agent,
+			host: row.host ?? "local",
+			error: closed.error,
+		});
+		return closed.error;
 	}
 
 	/**
@@ -3372,7 +3524,13 @@ export class Daemon {
 			// `tasks close --as done` changed the ledger in the CLI process: this is where the daemon learns of it.
 			if (request.op === "tasks_sync" && row !== undefined) await this.#wikiNotes?.taskDone(row.taskId);
 			if (row === undefined || this.#taskSweeper === undefined) return { ok: false, error: "task not found" };
-			if (request.op === "tasks_sync") return { ok: await this.#taskSweeper.syncReaction(row.taskId) };
+			if (request.op === "tasks_sync") {
+				const ok = await this.#taskSweeper.syncReaction(row.taskId);
+				// A task closed in the CLI (a remote task's landing, a cancel) ends its worker here too.
+				const status = this.#store?.tasks.get(row.taskId)?.status;
+				if (status === "done" || status === "cancelled") await this.#closeTaskAgent(row);
+				return { ok };
+			}
 			return { ok: true, ...(await this.#taskSweeper.check(row)) };
 		}
 		return { ok: false, error: `unknown op` };
@@ -3490,6 +3648,8 @@ export class Daemon {
 		this.#lanes?.stop();
 		// Running [TASK] gates are aborted and waited for (their copies removed); nothing is recorded.
 		await this.#taskGates?.stop();
+		// Queued [TASK] checks are dropped and the running one killed; none of it reaches the cache.
+		await this.#checkRunner?.stop();
 		this.#heartbeat?.stop();
 		this.#heartbeat = undefined;
 		installProcessAudit(undefined);

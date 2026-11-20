@@ -20,14 +20,14 @@ export const STUCK_CANCEL_AT = 6;
 
 // Timeouts, rate limits, 5xx, dropped connections: waiting may fix them, so the same error a few more times is not
 // necessarily a loop — the thresholds double.
-const TRANSIENT =
+export const TRANSIENT =
 	/timed?\s*out|timeout|rate[\s_-]?limit|too many requests|\b429\b|\b50[234]\b|bad gateway|service unavailable|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|socket hang up|temporarily unavailable/i;
 
 /**
  * omp 18.11+ appends a counter to the third identical read ("[You have received this identical output N times...]").
  * N changes every time, so it is stripped before hashing or a true repeat never matches.
  */
-const OMP_REPEAT_NOTE = /\n*\[You have received this identical output \d+ times[^\]]*\]\s*$/;
+const OMP_REPEAT_NOTE = /\n*\[You have received this identical output \d+ times[\s\S]*\]\s*$/;
 
 function hasContent(result: unknown): result is { content: unknown } {
 	return result !== null && typeof result === "object" && "content" in result;
@@ -49,15 +49,19 @@ function isTransientError(result: unknown, isError: boolean): boolean {
 	return isError && TRANSIENT.test(resultText(result));
 }
 
+/** Nesting kept in a fingerprint; deeper parts hash as one marker, so a runaway output cannot overflow the stack. */
+const STABLE_MAX_DEPTH = 100;
+
 /** JSON with sorted keys: equal objects give equal strings. */
-function stable(value: unknown): string {
+function stable(value: unknown, depth = 0): string {
 	if (value === undefined) return "null";
 	if (value === null || typeof value !== "object") return JSON.stringify(value);
-	if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+	if (depth >= STABLE_MAX_DEPTH) return '"…"';
+	if (Array.isArray(value)) return `[${value.map((item) => stable(item, depth + 1)).join(",")}]`;
 	const record = value as Record<string, unknown>;
 	return `{${Object.keys(record)
 		.sort()
-		.map((key) => `${JSON.stringify(key)}:${stable(record[key])}`)
+		.map((key) => `${JSON.stringify(key)}:${stable(record[key], depth + 1)}`)
 		.join(",")}}`;
 }
 
@@ -158,11 +162,6 @@ export function createStuckDetector({ exempt = isStuckExempt }: StuckDetectorOpt
 /** Steer sent to the child at the steer threshold. */
 export function stuckSteerText(toolName: string, count: number): string {
 	return `[ompbot 알림] 같은 인자로 ${toolName}을(를) ${count}번 불렀는데 결과가 그대로입니다. 이 단계를 되풀이하지 말고 방법을 바꾸세요. 정말 할 수 없으면 멈추고 어디서 막혔는지, 누가 무엇을 해야 하는지 말하세요.`;
-}
-
-/** Thread notice when a turn is stopped for a loop. */
-export function stuckStopText(toolName: string, count: number): string {
-	return `같은 \`${toolName}\` 호출을 ${count}번 했는데 결과가 그대로라 멈췄습니다. 방법을 바꿔 다시 시키거나 정보를 더 주세요.`;
 }
 
 /** Failure reason of a turn stopped for a loop: `stuck-loop: <sentence>`. */

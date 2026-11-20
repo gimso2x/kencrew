@@ -35,6 +35,7 @@ import {
 	type RunProcessResult,
 } from "../dispatch/omp";
 import { type FlowTransition, type TaskStage, taskFlowStatus, taskStage } from "../flow/task-flow";
+import { heavyRunPaths, readHeavyRunStates } from "../heavy-run";
 import {
 	MONITOR_ORIGIN_PREFIX,
 	type MonitorRow,
@@ -69,6 +70,7 @@ import { type ReadTask, readTaskSql, type TaskRow, type TaskSql, type TaskStatus
 import { formatLocal, localIso } from "../time";
 import { type BoardPromptRef, type BoardState, type BoardSummary, type BoardTaskRef, summarizeBoard } from "./board";
 import { type HostChecksInfo, readHostChecks } from "./host-checks";
+import { discordThreadHref } from "./html";
 import type { PeerInstall } from "./peers";
 import { createSessionModelReader, type SessionModel } from "./session-model";
 import { readUsageLimits, type UsageLimitsInfo } from "./usage-limits";
@@ -88,6 +90,12 @@ const TURN_LIMIT = 200;
 const ERROR_CHARS = 200;
 
 /** Every section either carries its data or says why it could not; one failed section never breaks the others. */
+export interface HeavyRunInfo {
+	running: { label: string; ageMs: number } | null;
+	/** Longest waiting first (`since` order; the real lock order is not guaranteed). */
+	waiting: Array<{ label: string; waitedMs: number }>;
+}
+
 export type Section<T> = ({ ok: true } & T) | { ok: false; error: string };
 
 interface DaemonInfo {
@@ -276,6 +284,8 @@ export interface FlowChainInfo {
 	here: string | null;
 	now: string;
 	tasks: FlowStepInfo[];
+	/** The request thread on Discord ({@link discordThreadHref}); "" when it is not a Discord thread with a link. */
+	discordHref: string;
 }
 
 export interface LaneInfo {
@@ -286,6 +296,8 @@ export interface LaneInfo {
 	status: string;
 	cwd: string;
 	updatedAt: string;
+	/** Inputs of the lane's session parked as `uncertain` (they may have been read): the owner decides with `/queue`. */
+	uncertainCount: number;
 }
 
 export interface HerdrAgentInfo {
@@ -385,6 +397,23 @@ interface ApprovalStats {
 	medianAnswerMs: number | null;
 }
 
+/** One `ask` question the deadline answered, as the approvals view lists it. */
+export interface AutoChoiceInfo {
+	at: string;
+	originKey: string | null;
+	threadRef: string | null;
+	question: string;
+	chosen: string;
+}
+
+/** `ask` questions the deadline answered in the last {@link AUTO_CHOICE_DAYS} days (newest first, cut to {@link AUTO_CHOICE_LINES}). */
+interface AutoChoices {
+	days: number;
+	items: AutoChoiceInfo[];
+	/** How many of the last 24 hours, for the morning briefing line. */
+	last24h: number;
+}
+
 /** A monitor's ended events of the last {@link MONITOR_STATS_DAYS} days, by outcome. */
 interface MonitorStats {
 	days: number;
@@ -460,6 +489,8 @@ export interface MonitorInfo {
 const MONITOR_RECENT = 7;
 const MONITOR_STATS_DAYS = 30;
 const APPROVAL_STATS_DAYS = 7;
+const AUTO_CHOICE_DAYS = 7;
+const AUTO_CHOICE_LINES = 20;
 const APPROVAL_RECENT = 20;
 const MONITOR_FILES = 4;
 const WEEKDAYS = ["일", "월", "화", "수", "목", "금", "토", "일"];
@@ -585,12 +616,13 @@ function monitorFiles(row: MonitorRow): MonitorFile[] {
 }
 
 /**
- * A channel as the owner knows it: the DM, the config's Discord log or escalation channel, else its id.
+ * A channel as the owner knows it: the DM, the config's Discord log, escalation or alert channel, else its id.
  */
 function channelName(channel: string | null, config: DashboardConfig | undefined): string {
 	if (channel === null) return "오너 DM";
 	if (channel === config?.channels?.discord?.logChannelId) return "로그 채널";
 	if (channel === config?.channels?.discord?.escalationChannelId) return "에스컬레이션 채널";
+	if (channel === config?.channels?.discord?.alertChannelId) return "경보 채널";
 	return `채널 ${channel}`;
 }
 
@@ -696,6 +728,8 @@ export interface DashboardSnapshot {
 	herdr: Section<{ hosts: HerdrHostInfo[]; board?: BoardSummary; says?: HerdrSay[] }>;
 	/** `items`: the pending ones, oldest first; `recent`: the last settled ones, newest first. */
 	approvals: Section<{ items: ApprovalInfo[]; recent: ApprovalDecision[]; stats: ApprovalStats }>;
+	/** The `ask` questions the deadline answered; optional so hand-made snapshots still type. */
+	autoChoices?: Section<AutoChoices>;
 	/** `peerErrors`: one line per peer install whose monitors could not be read in full; absent without any. */
 	monitors: Section<{ items: MonitorInfo[]; peerErrors?: Array<{ install: string; error: string }> }>;
 	alerts: Section<{ items: AlertInfo[] }>;
@@ -715,6 +749,8 @@ export interface DashboardSnapshot {
 	 * 답하기 link needs for server channels and lanes; null otherwise (DM links do not need it). Optional like `ompbotCli`.
 	 */
 	discordGuild?: string | null;
+	/** The top-bar test chip: the full test run holding this host's heavy-run lock and those queued behind it. Read fresh every time. */
+	heavyRun?: Section<HeavyRunInfo>;
 	/** The "호스트 점검" card: only with config `dashboard.opsStatus` (absent otherwise, and in hand-made snapshots). */
 	hostChecks?: Section<HostChecksInfo>;
 	/** Config `dashboard.opsStatus.url`: the card head links it. */
@@ -747,6 +783,7 @@ export type DashboardConfig = Partial<
 			peerBots?: Array<{ userId: string; name: string }>;
 			logChannelId?: string;
 			escalationChannelId?: string;
+			alertChannelId?: string;
 		};
 	};
 };
@@ -1488,17 +1525,17 @@ function readJobs(
 		.slice(0, JOB_LIMIT);
 }
 
-/** Running `systemd-run --user --unit=ompbot-<name>` work is a job even without a progress file. */
-const UNIT_JOB_PREFIX = "ompbot-";
+/** Running `systemd-run --user --unit=ompbot-<name>` (or `kencrew-<name>`) work is a job even without a progress file. */
+const UNIT_JOB_PREFIXES = ["ompbot-", "kencrew-"];
 /** `ompbot-job-*` units only write a job file for another unit: listing them too would show that work twice. */
 const UNIT_HELPER_PREFIX = "ompbot-job-";
 const UNIT_TIMEOUT_MS = 5_000;
 const UNIT_PROPERTIES = ["Id", "Description", "Transient", "ActiveState", "ActiveEnterTimestamp", "MainPID"];
 
 /**
- * The user's running transient `ompbot-*.service` units (`systemd-run`), as `running` jobs named without the prefix. A unit
- * that a job file already shows (same name or pid) or a helper unit is left out. A host without `systemctl` has none; any
- * other failure comes back as one `invalid` row so the files still show.
+ * The user's running transient `ompbot-*.service` and `kencrew-*.service` units (`systemd-run`), as `running` jobs named
+ * without the prefix. A unit that a job file or an earlier unit already shows (same name or pid) or a helper unit is left
+ * out. A host without `systemctl` has none; any other failure comes back as one `invalid` row so the files still show.
  */
 async function readUnitJobs(run: ProcessRunner, files: JobInfo[], now: number, timezone: string): Promise<JobInfo[]> {
 	const result = await run(
@@ -1508,7 +1545,7 @@ async function readUnitJobs(run: ProcessRunner, files: JobInfo[], now: number, t
 			"show",
 			`--property=${UNIT_PROPERTIES.join(",")}`,
 			"--timestamp=unix",
-			`${UNIT_JOB_PREFIX}*.service`,
+			...UNIT_JOB_PREFIXES.map((prefix) => `${prefix}*.service`),
 		],
 		{ timeoutMs: UNIT_TIMEOUT_MS },
 	);
@@ -1533,10 +1570,12 @@ async function readUnitJobs(run: ProcessRunner, files: JobInfo[], now: number, t
 	for (const unit of parseSystemctlShow(result.stdout)) {
 		const id = unit.get("Id") ?? "";
 		if (unit.get("Transient") !== "yes" || unit.get("ActiveState") !== "active") continue;
-		if (!id.startsWith(UNIT_JOB_PREFIX) || id.startsWith(UNIT_HELPER_PREFIX) || !id.endsWith(".service")) continue;
-		const name = id.slice(UNIT_JOB_PREFIX.length, -".service".length);
+		const prefix = UNIT_JOB_PREFIXES.find((candidate) => id.startsWith(candidate));
+		if (prefix === undefined || id.startsWith(UNIT_HELPER_PREFIX) || !id.endsWith(".service")) continue;
+		const name = id.slice(prefix.length, -".service".length);
 		const pid = Number(unit.get("MainPID"));
 		if (!JOB_NAME.test(name) || known.has(name) || knownPids.has(pid)) continue;
+		known.add(name);
 		const started = parseUnixTimestamp(unit.get("ActiveEnterTimestamp") ?? "");
 		jobs.push({
 			name,
@@ -1577,6 +1616,8 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 	const run = sharedRunner(deps.run);
 	const machinesFetch = sharedFetch(deps.fetch ?? fetch);
 	const { config, timezone } = deps;
+	const guildIds = config?.channels?.discord?.guildIds;
+	const discordGuild = guildIds?.length === 1 ? (guildIds[0] ?? null) : null;
 	const iso = (ms: number): string => localIso(ms, timezone);
 	const dbPath = join(deps.homeDir, "ompbot.db");
 	const db = existsSync(dbPath) ? new Database(dbPath, { readonly: true, strict: true }) : undefined;
@@ -1651,13 +1692,25 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			return { items: [...units, ...files].slice(0, JOB_LIMIT) };
 		});
 
+		// No cache and no config: the state directory is read on every snapshot.
+		const heavyRun = section((): HeavyRunInfo => {
+			const states = readHeavyRunStates(heavyRunPaths());
+			const running = states.find((state) => state.state === "running");
+			return {
+				running: running === undefined ? null : { label: running.label, ageMs: Math.max(0, now - running.since) },
+				waiting: states
+					.filter((state) => state.state === "waiting")
+					.map((state) => ({ label: state.label, waitedMs: Math.max(0, now - state.since) })),
+			};
+		});
+
 		const turns = section(async () => {
 			const handle = needDb();
 			const TURN_COLUMNS = `inbound_id, platform_message_id, origin_key, text_ref, thread_ref, state, created_at,
 				dispatched_at, last_event_at`;
 			const open = rows<TurnSql>(
 				handle,
-				`SELECT ${TURN_COLUMNS} FROM inbound WHERE state IN ('pending','dispatched') ORDER BY created_at, inbound_id LIMIT ?`,
+				`SELECT ${TURN_COLUMNS} FROM inbound WHERE state IN ('pending','dispatched','uncertain') ORDER BY created_at, inbound_id LIMIT ?`,
 				TURN_LIMIT,
 			);
 			// Origins waiting on a live approval card, as `inbound_starved` counts them: a card past `expires_at` waits
@@ -1735,7 +1788,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			// Every conversation with an open turn, then the ones active in the window: newest activity first.
 			const since = now - THREAD_WINDOW_MS;
 			const ACTIVE = "COALESCE(last_event_at, dispatched_at, created_at)";
-			const OPEN = "state IN ('pending','dispatched')";
+			const OPEN = "state IN ('pending','dispatched','uncertain')";
 			/** The chip of a board thread: its origin's session model; nothing when the origin or its session is unknown. */
 			const threadModel = (key: string): SessionModel | undefined => {
 				try {
@@ -1819,7 +1872,9 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				const threadJobs =
 					threadRef === null ? [] : activeJobs.filter((job) => job.thread === threadRef).map((job) => job.name);
 				const column: ThreadColumn =
-					stalledCount > 0 || (openTurns.length === 0 && latest.state === "failed_notified")
+					stalledCount > 0 ||
+					openTurns.some((turn) => turn.state === "uncertain") ||
+					(openTurns.length === 0 && latest.state === "failed_notified")
 						? "attention"
 						: openTurns.length > 0 || threadJobs.length > 0
 							? "working"
@@ -2012,6 +2067,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 					here: here?.taskId ?? null,
 					now: line,
 					tasks: steps,
+					discordHref: discordThreadHref(discordGuild, originKey, threadRef),
 				};
 				return { open: open.length > 0, updatedAt, info };
 			});
@@ -2027,9 +2083,12 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				status: string;
 				cwd: string;
 				updated_at: number;
+				uncertain_count: number;
 			}>(
 				needDb(),
-				"SELECT name, origin_key, title, status, cwd, updated_at FROM lanes WHERE status != 'closed' ORDER BY updated_at DESC",
+				`SELECT name, origin_key, title, status, cwd, updated_at,
+					(SELECT COUNT(*) FROM inbound WHERE inbound.origin_key = lanes.origin_key AND inbound.state = 'uncertain') AS uncertain_count
+					FROM lanes WHERE status != 'closed' ORDER BY updated_at DESC`,
 			).map((r) => ({
 				name: r.name,
 				originKey: r.origin_key,
@@ -2037,6 +2096,7 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 				status: r.status,
 				cwd: r.cwd,
 				updatedAt: iso(r.updated_at),
+				uncertainCount: r.uncertain_count,
 			})),
 		}));
 
@@ -2163,6 +2223,39 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			};
 		});
 
+		const autoChoices = section((): AutoChoices => {
+			const handle = needDb();
+			// A daemon still on the old code has not created the table yet: nothing was recorded.
+			const present = rows<{ name: string }>(handle, "SELECT name FROM sqlite_master WHERE name = 'auto_choices'");
+			if (present.length === 0) return { days: AUTO_CHOICE_DAYS, items: [], last24h: 0 };
+			const items = rows<{
+				created_at: number;
+				origin_key: string | null;
+				thread_ref: string | null;
+				question: string;
+				chosen: string;
+			}>(
+				handle,
+				"SELECT created_at, origin_key, thread_ref, question, chosen FROM auto_choices WHERE created_at >= ? ORDER BY created_at DESC, id DESC LIMIT ?",
+				now - AUTO_CHOICE_DAYS * 86_400_000,
+				AUTO_CHOICE_LINES,
+			).map(
+				(r): AutoChoiceInfo => ({
+					at: iso(r.created_at),
+					originKey: r.origin_key,
+					threadRef: r.thread_ref,
+					question: redact(r.question),
+					chosen: redact(r.chosen),
+				}),
+			);
+			const [{ n = 0 } = {}] = rows<{ n: number }>(
+				handle,
+				"SELECT COUNT(*) AS n FROM auto_choices WHERE created_at >= ?",
+				now - 86_400_000,
+			);
+			return { days: AUTO_CHOICE_DAYS, items, last24h: n };
+		});
+
 		const monitors = section(() => {
 			const listed = monitorInfos(needDb(), { timezone, config, iso, now });
 			const peerErrors: Array<{ install: string; error: string }> = [];
@@ -2245,8 +2338,6 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			}),
 		}));
 
-		const guildIds = deps.config?.channels?.discord?.guildIds;
-
 		return {
 			generatedAt: iso(now),
 			timezone,
@@ -2257,13 +2348,15 @@ export async function buildSnapshot(deps: SnapshotDeps): Promise<DashboardSnapsh
 			lanes: await lanes,
 			herdr: await herdr,
 			approvals: await approvals,
+			autoChoices: await autoChoices,
 			monitors: await monitors,
 			alerts: await alerts,
 			gates,
 			backup: await backup,
 			jobs: await jobs,
+			heavyRun: await heavyRun,
 			ompbotCli: ["bun", join(deps.repoDir, "src", "main.ts")],
-			discordGuild: guildIds?.length === 1 ? (guildIds[0] ?? null) : null,
+			discordGuild,
 			...(hostChecks === undefined ? {} : { hostChecks: await hostChecks }),
 			...(opsStatus?.url === undefined ? {} : { hostChecksUrl: opsStatus.url }),
 			...(usageLimits === undefined ? {} : { usageLimits: await usageLimits }),

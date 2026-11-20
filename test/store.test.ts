@@ -127,6 +127,37 @@ describe("inbound", () => {
 		expect(() => store.discard("e")).toThrow(StoreError);
 	});
 
+	test("uncertain: pending <-> uncertain, uncertain -> discarded, never dispatched or answered", () => {
+		const store = open();
+		store.ensureOrigin("o1", "/s/o1");
+		const mk = (id: string) => store.recordInbound({ originKey: "o1", platformMessageId: id, textRef: "x" });
+		const dispatch = (id: string) => store.markDispatched(id, { opRef: "op", entryCursor: null });
+
+		mk("u1");
+		const parked = store.markUncertain("u1", "steer_threw");
+		expect(parked.state).toBe("uncertain");
+		expect(parked.uncertainReason).toBe("steer_threw");
+		expect(parked.uncertainAt).toBe(store.getInbound("u1")?.uncertainAt ?? -1);
+		expect(parked.uncertainAt).not.toBeNull();
+		expect(() => dispatch("u1")).toThrow(StoreError); // uncertain -/-> dispatched
+		expect(() => store.markUncertain("u1", "steer_threw")).toThrow(StoreError); // already uncertain
+		expect(store.retryUncertain("u1").state).toBe("pending"); // uncertain -> pending
+		expect(() => store.retryUncertain("u1")).toThrow(StoreError); // only uncertain retries
+
+		store.markUncertain("u1", "turn_ended_after_steer");
+		expect(store.getInbound("u1")?.uncertainReason).toBe("turn_ended_after_steer");
+		expect(store.discard("u1", "closeop").state).toBe("discarded"); // uncertain -> discarded
+
+		mk("u2");
+		dispatch("u2");
+		expect(() => store.markUncertain("u2", "steer_threw")).toThrow(StoreError); // dispatched stays dispatched
+
+		mk("u3");
+		store.markUncertain("u3", "dispatch_record_failed");
+		store.recordAnswer({ originKey: "o1", opRef: "none", threadRef: "t", parts: ["r"] });
+		expect(store.getInbound("u3")?.state).toBe("uncertain"); // an answer never closes it
+	});
+
 	test("a pending row is not answered by recordAnswer", () => {
 		const store = open();
 		store.ensureOrigin("o1", "/s/o1");

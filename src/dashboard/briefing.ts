@@ -27,6 +27,7 @@ export function renderBriefingHtml(snapshot: DashboardSnapshot, now: number): st
 		`<h1>${esc(redact(`ompbot 브리핑 · ${minuteOf(now, snapshot.timezone)}`))}</h1>`,
 		`<p class="meta">${esc(redact(daemonLine(snapshot)))}</p>`,
 		`<p class="summary${attention.length > 0 ? " warn" : ""}">${esc(redact(summary))}</p>`,
+		...autoChoiceLine(snapshot),
 		section("주의", attention),
 		section("진행 중", working),
 		monitorSection(snapshot, monitoring),
@@ -55,6 +56,13 @@ function summaryCounts(snapshot: DashboardSnapshot): (readonly [string, number])
 		["게이트 열림", openGates(snapshot).length],
 		["모니터 실패", failedMonitors(snapshot).length],
 	];
+}
+
+/** `지난 24시간 자동 선택 N건` under the summary; no line when none (or unreadable: the page has the reason). */
+function autoChoiceLine(snapshot: DashboardSnapshot): string[] {
+	const choices = snapshot.autoChoices;
+	if (choices === undefined || !choices.ok || choices.last24h === 0) return [];
+	return [`<p class="meta">${esc(`지난 24시간 시간 초과로 자동 선택된 질문 ${choices.last24h}건`)}</p>`];
 }
 
 const CSS = `:root{--sp-half:2px;--sp-1:4px;--sp-2:8px;--sp-3:12px;--sp-4:16px;--sp-6:24px;--sp-8:32px;--r-l:8px}

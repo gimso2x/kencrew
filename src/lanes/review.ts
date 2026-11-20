@@ -1,11 +1,12 @@
 import { chmodSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { type ProcessRunner, runOmpPrint } from "../dispatch/omp";
+import { type OmpPrintOptions, ompPrintArgs, type ProcessRunner, runOmpPrint } from "../dispatch/omp";
 import type { Logger } from "../log";
 import { byteLength, redact, truncateUtf8 } from "../redact";
 import type { TaskCheck } from "../tasks/checker";
 import type { AcceptanceItem } from "../tasks/docs";
-import type { LaneReview, LaneRow } from "./status";
+import { argvForReceipt, overlayHash, receiptRuntime } from "./runtime";
+import type { LaneReview, LaneRow, ReceiptRuntime } from "./status";
 import { defaultGit, type GitRunner } from "./verify";
 
 /**
@@ -279,6 +280,7 @@ export interface GateReviewInput {
 export async function reviewSubject(input: GateReviewInput, deps: LaneReviewDeps): Promise<LaneReview> {
 	const { subject, model } = input;
 	const { sha } = subject;
+	let runtime: ReceiptRuntime | undefined;
 	const receipt = (verdict: LaneReview["verdict"], text: string, reason?: string): LaneReview => {
 		// The findings sit right above the VERDICT line: a long output keeps its end.
 		const notes = redact(text.trim());
@@ -289,6 +291,7 @@ export async function reviewSubject(input: GateReviewInput, deps: LaneReviewDeps
 			at: deps.now(),
 			notes: notes.length > NOTES_MAX ? `…${notes.slice(-(NOTES_MAX - 1))}` : notes,
 			...(reason === undefined ? {} : { reason }),
+			...(runtime === undefined ? {} : { runtime }),
 		};
 	};
 	const inconclusive = (reason: string, notes = ""): LaneReview => receipt("inconclusive", notes, reason);
@@ -316,9 +319,17 @@ export async function reviewSubject(input: GateReviewInput, deps: LaneReviewDeps
 		writeFileSync(diffPath, diff, { mode: 0o600 });
 		chmodSync(diffPath, 0o600);
 		const isolation = isolationPaths(deps.reviewsDir, subject.id, sha);
+		const printOptions = reviewPrintOptions(isolation, { subject, diff, diffPath, input, deps });
+		const baseTip = await git(["-C", repo, "rev-parse", "--verify", "-q", `refs/heads/${baseBranch}^{commit}`]);
+		runtime = receiptRuntime({
+			head: head.sha,
+			...(baseTip.code === 0 && baseTip.stdout.trim() !== "" ? { base: baseTip.stdout.trim() } : {}),
+			overlay: overlayHash(REVIEW_OVERLAY_YAML),
+			argv: argvForReceipt(ompPrintArgs(printOptions)),
+		});
 		let result: Awaited<ReturnType<typeof runOmpPrint>>;
 		try {
-			result = await runIsolated(isolation, { subject, diff, diffPath, input, deps });
+			result = await runIsolated(isolation, printOptions);
 		} finally {
 			dropFiles([diffPath, isolation.configPath, isolation.cwd], deps.log);
 		}
@@ -334,19 +345,13 @@ export async function reviewSubject(input: GateReviewInput, deps: LaneReviewDeps
 	}
 }
 
-/** Writes the overlay (0600) and a fresh empty cwd (0700), then runs the reviewer isolated in them. */
-async function runIsolated(
+/** The reviewer's `omp -p` run: isolated in its overlay and empty cwd, read-only tools, the review prompt. */
+function reviewPrintOptions(
 	isolation: { configPath: string; cwd: string },
 	ctx: { subject: GateSubject; diff: string; diffPath: string; input: GateReviewInput; deps: LaneReviewDeps },
-): Promise<Awaited<ReturnType<typeof runOmpPrint>>> {
+): OmpPrintOptions {
 	const { subject, diff, diffPath, input, deps } = ctx;
-	writeFileSync(isolation.configPath, REVIEW_OVERLAY_YAML, { mode: 0o600 });
-	chmodSync(isolation.configPath, 0o600);
-	// A leftover of an earlier run (killed daemon) must not be the reviewer's cwd content.
-	rmSync(isolation.cwd, { force: true, recursive: true });
-	mkdirSync(isolation.cwd, { mode: 0o700 });
-	chmodSync(isolation.cwd, 0o700);
-	return runOmpPrint({
+	return {
 		task: reviewPrompt({ subject, diff, diffPath }),
 		cwd: isolation.cwd,
 		isolation: { configPath: isolation.configPath },
@@ -360,7 +365,21 @@ async function runIsolated(
 		...(deps.run === undefined ? {} : { run: deps.run }),
 		...(deps.inheritedEnv === undefined ? {} : { inheritedEnv: deps.inheritedEnv }),
 		...(deps.ompProfile === undefined ? {} : { ompProfile: deps.ompProfile }),
-	});
+	};
+}
+
+/** Writes the overlay (0600) and a fresh empty cwd (0700), then runs the reviewer isolated in them. */
+async function runIsolated(
+	isolation: { configPath: string; cwd: string },
+	options: OmpPrintOptions,
+): Promise<Awaited<ReturnType<typeof runOmpPrint>>> {
+	writeFileSync(isolation.configPath, REVIEW_OVERLAY_YAML, { mode: 0o600 });
+	chmodSync(isolation.configPath, 0o600);
+	// A leftover of an earlier run (killed daemon) must not be the reviewer's cwd content.
+	rmSync(isolation.cwd, { force: true, recursive: true });
+	mkdirSync(isolation.cwd, { mode: 0o700 });
+	chmodSync(isolation.cwd, 0o700);
+	return runOmpPrint(options);
 }
 
 /** Removes a review's diff file, overlay and cwd whatever the run's end; a failure is logged, never thrown. */

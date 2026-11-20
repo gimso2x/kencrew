@@ -159,6 +159,49 @@ describe("TaskLedger", () => {
 		);
 	});
 
+	test("AC-1: migration adds check_json to a database without it; existing rows read checks: null", () => {
+		const db = new Database(":memory:", { strict: true });
+		db.run(TASK_SCHEMA);
+		db.run("ALTER TABLE tasks DROP COLUMN check_json");
+		db.run(
+			`INSERT INTO tasks (task_id, title, risk, origin_key, thread_ref, host, repo, worktree, branch, agent, status,
+				acceptance_json, created_at, updated_at) VALUES ('T-20261001-01', 't', 'L2', 'o', '111111111111111111:700000000000000001', NULL, '/r', '/r-t', 'b', 'a', 'review', '[]', 5, 6)`,
+		);
+		const columns = () => (db.query("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((c) => c.name);
+		expect(columns()).not.toContain("check_json");
+		migrateTaskSchema(db);
+		expect(columns()).toContain("check_json");
+		const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => 7 } });
+		expect(ledger.require("T-20261001-01").checks).toBeNull();
+	});
+
+	test("check_json round-trips; AC-3/AC-8: any malformed part reads as no results", () => {
+		const db = new Database(":memory:", { strict: true });
+		const ledger = new TaskLedger(db, { timezone: "Asia/Seoul", clock: { now: () => 7 } });
+		const { taskId } = ledger.register(base);
+		const good = { head: "a".repeat(40), results: [{ signal: "s", ok: false, detail: "exit 1" }] };
+		ledger.recordChecks(taskId, good);
+		expect(ledger.require(taskId).checks).toEqual(good);
+
+		const read = (raw: string) => {
+			db.query("UPDATE tasks SET check_json = ? WHERE task_id = ?").run(raw, taskId);
+			return ledger.require(taskId).checks;
+		};
+		const item = { signal: "s", ok: true, detail: "d" };
+		expect(read(JSON.stringify({ results: [item] }))).toBeNull();
+		expect(read(JSON.stringify({ head: "", results: [item] }))).toBeNull();
+		expect(read(JSON.stringify({ head: "h", results: [{ ...item, ok: "yes" }] }))).toBeNull();
+		expect(read(JSON.stringify({ head: "h", results: [{ ...item, inconclusive: true }] }))).toBeNull();
+		expect(read(JSON.stringify({ head: "h", results: [item, { signal: "t", ok: true }] }))).toBeNull();
+		expect(read(JSON.stringify({ head: "h", results: "x" }))).toBeNull();
+		expect(read("[1]")).toBeNull();
+		expect(read("{not json")).toBeNull();
+		expect(read(JSON.stringify({ head: "h", results: [item] }))).toEqual({ head: "h", results: [item] });
+
+		ledger.recordChecks(taskId, null);
+		expect(ledger.require(taskId).checks).toBeNull();
+	});
+
 	test("migration adds the history table to a database that predates it, leaving task rows alone", () => {
 		const db = new Database(":memory:", { strict: true });
 		db.run(TASK_SCHEMA.slice(0, TASK_SCHEMA.indexOf("CREATE TABLE IF NOT EXISTS task_transitions")));

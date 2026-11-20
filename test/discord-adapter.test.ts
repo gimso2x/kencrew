@@ -58,6 +58,7 @@ function core(): CoreSink {
 		onCommand: () => undefined,
 		onAction: () => {},
 		knowsThread: (threadRef) => inbound.some((m) => m.threadRef === threadRef),
+		hasInbound: (platformMessageId) => inbound.some((m) => m.platformMessageId === platformMessageId),
 	};
 }
 
@@ -284,6 +285,61 @@ describe("server channel", () => {
 		await transport.emitMessage(message("<@&900000000000000002> 남의 역할"));
 		await transport.emitMessage(message("<@&900000000000000001> 역할로 부름"));
 		expect(inbound.map((m) => m.text)).toEqual(["역할로 부름"]);
+	});
+
+	test("channel events fill, change and drop the cached place; a GUILD_CREATE channel reads as a server channel in recovery", async () => {
+		const channel = new DiscordChannel(transport, { ownerUserId: OWNER });
+		const NEW = "111111111111111120";
+		const THREAD = "700000000000000500";
+		const cursors = new Map<string, string>([[`dc:${NEW}`, "1"]]);
+		const made = await adapter({
+			channel,
+			mentionFreeChannels: [NEW],
+			recovery: {
+				cursors: {
+					getCursor: (key) => cursors.get(key),
+					setCursor: (key, value) => void cursors.set(key, value),
+					deleteCursor: (key) => void cursors.delete(key),
+				},
+				targets: () => [{ channelId: NEW, dm: false }],
+			},
+		});
+		// Not known to Discord's REST fake: only the gateway list can tell the cache about it.
+		transport.emitChannel({ id: NEW, type: 0, guildId: GUILD, name: "배포", topic: "첫 토픽" });
+		expect(channel.conversationContext(NEW)).toEqual({ channelName: "배포", topic: "첫 토픽" });
+		transport.history.set(NEW, [message("놓친 말", { channel_id: NEW, guild_id: undefined })]);
+		made.recover();
+		await made.recoveryIdle();
+		expect(calls("getChannel").filter((c) => c.channelId === NEW)).toHaveLength(0);
+		expect(channel.isDirect(NEW)).toBe(false);
+		expect(inbound).toHaveLength(1);
+
+		transport.emitChannel({ id: NEW, type: 0, guildId: GUILD, name: "배포2", topic: "바뀐 토픽" });
+		expect(channel.conversationContext(NEW)).toEqual({ channelName: "배포2", topic: "바뀐 토픽" });
+		transport.emitChannel({ id: THREAD, type: 11, parentId: NEW, guildId: GUILD, name: "스레드 이름" });
+		expect(channel.conversationContext(NEW, THREAD)).toEqual({
+			channelName: "배포2",
+			topic: "바뀐 토픽",
+			threadName: "스레드 이름",
+		});
+		transport.emitChannelGone(THREAD);
+		expect(channel.conversationContext(NEW, THREAD)).toEqual({ channelName: "배포2", topic: "바뀐 토픽" });
+		transport.emitChannelGone(NEW);
+		expect(channel.conversationContext(NEW)).toBeUndefined();
+	});
+
+	test("a thread message warms its parent, so the context names the channel and the thread", async () => {
+		const channel = new DiscordChannel(transport, { ownerUserId: OWNER });
+		const THREAD = "700000000000000501";
+		transport.setChannel({ id: CH, type: 0, guildId: GUILD, name: "질문방", topic: "묻는 곳" });
+		transport.setChannel({ id: THREAD, type: 11, parentId: CH, guildId: GUILD, name: "배포 질문" });
+		await adapter({ channel, mentionFreeChannels: [CH] });
+		await transport.emitMessage(message("스레드 안 말", { channel_id: THREAD }));
+		expect(channel.conversationContext(CH, THREAD)).toEqual({
+			channelName: "질문방",
+			topic: "묻는 곳",
+			threadName: "배포 질문",
+		});
 	});
 
 	test("a malformed role element is skipped without throwing; the valid roles of the same event still count (qa-l #59)", async () => {
@@ -1089,5 +1145,118 @@ describe("start without a first Ready (qa-q #19)", () => {
 		transport.emitFatal(new DiscordGatewayFatalError(4004, "Authentication failed"));
 		expect(fatals).toHaveLength(1);
 		expect(fatals[0]).toBeInstanceOf(DiscordGatewayFatalError);
+	});
+});
+
+describe("owner edits (doc/plans/discord-message-edit.md)", () => {
+	const MARKER = "[오너가 앞 글을 고쳤다 — 이미 답했다면 바뀐 부분만 반영한다]";
+	const PEER = "400000000000000009";
+	const editedAt = (id: string, afterMs = 60_000) => new Date(snowflakeTime(id) + afterMs).toISOString();
+	const edit = (original: DiscordMessageEvent, content: string, overrides: Partial<DiscordMessageEvent> = {}) => ({
+		...original,
+		content,
+		edited_timestamp: editedAt(original.id),
+		...overrides,
+	});
+	const cardReplies: string[] = [];
+
+	async function editAdapter(): Promise<void> {
+		cardReplies.length = 0;
+		await adapter({
+			core: {
+				...core(),
+				onCardReply: ({ threadRef, text }) => {
+					cardReplies.push(text);
+					return threadRef === `${CH}:${CARD}` ? { kind: "settled" } : undefined;
+				},
+			},
+			peerBots: [{ userId: PEER, name: "떡" }],
+		});
+	}
+	const CARD = "733333333333333333";
+
+	test("a channel root's edit is one new input in the thread the root opened, under the root's keys; a replay is a duplicate", async () => {
+		await editAdapter();
+		const root = message(`<@${BOT}> 시작`);
+		await transport.emitMessage(root);
+		const [first] = inbound;
+		expect(calls("startThread")).toHaveLength(1);
+		const fixed = edit(root, `<@${BOT}> 시작, 조건 추가`);
+		await transport.emitMessageUpdate(fixed);
+		await transport.emitMessageUpdate({ ...fixed });
+		expect(inbound).toHaveLength(2);
+		expect(inbound[1]).toEqual({
+			platformMessageId: `${CH}:${root.id}#edit:${fixed.edited_timestamp}`,
+			originKey: first?.originKey ?? "",
+			text: `${MARKER}\n시작, 조건 추가`,
+			threadRef: first?.threadRef ?? "",
+			ownerVerified: true,
+		});
+		expect(calls("startThread")).toHaveLength(1);
+		expect(logged("event=inbound_duplicate")).toBe(true);
+		expect(cardReplies).toHaveLength(0);
+		expect(failures).toBe(0);
+	});
+
+	test("an edit of a reply inside a thread and of a DM message keep their original's origin and thread ref", async () => {
+		await editAdapter();
+		const THREAD = "744444444444444444";
+		transport.setChannel({ id: THREAD, type: 11, parentId: CH, guildId: GUILD });
+		transport.setChannel({ id: DM, type: 1 });
+		const inThread = message(`<@${BOT}> 스레드 답`, { channel_id: THREAD });
+		const dm = message("디엠", { channel_id: DM, guild_id: undefined });
+		await transport.emitMessage(inThread);
+		await transport.emitMessage(dm);
+		await transport.emitMessageUpdate(edit(inThread, `<@${BOT}> 스레드 답 수정`));
+		await transport.emitMessageUpdate(edit(dm, "디엠 수정"));
+		expect(inbound).toHaveLength(4);
+		for (const [original, edited] of [
+			[inbound[0], inbound[2]],
+			[inbound[1], inbound[3]],
+		]) {
+			expect(edited?.originKey).toBe(original?.originKey ?? "");
+			expect(edited?.threadRef).toBe(original?.threadRef ?? "");
+			expect(edited?.text.startsWith(`${MARKER}\n`)).toBe(true);
+		}
+	});
+
+	test("what is not an owner's recorded plain edit is dropped, never a card reply, never a new thread", async () => {
+		await editAdapter();
+		const root = message(`<@${BOT}> 원본`);
+		await transport.emitMessage(root);
+		const keep = inbound.length;
+		const THREAD = "744444444444444444";
+		transport.setChannel({ id: THREAD, type: 11, parentId: CH, guildId: GUILD });
+		const unrecorded = message(`<@${BOT}> 기록 없음`);
+		// A card's reply the card consumed leaves no row, so its edit has no original.
+		const consumed = message("그래 진행해", { channel_id: THREAD, referenced_message: { id: CARD } });
+		const cardThread = { ...consumed, message_reference: { message_id: CARD } };
+		transport.setChannel({ id: CARD, type: 11, parentId: CH, guildId: GUILD });
+		await transport.emitMessage({ ...cardThread, channel_id: CARD });
+		const repliesBefore = cardReplies.length;
+		const cases: Array<[string, Parameters<typeof transport.emitMessageUpdate>[0]]> = [
+			["edit_partial", { id: root.id, channel_id: CH, content: "임베드만 갱신" }],
+			["edit_partial", { ...edit(root, "수정"), type: undefined }],
+			["edit_partial", edit(root, "수정", { edited_timestamp: null })],
+			["edit_partial", edit(root, "수정", { edited_timestamp: undefined })],
+			["edit_too_late", edit(root, "수정", { edited_timestamp: editedAt(root.id, 30 * 60_000 + 1) })],
+			["edit_no_original", edit(unrecorded, "수정")],
+			["edit_no_original", edit({ ...cardThread, channel_id: CARD }, "그래 말고 중단해")],
+			["edit_command", edit(root, "!model")],
+			["not_owner", edit(root, "수정", { author: { id: PEER, bot: true } })],
+			["not_owner", edit(root, "수정", { author: { id: STRANGER } })],
+		];
+		for (const [reason, update] of cases) {
+			const before = logs.length;
+			await transport.emitMessageUpdate(update);
+			expect(
+				logs.slice(before).some((line) => line.includes("event=inbound_dropped") && line.includes(`reason=${reason}`)),
+			).toBe(true);
+		}
+		expect(inbound).toHaveLength(keep);
+		expect(inbound.filter((m) => m.platformMessageId.includes("#edit:"))).toHaveLength(0);
+		expect(cardReplies).toHaveLength(repliesBefore);
+		expect(calls("startThread")).toHaveLength(1);
+		expect(failures).toBe(0);
 	});
 });

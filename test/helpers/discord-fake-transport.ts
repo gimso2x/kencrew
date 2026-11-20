@@ -8,6 +8,7 @@ import {
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
+	type DiscordMessageUpdate,
 	type DiscordRole,
 	type DiscordTransport,
 	type DownloadAttachmentArgs,
@@ -195,8 +196,22 @@ export class FakeDiscordTransport implements DiscordTransport {
 		this.handlers?.roles?.(roles);
 	}
 
+	/** A channel or thread as `CHANNEL_UPDATE`, `THREAD_UPDATE` and the `GUILD_CREATE` lists bring it. */
+	emitChannel(info: DiscordChannelInfo): void {
+		this.handlers?.channel?.(info);
+	}
+
+	/** `CHANNEL_DELETE` / `THREAD_DELETE`. */
+	emitChannelGone(id: string): void {
+		this.handlers?.channelGone?.(id);
+	}
+
 	async emitMessage(event: DiscordMessageEvent): Promise<void> {
 		await this.handlers?.message(event);
+	}
+
+	async emitMessageUpdate(event: DiscordMessageUpdate): Promise<void> {
+		await this.handlers?.messageUpdate?.(event);
 	}
 
 	async emitInteraction(interaction: DiscordInteraction): Promise<void> {

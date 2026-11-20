@@ -45,7 +45,16 @@ export interface DiscordMessageEvent {
 		| ReadonlyArray<{ message?: { content?: string; attachments?: ReadonlyArray<DiscordAttachment> } | undefined }>
 		| undefined;
 	timestamp?: string | undefined;
+	/** Set when the author edited the content; an embed refresh leaves it alone. */
+	edited_timestamp?: string | null | undefined;
 }
+
+/**
+ * `MESSAGE_UPDATE` payload: Discord sends only the changed fields for some updates (embed refresh, pin), so everything
+ * but the ids may be missing.
+ */
+export type DiscordMessageUpdate = Pick<DiscordMessageEvent, "id" | "channel_id"> &
+	Partial<Omit<DiscordMessageEvent, "id" | "channel_id">>;
 
 /** `INTERACTION_CREATE`: type 2 application command, type 3 message component. */
 export interface DiscordInteraction {
@@ -69,6 +78,8 @@ export interface DiscordInteraction {
 
 export interface DiscordHandlers {
 	message(event: DiscordMessageEvent): Promise<void>;
+	/** `MESSAGE_UPDATE`: the owner may have edited a message the bot recorded. */
+	messageUpdate?(event: DiscordMessageUpdate): Promise<void>;
 	interaction(interaction: DiscordInteraction): Promise<void>;
 	/** Every Ready (`resumed: false`: a new session, the events in between are lost) and Resumed (`resumed: true`). */
 	ready?(info: { resumed: boolean }): void;
@@ -76,6 +87,10 @@ export interface DiscordHandlers {
 	fatal?(error: DiscordGatewayFatalError): void;
 	/** Guild roles from `GUILD_CREATE` and `GUILD_ROLE_CREATE`/`GUILD_ROLE_UPDATE`. */
 	roles?(roles: ReadonlyArray<DiscordRole>): void;
+	/** A channel or thread from `CHANNEL_UPDATE`, `THREAD_UPDATE` and the `GUILD_CREATE` channel and thread lists. */
+	channel?(info: DiscordChannelInfo): void;
+	/** `CHANNEL_DELETE` and `THREAD_DELETE`: the channel id is gone. */
+	channelGone?(id: string): void;
 }
 
 /** A guild role; a bot's managed role carries the bot's user id under `tags.bot_id`. */
@@ -90,6 +105,27 @@ export interface DiscordChannelInfo {
 	type: number;
 	parentId?: string | undefined;
 	guildId?: string | undefined;
+	/** Channel or thread name, and a channel's topic (a thread has none); only for the prompt's context lines. */
+	name?: string | undefined;
+	topic?: string | undefined;
+}
+
+/**
+ * A channel object (REST body or gateway payload) as the adapter caches it; `undefined` when it has no id or type.
+ * `guildId` fills in `guild_id` for the entries of a `GUILD_CREATE` array, which may not carry it.
+ */
+export function parseChannelInfo(value: unknown, guildId?: string): DiscordChannelInfo | undefined {
+	const body = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>;
+	if (typeof body.id !== "string" || typeof body.type !== "number") return undefined;
+	const guild = typeof body.guild_id === "string" ? body.guild_id : guildId;
+	return {
+		id: body.id,
+		type: body.type,
+		...(typeof body.parent_id === "string" ? { parentId: body.parent_id } : {}),
+		...(guild === undefined ? {} : { guildId: guild }),
+		...(typeof body.name === "string" ? { name: body.name } : {}),
+		...(typeof body.topic === "string" ? { topic: body.topic } : {}),
+	};
 }
 
 export interface AllowedMentions {

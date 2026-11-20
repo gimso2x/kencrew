@@ -58,8 +58,9 @@ export class DiscordSocketTransport implements DiscordTransport {
 	}
 
 	async start(handlers: DiscordHandlers): Promise<{ botUserId: string; applicationId: string }> {
+		if (this.#gateway !== undefined) throw new Error("discord transport already started");
 		const lifecycle = this.#options.onLifecycle ?? (() => {});
-		this.#gateway = new DiscordGateway({
+		const gateway = new DiscordGateway({
 			token: this.#token,
 			url: async () => (await this.#rest.getGatewayBot()).url,
 			handlers,
@@ -78,7 +79,15 @@ export class DiscordSocketTransport implements DiscordTransport {
 			},
 			onReconnect: (reason) => lifecycle({ type: "reconnecting", detail: reason }),
 		});
-		const ids = await this.#gateway.start();
+		this.#gateway = gateway;
+		let ids: { botUserId: string; applicationId: string };
+		try {
+			ids = await gateway.start();
+		} catch (err) {
+			// A start that failed (fatal close, refused token) leaves a stopped gateway: let a later start() make its own.
+			if (this.#gateway === gateway) this.#gateway = undefined;
+			throw err;
+		}
 		const displayName = this.#options.displayName;
 		if (displayName !== undefined) {
 			try {
@@ -96,6 +105,7 @@ export class DiscordSocketTransport implements DiscordTransport {
 
 	async stop(): Promise<void> {
 		this.#gateway?.stop();
+		this.#gateway = undefined;
 	}
 
 	/** When the latest spent REST bucket reopens (0 = none); the delivery pump defers instead of posting into it. */

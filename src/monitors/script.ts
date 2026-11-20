@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import { resolveScript, SCRIPT_TIMEOUT_MS } from "./spec";
 
 /** The payload handed to the agent is cut to this many chars (the script is not killed for it). */
@@ -180,26 +180,37 @@ export async function runScript(
 
 /**
  * sha256 of the stream's `trim()`med text, fed chunk by chunk: leading whitespace is skipped, trailing whitespace is
- * held back until more text follows it (JS `trim` and `\s` strip the same characters).
+ * not part of the digest (JS `trim` and `\s` strip the same characters). Trailing whitespace goes into a forked copy of
+ * the hash state instead of a pending string, so a huge whitespace run costs no memory; text that follows it adopts
+ * the fork, text that never comes leaves `sha` as it was.
  */
 function trimmedHash(): { update(chunk: string): void; digest(): string } {
-	const sha = createHash("sha256");
+	let sha = createHash("sha256");
 	let started = false;
-	let pending = "";
+	/** `sha` plus the whitespace seen since the last non-whitespace character; undefined when there is none. */
+	let ahead: Hash | undefined;
 	return {
 		update(chunk) {
 			const text = started ? chunk : chunk.replace(/^\s+/, "");
 			if (text === "") return;
 			started = true;
-			// Only the new chunk is scanned backwards (a pending whitespace run is never rescanned: that was quadratic).
+			// Only the new chunk is scanned backwards (a whitespace run is never rescanned: that was quadratic).
 			let end = text.length;
 			while (end > 0 && /\s/.test(text[end - 1] as string)) end -= 1;
 			if (end === 0) {
-				pending += text;
+				ahead ??= sha.copy();
+				ahead.update(text);
 				return;
 			}
-			sha.update(pending + text.slice(0, end));
-			pending = text.slice(end);
+			if (ahead !== undefined) {
+				sha = ahead;
+				ahead = undefined;
+			}
+			sha.update(text.slice(0, end));
+			if (end < text.length) {
+				ahead = sha.copy();
+				ahead.update(text.slice(end));
+			}
 		},
 		digest: () => sha.digest("hex"),
 	};

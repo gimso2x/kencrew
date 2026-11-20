@@ -19,16 +19,13 @@
 
 export type OmpDriverErrorCode =
 	| "omp_executable_missing"
-	| "bun_missing"
-	| "omp_rpc_client_missing"
-	| "omp_launcher_standalone"
-	| "omp_launcher_unreadable"
-	| "bun_too_old"
+	| "omp_rpc_unsupported"
 	| "agy_executable_missing"
 	| "invalid_env"
 	| "already_started"
 	| "not_started"
 	| "unknown_since"
+	| "request_timeout"
 	| "rpc_error";
 
 export class OmpDriverError extends Error {
@@ -117,6 +114,12 @@ export type OmpDialogRequest =
 			timeout?: number;
 			/** omp's `selectionMarker`: "checkbox" is a multi-select (rows toggle), "radio" a single choice. */
 			selectionMarker?: string;
+			/** omp's `optionDetails`, aligned with `options`: the description of each row (undefined where it has none). */
+			descriptions?: Array<string | undefined>;
+			/** Checkbox select: the rows omp already shows as checked. */
+			checkedIndices?: number[];
+			/** Checkbox select: how many leading rows are markable; the rest are action rows (Done, Other). */
+			markableCount?: number;
 	  }
 	| { method: "confirm"; id: string; title: string; message: string; timeout?: number }
 	| { method: "input"; id: string; title: string; placeholder?: string; timeout?: number; secret?: boolean }
@@ -212,7 +215,7 @@ export interface OmpExitInfo {
 }
 
 export interface OmpSessionDriver {
-	/** Spawn the child. Fails fast with `omp_executable_missing` / `bun_missing`. */
+	/** Spawn the child. Fails fast with `omp_executable_missing` / `omp_rpc_unsupported`. */
 	start(): Promise<void>;
 	/** Admit a prompt while idle. Returns the `opRef` that `onFinal` will carry. */
 	prompt(text: string): Promise<string>;

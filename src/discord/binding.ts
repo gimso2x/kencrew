@@ -89,7 +89,7 @@ export class DiscordBinding implements ChannelBinding {
 	readonly readThread = async (channel: string, threadTs: string, limit?: number): Promise<ThreadMessage[]> => {
 		const transport = this.port.transport;
 		const [root] = await transport.listMessages({ channelId: channel, after: String(BigInt(threadTs) - 1n), limit: 1 });
-		const out = root === undefined ? [] : [threadMessage(root)];
+		const out = root?.id === threadTs ? [threadMessage(root)] : [];
 		if (limit !== undefined) return out;
 		let after = threadTs;
 		for (let page = 0; page < THREAD_CONTEXT_MAX_PAGES; page++) {

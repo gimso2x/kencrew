@@ -11,7 +11,6 @@ import {
 	readFileSync,
 	readlinkSync,
 	realpathSync,
-	renameSync,
 	rmSync,
 	type Stats,
 	statSync,
@@ -19,49 +18,35 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig, type OmpbotConfig } from "../config";
 import { countOmpModels } from "../daemon/doctor";
 import { botRpcEnv, splitModel } from "../daemon/run";
 import { dispatchEnv, type ProcessRunner, realProcessRunner } from "../dispatch/omp";
 import type { OmpFinal } from "../omp/driver";
-import { withOmpProfile } from "../omp/env";
+import { buildChildEnv, withOmpProfile } from "../omp/env";
 import { RpcOmpDriver } from "../omp/rpc-driver";
 import { checkOmpRuntime, type OmpRuntimeProblem } from "../omp/runtime-check";
 
-export const OMP_USAGE = `  omp install <version>          install @oh-my-pi/pi-coding-agent@<version> under <home>/omp/<version> (bun add; the
-                                 installed --version must be omp/<version>, else the folder is removed); current is untouched
-  omp use <version>              install if missing, then trial-run it (runtime check, one RPC turn, one omp -p) with the
-                                 bot's env; all three pass → <home>/omp/current points at it, the old one becomes previous.
-                                 Prints the ompExecutable to set; the daemon picks it up at the next restart (ompbot apply)
-  omp rollback                   current ← previous (no trial run)
-  omp status                     current/previous/installed versions, global omp, whether ompExecutable is current, the
-                                 profile dir, last sync and pending changes, and whether the pinned omp reads the login
-                                 (models --json > 0, bot env); exit 1 when that check fails
-  omp prune                      remove installed versions other than current and previous
+export const OMP_USAGE = `  omp trial [--executable <abs>] trial-run the omp named by --executable (default: config ompExecutable) with the bot's env (runtime check, one RPC
+                                 turn, one omp -p; the answer must contain OK); exit 0 when all three pass, else the failed
+                                 stage and the log tail, exit 1. Run it after every omp update
+  omp status                     global omp version, ompExecutable, the profile dir, last sync and pending changes, and
+                                 whether that omp reads the login (models --json > 0, bot env); exit 1 when that check fails
   omp sync [--init]              copy the owner's omp agent dir into the bot profile (config ompProfile): RULES.md,
                                  extensions/, skills/, models.yml, mcp.json mirrored, config.yml with its agent-dir paths
                                  rewritten, agent.db(-shm,-wal) as symlinks to the owner's login, managed-skills/ added
                                  and updated (the bot's own kept); --init also copies the mnemopi memory once
 `;
 
-const OMP_PACKAGE = "@oh-my-pi/pi-coding-agent";
-/** An npm version of omp: `18.18.9`, `18.19.0-beta.1`. */
-const OMP_VERSION_PATTERN = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
-/** The trial prompt of `omp use` (RPC turn and `omp -p`): the answer must contain `OK`. */
+/** The trial prompt of `omp trial` (RPC turn and `omp -p`): the answer must contain `OK`. */
 export const TRIAL_PROMPT = "OK 한 단어로만 답해";
 const TRIAL_TIMEOUT_MS = 120_000;
-const INSTALL_TIMEOUT_MS = 600_000;
 const FAIL_TAIL_LINES = 20;
 
-/** `<home>/omp`: one folder per installed version, the `current`/`previous` links and `last-sync`. */
-export const ompRoot = (homeDir: string): string => join(homeDir, "omp");
-/** The launcher inside an install folder (a version folder or `current`). */
-export const cliPathIn = (installDir: string): string =>
-	join(installDir, "node_modules", OMP_PACKAGE, "dist", "cli.js");
-/** What `ompExecutable` names once the bot runs the pinned omp. */
-const currentCliPath = (homeDir: string): string => cliPathIn(join(ompRoot(homeDir), "current"));
+/** `<home>/omp/last-sync`: when `omp sync` last ran. */
+const lastSyncPath = (homeDir: string): string => join(homeDir, "omp", "last-sync");
 /** omp's agent dir of `OMP_PROFILE=<profile>` (`~/.omp/profiles/<profile>/agent`). */
 export const profileAgentDir = (userHome: string, profile: string): string =>
 	join(userHome, ".omp", "profiles", profile, "agent");
@@ -81,12 +66,10 @@ export interface OmpCliDeps {
 	config?: OmpbotConfig;
 	/** Parent env: HOME, PATH, PI_CODING_AGENT_DIR. */
 	env: Record<string, string | undefined>;
-	/** The bun that installs and runs omp. */
-	bun: string;
-	/** `bun add`, `--version` and the `omp -p` trial. */
+	/** `--version` and the `omp -p` trial. */
 	run: ProcessRunner;
-	/** Trial ①: the launcher/bun check the RPC driver runs before every spawn. */
-	runtimeCheck: (cliPath: string, bun: string) => OmpRuntimeProblem | undefined;
+	/** Trial ①: the `--version` check the RPC driver runs before every spawn. */
+	runtimeCheck: (cliPath: string) => Promise<OmpRuntimeProblem | undefined>;
 	/** Trial ②: one RPC turn through the driver the daemon uses. */
 	rpcTrial: (input: { cliPath: string; cwd: string; profile?: string; model?: string }) => Promise<TrialResult>;
 	/** `models --json` count with the bot env (number) or why it could not be read (string). */
@@ -105,105 +88,24 @@ function readLink(path: string): string | undefined {
 	}
 }
 
-/** Points `<root>/<name>` at `target` (a version folder name) atomically: a temp link, then rename over the old one. */
-function swapLink(root: string, name: "current" | "previous", target: string, now: number): void {
-	const temp = join(root, `.${name}-${process.pid}-${now}`);
-	rmSync(temp, { force: true });
-	symlinkSync(target, temp);
-	renameSync(temp, join(root, name));
-}
-
-function installedVersions(homeDir: string): string[] {
-	const root = ompRoot(homeDir);
-	if (!existsSync(root)) return [];
-	return readdirSync(root, { withFileTypes: true })
-		.filter((entry) => entry.isDirectory() && OMP_VERSION_PATTERN.test(entry.name))
-		.map((entry) => entry.name)
-		.sort((a, b) => Bun.semver.order(a, b));
-}
-
-/** The version a launcher reports (`omp/<version>` → `<version>`), or the raw first line / failure. */
-async function launcherVersion(deps: OmpCliDeps, cliPath: string): Promise<string> {
-	const result = await deps.run([deps.bun, cliPath, "--version"], {
-		timeoutMs: 30_000,
-		env: dispatchEnv(deps.env),
-	});
-	const line = result.stdout.trim().split("\n")[0]?.trim() ?? "";
-	return result.code === 0 ? line : `exit=${result.code ?? "killed"} ${line}`.trim();
-}
-
-/** `ompbot omp install <version>`. */
-async function ompInstall(version: string, deps: OmpCliDeps): Promise<number> {
-	if (!OMP_VERSION_PATTERN.test(version)) {
-		deps.out(`omp install: invalid version ${version}`);
-		return 2;
-	}
-	const root = ompRoot(deps.homeDir);
-	const dir = join(root, version);
-	const cliPath = cliPathIn(dir);
-	if (existsSync(cliPath) && (await launcherVersion(deps, cliPath)) === `omp/${version}`) {
-		chmodSync(cliPath, 0o755);
-		deps.out(`omp_install version=${version} dir=${dir} already_installed`);
-		return 0;
-	}
-	rmSync(dir, { recursive: true, force: true });
-	mkdirSync(root, { recursive: true, mode: 0o700 });
-	mkdirSync(dir, { mode: 0o700 });
-	chmodSync(dir, 0o700);
-	writeFileSync(join(dir, "package.json"), `${JSON.stringify({ private: true })}\n`, { mode: 0o600 });
-	const added = await deps.run([deps.bun, "add", `${OMP_PACKAGE}@${version}`], {
-		cwd: dir,
-		timeoutMs: INSTALL_TIMEOUT_MS,
-		env: dispatchEnv(deps.env),
-	});
-	const fail = (reason: string, output = ""): number => {
-		rmSync(dir, { recursive: true, force: true });
-		deps.out(`omp install failed: ${reason} (removed ${dir})`);
-		if (output.trim() !== "") deps.out(tail(output));
+/** `ompbot omp trial`: the omp named by `--executable`, else config `ompExecutable`, with the bot's env: runtime check, one RPC turn, one `omp -p`. */
+async function ompTrial(deps: OmpCliDeps, executable: string | undefined): Promise<number> {
+	if (deps.config === undefined) {
+		deps.out(`omp trial failed: no config.json in ${deps.homeDir} (ompExecutable unknown)`);
 		return 1;
-	};
-	if (added.code !== 0 || added.timedOut) {
-		return fail(`bun add exit=${added.code ?? "killed"}`, `${added.stdout}\n${added.stderr ?? ""}`);
 	}
-	if (!existsSync(cliPath)) return fail(`${cliPath} missing after bun add`);
-	// The RPC driver requires X_OK on the launcher.
-	chmodSync(cliPath, 0o755);
-	const reported = await launcherVersion(deps, cliPath);
-	if (reported !== `omp/${version}`) return fail(`installed --version is "${reported}", expected omp/${version}`);
-	deps.out(`omp_install version=${version} dir=${dir}`);
-	return 0;
-}
-
-/** `ompbot omp use <version>`: trial-run the install with the bot's env, then switch `current` only if all three pass. */
-async function ompUse(version: string, deps: OmpCliDeps): Promise<number> {
-	if (!OMP_VERSION_PATTERN.test(version)) {
-		deps.out(`omp use: invalid version ${version}`);
-		return 2;
-	}
-	const root = ompRoot(deps.homeDir);
-	const dir = join(root, version);
-	if (!existsSync(cliPathIn(dir))) {
-		const installed = await ompInstall(version, deps);
-		if (installed !== 0) return installed;
-	}
-	const cliPath = cliPathIn(dir);
-	const profile = deps.config?.ompProfile;
-	const model = deps.config?.model;
+	const cliPath = executable ?? deps.config.ompExecutable;
+	const profile = deps.config.ompProfile;
+	const model = deps.config.model;
 	const fail = (stage: string, detail: string): number => {
-		deps.out(`omp use failed: ${stage}; current unchanged`);
+		deps.out(`omp trial failed: ${stage} (${cliPath})`);
 		if (detail.trim() !== "") deps.out(tail(detail));
 		return 1;
 	};
 
-	let real: string;
-	try {
-		real = realpathSync(cliPath);
-	} catch (error) {
-		return fail("runtime", String(error));
-	}
-	const problem = deps.runtimeCheck(real, deps.bun);
+	const problem = await deps.runtimeCheck(cliPath);
 	if (problem !== undefined) return fail("runtime", `${problem.code} ${problem.message}`);
-	deps.out("omp_use_trial stage=runtime ok=true");
+	deps.out("omp_trial stage=runtime ok=true");
 
 	const cwd = mkdtempSync(join(tmpdir(), "ompbot-omp-trial-"));
 	try {
@@ -214,7 +116,7 @@ async function ompUse(version: string, deps: OmpCliDeps): Promise<number> {
 			...(model === undefined ? {} : { model }),
 		});
 		if (!rpc.ok) return fail("rpc", rpc.detail);
-		deps.out("omp_use_trial stage=rpc ok=true");
+		deps.out("omp_trial stage=rpc ok=true");
 
 		const print = await deps.run(
 			[cliPath, "-p", "--no-title", ...(model === undefined ? [] : ["--model", model]), TRIAL_PROMPT],
@@ -224,79 +126,30 @@ async function ompUse(version: string, deps: OmpCliDeps): Promise<number> {
 		if (print.timedOut) return fail("print", `timeout after ${TRIAL_TIMEOUT_MS / 1000}s\n${printed}`);
 		if (print.code !== 0) return fail("print", `exit=${print.code ?? "killed"}\n${printed}`);
 		if (!print.stdout.includes("OK")) return fail("print", `no OK in the answer\n${printed}`);
-		deps.out("omp_use_trial stage=print ok=true");
+		deps.out("omp_trial stage=print ok=true");
 	} finally {
 		rmSync(cwd, { recursive: true, force: true });
 	}
-
-	const old = readLink(join(root, "current"));
-	swapLink(root, "current", version, deps.now());
-	if (old !== undefined && old !== version) swapLink(root, "previous", old, deps.now());
-	deps.out(`omp_use current=${version} previous=${readLink(join(root, "previous")) ?? "none"}`);
-	deps.out(`ompExecutable: ${currentCliPath(deps.homeDir)}`);
-	if (deps.config !== undefined && deps.config.ompExecutable !== currentCliPath(deps.homeDir)) {
-		deps.out(`config.json ompExecutable is ${deps.config.ompExecutable}; set it to the path above`);
-	}
-	deps.out("`ompbot apply`로 재시작해야 반영된다");
+	deps.out(`omp_trial ok executable=${cliPath}`);
 	return 0;
 }
 
-/** `ompbot omp rollback`: current ← previous, the old current becomes previous. */
-function ompRollback(deps: OmpCliDeps): number {
-	const root = ompRoot(deps.homeDir);
-	const previous = readLink(join(root, "previous"));
-	if (previous === undefined || !existsSync(join(root, previous))) {
-		deps.out("omp rollback failed: no previous version");
-		return 1;
-	}
-	const current = readLink(join(root, "current"));
-	swapLink(root, "current", previous, deps.now());
-	if (current !== undefined && current !== previous) swapLink(root, "previous", current, deps.now());
-	deps.out(`omp_rollback current=${previous} previous=${current ?? "none"}`);
-	deps.out("`ompbot apply`로 재시작해야 반영된다");
-	return 0;
-}
-
-/** `ompbot omp prune`: removes version folders other than `current` and `previous` (only under `<home>/omp`). */
-function ompPrune(deps: OmpCliDeps): number {
-	const root = ompRoot(deps.homeDir);
-	const keep = new Set([readLink(join(root, "current")), readLink(join(root, "previous"))]);
-	let removed = 0;
-	for (const version of installedVersions(deps.homeDir)) {
-		if (keep.has(version)) continue;
-		rmSync(join(root, version), { recursive: true, force: true });
-		deps.out(`omp_prune removed=${version}`);
-		removed += 1;
-	}
-	deps.out(`omp_prune_done removed=${removed} kept=${[...keep].filter((v) => v !== undefined).join(",") || "none"}`);
-	return 0;
-}
-
-/** `ompbot omp status`; exit 1 when the pinned omp cannot read the login (or there is no current). */
+/** `ompbot omp status`; exit 1 when the omp of `ompExecutable` (else the global one) cannot read the login. */
 async function ompStatus(deps: OmpCliDeps): Promise<number> {
-	const root = ompRoot(deps.homeDir);
-	const current = readLink(join(root, "current"));
-	const previous = readLink(join(root, "previous"));
 	const profile = deps.config?.ompProfile;
-	let failed = false;
-	deps.out(`current=${current ?? "none"} previous=${previous ?? "none"}`);
-	deps.out(`installed=${installedVersions(deps.homeDir).join(",") || "none"}`);
 	const globalOmp = Bun.which("omp", { PATH: deps.env.PATH ?? "" });
 	if (globalOmp === null) deps.out("global=none");
 	else {
 		const result = await deps.run([globalOmp, "--version"], { timeoutMs: 30_000, env: dispatchEnv(deps.env) });
 		deps.out(`global=${result.stdout.trim().split("\n")[0] ?? ""} (${globalOmp})`);
 	}
-	if (deps.config !== undefined) {
-		const pinned = deps.config.ompExecutable === currentCliPath(deps.homeDir);
-		deps.out(`ompExecutable=${deps.config.ompExecutable} current=${pinned ? "yes" : "no"}`);
-	}
+	if (deps.config !== undefined) deps.out(`ompExecutable=${deps.config.ompExecutable}`);
 	if (profile === undefined) deps.out("profile=none (config ompProfile not set)");
 	else {
 		const target = profileAgentDir(userHomeOf(deps.env), profile);
 		deps.out(`profile=${profile} dir=${target} exists=${existsSync(target) ? "yes" : "no"}`);
-		const lastSync = existsSync(join(root, "last-sync"))
-			? readFileSync(join(root, "last-sync"), "utf8").trim()
+		const lastSync = existsSync(lastSyncPath(deps.homeDir))
+			? readFileSync(lastSyncPath(deps.homeDir), "utf8").trim()
 			: "never";
 		let pending: string;
 		try {
@@ -309,19 +162,20 @@ async function ompStatus(deps: OmpCliDeps): Promise<number> {
 		}
 		deps.out(`last_sync=${lastSync} pending_changes=${pending}`);
 	}
-	if (current === undefined) {
-		deps.out("login fail: no current version (ompbot omp use <version>)");
+	const loginOmp = deps.config?.ompExecutable ?? globalOmp;
+	if (loginOmp === null || loginOmp === undefined) {
+		deps.out("login fail: no omp (config ompExecutable unset, no omp on PATH)");
 		return 1;
 	}
-	const models = await deps.countModels(currentCliPath(deps.homeDir), profile);
-	if (typeof models === "number" && models > 0) deps.out(`login ok models=${models}`);
-	else {
-		failed = true;
-		deps.out(
-			`login fail ${typeof models === "number" ? "models=0 (the pinned omp reads no login: agent.db schema or provider login)" : models}`,
-		);
+	const models = await deps.countModels(loginOmp, profile);
+	if (typeof models === "number" && models > 0) {
+		deps.out(`login ok models=${models}`);
+		return 0;
 	}
-	return failed ? 1 : 0;
+	deps.out(
+		`login fail ${typeof models === "number" ? "models=0 (this omp reads no login: agent.db schema or provider login)" : models}`,
+	);
+	return 1;
 }
 
 // ---------------------------------------------------------------- profile sync
@@ -580,11 +434,14 @@ export function runProfileSync(input: {
 	});
 	for (const warning of result.warnings) input.out(`warn ${warning}`);
 	for (const line of result.changed) input.out(line);
-	const root = ompRoot(input.homeDir);
-	mkdirSync(root, { recursive: true, mode: 0o700 });
-	writeFileSync(join(root, "last-sync"), `${new Date(input.now()).toISOString()} changed=${result.changed.length}\n`, {
-		mode: 0o600,
-	});
+	mkdirSync(dirname(lastSyncPath(input.homeDir)), { recursive: true, mode: 0o700 });
+	writeFileSync(
+		lastSyncPath(input.homeDir),
+		`${new Date(input.now()).toISOString()} changed=${result.changed.length}\n`,
+		{
+			mode: 0o600,
+		},
+	);
 	input.out(`omp_profile_sync changed=${result.changed.length}`);
 	return result.changed.length;
 }
@@ -594,7 +451,6 @@ export function runProfileSync(input: {
 /** Trial ②: one turn through `RpcOmpDriver` (the daemon's driver, same env), `OK` expected within the deadline. */
 async function realRpcTrial(
 	input: { cliPath: string; cwd: string; profile?: string; model?: string },
-	bun: string,
 	env: Record<string, string | undefined>,
 	timeoutMs = TRIAL_TIMEOUT_MS,
 ): Promise<TrialResult> {
@@ -605,7 +461,6 @@ async function realRpcTrial(
 		...splitModel(input.model),
 		...botRpcEnv(input.profile, env),
 		...(input.profile === undefined ? { baseEnv: env } : {}),
-		bunExecutable: bun,
 	});
 	const final = Promise.withResolvers<OmpFinal>();
 	// An exit after the answer (the stop below) rejects nothing anyone still waits on.
@@ -631,15 +486,13 @@ async function realRpcTrial(
 
 function realDeps(homeDir: string, env: Record<string, string | undefined>, out: (line: string) => void): OmpCliDeps {
 	const config = existsSync(join(homeDir, "config.json")) ? loadConfig(homeDir, { checkTokens: false }) : undefined;
-	const bun = Bun.which("bun", { PATH: env.PATH ?? "" }) ?? process.execPath;
 	return {
 		homeDir,
 		...(config === undefined ? {} : { config }),
 		env,
-		bun,
 		run: realProcessRunner,
-		runtimeCheck: checkOmpRuntime,
-		rpcTrial: (input) => realRpcTrial(input, bun, env),
+		runtimeCheck: (cliPath) => checkOmpRuntime(cliPath, buildChildEnv(undefined, env)),
+		rpcTrial: (input) => realRpcTrial(input, env),
 		countModels: (cliPath, profile) => countOmpModels(cliPath, 30_000, profile, env),
 		out,
 		now: () => Date.now(),
@@ -656,7 +509,7 @@ export async function ompCommand(
 	const { positionals, values } = parseArgs({
 		args,
 		allowPositionals: true,
-		options: { init: { type: "boolean" } },
+		options: { init: { type: "boolean" }, executable: { type: "string" } },
 		strict: true,
 	});
 	const [sub, version, ...extra] = positionals;
@@ -665,15 +518,10 @@ export async function ompCommand(
 		return 2;
 	};
 	if (extra.length > 0 || (values.init === true && sub !== "sync")) return usage();
+	if (values.executable !== undefined && (sub !== "trial" || !isAbsolute(values.executable))) return usage();
 	switch (sub) {
-		case "install":
-			return version === undefined ? usage() : await ompInstall(version, deps);
-		case "use":
-			return version === undefined ? usage() : await ompUse(version, deps);
-		case "rollback":
-			return version === undefined ? ompRollback(deps) : usage();
-		case "prune":
-			return version === undefined ? ompPrune(deps) : usage();
+		case "trial":
+			return version === undefined ? await ompTrial(deps, values.executable) : usage();
 		case "status":
 			return version === undefined ? await ompStatus(deps) : usage();
 		case "sync":

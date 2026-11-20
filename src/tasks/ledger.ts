@@ -2,6 +2,7 @@ import { constants, Database } from "bun:sqlite";
 import { pathToFileURL } from "node:url";
 import type { LaneModelTier } from "../config";
 import type { LaneQa, LaneReview } from "../lanes/status";
+import { checkSchemaVersion } from "../store/schema-version";
 import { localDay } from "../time";
 import {
 	type AcceptanceItem,
@@ -12,6 +13,7 @@ import {
 	type TaskRisk,
 	worktreePathOf,
 } from "./docs";
+import type { SignalCheck } from "./signals";
 
 export const TASK_STATUSES = ["working", "blocked", "review", "done", "cancelled"] as const;
 export type TaskStatus = (typeof TASK_STATUSES)[number];
@@ -72,6 +74,14 @@ export interface TaskRow {
 	tierConfidence: number | null;
 	/** The independent review and run QA receipts of the task's tips (`recordGate`); null before the first. */
 	gate: TaskGate | null;
+	/** The `[check: …]` results at one HEAD (`recordChecks`); null before the first or when the stored value is unusable. */
+	checks: TaskChecks | null;
+}
+
+/** A task's `[check:]` results, bound to the HEAD they ran at: reused only while the worktree is still there. */
+export interface TaskChecks {
+	head: string;
+	results: SignalCheck[];
 }
 
 /** The [TASK] gate's receipts, shaped like a lane's meta: each one is bound to the tip it judged (`sha`). */
@@ -116,7 +126,8 @@ CREATE TABLE IF NOT EXISTS tasks (
 	tier TEXT,
 	tier_reason TEXT,
 	tier_confidence TEXT,
-	gate_json TEXT
+	gate_json TEXT,
+	check_json TEXT
 );
 CREATE INDEX IF NOT EXISTS tasks_thread ON tasks(thread_ref);
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status);
@@ -144,7 +155,14 @@ export interface TaskTransitionRow {
 }
 
 /** Columns added after the first `tasks` schema; rows that predate them read null. */
-const LATER_TASK_COLUMNS = ["worker_model", "tier", "tier_reason", "tier_confidence", "gate_json"] as const;
+const LATER_TASK_COLUMNS = [
+	"worker_model",
+	"tier",
+	"tier_reason",
+	"tier_confidence",
+	"gate_json",
+	"check_json",
+] as const;
 
 /** Creates the tables in a database that may predate them and adds later columns (idempotent, never touches rows). */
 export function migrateTaskSchema(db: Database): void {
@@ -204,6 +222,7 @@ export interface TaskSql {
 	tier_reason?: string | null;
 	tier_confidence?: string | null;
 	gate_json?: string | null;
+	check_json?: string | null;
 }
 
 interface TransitionSql {
@@ -278,6 +297,7 @@ export function readTaskSql(r: TaskSql): ReadTask {
 		tierReason: r.tier_reason ?? null,
 		tierConfidence: readTierConfidence(r.tier_confidence),
 		gate: parseGate(r.gate_json),
+		checks: parseChecks(r.check_json),
 	};
 	return { row, broken };
 }
@@ -288,6 +308,29 @@ function parseGate(json: string | null | undefined): TaskGate | null {
 	try {
 		const value: unknown = JSON.parse(json);
 		return typeof value === "object" && value !== null && !Array.isArray(value) ? (value as TaskGate) : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * A `check_json` value; null (no results, the checks run again) when absent, not JSON, or any part of it is off: no
+ * `head`, a result that is not `{signal, ok, detail}` of the right types, or an `inconclusive` one. Never partially kept.
+ */
+function parseChecks(json: string | null | undefined): TaskChecks | null {
+	if (json === null || json === undefined) return null;
+	try {
+		const value: unknown = JSON.parse(json);
+		if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+		const { head, results } = value as { head?: unknown; results?: unknown };
+		if (typeof head !== "string" || head === "" || !Array.isArray(results)) return null;
+		for (const item of results) {
+			if (typeof item !== "object" || item === null || Array.isArray(item)) return null;
+			const { signal, ok, detail, inconclusive } = item as Record<string, unknown>;
+			if (typeof signal !== "string" || typeof ok !== "boolean" || typeof detail !== "string") return null;
+			if (inconclusive !== undefined) return null;
+		}
+		return { head, results: results as SignalCheck[] };
 	} catch {
 		return null;
 	}
@@ -329,7 +372,10 @@ export class TaskLedger {
 		this.#clock = options.clock;
 		this.#timezone = options.timezone;
 		// A read-only handle cannot create tables, and a ledger it can open already has them.
-		if (options.readonly !== true) migrateTaskSchema(db);
+		if (options.readonly !== true) {
+			checkSchemaVersion(db);
+			migrateTaskSchema(db);
+		}
 	}
 
 	/** Allocates the next `T-YYYYMMDD-NN` of the bot zone's day and inserts the row as `working`, in one transaction. */
@@ -515,6 +561,14 @@ export class TaskLedger {
 		})();
 	}
 
+	/** Replaces the task's `[check:]` results wholesale (null clears them). */
+	recordChecks(taskId: string, value: TaskChecks | null): void {
+		this.require(taskId);
+		this.#db
+			.query("UPDATE tasks SET check_json = ? WHERE task_id = ?")
+			.run(value === null ? null : JSON.stringify(value), taskId);
+	}
+
 	/**
 	 * Marks a notice key as posted. True only for the call that set it, so the caller posts exactly when it wins —
 	 * a repeated sweep over the same state stays silent.
@@ -624,6 +678,7 @@ export function openTaskLedger(
 		return new TaskLedger(openReadonly(path), { clock, timezone, readonly: true });
 	}
 	const db = new Database(path, { create: true, strict: true });
+	checkSchemaVersion(db);
 	db.run("PRAGMA journal_mode = WAL");
 	db.run("PRAGMA busy_timeout = 5000");
 	return new TaskLedger(db, { clock, timezone });

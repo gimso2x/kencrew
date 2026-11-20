@@ -38,8 +38,8 @@ export function newestSessionFile(sessionDir: string): string | undefined {
 	for (const name of readdirSync(sessionDir)) {
 		if (!name.endsWith(".jsonl")) continue;
 		const file = join(sessionDir, name);
-		const stat = statSync(file);
-		if (!stat.isFile()) continue;
+		const stat = statSync(file, { throwIfNoEntry: false });
+		if (!stat?.isFile()) continue;
 		const { mtimeMs, birthtimeMs } = stat;
 		const listed = { file, mtimeMs, createdMs: birthtimeMs, name };
 		if (newest === undefined || listsBefore(listed, newest)) newest = listed;

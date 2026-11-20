@@ -8,13 +8,15 @@ import { TOP_LEVEL_TS } from "../src/core/normalize";
 import { Daemon } from "../src/daemon/daemon";
 import { DiscordCallError } from "../src/discord/transport";
 import { dispatchEnv, type ProcessRunner, type RunProcessResult } from "../src/dispatch/omp";
+import { receiptNowOf } from "../src/lanes/land";
 import { createGateSlot } from "../src/lanes/qa";
+import { bootRuntime } from "../src/lanes/runtime";
 import { createLogger } from "../src/log";
 import { FakeOmpDriver, FakeSessionStore } from "../src/omp/fake-driver";
 import { redact } from "../src/redact";
 import type { TaskCheck, TaskJudgement } from "../src/tasks/checker";
 import { acceptanceItems } from "../src/tasks/docs";
-import type { TaskGateEnd, TaskGateHooks } from "../src/tasks/gate";
+import { gateRuntimeKey, type TaskGateEnd, type TaskGateHooks } from "../src/tasks/gate";
 import { landTask, type TaskLandResult } from "../src/tasks/land";
 import { migrateTaskSchema, TaskLedger, type TaskRow } from "../src/tasks/ledger";
 import { autoLandBlockers, buildReachedCard, holdingIntegrityWarnings } from "../src/tasks/notify";
@@ -542,14 +544,37 @@ describe("[TASK] review·QA gate (task-review-qa-gate)", () => {
 		// A new tip whose review was started twice without a receipt (cut off by restarts).
 		g(row.worktree, "commit", "-q", "--allow-empty", "-m", "rework");
 		const sha = g(repo, "rev-parse", row.branch);
-		tasks.recordNotice(row.taskId, `gate:${sha}:review:1`);
-		tasks.recordNotice(row.taskId, `gate:${sha}:review:2`);
+		const rt = gateRuntimeKey(
+			receiptNowOf({
+				repos: [repo],
+				maxRisk: "L2",
+				review: { model: "rev/model", timeoutMs: 1 },
+				qa: { minRisk: "L3", overlay: join(root, "qa.omp.yml"), model: QA_MODEL, timeoutMs: 1 },
+			}),
+		);
+		tasks.recordNotice(row.taskId, `gate:${sha}:${rt}:review:1`);
+		tasks.recordNotice(row.taskId, `gate:${sha}:${rt}:review:2`);
 		expect(await gd.autoLand(tasks.require(row.taskId), hooks().gate)).toEqual({
 			state: "held",
 			reasons: ["독립 리뷰 확인 불가(재시도 2회 소진)"],
 		});
 		expect(await gd.autoLand(tasks.require(row.taskId), hooks().gate)).toEqual({ state: "held", reasons: [] });
 		expect(order).toEqual(["review"]);
+		// The same tip on another omp major.minor: the used-up starts were another runtime's, the gate starts again.
+		try {
+			await bootRuntime({ omp: "omp 99.0.0", sourceDir: repo });
+			const again = hooks();
+			expect(await gd.autoLand(tasks.require(row.taskId), again.gate)).toEqual({ state: "gating" });
+			await again.ended;
+			expect(order).toEqual(["review", "review"]);
+			expect(gd.store.tasks.require(row.taskId).gate?.review?.runtime?.omp).toBe("omp 99.0.0");
+		} finally {
+			await bootRuntime({
+				omp: "unknown",
+				sourceDir: "/nonexistent",
+				git: async () => ({ code: 1, stdout: "", stderr: "" }),
+			});
+		}
 	});
 
 	test("AC-4: an L2 task lands without review or QA; L4 keeps its risk reason only, L3 needs the receipts", async () => {

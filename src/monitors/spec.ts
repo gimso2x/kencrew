@@ -105,7 +105,7 @@ export interface SpecContext {
 	defaultTimezone: string;
 }
 
-const SPEC_KEYS = [
+export const SPEC_KEYS = [
 	"name",
 	"trigger",
 	"instruction",
@@ -449,7 +449,7 @@ export function mergeMonitorSpec(current: MonitorSpec | undefined, patch: unknow
 	if (
 		typeof name !== "string" ||
 		name.trim() === "" ||
-		name.length > MAX_NAME_CHARS ||
+		[...name].length > MAX_NAME_CHARS ||
 		/\p{Cc}/u.test(name) ||
 		!name.isWellFormed()
 	) {

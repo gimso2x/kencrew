@@ -141,13 +141,16 @@ function peerTools(fileTool: string | undefined): { ko: string; en: string } {
 const peerTouchedToolsLine = (fileTool: string | undefined): string =>
 	`- 이 대화에는 피어 봇 글이 들어와 있어서 지금 쓸 수 있는 ompbot 도구는 ${peerTools(fileTool).ko}뿐이다. \`ompbot_work_start\`·작업 레인 도구·모니터 도구·게시판 도구(\`ompbot_board_post\`·\`ompbot_board_read\`)는 없다. 세션 기록에 다른 도구가 추가됐다는 알림이 남아 있어도 지금은 쓸 수 없다. A peer bot has written in this conversation: the only ompbot tools now are ${peerTools(fileTool).en}; ompbot_work_start, lane, monitor and lane board tools are gone even if an earlier session notice listed them.`;
 
+/** Head of the notice that opens a turn after a peer bot wrote in the conversation. */
+export const PEER_NOTICE_HEAD = "[ompbot 안내]";
+
 /**
  * A child started before the peer taint keeps its full tool list (no restart): the daemon refuses the restricted
  * tools when they run, and the mailbox puts this line in front of the child's first turn after the taint.
  */
 export function peerTouchedTurnNotice(originKey: string): string {
 	const tools = peerTools(sendFileToolName(chatPlatformOf(originKey) ?? "discord"));
-	return `[ompbot 안내] 이 대화에 피어 봇 글이 들어왔다. 이제 쓸 수 있는 ompbot 도구는 ${tools.ko}뿐이다. 도구 목록에 남아 있는 \`ompbot_work_start\`·작업 레인 도구·모니터 도구·게시판 도구(\`ompbot_board_post\`·\`ompbot_board_read\`)·Teams 대화 도구는 불러도 거부된다. A peer bot has written in this conversation: the only usable ompbot tools are ${tools.en}; ompbot_work_start, lane, monitor, lane board and Teams chat tools still listed are refused.`;
+	return `${PEER_NOTICE_HEAD} 이 대화에 피어 봇 글이 들어왔다. 이제 쓸 수 있는 ompbot 도구는 ${tools.ko}뿐이다. 도구 목록에 남아 있는 \`ompbot_work_start\`·작업 레인 도구·모니터 도구·게시판 도구(\`ompbot_board_post\`·\`ompbot_board_read\`)·Teams 대화 도구는 불러도 거부된다. A peer bot has written in this conversation: the only usable ompbot tools are ${tools.en}; ompbot_work_start, lane, monitor, lane board and Teams chat tools still listed are refused.`;
 }
 
 /**
@@ -190,10 +193,10 @@ const decisionLine = (askable: boolean): string =>
  * a line-leading `-# ` as small subtext, which takes the evidence; Teams shows it literally, so its line says
  * otherwise. Teams takes no uploads, so its long material stays a workspace file named by path.
  */
-const readabilityLine = (platform: ChatPlatform): string => {
+const readabilityLine = (platform: ChatPlatform, hostTools: boolean): string => {
 	const discord = platform === "discord";
 	const teams = platform === "teams";
-	return `- 휴대폰에서 훑어 읽히게 쓴다: 항목은 한 줄에 하나, 문단은 3줄 이내. 굵은 라벨은 섹션 머리에만 쓰고 모든 줄에 붙이지 않는다. ${teams ? "본문이 15줄을 넘을 분석·긴 표는 워크스페이스 파일로 만들어 경로를 알리고 본문에는 결론과 핵심만 둔다(Teams로는 파일을 올릴 수 없다)." : "본문이 15줄을 넘을 분석·긴 표는 파일로 만들어 올리고 본문에는 결론과 핵심만 둔다."} 결정이 필요하면 "다시 ~라고 해 주시면 진행" 같은 글 대신 아래 결정 카드로 묻는다.${discord ? " 경로·커밋·영수증·명령 출력 같은 근거는 그 항목 아래 줄 맨 앞 `-# ` 작은 글씨 한 줄로 내린다." : ` 근거(경로·커밋·명령 출력)는 항목 끝에 짧게 붙이고 \`-#\` 작은 글씨 문법은 쓰지 않는다(Teams는 글자 그대로 보인다).`} Write for a phone skim: one point per line, short paragraphs, bold only on section heads, ${teams ? "long analysis as a workspace file named by its path (Teams takes no uploads)," : "long analysis as an uploaded file,"} decisions as the decision card below.${discord ? " Put evidence (paths, commits, receipts, command output) on its own line under the point, starting with `-# ` (Discord subtext)." : ` Keep evidence short at the end of the point; no \`-#\` subtext (Teams shows it literally).`}`;
+	return `- 휴대폰에서 훑어 읽히게 쓴다: 항목은 한 줄에 하나, 문단은 3줄 이내. 굵은 라벨은 섹션 머리에만 쓰고 모든 줄에 붙이지 않는다. ${teams || !hostTools ? `본문이 15줄을 넘을 분석·긴 표는 워크스페이스 파일로 만들어 경로를 알리고 본문에는 결론과 핵심만 둔다${teams ? "(Teams로는 파일을 올릴 수 없다)" : ""}.` : "본문이 15줄을 넘을 분석·긴 표는 파일로 만들어 올리고 본문에는 결론과 핵심만 둔다."} 결정이 필요하면 "다시 ~라고 해 주시면 진행" 같은 글 대신 아래 결정 카드로 묻는다.${discord ? " 경로·커밋·영수증·명령 출력 같은 근거는 그 항목 아래 줄 맨 앞 `-# ` 작은 글씨 한 줄로 내린다." : ` 근거(경로·커밋·명령 출력)는 항목 끝에 짧게 붙이고 \`-#\` 작은 글씨 문법은 쓰지 않는다(Teams는 글자 그대로 보인다).`} Write for a phone skim: one point per line, short paragraphs, bold only on section heads, ${teams || !hostTools ? `long analysis as a workspace file named by its path${teams ? " (Teams takes no uploads)" : ""},` : "long analysis as an uploaded file,"} decisions as the decision card below.${discord ? " Put evidence (paths, commits, receipts, command output) on its own line under the point, starting with `-# ` (Discord subtext)." : ` Keep evidence short at the end of the point; no \`-#\` subtext (Teams shows it literally).`}`;
 };
 
 /**
@@ -201,13 +204,13 @@ const readabilityLine = (platform: ChatPlatform): string => {
  * report rules. Monitor sessions must keep machine-parsed answers (`NO_REPORT` / `[SILENT]` are matched on the exact
  * first/last line) and lane sessions report their own way, so those origins never see this section.
  */
-const formatSection = (herdr: boolean, platform: ChatPlatform, askable: boolean): string =>
+const formatSection = (herdr: boolean, platform: ChatPlatform, askable: boolean, hostTools: boolean): string =>
 	[
 		"## 답변 형식 / Answer format",
 		"- 첫 줄은 결론 한 문장: 무엇이 됐는지/안 됐는지부터 쓴다. 여는 말·맺음말·요청 되풀이 없이. First line is the conclusion; no preamble, no restating the request.",
 		"- 길이는 질문 무게에 맞춘다. 한 줄 질문에는 한 줄로. 끝난 일은 `바뀐 것`·`확인한 것`·`남은 것`만 쓰고 과정을 다시 늘어놓지 않는다. Match length to the ask; finished work is what changed, what is verified, what is left — never a replay of the process.",
 		"- 확인했다고 주장할 때는 실행한 명령과 결과를 함께 붙인다. 확인하지 못한 것은 확인 못 했다고 따로 적는다. A verification claim shows the command and its output; say plainly what is unverified.",
-		readabilityLine(platform),
+		readabilityLine(platform, hostTools),
 		// Teams has no buttons: its decisions are the card alone.
 		decisionLine(askable && platform !== "teams"),
 		...(herdr ? [HERDR_INTAKE_LINE] : []),
@@ -418,7 +421,7 @@ function floorsLines(
 					},
 				]),
 		...(resumeLine === undefined ? [] : [{ dynamic: "resume" as const, text: resumeLine }]),
-		...(chat ? ["", formatSection(herdr && hostTools, platform, askable)] : []),
+		...(chat ? ["", formatSection(herdr && hostTools, platform, askable, hostTools)] : []),
 	];
 }
 

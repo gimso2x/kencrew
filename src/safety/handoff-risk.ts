@@ -60,9 +60,19 @@ function blankGitGlobalOptions(text: string): string {
 	);
 }
 
+/**
+ * A long option and each of its prefixes from `min` characters on (`longOption("hard", 1)`: `--h` … `--hard`): git
+ * takes any unique prefix of a long option, so a rule naming only the full word misses `git reset --h`.
+ */
+function longOption(name: string, min: number): string {
+	let rest = "";
+	for (let i = name.length - 1; i >= min; i--) rest = `(?:${name[i]}${rest})?`;
+	return `--${name.slice(0, min)}${rest}`;
+}
+
 /** `git branch` delete and force flags, case-sensitive: `-d` alone is the safe delete. */
-const BRANCH_DELETE = "(?:--delete|-[a-zA-Z]*d[a-zA-Z]*)(?![\\w-])";
-const BRANCH_FORCE = "(?:--force|-[a-zA-Z]*f[a-zA-Z]*)(?![\\w-])";
+const BRANCH_DELETE = `(?:${longOption("delete", 1)}|-[a-zA-Z]*d[a-zA-Z]*)(?![\\w-])`;
+const BRANCH_FORCE = `(?:${longOption("force", 1)}|-[a-zA-Z]*f[a-zA-Z]*)(?![\\w-])`;
 
 /** `--staged` anywhere later in the command: a `git restore` naming it leaves the work tree alone. */
 const RESTORE_STAGED = "[^;&|`\\n]*--staged";
@@ -79,11 +89,11 @@ interface PatternRule {
 	verb?: RegExp;
 }
 
-// Long options are matched with the unique prefixes git accepts too (`--har`, `--forc`, `--del`, `--mir`).
+// Long options are matched with the unique prefixes git accepts too (`--h`, `--forc`, `--del`, `--disc`, `--mir`).
 const HIGH_RISK_PATTERNS: readonly PatternRule[] = [
 	{
 		rule: "git_reset_hard",
-		pattern: new RegExp(`\\bgit\\s+reset\\b${SEGMENT}\\s--ha(?:rd?)?(?![\\w-])`, "i"),
+		pattern: new RegExp(`\\bgit\\s+reset\\b${SEGMENT}\\s${longOption("hard", 1)}(?![\\w-])`, "i"),
 		verb: /\bgit\s+(reset)\b/i,
 	},
 	{
@@ -116,7 +126,7 @@ const HIGH_RISK_PATTERNS: readonly PatternRule[] = [
 	{
 		rule: "git_discard_worktree",
 		pattern: new RegExp(
-			`\\bgit\\s+(?:(?:checkout|switch)\\b${SEGMENT}\\s(?:-[a-z]*f[a-z]*|--force|--discard-changes)(?![\\w-])|(?:checkout\\b|restore\\b(?:(?=${SEGMENT}\\s(?:--worktree|-[a-z]*w[a-z]*)(?![\\w-]))|(?!${RESTORE_STAGED})))${SEGMENT}\\s(?:\\.\\/?|:\\/\\.?|\\.\\/\\*|:\\/\\*|\\*|'\\*'|"\\*")(?=\\s|$|[;&|\`]))`,
+			`\\bgit\\s+(?:(?:checkout|switch)\\b${SEGMENT}\\s(?:-[a-z]*f[a-z]*|${longOption("force", 1)}|${longOption("discard-changes", 2)})(?![\\w-])|(?:checkout\\b|restore\\b(?:(?=${SEGMENT}\\s(?:--worktree|-[a-z]*w[a-z]*)(?![\\w-]))|(?!${RESTORE_STAGED})))${SEGMENT}\\s(?:\\.\\/?|:\\/\\.?|\\.\\/\\*|:\\/\\*|\\*|'\\*'|"\\*")(?=\\s|$|[;&|\`]))`,
 			"i",
 		),
 		verb: /\bgit\s+(checkout|switch|restore)\b/i,

@@ -4,10 +4,12 @@ import { DiscordGateway, type DiscordGatewayOptions, type GatewayTimers } from "
 import { DiscordSocketTransport } from "../src/discord/socket-transport";
 import {
 	DISCORD_INTENTS,
+	type DiscordChannelInfo,
 	DiscordGatewayFatalError,
 	type DiscordHandlers,
 	type DiscordInteraction,
 	type DiscordMessageEvent,
+	type DiscordMessageUpdate,
 	type DiscordRole,
 } from "../src/discord/transport";
 
@@ -171,8 +173,11 @@ function startHarness(): Harness {
 
 interface Recorded {
 	messages: DiscordMessageEvent[];
+	updates: DiscordMessageUpdate[];
 	interactions: DiscordInteraction[];
 	roles: DiscordRole[][];
+	channels: DiscordChannelInfo[];
+	gone: string[];
 	ready: Array<{ resumed: boolean }>;
 	fatal: DiscordGatewayFatalError[];
 	reconnects: string[];
@@ -199,8 +204,11 @@ function make(
 ): { gw: DiscordGateway; rec: Recorded } {
 	const rec: Recorded = {
 		messages: [],
+		updates: [],
 		interactions: [],
 		roles: [],
+		channels: [],
+		gone: [],
 		ready: [],
 		fatal: [],
 		reconnects: [],
@@ -211,12 +219,24 @@ function make(
 			rec.messages.push(event);
 			h.notify();
 		},
+		messageUpdate: async (event) => {
+			rec.updates.push(event);
+			h.notify();
+		},
 		interaction: async (interaction) => {
 			rec.interactions.push(interaction);
 			h.notify();
 		},
 		roles: (roles) => {
 			rec.roles.push([...roles]);
+			h.notify();
+		},
+		channel: (info) => {
+			rec.channels.push(info);
+			h.notify();
+		},
+		channelGone: (id) => {
+			rec.gone.push(id);
 			h.notify();
 		},
 	};
@@ -285,6 +305,17 @@ describe("DiscordGateway", () => {
 		});
 		await h.until(() => rec.messages.length === 1);
 		expect(gw.connectionState()).toEqual({ state: "up", since: 0 });
+	});
+
+	test("MESSAGE_UPDATE reaches messageUpdate as sent, partial fields included", async () => {
+		const h = startHarness();
+		harness = h;
+		const { gw, rec } = make(h, new FakeTimers());
+		await gw.start();
+		h.send(0, { op: 0, t: "MESSAGE_UPDATE", s: 2, d: { id: "1", channel_id: "2", content: "수정" } });
+		await h.until(() => rec.updates.length === 1);
+		expect(rec.updates[0]).toEqual({ id: "1", channel_id: "2", content: "수정" });
+		expect(rec.messages).toHaveLength(0);
 	});
 
 	test("the first heartbeat waits interval × jitter, then one per interval carrying the last sequence", async () => {
@@ -596,6 +627,40 @@ describe("DiscordGateway", () => {
 			[{ id: "42", tags: { bot_id: "31" } }],
 			[{ id: "41", tags: { bot_id: "30" } }],
 		] as DiscordRole[][]);
+	});
+
+	test("GUILD_CREATE channels and threads take the guild id; updates replace and deletes drop a channel", async () => {
+		const h = startHarness();
+		harness = h;
+		const { gw, rec } = make(h, new FakeTimers());
+		await gw.start();
+		h.send(0, {
+			op: 0,
+			t: "GUILD_CREATE",
+			s: 2,
+			d: {
+				id: "40",
+				channels: [{ id: "50", type: 0, name: "배포", topic: "토픽" }, { name: "no id" }],
+				threads: [{ id: "51", type: 11, parent_id: "50", guild_id: "40", name: "스레드" }],
+			},
+		});
+		h.send(0, { op: 0, t: "CHANNEL_UPDATE", s: 3, d: { id: "50", type: 0, guild_id: "40", name: "배포2", topic: 7 } });
+		h.send(0, {
+			op: 0,
+			t: "THREAD_UPDATE",
+			s: 4,
+			d: { id: "51", type: 11, parent_id: "50", guild_id: "40", name: "새 이름" },
+		});
+		h.send(0, { op: 0, t: "CHANNEL_DELETE", s: 5, d: { id: "50", type: 0, guild_id: "40" } });
+		h.send(0, { op: 0, t: "THREAD_DELETE", s: 6, d: { id: "51", type: 11, guild_id: "40", parent_id: "50" } });
+		await h.until(() => rec.gone.length === 2);
+		expect(rec.channels).toEqual([
+			{ id: "50", type: 0, guildId: "40", name: "배포", topic: "토픽" },
+			{ id: "51", type: 11, parentId: "50", guildId: "40", name: "스레드" },
+			{ id: "50", type: 0, guildId: "40", name: "배포2" },
+			{ id: "51", type: 11, parentId: "50", guildId: "40", name: "새 이름" },
+		]);
+		expect(rec.gone).toEqual(["50", "51"]);
 	});
 
 	test("a throwing handler is reported and the connection stays", async () => {

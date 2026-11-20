@@ -7,6 +7,7 @@ import {
 	dispatchEnv,
 	herdrAgentExists,
 	herdrAgentStatus,
+	herdrCloseTaskAgent,
 	herdrPromptExisting,
 	herdrRemoteStart,
 	herdrSshArgv,
@@ -811,6 +812,72 @@ describe("herdrAgentStatus", () => {
 		expect(result).toEqual({ ok: true, status: "blocked" });
 		expect(seen).toEqual([herdrSshArgv("wsl", "/home/dev/.local/bin/herdr", ["agent", "list"])]);
 		expect(seen[0]?.slice(0, 7)).toEqual(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "--", "wsl"]);
+	});
+});
+
+describe("herdrCloseTaskAgent", () => {
+	const listing: RunProcessResult = {
+		code: 0,
+		stdout: JSON.stringify({
+			result: {
+				agents: [
+					{ name: "other", workspace_id: "w1", tab_id: "w1:t1" },
+					{ name: "t-1", workspace_id: "w1", tab_id: "w1:t2" },
+				],
+			},
+		}),
+		timedOut: false,
+	};
+	const recording = (answer: RunProcessResult = listing) => {
+		const seen: string[][] = [];
+		const run: ProcessRunner = async (cmd) => {
+			seen.push(cmd);
+			// Over ssh every remote word is quoted, so the list call is found in the joined argv.
+			return cmd.join(" ").includes("list") ? answer : { code: 0, stdout: "", timedOut: false };
+		};
+		return { seen, run };
+	};
+
+	test("a local task's agent closes its own workspace", async () => {
+		const { seen, run } = recording();
+		expect(await herdrCloseTaskAgent("t-1", { run })).toEqual({ ok: true });
+		expect(seen).toEqual([
+			["herdr", "agent", "list"],
+			["herdr", "workspace", "close", "w1"],
+		]);
+	});
+
+	test("a remote task's agent closes only its tab of the shared owners workspace, over ssh", async () => {
+		const { seen, run } = recording();
+		const options = { sshTarget: "wsl", herdrBin: "/home/dev/.local/bin/herdr", run };
+		expect(await herdrCloseTaskAgent("t-1", options)).toEqual({ ok: true });
+		expect(seen).toEqual([
+			herdrSshArgv("wsl", "/home/dev/.local/bin/herdr", ["agent", "list"]),
+			herdrSshArgv("wsl", "/home/dev/.local/bin/herdr", ["tab", "close", "w1:t2"]),
+		]);
+	});
+
+	test("no agent of that name closes nothing; a failed close or a missing id is an error", async () => {
+		const gone = recording({ code: 0, stdout: JSON.stringify({ result: { agents: [] } }), timedOut: false });
+		expect(await herdrCloseTaskAgent("t-1", { run: gone.run })).toEqual({ ok: true });
+		expect(gone.seen).toHaveLength(1);
+		const noTab = recording({
+			code: 0,
+			stdout: JSON.stringify({ result: { agents: [{ name: "t-1", workspace_id: "w1" }] } }),
+			timedOut: false,
+		});
+		expect(await herdrCloseTaskAgent("t-1", { sshTarget: "wsl", run: noTab.run })).toEqual({
+			ok: false,
+			error: "agent t-1 has no tab_id",
+		});
+		const refused = runner([
+			{ match: (cmd) => cmd.includes("list"), respond: () => listing },
+			{ match: () => true, respond: () => ({ code: 1, stdout: "no such workspace", timedOut: false }) },
+		]);
+		expect(await herdrCloseTaskAgent("t-1", { run: refused })).toEqual({
+			ok: false,
+			error: "workspace close failed: no such workspace",
+		});
 	});
 });
 

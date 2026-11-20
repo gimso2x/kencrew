@@ -8,7 +8,7 @@ import {
 } from "../channel/port";
 import type { ChannelRegistry } from "../channel/registry";
 import { parseThreadRef } from "../core/normalize";
-import { confidentBand, receiptBlockers } from "../lanes/land";
+import { confidentBand, type ReceiptNow, receiptBlockers, receiptNowOf } from "../lanes/land";
 import { formatConfidence } from "../lanes/review";
 import { redact } from "../redact";
 import type { TaskCheck, TaskJudgement } from "./checker";
@@ -290,6 +290,11 @@ export interface AutoLandPolicy {
 	review?: { model: string; timeoutMs: number; confident?: LaneReviewConfident };
 	/** The run QA a reviewed lane or banded [TASK] at `minRisk` or above needs a `PASS` receipt from for that commit. */
 	qa?: LaneQaPolicy;
+	/**
+	 * `taskAutoLand.commitEmails`: per repository (absolute path) the author/committer emails a lane's commits may
+	 * carry. A repository not listed is not checked.
+	 */
+	commitEmails?: Record<string, string[]>;
 }
 
 /** `taskAutoLand.qa` as the lanes apply it (`minRisk` defaults to L3, `timeoutMs` to the review's default). */
@@ -342,6 +347,7 @@ export function autoLandBlockers(
 	policy: AutoLandPolicy,
 	repoMatched: boolean,
 	head?: string,
+	now: ReceiptNow = receiptNowOf(policy),
 ): string[] {
 	const blockers: string[] = [];
 	if (row.host !== null) blockers.push(`원격 호스트(${row.host}) TASK`);
@@ -360,7 +366,7 @@ export function autoLandBlockers(
 		const names = unfinished.map((s) => s.id).join(", ");
 		blockers.push(`PROGRESS 미완료 단계 ${unfinished.length}개(${names})`);
 	}
-	if (band !== undefined) blockers.push(...receiptBlockers(row.gate ?? {}, head, row.risk, policy));
+	if (band !== undefined) blockers.push(...receiptBlockers(row.gate ?? {}, head, row.risk, policy, now));
 	return blockers;
 }
 
@@ -612,11 +618,24 @@ export const formatSpecChangedNotice = (row: TaskRow): string =>
 	`⚠️ ${row.taskId} spec.md 수락기준이 등록 스냅샷과 다릅니다(개수·ID·문구). 고쳐질 때까지 Outcome에 도달하지 않습니다.`;
 
 /** `askedOwner`: the worker stopped on a question in prose, so the owner (this user id) is mentioned with it. */
-export const formatStaleNotice = (row: TaskRow, minutes: number, link?: string, askedOwner?: string): string =>
+export const formatStaleNotice = (
+	row: TaskRow,
+	minutes: number,
+	link?: string,
+	askedOwner?: string,
+	noEvidence?: boolean,
+): string =>
 	[
 		`⏰ ${row.title}: PROGRESS.md가 ${minutes}분 넘게 갱신되지 않았습니다. (${ownerTag(row)})${askedOwner === undefined ? "" : ` 워커가 질문하고 기다립니다. ${mentionToken(askedOwner)}`}`,
+		...(noEvidence ? [NO_EVIDENCE_LINE] : []),
 		...boardFooter(link),
 	].join("\n");
+
+/**
+ * The line a reminder or notice carries when the latest `updated` rewrite moved nothing else in the worktree: the
+ * clock is not progress (doc/plans/task-progress-evidence.md).
+ */
+export const NO_EVIDENCE_LINE = "PROGRESS.md 시각만 바뀌고 내용·커밋·파일 변화가 없습니다.";
 
 /** The worker is herdr-working but PROGRESS.md has not moved for `minutes`: told once, with the screen tail. */
 export const formatWorkingSilentNotice = (
@@ -624,9 +643,11 @@ export const formatWorkingSilentNotice = (
 	minutes: number,
 	screen: { ok: boolean; output?: string; error?: string },
 	link?: string,
+	noEvidence?: boolean,
 ): string =>
 	[
 		`⏳ ${row.title}: 워커는 작업 중(herdr working)인데 PROGRESS.md가 ${minutes}분째 그대로입니다 — 긴 실행이거나 같은 일을 되풀이하고 있을 수 있습니다. (${ownerTag(row)})`,
+		...(noEvidence ? [NO_EVIDENCE_LINE] : []),
 		...(screen.ok
 			? ["*화면 끝부분*:", "```", ...cardTailLines(screen.output ?? ""), "```"]
 			: [`*화면*: 읽지 못함 (${redact(screen.error ?? "unknown").slice(0, 120)})`]),

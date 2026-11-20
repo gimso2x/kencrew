@@ -45,6 +45,7 @@ export function buildTaskPrompt(input: TaskPromptInput): string {
 		"5. 완료 선언·merge·push·배포를 하지 않는다. Outcome 판정은 ompbot이 한다.",
 		"6. `[check: …]`가 붙은 수락기준은 ompbot이 직접 다시 실행한다. 커밋한 뒤 같은 명령으로 직접 확인하라.",
 		"7. 컨텍스트 예산: 단일 세션 컨텍스트가 200k 토큰을 넘기 전에 단계를 3~5개 안쪽으로 마무리한다(300k 초과 금지). 작업이 커지면 남은 단계를 후속 작업으로 분할할 수 있게 정리한다.",
+		"8. 전체 테스트는 `bun run test`로 한다(호스트에서 한 번에 하나씩 줄을 선다). 수정 중에는 고친 파일의 테스트만 돌린다.",
 	].join("\n");
 	const instruction = input.instruction?.trim();
 	return instruction === undefined || instruction === "" ? header : `${header}\n\n---\n${instruction}`;

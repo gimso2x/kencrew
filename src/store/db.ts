@@ -9,8 +9,9 @@ import {
 	parseChatOrigin,
 	platformOfConversationId,
 } from "../core/origin-key";
-import { COMMAND_OP_REF, PEER_FAILURE_MARK, parseCommand } from "../core/types";
+import { COMMAND_OP_REF, PEER_FAILURE_MARK, parseCommand, parsePurposeCommand } from "../core/types";
 import { previewLine } from "../dashboard/snapshot";
+import type { LaneReservation, ReservationState } from "../lanes/reservations";
 import {
 	assertLaneTransition,
 	LANE_ORIGIN_PREFIX,
@@ -28,8 +29,9 @@ import {
 	monitorOrigin,
 	withoutMarkerLines,
 } from "../monitors/ledger";
-import type { ApprovalDetail } from "../safety/approval";
+import type { ApprovalDetail, ApprovalInput, AutoChoiceInput, ExpiredApproval } from "../safety/approval";
 import { TaskLedger } from "../tasks/ledger";
+import { checkSchemaVersion, stampSchemaVersion } from "./schema-version";
 import {
 	assertInboundTransition,
 	type DeliveryEvent,
@@ -39,6 +41,7 @@ import {
 	type InboundState,
 	StoreError,
 	transitionDelivery,
+	type UncertainReason,
 } from "./transitions";
 
 /** Words a placeholder answer uses when omp returned no text (mailbox writes it); a monitor treats it as a failure. */
@@ -89,7 +92,7 @@ interface AlertIncident {
 	standing: boolean;
 }
 
-export type { DeliveryState, InboundState } from "./transitions";
+export type { DeliveryState, InboundState, UncertainReason } from "./transitions";
 export { StoreError } from "./transitions";
 
 interface StoreClock {
@@ -187,6 +190,9 @@ export interface InboundRow {
 	threadRef: string;
 	/** User id of the peer bot that wrote this row; null for every owner row (and rows from before the column). */
 	peerUserId: string | null;
+	/** Set while `state` is `uncertain` (and kept after retry/close): why the input was parked, and when. */
+	uncertainReason: UncertainReason | null;
+	uncertainAt: number | null;
 }
 
 export interface DeliveryRow {
@@ -218,16 +224,6 @@ export interface RecallCandidate {
 	text: string;
 	opRef: string | null;
 }
-
-/** A pending approval the sweep just expired, for its card rewrite (the mirror too, and `다시 요청` with a thread). */
-type ExpiredApproval = {
-	approvalId: string;
-	channel: string;
-	messageTs: string;
-	summary: string;
-	originThreadRef: string | null;
-	mirrorRef: string | null;
-};
 
 /**
  * Written by older versions (delivery pinning): nothing reads or writes this table now. Its rows still go with their
@@ -284,6 +280,23 @@ const LANES_DDL = `CREATE TABLE IF NOT EXISTS lanes (
 	created_at INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL
 );`;
+
+/** Lane start reservations (doc/plans/lane-after-queue.md); `notice` and `lane_name` are the ledger's own bookkeeping. */
+const LANE_RESERVATIONS_DDL = `CREATE TABLE IF NOT EXISTS lane_reservations (
+	id INTEGER PRIMARY KEY,
+	origin_key TEXT NOT NULL,
+	thread_ref TEXT NOT NULL,
+	repo TEXT NOT NULL,
+	after_json TEXT NOT NULL,
+	start_args_json TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'waiting'
+		CHECK (state IN ('waiting','ready','started','cancelled','expired')),
+	notice TEXT,
+	lane_name TEXT,
+	created_at INTEGER NOT NULL,
+	expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS lane_reservations_state ON lane_reservations(state);`;
 
 /**
  * Turn snapshot ledger for `!undo` (doc/plans/turn-undo.md §D): one row per repository a conversation turn changed, with
@@ -555,6 +568,49 @@ interface LaneBoardCursor {
 	lastNoticed: number;
 }
 
+/**
+ * The inbound ledger. `uncertain` parks an input that may already have reached the omp child (`uncertain_reason` says
+ * why, `uncertain_at` when) until the owner closes or retries it. A ledger without it is rebuilt by `migrateInbound`.
+ */
+const INBOUND_DDL = `CREATE TABLE IF NOT EXISTS inbound (
+	inbound_id INTEGER PRIMARY KEY AUTOINCREMENT,
+	platform_message_id TEXT NOT NULL UNIQUE,
+	origin_key TEXT NOT NULL REFERENCES origins(origin_key),
+	epoch INTEGER NOT NULL,
+	text_ref TEXT NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending'
+		CHECK (state IN ('pending','dispatched','answered','failed_notified','discarded','uncertain')),
+	created_at INTEGER NOT NULL,
+	dispatched_at INTEGER,
+	op_ref TEXT,
+	entry_cursor TEXT,
+	thread_ref TEXT,
+	last_event_at INTEGER,
+	peer_user_id TEXT,
+	uncertain_reason TEXT,
+	uncertain_at INTEGER
+);`;
+
+const INBOUND_INDEXES_DDL = `CREATE INDEX IF NOT EXISTS inbound_origin_state ON inbound(origin_key, state);
+CREATE INDEX IF NOT EXISTS inbound_state ON inbound(state);
+CREATE INDEX IF NOT EXISTS inbound_origin_op ON inbound(origin_key, op_ref);
+CREATE INDEX IF NOT EXISTS inbound_origin_created ON inbound(origin_key, created_at);
+CREATE INDEX IF NOT EXISTS inbound_created ON inbound(created_at);
+CREATE INDEX IF NOT EXISTS inbound_state_dispatched ON inbound(state, dispatched_at);`;
+
+/** Created by `migrate`, not `SCHEMA`: a pre-`thread_ref` ledger has no such column when `SCHEMA` runs. */
+const INBOUND_THREAD_INDEX_DDL = "CREATE INDEX IF NOT EXISTS inbound_thread ON inbound(thread_ref)";
+
+const INBOUND_INDEX_NAMES = [
+	"inbound_origin_state",
+	"inbound_state",
+	"inbound_origin_op",
+	"inbound_origin_created",
+	"inbound_created",
+	"inbound_state_dispatched",
+	"inbound_thread",
+] as const;
+
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS origins (
 	origin_key TEXT PRIMARY KEY,
@@ -562,28 +618,8 @@ CREATE TABLE IF NOT EXISTS origins (
 	session_dir TEXT NOT NULL,
 	updated_at INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS inbound (
-	inbound_id INTEGER PRIMARY KEY AUTOINCREMENT,
-	platform_message_id TEXT NOT NULL UNIQUE,
-	origin_key TEXT NOT NULL REFERENCES origins(origin_key),
-	epoch INTEGER NOT NULL,
-	text_ref TEXT NOT NULL,
-	state TEXT NOT NULL DEFAULT 'pending'
-		CHECK (state IN ('pending','dispatched','answered','failed_notified','discarded')),
-	created_at INTEGER NOT NULL,
-	dispatched_at INTEGER,
-	op_ref TEXT,
-	entry_cursor TEXT,
-	thread_ref TEXT,
-	last_event_at INTEGER,
-	peer_user_id TEXT
-);
-CREATE INDEX IF NOT EXISTS inbound_origin_state ON inbound(origin_key, state);
-CREATE INDEX IF NOT EXISTS inbound_state ON inbound(state);
-CREATE INDEX IF NOT EXISTS inbound_origin_op ON inbound(origin_key, op_ref);
-CREATE INDEX IF NOT EXISTS inbound_origin_created ON inbound(origin_key, created_at);
-CREATE INDEX IF NOT EXISTS inbound_created ON inbound(created_at);
-CREATE INDEX IF NOT EXISTS inbound_state_dispatched ON inbound(state, dispatched_at);
+${INBOUND_DDL}
+${INBOUND_INDEXES_DDL}
 CREATE TABLE IF NOT EXISTS deliveries (
 	delivery_id INTEGER PRIMARY KEY AUTOINCREMENT,
 	origin_key TEXT NOT NULL,
@@ -606,6 +642,7 @@ CREATE INDEX IF NOT EXISTS deliveries_state_next ON deliveries(state, next_at);
 CREATE INDEX IF NOT EXISTS deliveries_created ON deliveries(created_at);
 CREATE INDEX IF NOT EXISTS deliveries_thread ON deliveries(thread_ref);
 ${LANES_DDL}
+${LANE_RESERVATIONS_DDL}
 CREATE TABLE IF NOT EXISTS slack_cursors (
 	cursor_key TEXT PRIMARY KEY,
 	last_ts TEXT NOT NULL,
@@ -628,6 +665,11 @@ CREATE TABLE IF NOT EXISTS owner_home (
 	platform TEXT NOT NULL,
 	conversation_id TEXT NOT NULL,
 	set_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_purposes (
+	scope_key TEXT PRIMARY KEY,
+	text TEXT NOT NULL,
+	updated_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS teams_conversations (
 	alias TEXT PRIMARY KEY,
@@ -655,6 +697,15 @@ CREATE TABLE IF NOT EXISTS usage_daily (
 	calls INTEGER NOT NULL,
 	PRIMARY KEY(day, origin_key)
 );
+CREATE TABLE IF NOT EXISTS auto_choices (
+	id INTEGER PRIMARY KEY,
+	origin_key TEXT,
+	thread_ref TEXT,
+	question TEXT NOT NULL,
+	chosen TEXT NOT NULL,
+	created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS auto_choices_at ON auto_choices(created_at);
 ${LEGACY_FEEDBACK_DDL}
 ${TURN_SNAPSHOTS_DDL}
 ${WIKI_NOTES_DDL}
@@ -689,6 +740,34 @@ const toLane = (r: LaneSql): LaneRow => ({
 	meta: JSON.parse(r.meta) as LaneMeta,
 	createdAt: r.created_at,
 	updatedAt: r.updated_at,
+});
+
+interface LaneReservationSql {
+	id: number;
+	origin_key: string;
+	thread_ref: string;
+	repo: string;
+	after_json: string;
+	start_args_json: string;
+	state: ReservationState;
+	notice: string | null;
+	lane_name: string | null;
+	created_at: number;
+	expires_at: number;
+}
+
+const toLaneReservation = (r: LaneReservationSql): LaneReservation => ({
+	id: r.id,
+	originKey: r.origin_key,
+	threadRef: r.thread_ref,
+	repo: r.repo,
+	after: JSON.parse(r.after_json) as string[],
+	startArgs: JSON.parse(r.start_args_json) as Record<string, unknown>,
+	state: r.state,
+	notice: r.notice,
+	laneName: r.lane_name,
+	createdAt: r.created_at,
+	expiresAt: r.expires_at,
 });
 
 /** The registry keeps the newest entries only; a lane that lives for weeks must not grow without bound. */
@@ -745,6 +824,8 @@ interface InboundSql {
 	entry_cursor: string | null;
 	thread_ref: string | null;
 	peer_user_id: string | null;
+	uncertain_reason: UncertainReason | null;
+	uncertain_at: number | null;
 }
 interface DeliverySql {
 	delivery_id: number;
@@ -785,6 +866,8 @@ const toInbound = (r: InboundSql): InboundRow => ({
 	entryCursor: r.entry_cursor,
 	threadRef: r.thread_ref ?? r.platform_message_id,
 	peerUserId: r.peer_user_id ?? null,
+	uncertainReason: r.uncertain_reason ?? null,
+	uncertainAt: r.uncertain_at ?? null,
 });
 
 const toDelivery = (r: DeliverySql): DeliveryRow => ({
@@ -816,6 +899,7 @@ export class Store {
 	/** [TASK] registry; shares this connection. */
 	readonly tasks: TaskLedger;
 	private logChannels: LogChannels = {};
+	private alertChannels: LogChannels = {};
 	/** Rows `sweepExpired` expired that no adapter took yet (`takeExpired`); memory only, like the statuses they end. */
 	private expiredUnfinished: DeliveryRow[] = [];
 	private peerCallPolicy: PeerCallPolicy | undefined;
@@ -838,18 +922,34 @@ export class Store {
 		this.logChannels = { ...channel };
 	}
 
+	/** Start and config reload: monitor failure notices go to the Discord alert channel when set, else the owner home. */
+	setAlertChannel(channel: LogChannels | undefined): void {
+		this.alertChannels = { ...channel };
+	}
+
 	constructor(options: StoreOptions) {
 		this.clock = options.clock;
 		this.setLogChannel(options.logChannel);
 		this.redact = options.redact;
 		this.hooks = options.hooks ?? {};
 		this.db = new Database(options.path, { create: true, strict: true });
+		try {
+			checkSchemaVersion(this.db);
+		} catch (error) {
+			this.db.close();
+			throw error;
+		}
 		this.db.run("PRAGMA journal_mode = WAL");
 		this.db.run("PRAGMA synchronous = NORMAL");
 		this.db.run("PRAGMA foreign_keys = ON");
 		this.db.run("PRAGMA busy_timeout = 5000");
 		this.db.run(SCHEMA);
-		this.migrate();
+		try {
+			this.migrate();
+		} catch (error) {
+			this.db.close();
+			throw error;
+		}
 		this.monitors = new MonitorLedger(this.db, {
 			clock: options.clock,
 			redact: options.redact,
@@ -857,6 +957,7 @@ export class Store {
 			canAlert: (monitorId) => this.ownerHome() !== undefined || this.noteUnroutableCheckError(monitorId),
 		});
 		this.tasks = new TaskLedger(this.db, { clock: options.clock, timezone: options.timezone });
+		stampSchemaVersion(this.db);
 		this.recoveredInflight = this.db
 			.query("UPDATE deliveries SET state = 'pending', redelivered = 1, next_at = ? WHERE state = 'inflight'")
 			.run(this.clock.now()).changes;
@@ -912,22 +1013,7 @@ export class Store {
 		return rows.map((row) => row.cursor_key);
 	}
 
-	createApproval(input: {
-		approvalId: string;
-		channel: string;
-		messageTs: string;
-		summary: string;
-		createdAt: number;
-		expiresAt: number;
-		/** The conversation that asked and the thread the request came from (absent for lane/legacy callers). */
-		originKey?: string | undefined;
-		originThreadRef?: string | undefined;
-		/** The card's structured sections as shown (already redacted and cut); only filled fields are stored. */
-		detail?: ApprovalDetail | undefined;
-		/** Permalinks of the card and of the asking thread (best effort; absent when the lookup failed). */
-		cardUrl?: string | undefined;
-		originUrl?: string | undefined;
-	}): void {
+	createApproval(input: ApprovalInput): void {
 		const detail: ApprovalDetail = {};
 		for (const key of ["action", "why", "impact", "rollback"] as const) {
 			const value = input.detail?.[key];
@@ -1259,7 +1345,27 @@ export class Store {
 		return this.requireInbound(platformMessageId);
 	}
 
-	/** pending|dispatched -> discarded. With `opRef` the row is re-linked to that op (see `newEpoch`). */
+	/** pending -> uncertain: the input may already have reached the omp child, so nothing replays it until the owner decides. */
+	markUncertain(platformMessageId: string, reason: UncertainReason): InboundRow {
+		const current = this.requireInbound(platformMessageId);
+		assertInboundTransition(current.state, "uncertain");
+		this.db
+			.query(
+				"UPDATE inbound SET state = 'uncertain', uncertain_reason = ?, uncertain_at = ? WHERE platform_message_id = ?",
+			)
+			.run(reason, this.clock.now(), platformMessageId);
+		return this.requireInbound(platformMessageId);
+	}
+
+	/** uncertain -> pending: the owner's explicit retry; the next drain sends it from scratch. */
+	retryUncertain(platformMessageId: string): InboundRow {
+		const current = this.requireInbound(platformMessageId);
+		assertInboundTransition(current.state, "pending");
+		this.db.query("UPDATE inbound SET state = 'pending' WHERE platform_message_id = ?").run(platformMessageId);
+		return this.requireInbound(platformMessageId);
+	}
+
+	/** pending|dispatched|uncertain -> discarded. With `opRef` the row is re-linked to that op (see `newEpoch`). */
 	discard(platformMessageId: string, opRef?: string): InboundRow {
 		const current = this.requireInbound(platformMessageId);
 		assertInboundTransition(current.state, "discarded");
@@ -1366,7 +1472,7 @@ export class Store {
 		for (const row of rows) {
 			const bookkeeping =
 				row.kind === "inbound"
-					? parseCommand(row.text) !== undefined
+					? parseCommand(row.text) !== undefined || parsePurposeCommand(row.text) !== undefined
 					: (row.op_ref !== null && COMMAND_OP_REF.test(row.op_ref)) ||
 						row.text.startsWith(STEER_NOTICE_HEAD) ||
 						row.text.startsWith(TURN_FAILED_HEAD);
@@ -1619,6 +1725,28 @@ export class Store {
 			.run(home.platform, home.conversationId, this.clock.now());
 	}
 
+	/** `!용도`: the purpose memo of a channel (`<platform>:<conversationId>`) or thread (`<platform>:<threadRef>`). */
+	setPurpose(scopeKey: string, text: string): void {
+		this.db
+			.query(
+				`INSERT INTO conversation_purposes (scope_key, text, updated_at) VALUES (?, ?, ?)
+				 ON CONFLICT(scope_key) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at`,
+			)
+			.run(scopeKey, text, this.clock.now());
+	}
+
+	getPurpose(scopeKey: string): string | undefined {
+		const row = this.db.query("SELECT text FROM conversation_purposes WHERE scope_key = ?").get(scopeKey) as {
+			text: string;
+		} | null;
+		return row?.text;
+	}
+
+	/** True when a memo existed. */
+	clearPurpose(scopeKey: string): boolean {
+		return this.db.query("DELETE FROM conversation_purposes WHERE scope_key = ?").run(scopeKey).changes > 0;
+	}
+
 	/**
 	 * Where daemon-level owner notices and channel-less monitor reports go: ① the home registered with `!home`, ② the
 	 * owner's newest 1:1 conversation on any platform, ③ the conversation the owner last wrote in. `undefined` before
@@ -1784,6 +1912,12 @@ export class Store {
 		return undefined;
 	}
 
+	/** Top-level thread ref of an owner alert: the Discord alert channel when set, else `ownerTopLevelThreadRef`. */
+	private ownerAlertThreadRef(input: { originKey: string; opRef: string }): string | undefined {
+		const alert = this.alertChannels.discord;
+		return alert === undefined ? this.ownerTopLevelThreadRef(input) : threadRefOf(alert, TOP_LEVEL_TS);
+	}
+
 	/** Monitor event ids of the dispatched inbound rows of an op (message ids are `monitor:<id>:<event>:<attempt>`). */
 	private monitorEventsOfOp(originKey: string, opRef: string): number[] {
 		const rows = this.db
@@ -1921,7 +2055,7 @@ export class Store {
 			if (!settled?.terminal) return undefined;
 			// Without an owner destination the incident is not consumed: a later failure must still alert.
 			const target = { originKey: monitorOrigin(settled.event.monitorId), opRef: `monitor-notice:${eventId}` };
-			const threadRef = this.ownerTopLevelThreadRef(target);
+			const threadRef = this.ownerAlertThreadRef(target);
 			if (threadRef === undefined) return undefined;
 			// Same monitor + same normalized error inside the repeat window stays quiet (hermes incident dedup).
 			const incident = this.monitors.recordMonitorIncident(settled.event.monitorId, error, this.clock.now());
@@ -1949,7 +2083,7 @@ export class Store {
 	private postCheckErrorNotice(alert: CheckErrorAlert): void {
 		const now = this.clock.now();
 		const target = { originKey: monitorOrigin(alert.monitorId), opRef: `monitor-check-error:${now}` };
-		const threadRef = this.ownerTopLevelThreadRef(target);
+		const threadRef = this.ownerAlertThreadRef(target);
 		if (threadRef === undefined) return;
 		const repeat = alert.count > 1 ? ` · 반복 ${alert.count}회차` : "";
 		this.insertDelivery(
@@ -1989,6 +2123,15 @@ export class Store {
 			.query("SELECT origin_key, cost FROM usage_daily WHERE day = ? ORDER BY cost DESC, origin_key LIMIT ?")
 			.all(day, limit) as Array<{ origin_key: string; cost: number }>;
 		return rows.map((row) => ({ originKey: row.origin_key, cost: row.cost }));
+	}
+
+	// ---- `ask` questions the deadline answered (src/safety/choice.ts) ----
+
+	/** Records one `ask` question that closed unanswered and what omp's fallback picked for it. */
+	addAutoChoice(input: AutoChoiceInput): void {
+		this.db
+			.query("INSERT INTO auto_choices (origin_key, thread_ref, question, chosen, created_at) VALUES (?, ?, ?, ?, ?)")
+			.run(input.originKey ?? null, input.threadRef ?? null, input.question, input.chosen, input.createdAt);
 	}
 
 	// ---- alert incidents (owner-notice repeat suppression) ----
@@ -2397,7 +2540,7 @@ export class Store {
 						threadRef: group.thread_ref,
 					},
 					0,
-					`<@${policy.ownerUserId}> ⚠️ ${name} 무응답 ${minutes}분 — VM이 잠든 것 같으니 앱을 열어 주세요`,
+					`<@${policy.ownerUserId}> ⚠️ ${name} 무응답 ${minutes}분 — 재시작·VM 교체 뒤 복원 중일 수 있습니다`,
 				);
 				alerts += 1;
 			}
@@ -2655,6 +2798,66 @@ export class Store {
 		return lane;
 	}
 
+	// ---- lane reservations (doc/plans/lane-after-queue.md) ----
+
+	/** A new reservation in `waiting`; `startArgs` is stored as given (the caller has redacted it). */
+	insertLaneReservation(input: {
+		originKey: string;
+		threadRef: string;
+		repo: string;
+		after: readonly string[];
+		startArgs: Record<string, unknown>;
+		expiresAt: number;
+	}): LaneReservation {
+		const row = this.db
+			.query(
+				"INSERT INTO lane_reservations (origin_key, thread_ref, repo, after_json, start_args_json, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *",
+			)
+			.get(
+				input.originKey,
+				input.threadRef,
+				input.repo,
+				JSON.stringify(input.after),
+				JSON.stringify(input.startArgs),
+				this.clock.now(),
+				input.expiresAt,
+			) as LaneReservationSql;
+		return toLaneReservation(row);
+	}
+
+	getLaneReservation(id: number): LaneReservation | undefined {
+		const row = this.db.query("SELECT * FROM lane_reservations WHERE id = ?").get(id) as LaneReservationSql | null;
+		return row ? toLaneReservation(row) : undefined;
+	}
+
+	/** Reservations in any of `states`, oldest first. */
+	listLaneReservations(states: readonly ReservationState[]): LaneReservation[] {
+		const marks = states.map(() => "?").join(",");
+		const rows = this.db
+			.query(`SELECT * FROM lane_reservations WHERE state IN (${marks}) ORDER BY id`)
+			.all(...states) as LaneReservationSql[];
+		return rows.map(toLaneReservation);
+	}
+
+	/**
+	 * Moves a reservation to `to` only while it is in one of `from` (a double click or a tick racing a button changes
+	 * it once); `patch` sets the notice signature and the lane it opened. False when it was not in `from`.
+	 */
+	moveLaneReservation(
+		id: number,
+		from: readonly ReservationState[],
+		to: ReservationState,
+		patch: { notice?: string | null; laneName?: string } = {},
+	): boolean {
+		const marks = from.map(() => "?").join(",");
+		const result = this.db
+			.query(
+				`UPDATE lane_reservations SET state = ?, notice = CASE WHEN ? THEN ? ELSE notice END, lane_name = COALESCE(?, lane_name) WHERE id = ? AND state IN (${marks})`,
+			)
+			.run(to, "notice" in patch ? 1 : 0, patch.notice ?? null, patch.laneName ?? null, id, ...from);
+		return result.changes > 0;
+	}
+
 	// ---- internals ----
 
 	/**
@@ -2693,7 +2896,8 @@ export class Store {
 			this.db.run("ALTER TABLE teams_conversations ADD COLUMN owner_at INTEGER");
 		}
 		this.db.run("UPDATE inbound SET thread_ref = platform_message_id WHERE thread_ref IS NULL");
-		this.db.run("CREATE INDEX IF NOT EXISTS inbound_thread ON inbound(thread_ref)");
+		this.db.run(INBOUND_THREAD_INDEX_DDL);
+		this.migrateInbound();
 		this.migrateApprovals();
 		this.migrateLanes();
 		// After the rebuild (which already creates the dashboard columns): a 'replied'-era table lacks them, and every
@@ -2708,6 +2912,42 @@ export class Store {
 		// table carried (a RENAME follows the table, the DROP kills it), so a pre-'replied' ledger would end this
 		// open without it. This runs after every open, so the sweep's status = 'pending' scan stays indexed.
 		this.db.run("CREATE INDEX IF NOT EXISTS approvals_status ON approvals(status)");
+	}
+
+	/**
+	 * The `uncertain` state widens a CHECK constraint, which SQLite cannot ALTER: an inbound table without it is rebuilt
+	 * (rename, create, copy, drop) in one transaction. A RENAME keeps the old table's indexes under their names, so they
+	 * are dropped first and all seven recreated on the new table. `inbound_id` is copied as is, so the AUTOINCREMENT
+	 * sequence carries on; the new columns stay NULL. `inbound.origin_key` references `origins`, and a long-lived ledger
+	 * holds rows whose origin is gone (2026-11-20: 522 answered rows of removed Slack threads), so the copy runs with
+	 * `foreign_keys` off, as SQLite's table-rebuild procedure prescribes; the pragma is a no-op inside a transaction, so
+	 * it is switched around it. The rows keep exactly the references they had.
+	 */
+	private migrateInbound(): void {
+		const current = this.db.query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'inbound'").get() as {
+			sql: string;
+		} | null;
+		if (current === null || current.sql.includes("'uncertain'")) return;
+		this.db.run("PRAGMA foreign_keys = OFF");
+		try {
+			this.rebuildInbound();
+		} finally {
+			this.db.run("PRAGMA foreign_keys = ON");
+		}
+	}
+
+	private rebuildInbound(): void {
+		this.db.transaction(() => {
+			this.db.run("ALTER TABLE inbound RENAME TO inbound_old");
+			for (const name of INBOUND_INDEX_NAMES) this.db.run(`DROP INDEX IF EXISTS ${name}`);
+			this.db.run(INBOUND_DDL);
+			this.db.run(
+				"INSERT INTO inbound (inbound_id, platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, op_ref, entry_cursor, thread_ref, last_event_at, peer_user_id) SELECT inbound_id, platform_message_id, origin_key, epoch, text_ref, state, created_at, dispatched_at, op_ref, entry_cursor, thread_ref, last_event_at, peer_user_id FROM inbound_old",
+			);
+			this.db.run("DROP TABLE inbound_old");
+			this.db.run(INBOUND_INDEXES_DDL);
+			this.db.run(INBOUND_THREAD_INDEX_DDL);
+		})();
 	}
 
 	/**

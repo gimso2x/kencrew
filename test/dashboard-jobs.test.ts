@@ -343,6 +343,25 @@ describe("dashboard jobs from systemd-run units", () => {
 		});
 	});
 
+	test("kencrew-* units are jobs too, and a name both prefixes share shows once", async () => {
+		let asked: string[] = [];
+		const stdout = [
+			transient("ompbot-intake.service", 601),
+			transient("kencrew-intake.service", 602),
+			transient("kencrew-fable-intake.service", 603),
+		].join("\n\n");
+		const run = async (cmd: string[]) => {
+			if (cmd[0] === "systemctl") asked = cmd;
+			return listing(stdout)(cmd);
+		};
+		const jobs = await jobsOf({ run });
+		expect(asked).toEqual(expect.arrayContaining(["ompbot-*.service", "kencrew-*.service"]));
+		expect(jobs.map((job) => [job.name, job.pid])).toEqual([
+			["intake", 601],
+			["fable-intake", 603],
+		]);
+	});
+
 	test("no systemctl on the host means no unit jobs; a failing systemctl is one invalid row beside the files", async () => {
 		writeJob("audit.json", { state: "running", updatedAt: iso(NOW - MINUTE), pid: LIVE_PID });
 		expect((await jobsOf({ run: listing("spawn failed: ENOENT", null) })).map((job) => job.name)).toEqual(["audit"]);
